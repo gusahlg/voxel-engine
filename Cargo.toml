@@ -1,6 +1,16 @@
 [package]
-name = "voxel_engine"
+name = "vk_rust_renderer"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
+ash = "0.38"
+ash-window = "0.13"
+winit = { version = "0.30", features = ["wayland", "x11"] }
+raw-window-handle = "0.6"
+
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
