@@ -1,14 +1,24 @@
 use winit::event_loop::ActiveEventLoop;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
-/// Holds all core Vulkan state and the window. Created in App::resumed() once
-/// the event loop is active and we can obtain platform display/window handles.
+mod device;
+use device::Device;
+
+// Holds all core Vulkan state and the window. Created in App::resumed() once
+// the event loop is active and we can obtain platform display/window handles.
 pub struct Renderer {
     vk_entry: ash::Entry,
     vk_instance: ash::Instance,
     surface_loader: ash::khr::surface::Instance,
     surface: ash::vk::SurfaceKHR,
     pub window: winit::window::Window,
+
+    // Abstraction that stores:
+    //      * Graphics and present queue
+    //      * Physical device
+    //      * Logical device
+    //      * Command pool
+    device: Device,
 }
 
 impl Renderer {
@@ -56,12 +66,18 @@ impl Renderer {
             .expect("Failed to create Vulkan surface")
         };
 
-        let mut new_renderer = Self { vk_entry: entry, vk_instance: instance, surface_loader, surface, window };
-
         // Below is for finding the physical devices and then also adding on the abstraction of the
         // logical device to make the renderer ready to actually interact with the gpu.
+        let device: Device = Device::new(&instance, &surface_loader, surface);
 
-        new_renderer
+        Self {
+            vk_entry: entry, 
+            vk_instance: instance, 
+            surface_loader: surface_loader, 
+            surface: surface, 
+            window: window, 
+            device: device,
+        }
     }
 }
 

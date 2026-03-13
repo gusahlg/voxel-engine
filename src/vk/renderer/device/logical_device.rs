@@ -1,5 +1,6 @@
 /// This file is suppossed to help with setting up the logical device used for explaining what
 /// features from the physical device to use and in what way.
+use super::physical_device::QueueFamiliesIndices;
 pub fn acquire_logical_device(
     instance: &ash::Instance, physical_device: ash::vk::PhysicalDevice,
     indices: QueueFamiliesIndices, queue_priorities: &[f32],
@@ -16,11 +17,11 @@ pub fn acquire_logical_device(
             .enabled_extension_names(&device_extensions)
             .enabled_features(&device_features);
 
-        let logical_device = instance.create_device(
+        let logical_device = unsafe { instance.create_device(
             physical_device,
             &device_create_info,
             None,
-        ).expect("Failed to create logical device!");
+        ).expect("Failed to create logical device!") };
         return logical_device;
     }
 
@@ -40,11 +41,11 @@ pub fn acquire_logical_device(
             .enabled_extension_names(&device_extensions)
             .enabled_features(&device_features);
 
-        let logical_device = instance.create_device(
+        let logical_device = unsafe { instance.create_device(
             physical_device,
             &device_create_info,
             None,
-        ).expect("Failed to create logical device!");
+        ).expect("Failed to create logical device!") };
         return logical_device;
     }
 }

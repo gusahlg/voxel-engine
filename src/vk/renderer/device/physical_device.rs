@@ -41,6 +41,7 @@ pub fn acquire_queue_families(instance: &ash::Instance, physical_device: ash::vk
     })
 }
 
+#[derive(Clone)]
 pub struct QueueFamiliesIndices {
     pub graphics: u32,
     pub present: u32,
