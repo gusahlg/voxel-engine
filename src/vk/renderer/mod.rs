@@ -4,21 +4,27 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 mod device;
 use device::Device;
 
+mod swapchain;
+use swapchain::{acquire_swapchain, SwapchainInfo};
+
 // Holds all core Vulkan state and the window. Created in App::resumed() once
 // the event loop is active and we can obtain platform display/window handles.
 pub struct Renderer {
-    vk_entry: ash::Entry,
-    vk_instance: ash::Instance,
-    surface_loader: ash::khr::surface::Instance,
-    surface: ash::vk::SurfaceKHR,
-    pub window: winit::window::Window,
-
     // Abstraction that stores:
     //      * Graphics and present queue
     //      * Physical device
     //      * Logical device
     //      * Command pool
     device: Device,
+
+    vk_entry: ash::Entry,
+    vk_instance: ash::Instance,
+
+    swapchain_info: SwapchainInfo,
+
+    surface_loader: ash::khr::surface::Instance,
+    surface: ash::vk::SurfaceKHR,
+    pub window: winit::window::Window,
 }
 
 impl Renderer {
@@ -70,27 +76,48 @@ impl Renderer {
         // logical device to make the renderer ready to actually interact with the gpu.
         let device: Device = Device::new(&instance, &surface_loader, surface);
 
+        let size = window.inner_size();
+        let window_extent = ash::vk::Extent2D {
+            width: size.width,
+            height: size.height,
+        };
+
+        // Create swapchain
+        let swapchain_info = acquire_swapchain(
+            &instance,
+            device.physical_device,
+            &device.logical_device,
+            &surface_loader,
+            surface,
+            window_extent,
+            device.graphics_queue_family,
+            device.present_queue_family,
+        );
+
         Self {
-            vk_entry: entry, 
-            vk_instance: instance, 
-            surface_loader: surface_loader, 
-            surface: surface, 
-            window: window, 
-            device: device,
+            vk_entry: entry,
+            vk_instance: instance,
+            swapchain_info,
+            surface_loader,
+            surface,
+            window,
+            device,
         }
     }
 }
 
-// Destroy in reverse creation order: surface first, then instance.
+// Destroy in reverse creation order.
 // Entry doesn't need explicit cleanup (it's just loaded function pointers).
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
+            for &view in &self.swapchain_info.image_views {
+                self.device.logical_device.destroy_image_view(view, None);
+            }
+            self.swapchain_info.swapchain_loader
+                .destroy_swapchain(self.swapchain_info.swapchain, None);
             self.surface_loader.destroy_surface(self.surface, None);
             self.vk_instance.destroy_instance(None);
         }
     }
 }
-
-// Helper functions 
-

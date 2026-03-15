@@ -13,6 +13,9 @@ pub struct Device {
     pub graphics_queue: ash::vk::Queue,
     pub present_queue: ash::vk::Queue,
 
+    pub graphics_queue_family: u32,
+    pub present_queue_family: u32,
+
     pub command_pool: ash::vk::CommandPool,
 }
 impl Device {
@@ -75,11 +78,13 @@ impl Device {
         };
         
         Self {
-            physical_device: physical_device,
-            logical_device: logical_device,
-            graphics_queue: graphics_queue,
-            present_queue: present_queue,
-            command_pool: command_pool,
+            physical_device,
+            logical_device,
+            graphics_queue,
+            present_queue,
+            graphics_queue_family: indices.graphics,
+            present_queue_family: indices.present,
+            command_pool,
         }
     }
 }
