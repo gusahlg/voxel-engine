@@ -5,7 +5,10 @@ pub struct SwapchainInfo {
     pub swapchain: vk::SwapchainKHR,
     pub images: Vec<vk::Image>,
     pub image_views: Vec<vk::ImageView>,
+
+    // Needed for render pass initialization
     pub format: vk::Format,
+
     pub extent: vk::Extent2D,
 }
 

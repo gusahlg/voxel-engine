@@ -40,8 +40,9 @@ impl ApplicationHandler for App {
                 log::info!("Resized to {}x{}", size.width, size.height);
             }
 
+            // For drawing frames
             WindowEvent::RedrawRequested => {
-                // Later: render a Vulkan frame here.
+                self.renderer.as_ref().expect("Renderer was not found at frame rendering!").draw_frame();
             }
 
             _ => {}

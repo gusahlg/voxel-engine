@@ -7,6 +7,9 @@ use device::Device;
 mod swapchain;
 use swapchain::{acquire_swapchain, SwapchainInfo};
 
+mod render_pass;
+use render_pass::{acquire_render_pass};
+
 // Holds all core Vulkan state and the window. Created in App::resumed() once
 // the event loop is active and we can obtain platform display/window handles.
 pub struct Renderer {
@@ -21,6 +24,12 @@ pub struct Renderer {
     vk_instance: ash::Instance,
 
     swapchain_info: SwapchainInfo,
+    render_pass: ash::vk::RenderPass,
+    
+    // For later:
+    // pipeline_layout: ash::vk::PipelineLayout,
+    // graphics_pipeline: ash::vk::Pipeline,
+    // framebuffers: Vec<ash::vk::Framebuffer>,
 
     surface_loader: ash::khr::surface::Instance,
     surface: ash::vk::SurfaceKHR,
@@ -94,15 +103,22 @@ impl Renderer {
             device.present_queue_family,
         );
 
+        let render_pass = acquire_render_pass(&device, &swapchain_info.format);
+
         Self {
             vk_entry: entry,
             vk_instance: instance,
             swapchain_info,
+            render_pass,
             surface_loader,
             surface,
             window,
             device,
         }
+    }
+
+    pub fn draw_frame(&self) {
+
     }
 }
 
