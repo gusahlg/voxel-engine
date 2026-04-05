@@ -10,6 +10,9 @@ use swapchain::{acquire_swapchain, SwapchainInfo};
 mod render_pass;
 use render_pass::{acquire_render_pass};
 
+mod rendering;
+use rendering::*;
+
 // Holds all core Vulkan state and the window. Created in App::resumed() once
 // the event loop is active and we can obtain platform display/window handles.
 pub struct Renderer {
@@ -26,11 +29,10 @@ pub struct Renderer {
     swapchain_info: SwapchainInfo,
     render_pass: ash::vk::RenderPass,
     
-    // For later:
-    // pipeline_layout: ash::vk::PipelineLayout,
-    // graphics_pipeline: ash::vk::Pipeline,
-    // framebuffers: Vec<ash::vk::Framebuffer>,
+    // For rendering
+    pipeline_bundle: RenderingBundle,
 
+    // For interacting with the screen
     surface_loader: ash::khr::surface::Instance,
     surface: ash::vk::SurfaceKHR,
     pub window: winit::window::Window,
@@ -103,13 +105,21 @@ impl Renderer {
             device.present_queue_family,
         );
 
-        let render_pass = acquire_render_pass(&device, &swapchain_info.format);
+        let render_pass = acquire_render_pass(&device.logical_device, &swapchain_info.format);
+
+        let pipeline_bundle = RenderingBundle::new(
+            &device.logical_device,
+            render_pass,
+            swapchain_info.extent,
+            &swapchain_info.image_views,
+        );
 
         Self {
             vk_entry: entry,
             vk_instance: instance,
             swapchain_info,
             render_pass,
+            pipeline_bundle,
             surface_loader,
             surface,
             window,
@@ -127,6 +137,8 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
+            self.pipeline_bundle.destroy(&self.device.logical_device);
+
             for &view in &self.swapchain_info.image_views {
                 self.device.logical_device.destroy_image_view(view, None);
             }

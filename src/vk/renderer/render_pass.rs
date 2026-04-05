@@ -1,9 +1,9 @@
 /// This is the file for logic that is related to the render pass, it's main purpose is to contian
 /// the acquire_render_pass function, this function is what initializes the render pass.
-use ash::vk::*;
-pub fn acquire_render_pass(device: &Device, swapchain_format: &Format) -> RenderPass {
+use ash::vk;
+pub fn acquire_render_pass(device: &ash::Device, swapchain_format: &vk::Format) -> vk::RenderPass {
     let color_attachment = vk::AttachmentDescription::default()
-        .format(swapchain_format)
+        .format(*swapchain_format)
         .samples(vk::SampleCountFlags::TYPE_1)
         .load_op(vk::AttachmentLoadOp::CLEAR)
         .store_op(vk::AttachmentStoreOp::STORE)
