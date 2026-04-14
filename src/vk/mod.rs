@@ -42,7 +42,15 @@ impl ApplicationHandler for App {
 
             // For drawing frames
             WindowEvent::RedrawRequested => {
-                self.renderer.as_ref().expect("Renderer was not found at frame rendering!").draw_frame();
+                if let Err(err) = self
+                    .renderer
+                    .as_mut()
+                    .expect("Renderer was not found at frame rendering!")
+                    .draw_frame()
+                {
+                    log::error!("Failed to draw frame: {err:?}");
+                    event_loop.exit();
+                }
             }
 
             _ => {}

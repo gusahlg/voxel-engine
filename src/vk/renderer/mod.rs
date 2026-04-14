@@ -1,5 +1,6 @@
 use winit::event_loop::ActiveEventLoop;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use ash::vk;
 
 mod device;
 use device::Device;
@@ -12,6 +13,16 @@ use render_pass::{acquire_render_pass};
 
 mod rendering;
 use rendering::*;
+
+mod constants;
+use constants as VkConsts;
+
+struct FrameSlot {
+    command_buffer: vk::CommandBuffer,
+    in_flight_fence: vk::Fence,
+    image_available_semaphore: vk::Semaphore,
+    render_finished_semaphore: vk::Semaphore,
+}
 
 // Holds all core Vulkan state and the window. Created in App::resumed() once
 // the event loop is active and we can obtain platform display/window handles.
@@ -31,6 +42,11 @@ pub struct Renderer {
     
     // For rendering
     pipeline_bundle: RenderingBundle,
+
+    // Synchronization
+    frames: Vec<FrameSlot>,
+    current_frame: usize,
+
 
     // For interacting with the screen
     surface_loader: ash::khr::surface::Instance,
@@ -114,12 +130,48 @@ impl Renderer {
             &swapchain_info.image_views,
         );
 
+        // COMMAND BUFFERS AND SYNCHRONIZATION
+        let mut frames: Vec<FrameSlot> = Vec::with_capacity(VkConsts::MAX_FRAMES_IN_FLIGHT as usize);
+
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(device.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(VkConsts::MAX_FRAMES_IN_FLIGHT.into());
+
+        let command_buffers = unsafe {
+            device.logical_device.allocate_command_buffers(&allocate_info).expect("Failed to allocate command buffers")
+        };
+        
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        let semaphore_info = vk::SemaphoreCreateInfo::default();
+
+        for i in 0..command_buffers.len() {
+            let fence = unsafe {
+                device.logical_device.create_fence(&fence_info, None).expect("Failed to create fence")
+            };
+
+            let image_available_semaphore = unsafe {
+                device.logical_device.create_semaphore(&semaphore_info, None).expect("Failed to create semaphore")
+            };
+            let render_finished_semaphore = unsafe {
+                device.logical_device.create_semaphore(&semaphore_info, None).expect("Failed to create semaphore")
+            };
+            frames.push(FrameSlot {
+                command_buffer: command_buffers[i],
+                in_flight_fence: fence,
+                image_available_semaphore,
+                render_finished_semaphore,
+            });
+        }
+
         Self {
             vk_entry: entry,
             vk_instance: instance,
             swapchain_info,
             render_pass,
             pipeline_bundle,
+            frames, 
+            current_frame: 0,
             surface_loader,
             surface,
             window,
@@ -127,9 +179,117 @@ impl Renderer {
         }
     }
 
-    pub fn draw_frame(&self) {
+// EXPERIMENTAL
+    // TODO: Add in render loop with command buffer recording and then present to screen, also add
+    // in synchronization primitives
+    pub fn draw_frame(&mut self) -> Result<(), vk::Result> {
+        let frame = &self.frames[self.current_frame];
 
+        unsafe {
+            self.device.logical_device.wait_for_fences(
+                &[frame.in_flight_fence],
+                true,
+                u64::MAX,
+            )?;
+
+            self.device.logical_device.reset_fences(&[frame.in_flight_fence])?;
+
+            let (image_index, _suboptimal) = self.swapchain_info.swapchain_loader.acquire_next_image(
+                self.swapchain_info.swapchain,
+                u64::MAX,
+                frame.image_available_semaphore,
+                vk::Fence::null(),
+            )?;
+
+            self.device.logical_device.reset_command_buffer(
+                frame.command_buffer,
+                vk::CommandBufferResetFlags::empty(),
+            )?;
+
+            self.record_command_buffer(frame.command_buffer, image_index as usize)?;
+
+            let wait_semaphores = [frame.image_available_semaphore];
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let command_buffers = [frame.command_buffer];
+            let signal_semaphores = [frame.render_finished_semaphore];
+
+            let submit_info = vk::SubmitInfo::default()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_semaphores);
+
+            self.device.logical_device.queue_submit(
+                self.device.graphics_queue,
+                &[submit_info],
+                frame.in_flight_fence,
+            )?;
+
+            // 6. Present. Presentation waits until rendering is finished.
+            let present_wait_semaphores = [frame.render_finished_semaphore];
+            let swapchains = [self.swapchain_info.swapchain];
+            let image_indices = [image_index];
+
+            let present_info = vk::PresentInfoKHR::default()
+                .wait_semaphores(&present_wait_semaphores)
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
+
+            self.swapchain_info.swapchain_loader.queue_present(self.device.present_queue, &present_info)?;
+        }
+
+        self.current_frame = (self.current_frame + 1) % self.frames.len();
+        Ok(())
     }
+
+    fn record_command_buffer(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        image_index: usize,
+    ) -> Result<(), vk::Result> {
+        let begin_info = vk::CommandBufferBeginInfo::default();
+
+        let clear_values = [
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                },
+            },
+        ];
+
+        let render_pass_info = vk::RenderPassBeginInfo::default()
+            .render_pass(self.render_pass)
+            .framebuffer(self.pipeline_bundle.framebuffers[image_index])
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.swapchain_info.extent,
+            })
+            .clear_values(&clear_values);
+
+        unsafe {
+            self.device.logical_device.begin_command_buffer(command_buffer, &begin_info)?;
+
+            self.device.logical_device.cmd_begin_render_pass(
+                command_buffer,
+                &render_pass_info,
+                vk::SubpassContents::INLINE,
+            );
+
+            self.device.logical_device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_bundle.graphics_pipeline,
+            );
+
+            self.device.logical_device.cmd_draw(command_buffer, 3, 1, 0, 0);
+
+            self.device.logical_device.cmd_end_render_pass(command_buffer);
+            self.device.logical_device.end_command_buffer(command_buffer)?;
+        }
+
+        Ok(())
+    }
+// EXPERIMENTAL
 }
 
 // Destroy in reverse creation order.
