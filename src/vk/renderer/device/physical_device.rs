@@ -1,7 +1,21 @@
 /// This file is for setting up the physical device and should make all the checks associated with
 /// doing so as well as holding additional metadata.
+use ash::vk;
+
 fn get_queues(instance: &ash::Instance, physical_device: ash::vk::PhysicalDevice) -> Vec<ash::vk::QueueFamilyProperties> {
     unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
+}
+
+pub fn supports_modern_features(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> bool {
+    let mut vulkan_13_features = vk::PhysicalDeviceVulkan13Features::default();
+    let mut features_2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan_13_features);
+
+    unsafe {
+        instance.get_physical_device_features2(physical_device, &mut features_2);
+    }
+
+    vulkan_13_features.dynamic_rendering == vk::TRUE
+        && vulkan_13_features.synchronization2 == vk::TRUE
 }
 
 pub fn acquire_queue_families(instance: &ash::Instance, physical_device: ash::vk::PhysicalDevice, surface_loader: &ash::khr::surface::Instance, surface: ash::vk::SurfaceKHR) -> Option<QueueFamiliesIndices> {

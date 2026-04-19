@@ -10,15 +10,13 @@ use shader_helpers::*;
 pub struct RenderingBundle {
     pub pipeline_layout: vk::PipelineLayout,
     pub graphics_pipeline: vk::Pipeline,
-    pub framebuffers: Vec<vk::Framebuffer>,
 }
 
 impl RenderingBundle {
     pub fn new(
         device: &Device,
-        render_pass: vk::RenderPass,
+        swapchain_format: vk::Format,
         swapchain_extent: vk::Extent2D,
-        swapchain_image_views: &[vk::ImageView],
     ) -> Self {
         let vert_code = read_spv("shaders_spv/tri.vert.spv");
         let frag_code = read_spv("shaders_spv/tri.frag.spv");
@@ -102,6 +100,10 @@ impl RenderingBundle {
                 .unwrap()
         };
 
+        let color_attachment_formats = [swapchain_format];
+        let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_attachment_formats);
+
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&shader_stages)
             .vertex_input_state(&vertex_input_info)
@@ -111,8 +113,7 @@ impl RenderingBundle {
             .multisample_state(&multisampling)
             .color_blend_state(&color_blending)
             .layout(pipeline_layout)
-            .render_pass(render_pass)
-            .subpass(0);
+            .push_next(&mut rendering_info);
 
         let graphics_pipeline = unsafe {
             device
@@ -126,41 +127,16 @@ impl RenderingBundle {
             device.destroy_shader_module(frag_module, None);
         }
 
-        let mut framebuffers = Vec::with_capacity(swapchain_image_views.len());
-
-        for &image_view in swapchain_image_views {
-            let attachments = [image_view];
-
-            let framebuffer_info = vk::FramebufferCreateInfo::default()
-                .render_pass(render_pass)
-                .attachments(&attachments)
-                .width(swapchain_extent.width)
-                .height(swapchain_extent.height)
-                .layers(1);
-
-            let framebuffer = unsafe { device.create_framebuffer(&framebuffer_info, None).unwrap() };
-            framebuffers.push(framebuffer);
-        }
-
         Self {
             pipeline_layout,
             graphics_pipeline,
-            framebuffers,
         }
     }
 
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe {
-        // Destroy framebuffers first
-        for &fb in &self.framebuffers {
-            device.destroy_framebuffer(fb, None);
-        }
-
-        // Then pipeline
-        device.destroy_pipeline(self.graphics_pipeline, None);
-
-        // Then pipeline layout
-        device.destroy_pipeline_layout(self.pipeline_layout, None);
+            device.destroy_pipeline(self.graphics_pipeline, None);
+            device.destroy_pipeline_layout(self.pipeline_layout, None);
         }
     }
 }

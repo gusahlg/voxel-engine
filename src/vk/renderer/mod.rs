@@ -1,15 +1,13 @@
 use winit::event_loop::ActiveEventLoop;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use ash::vk;
+use std::mem::ManuallyDrop;
 
 mod device;
 use device::Device;
 
 mod swapchain;
 use swapchain::{acquire_swapchain, SwapchainInfo};
-
-mod render_pass;
-use render_pass::{acquire_render_pass};
 
 mod rendering;
 use rendering::*;
@@ -32,14 +30,13 @@ pub struct Renderer {
     //      * Physical device
     //      * Logical device
     //      * Command pool
-    device: Device,
+    device: ManuallyDrop<Device>,
 
-    vk_entry: ash::Entry,
+    _vk_entry: ash::Entry,
     vk_instance: ash::Instance,
 
     swapchain_info: SwapchainInfo,
-    render_pass: ash::vk::RenderPass,
-    
+
     // For rendering
     pipeline_bundle: RenderingBundle,
 
@@ -101,7 +98,7 @@ impl Renderer {
 
         // Below is for finding the physical devices and then also adding on the abstraction of the
         // logical device to make the renderer ready to actually interact with the gpu.
-        let device: Device = Device::new(&instance, &surface_loader, surface);
+        let device = ManuallyDrop::new(Device::new(&instance, &surface_loader, surface));
 
         let size = window.inner_size();
         let window_extent = ash::vk::Extent2D {
@@ -121,13 +118,10 @@ impl Renderer {
             device.present_queue_family,
         );
 
-        let render_pass = acquire_render_pass(&device.logical_device, &swapchain_info.format);
-
         let pipeline_bundle = RenderingBundle::new(
             &device.logical_device,
-            render_pass,
+            swapchain_info.format,
             swapchain_info.extent,
-            &swapchain_info.image_views,
         );
 
         // COMMAND BUFFERS AND SYNCHRONIZATION
@@ -165,10 +159,9 @@ impl Renderer {
         }
 
         Self {
-            vk_entry: entry,
+            _vk_entry: entry,
             vk_instance: instance,
             swapchain_info,
-            render_pass,
             pipeline_bundle,
             frames, 
             current_frame: 0,
@@ -179,9 +172,7 @@ impl Renderer {
         }
     }
 
-// EXPERIMENTAL
-    // TODO: Add in render loop with command buffer recording and then present to screen, also add
-    // in synchronization primitives
+    // Function that synchronizes rendering and drawing as a whole
     pub fn draw_frame(&mut self) -> Result<(), vk::Result> {
         let frame = &self.frames[self.current_frame];
 
@@ -208,24 +199,26 @@ impl Renderer {
 
             self.record_command_buffer(frame.command_buffer, image_index as usize)?;
 
-            let wait_semaphores = [frame.image_available_semaphore];
-            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let command_buffers = [frame.command_buffer];
-            let signal_semaphores = [frame.render_finished_semaphore];
+            let command_buffer_info = [vk::CommandBufferSubmitInfo::default()
+                .command_buffer(frame.command_buffer)];
+            let wait_semaphore_info = [vk::SemaphoreSubmitInfo::default()
+                .semaphore(frame.image_available_semaphore)
+                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)];
+            let signal_semaphore_info = [vk::SemaphoreSubmitInfo::default()
+                .semaphore(frame.render_finished_semaphore)
+                .stage_mask(vk::PipelineStageFlags2::ALL_GRAPHICS)];
 
-            let submit_info = vk::SubmitInfo::default()
-                .wait_semaphores(&wait_semaphores)
-                .wait_dst_stage_mask(&wait_stages)
-                .command_buffers(&command_buffers)
-                .signal_semaphores(&signal_semaphores);
+            let submit_info = [vk::SubmitInfo2::default()
+                .wait_semaphore_infos(&wait_semaphore_info)
+                .command_buffer_infos(&command_buffer_info)
+                .signal_semaphore_infos(&signal_semaphore_info)];
 
-            self.device.logical_device.queue_submit(
+            self.device.logical_device.queue_submit2(
                 self.device.graphics_queue,
-                &[submit_info],
+                &submit_info,
                 frame.in_flight_fence,
             )?;
 
-            // 6. Present. Presentation waits until rendering is finished.
             let present_wait_semaphores = [frame.render_finished_semaphore];
             let swapchains = [self.swapchain_info.swapchain];
             let image_indices = [image_index];
@@ -242,38 +235,56 @@ impl Renderer {
         Ok(())
     }
 
-    fn record_command_buffer(
-        &self,
-        command_buffer: vk::CommandBuffer,
-        image_index: usize,
-    ) -> Result<(), vk::Result> {
+    fn record_command_buffer(&self, command_buffer: vk::CommandBuffer, image_index: usize,) -> Result<(), vk::Result> {
         let begin_info = vk::CommandBufferBeginInfo::default();
-
-        let clear_values = [
-            vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.0, 0.0, 0.0, 1.0],
-                },
-            },
-        ];
-
-        let render_pass_info = vk::RenderPassBeginInfo::default()
-            .render_pass(self.render_pass)
-            .framebuffer(self.pipeline_bundle.framebuffers[image_index])
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: self.swapchain_info.extent,
-            })
-            .clear_values(&clear_values);
 
         unsafe {
             self.device.logical_device.begin_command_buffer(command_buffer, &begin_info)?;
 
-            self.device.logical_device.cmd_begin_render_pass(
+            let pre_render_barrier = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.swapchain_info.images[image_index])
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })];
+            let pre_render_dependency = vk::DependencyInfo::default()
+                .image_memory_barriers(&pre_render_barrier);
+            self.device.logical_device.cmd_pipeline_barrier2(
                 command_buffer,
-                &render_pass_info,
-                vk::SubpassContents::INLINE,
+                &pre_render_dependency,
             );
+
+            let color_attachment = [vk::RenderingAttachmentInfo::default()
+                .image_view(self.swapchain_info.image_views[image_index])
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 1.0],
+                    },
+                })];
+
+            let rendering_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.swapchain_info.extent,
+                })
+                .layer_count(1)
+                .color_attachments(&color_attachment);
+
+            self.device.logical_device.cmd_begin_rendering(command_buffer, &rendering_info);
 
             self.device.logical_device.cmd_bind_pipeline(
                 command_buffer,
@@ -283,13 +294,37 @@ impl Renderer {
 
             self.device.logical_device.cmd_draw(command_buffer, 3, 1, 0, 0);
 
-            self.device.logical_device.cmd_end_render_pass(command_buffer);
+            self.device.logical_device.cmd_end_rendering(command_buffer);
+
+            let post_render_barrier = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                .dst_access_mask(vk::AccessFlags2::NONE)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.swapchain_info.images[image_index])
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })];
+            let post_render_dependency = vk::DependencyInfo::default()
+                .image_memory_barriers(&post_render_barrier);
+            self.device.logical_device.cmd_pipeline_barrier2(
+                command_buffer,
+                &post_render_dependency,
+            );
+
             self.device.logical_device.end_command_buffer(command_buffer)?;
         }
 
         Ok(())
     }
-// EXPERIMENTAL
 }
 
 // Destroy in reverse creation order.
@@ -297,13 +332,22 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
+            let _ = self.device.logical_device.device_wait_idle();
+
             self.pipeline_bundle.destroy(&self.device.logical_device);
+
+            for frame in &self.frames {
+                self.device.logical_device.destroy_semaphore(frame.render_finished_semaphore, None);
+                self.device.logical_device.destroy_semaphore(frame.image_available_semaphore, None);
+                self.device.logical_device.destroy_fence(frame.in_flight_fence, None);
+            }
 
             for &view in &self.swapchain_info.image_views {
                 self.device.logical_device.destroy_image_view(view, None);
             }
             self.swapchain_info.swapchain_loader
                 .destroy_swapchain(self.swapchain_info.swapchain, None);
+            ManuallyDrop::drop(&mut self.device);
             self.surface_loader.destroy_surface(self.surface, None);
             self.vk_instance.destroy_instance(None);
         }
