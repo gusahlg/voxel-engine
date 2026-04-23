@@ -43,6 +43,7 @@ pub struct Renderer {
     // Synchronization
     frames: Vec<FrameSlot>,
     current_frame: usize,
+    swapchain_dirty: bool,
 
 
     // For interacting with the screen
@@ -165,6 +166,7 @@ impl Renderer {
             pipeline_bundle,
             frames, 
             current_frame: 0,
+            swapchain_dirty: false,
             surface_loader,
             surface,
             window,
@@ -174,6 +176,10 @@ impl Renderer {
 
     // Function that synchronizes rendering and drawing as a whole
     pub fn draw_frame(&mut self) -> Result<(), vk::Result> {
+        if self.swapchain_dirty {
+            self.recreate_swapchain()?;
+        }
+
         let frame = &self.frames[self.current_frame];
 
         unsafe {
@@ -183,14 +189,21 @@ impl Renderer {
                 u64::MAX,
             )?;
 
-            self.device.logical_device.reset_fences(&[frame.in_flight_fence])?;
-
-            let (image_index, _suboptimal) = self.swapchain_info.swapchain_loader.acquire_next_image(
+            let (image_index, suboptimal) = match self.swapchain_info.swapchain_loader.acquire_next_image(
                 self.swapchain_info.swapchain,
                 u64::MAX,
                 frame.image_available_semaphore,
                 vk::Fence::null(),
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate_swapchain()?;
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
+
+            self.device.logical_device.reset_fences(&[frame.in_flight_fence])?;
 
             self.device.logical_device.reset_command_buffer(
                 frame.command_buffer,
@@ -228,7 +241,17 @@ impl Renderer {
                 .swapchains(&swapchains)
                 .image_indices(&image_indices);
 
-            self.swapchain_info.swapchain_loader.queue_present(self.device.present_queue, &present_info)?;
+            match self.swapchain_info.swapchain_loader.queue_present(self.device.present_queue, &present_info) {
+                Ok(present_suboptimal) => {
+                    if suboptimal || present_suboptimal {
+                        self.recreate_swapchain()?;
+                    }
+                }
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate_swapchain()?;
+                }
+                Err(err) => return Err(err),
+            }
         }
 
         self.current_frame = (self.current_frame + 1) % self.frames.len();
@@ -323,6 +346,57 @@ impl Renderer {
             self.device.logical_device.end_command_buffer(command_buffer)?;
         }
 
+        Ok(())
+    }
+
+    pub fn request_swapchain_recreation(&mut self) {
+        self.swapchain_dirty = true;
+    }
+
+    pub fn recreate_swapchain(&mut self) -> Result<(), vk::Result> {
+        // Get extent
+        let size = self.window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return Ok(());
+        }
+
+        let window_extent = ash::vk::Extent2D {
+            width: size.width,
+            height: size.height,
+        };
+
+        unsafe {
+            self.device.logical_device.device_wait_idle()?;
+            self.pipeline_bundle.destroy(&self.device.logical_device);
+            for &view in &self.swapchain_info.image_views {
+                self.device.logical_device.destroy_image_view(view, None);
+            }
+            self.swapchain_info.swapchain_loader.destroy_swapchain(self.swapchain_info.swapchain, None);
+        }
+
+        // Recreate the swapchain information
+        let swapchain_info = acquire_swapchain(
+            &self.vk_instance,
+            self.device.physical_device,
+            &self.device.logical_device,
+            &self.surface_loader,
+            self.surface,
+            window_extent,
+            self.device.graphics_queue_family,
+            self.device.present_queue_family,
+        );
+
+        // Recreate this too since it depends on the swapchain
+        let pipeline_bundle = RenderingBundle::new(
+            &self.device.logical_device,
+            swapchain_info.format,
+            swapchain_info.extent,
+        );
+
+        // In with the new
+        self.swapchain_info = swapchain_info;
+        self.pipeline_bundle = pipeline_bundle;
+        self.swapchain_dirty = false;
         Ok(())
     }
 }

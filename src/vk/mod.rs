@@ -38,6 +38,9 @@ impl ApplicationHandler for App {
 
             WindowEvent::Resized(size) => {
                 log::info!("Resized to {}x{}", size.width, size.height);
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.request_swapchain_recreation();
+                }
             }
 
             // For drawing frames
