@@ -7,7 +7,7 @@ mod device;
 use device::Device;
 
 mod swapchain;
-use swapchain::{acquire_swapchain, SwapchainInfo};
+use swapchain::SwapchainInfo;
 
 mod rendering;
 use rendering::*;
@@ -17,13 +17,6 @@ use constants as VkConsts;
 
 mod frame;
 use frame::*;
-
-struct FrameSlot {
-    command_buffer: vk::CommandBuffer,
-    in_flight_fence: vk::Fence,
-    image_available_semaphore: vk::Semaphore,
-    render_finished_semaphore: vk::Semaphore,
-}
 
 // Holds all core Vulkan state and the window. Created in App::resumed() once
 // the event loop is active and we can obtain platform display/window handles.
@@ -46,8 +39,6 @@ pub struct Renderer {
     // Synchronization
     frames: Vec<FrameSlot>,
     current_frame: usize,
-    swapchain_dirty: bool,
-
 
     // For interacting with the screen
     surface_loader: ash::khr::surface::Instance,
@@ -111,7 +102,7 @@ impl Renderer {
         };
 
         // Create swapchain
-        let swapchain_info = acquire_swapchain(
+        let swapchain_info = SwapchainInfo::new(
             &instance,
             device.physical_device,
             &device.logical_device,
@@ -169,7 +160,6 @@ impl Renderer {
             pipeline_bundle,
             frames, 
             current_frame: 0,
-            swapchain_dirty: false,
             surface_loader,
             surface,
             window,
@@ -179,18 +169,22 @@ impl Renderer {
 
     // Function that synchronizes rendering and drawing as a whole
     pub fn draw_frame(&mut self) -> Result<(), vk::Result> {
-        if self.swapchain_dirty {
-            self.recreate_swapchain()?;
+        if self.swapchain_info.dirty {
+            self.swapchain_info.recreate(
+                &mut self.pipeline_bundle,
+                &mut self.device,
+                &self.vk_instance,
+                self.surface,
+                &self.surface_loader,
+                &self.window,
+            )?;
         }
 
         let frame = &self.frames[self.current_frame];
 
+        // Refactor
         unsafe {
-            self.device.logical_device.wait_for_fences(
-                &[frame.in_flight_fence],
-                true,
-                u64::MAX,
-            )?;
+            self.device.logical_device.wait_for_fences(&[frame.in_flight_fence], true, u64::MAX,)?;
 
             let (image_index, suboptimal) = match self.swapchain_info.swapchain_loader.acquire_next_image(
                 self.swapchain_info.swapchain,
@@ -200,12 +194,20 @@ impl Renderer {
             ) {
                 Ok(result) => result,
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    self.recreate_swapchain()?;
+                    self.swapchain_info.recreate(
+                        &mut self.pipeline_bundle,
+                        &mut self.device,
+                        &self.vk_instance,
+                        self.surface,
+                        &self.surface_loader,
+                        &self.window,
+                    )?;
                     return Ok(());
                 }
                 Err(err) => return Err(err),
             };
 
+            // Maybe make resets a function
             self.device.logical_device.reset_fences(&[frame.in_flight_fence])?;
 
             self.device.logical_device.reset_command_buffer(
@@ -215,23 +217,12 @@ impl Renderer {
 
             record_command_buffer(&self.device, &self.swapchain_info, self.pipeline_bundle.graphics_pipeline, frame.command_buffer, image_index as usize)?;
 
-            let command_buffer_info = [vk::CommandBufferSubmitInfo::default()
-                .command_buffer(frame.command_buffer)];
-            let wait_semaphore_info = [vk::SemaphoreSubmitInfo::default()
-                .semaphore(frame.image_available_semaphore)
-                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)];
-            let signal_semaphore_info = [vk::SemaphoreSubmitInfo::default()
-                .semaphore(frame.render_finished_semaphore)
-                .stage_mask(vk::PipelineStageFlags2::ALL_GRAPHICS)];
-
-            let submit_info = [vk::SubmitInfo2::default()
-                .wait_semaphore_infos(&wait_semaphore_info)
-                .command_buffer_infos(&command_buffer_info)
-                .signal_semaphore_infos(&signal_semaphore_info)];
+            let frame_submit_info = create_submit_info(frame);
+            let submit_infos = frame_submit_info.submit_infos();
 
             self.device.logical_device.queue_submit2(
                 self.device.graphics_queue,
-                &submit_info,
+                &submit_infos,
                 frame.in_flight_fence,
             )?;
 
@@ -247,11 +238,25 @@ impl Renderer {
             match self.swapchain_info.swapchain_loader.queue_present(self.device.present_queue, &present_info) {
                 Ok(present_suboptimal) => {
                     if suboptimal || present_suboptimal {
-                        self.recreate_swapchain()?;
+                        self.swapchain_info.recreate(
+                            &mut self.pipeline_bundle,
+                            &mut self.device,
+                            &self.vk_instance,
+                            self.surface,
+                            &self.surface_loader,
+                            &self.window,
+                        )?;
                     }
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    self.recreate_swapchain()?;
+                    self.swapchain_info.recreate(
+                        &mut self.pipeline_bundle,
+                        &mut self.device,
+                        &self.vk_instance,
+                        self.surface,
+                        &self.surface_loader,
+                        &self.window,
+                    )?;
                 }
                 Err(err) => return Err(err),
             }
@@ -262,57 +267,7 @@ impl Renderer {
     }
 
     pub fn request_swapchain_recreation(&mut self) {
-        self.swapchain_dirty = true;
-    }
-
-    pub fn recreate_swapchain(&mut self) -> Result<(), vk::Result> {
-        // Get extent
-        let size = self.window.inner_size();
-        if size.width == 0 || size.height == 0 {
-            return Ok(());
-        }
-
-        let window_extent = ash::vk::Extent2D {
-            width: size.width,
-            height: size.height,
-        };
-
-        unsafe {
-            // Let rendering wait
-            self.device.logical_device.device_wait_idle()?;
-
-            // Delete the old
-            self.pipeline_bundle.destroy(&self.device.logical_device);
-            for &view in &self.swapchain_info.image_views {
-                self.device.logical_device.destroy_image_view(view, None);
-            }
-            self.swapchain_info.swapchain_loader.destroy_swapchain(self.swapchain_info.swapchain, None);
-        }
-
-        // Recreate the swapchain information
-        let swapchain_info = acquire_swapchain(
-            &self.vk_instance,
-            self.device.physical_device,
-            &self.device.logical_device,
-            &self.surface_loader,
-            self.surface,
-            window_extent,
-            self.device.graphics_queue_family,
-            self.device.present_queue_family,
-        );
-
-        // Recreate this too since it depends on the swapchain
-        let pipeline_bundle = RenderingBundle::new(
-            &self.device.logical_device,
-            swapchain_info.format,
-            swapchain_info.extent,
-        );
-
-        // In with the new
-        self.swapchain_info = swapchain_info;
-        self.pipeline_bundle = pipeline_bundle;
-        self.swapchain_dirty = false;
-        Ok(())
+        self.swapchain_info.dirty = true;
     }
 }
 
