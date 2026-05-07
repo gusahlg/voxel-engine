@@ -3,11 +3,11 @@
 ## Project Structure & Module Organization
 
 This is a Rust 2024 Vulkan renderer experiment using `ash` and `winit`.
-Application entry is [src/main.rs](/home/gusahlg/repos/voxel-engine/src/main.rs), which creates the event loop and `App`. Vulkan code lives under `src/vk/`, with renderer state in `src/vk/renderer/`. Device selection and logical-device setup are in `src/vk/renderer/device/`, frame synchronization and command buffers in `src/vk/renderer/frame/`, and pipeline/shader helpers in `src/vk/renderer/rendering/`. GLSL shader sources are in `shaders/`; compiled SPIR-V outputs are written to `shaders_spv/` by `build.rs`.
+Application entry is [src/main.rs](/home/gusahlg/repos/voxel-engine/src/main.rs), which creates the event loop and `App`. Vulkan code lives under `src/vk/`, with renderer state in `src/vk/renderer/`. Device selection and logical-device setup are in `src/vk/renderer/device/`, frame synchronization and command buffers in `src/vk/renderer/frame/`, and pipeline/shader helpers in `src/vk/renderer/rendering/`. Slang shader sources are in `shaders/`; compiled SPIR-V outputs are written to `shaders_spv/` by `build.rs`.
 
 ## Build, Test, and Development Commands
 
-- `nix develop`: enter the intended Linux dev shell with Rust, Shaderc `glslc`, Vulkan loader/tools, Wayland, and X11 dependencies.
+- `nix develop`: enter the intended Linux dev shell with Rust, Slang `slangc`, Vulkan loader/tools, Wayland, and X11 dependencies.
 - `cargo check`: type-check the project and run `build.rs`, including shader compilation.
 - `cargo build`: build the `vk_rust_renderer` binary.
 - `cargo run`: build and launch the renderer window locally.
@@ -17,7 +17,7 @@ Application entry is [src/main.rs](/home/gusahlg/repos/voxel-engine/src/main.rs)
 
 ## Coding Style & Naming Conventions
 
-Use standard `rustfmt` formatting with 4-space indentation. Follow Rust naming conventions: modules and functions in `snake_case`, types in `PascalCase`, constants in `SCREAMING_SNAKE_CASE`. Keep unsafe Vulkan calls narrow and close to the resource they create, with explicit error messages on `expect`. Prefer existing module boundaries over adding new top-level modules. Shader files should use the `name.stage` pattern, for example `tri.vert` and `tri.frag`.
+Use standard `rustfmt` formatting with 4-space indentation. Follow Rust naming conventions: modules and functions in `snake_case`, types in `PascalCase`, constants in `SCREAMING_SNAKE_CASE`. Keep unsafe Vulkan calls narrow and close to the resource they create, with explicit error messages on `expect`. Prefer existing module boundaries over adding new top-level modules. Shader files should use the `name.stage.slang` pattern, for example `tri.vert.slang` and `tri.frag.slang`.
 
 ## Testing Guidelines
 

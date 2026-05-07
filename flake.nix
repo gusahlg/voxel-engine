@@ -13,7 +13,7 @@
           rustc
           cargo
           pkg-config
-          shaderc
+          shader-slang
           wayland
           libxkbcommon
           vulkan-loader
