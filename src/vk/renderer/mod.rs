@@ -7,7 +7,7 @@ mod device;
 use device::Device;
 
 mod swapchain;
-use swapchain::SwapchainInfo;
+use swapchain::SwapchainManager;
 
 mod rendering;
 use rendering::*;
@@ -31,7 +31,7 @@ pub struct Renderer {
     _vk_entry: ash::Entry,
     vk_instance: ash::Instance,
 
-    swapchain_info: SwapchainInfo,
+    swapchain_info: SwapchainManager,
 
     // For rendering
     pipeline_bundle: RenderingBundle,
@@ -102,7 +102,7 @@ impl Renderer {
         };
 
         // Create swapchain
-        let swapchain_info = SwapchainInfo::new(
+        let swapchain_info = SwapchainManager::new(
             &instance,
             device.physical_device,
             &device.logical_device,

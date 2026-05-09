@@ -1,11 +1,11 @@
 /// Provides helpers for command buffers
 use ash::vk;
 
-use crate::vk::renderer::swapchain::SwapchainInfo;
+use crate::vk::renderer::swapchain::SwapchainManager;
 use crate::vk::renderer::device::Device;
 
 pub fn record_command_buffer(device: &Device,
-                            swapchain_info: &SwapchainInfo,
+                            swapchain_info: &SwapchainManager,
                             graphics_pipeline: vk::Pipeline,
                             command_buffer: vk::CommandBuffer, 
                             image_index: usize,

@@ -3,7 +3,7 @@ use ash::vk;
 use super::rendering::RenderingBundle;
 use super::device::Device;
 
-pub struct SwapchainInfo {
+pub struct SwapchainManager {
     pub swapchain_loader: ash::khr::swapchain::Device,
     pub swapchain: vk::SwapchainKHR,
     pub images: Vec<vk::Image>,
@@ -15,7 +15,7 @@ pub struct SwapchainInfo {
     pub dirty: bool,
 }
 
-impl SwapchainInfo {
+impl SwapchainManager {
     pub fn recreate(&mut self,
                     pipeline_bundle: &mut RenderingBundle,
                     device: &mut Device,
