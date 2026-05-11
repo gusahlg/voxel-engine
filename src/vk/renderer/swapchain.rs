@@ -49,7 +49,7 @@ impl SwapchainManager {
         }
 
         // Recreate the swapchain information
-        let new_swapchain_info = Self::new(
+        let new_swapchain_manager = Self::new(
             vk_instance,
             device.physical_device,
             &device.logical_device,
@@ -68,7 +68,7 @@ impl SwapchainManager {
         );
 
         // In with the new
-        *self = new_swapchain_info;
+        *self = new_swapchain_manager;
         *pipeline_bundle = new_pipeline_bundle;
         self.dirty  = false;
         Ok(())

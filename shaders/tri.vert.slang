@@ -1,24 +1,29 @@
-struct VertexOutput {
-    float4 position: SV_Position;
+// tri.vert.slang
+
+struct VertexInput
+{
     [[vk::location(0)]]
-    float3 color: COLOR0;
+    float2 position;
+
+    [[vk::location(1)]]
+    float3 color;
+};
+
+struct VertexOutput
+{
+    float4 position : SV_Position;
+
+    [[vk::location(0)]]
+    float3 color;
 };
 
 [shader("vertex")]
-VertexOutput main(uint vertex_index: SV_VertexID)
+VertexOutput vertexMain(VertexInput input)
 {
     VertexOutput output;
 
-    if (vertex_index == 0) {
-        output.position = float4(0.0, -0.5, 0.0, 1.0);
-        output.color = float3(1.0, 0.0, 0.0);
-    } else if (vertex_index == 1) {
-        output.position = float4(0.5, 0.5, 0.0, 1.0);
-        output.color = float3(0.0, 1.0, 0.0);
-    } else {
-        output.position = float4(-0.5, 0.5, 0.0, 1.0);
-        output.color = float3(0.0, 0.0, 1.0);
-    }
+    output.position = float4(input.position, 0.0, 1.0);
+    output.color = input.color;
 
     return output;
 }

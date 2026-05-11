@@ -18,6 +18,11 @@ use constants as VkConsts;
 mod frame;
 use frame::*;
 
+mod resources;
+use resources::*;
+
+use crate::vertex_buffer;
+
 // Holds all core Vulkan state and the window. Created in App::resumed() once
 // the event loop is active and we can obtain platform display/window handles.
 pub struct Renderer {
@@ -31,7 +36,7 @@ pub struct Renderer {
     _vk_entry: ash::Entry,
     vk_instance: ash::Instance,
 
-    swapchain_info: SwapchainManager,
+    swapchain_manager: SwapchainManager,
 
     // For rendering
     pipeline_bundle: RenderingBundle,
@@ -39,6 +44,9 @@ pub struct Renderer {
     // Synchronization
     frames: Vec<FrameSlot>,
     current_frame: usize,
+
+    // Frame data
+    vertex_buffer: Buffer,
 
     // For interacting with the screen
     surface_loader: ash::khr::surface::Instance,
@@ -102,7 +110,7 @@ impl Renderer {
         };
 
         // Create swapchain
-        let swapchain_info = SwapchainManager::new(
+        let swapchain_manager = SwapchainManager::new(
             &instance,
             device.physical_device,
             &device.logical_device,
@@ -115,8 +123,8 @@ impl Renderer {
 
         let pipeline_bundle = RenderingBundle::new(
             &device.logical_device,
-            swapchain_info.format,
-            swapchain_info.extent,
+            swapchain_manager.format,
+            swapchain_manager.extent,
         );
 
         // COMMAND BUFFERS AND SYNCHRONIZATION
@@ -153,13 +161,29 @@ impl Renderer {
             });
         }
 
+        let ctx = BufferContext::new(&instance, &device.logical_device, device.physical_device);
+        let vertex_buffer = vertex_buffer!(ctx,
+            Vertex { pos: [-0.5,-0.5], color: [1.0,0.0,0.0] },
+            Vertex { pos: [0.5,-0.5],  color: [0.0,1.0,0.0] },
+            Vertex { pos: [-0.5,0.5],  color: [0.0,0.0,1.0] },
+
+            Vertex { pos: [0.5,-0.5],  color: [0.0,1.0,0.0] },
+            Vertex { pos: [-0.5,0.5],  color: [0.0,0.0,1.0] },
+            Vertex { pos: [0.5,0.5],   color: [1.0,0.0,1.0] },
+
+            Vertex { pos: [0.5,-0.5],  color: [0.0,1.0,0.0] },
+            Vertex { pos: [0.5,0.5],   color: [1.0,0.0,1.0] },
+            Vertex { pos: [0.8,0.0],  color: [0.1,1.0,1.0] },
+        ).expect("Failed to create a vertex buffer");
+
         Self {
             _vk_entry: entry,
             vk_instance: instance,
-            swapchain_info,
+            swapchain_manager,
             pipeline_bundle,
             frames, 
             current_frame: 0,
+            vertex_buffer,
             surface_loader,
             surface,
             window,
@@ -169,8 +193,8 @@ impl Renderer {
 
     // Function that synchronizes rendering and drawing as a whole
     pub fn draw_frame(&mut self) -> Result<(), vk::Result> {
-        if self.swapchain_info.dirty {
-            self.swapchain_info.recreate(
+        if self.swapchain_manager.dirty {
+            self.swapchain_manager.recreate(
                 &mut self.pipeline_bundle,
                 &mut self.device,
                 &self.vk_instance,
@@ -186,15 +210,15 @@ impl Renderer {
         unsafe {
             self.device.logical_device.wait_for_fences(&[frame.in_flight_fence], true, u64::MAX,)?;
 
-            let (image_index, suboptimal) = match self.swapchain_info.swapchain_loader.acquire_next_image(
-                self.swapchain_info.swapchain,
+            let (image_index, suboptimal) = match self.swapchain_manager.swapchain_loader.acquire_next_image(
+                self.swapchain_manager.swapchain,
                 u64::MAX,
                 frame.image_available_semaphore,
                 vk::Fence::null(),
             ) {
                 Ok(result) => result,
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    self.swapchain_info.recreate(
+                    self.swapchain_manager.recreate(
                         &mut self.pipeline_bundle,
                         &mut self.device,
                         &self.vk_instance,
@@ -215,7 +239,7 @@ impl Renderer {
                 vk::CommandBufferResetFlags::empty(),
             )?;
 
-            record_command_buffer(&self.device, &self.swapchain_info, self.pipeline_bundle.graphics_pipeline, frame.command_buffer, image_index as usize)?;
+            record_command_buffer(&self.device, &self.swapchain_manager, self.pipeline_bundle.graphics_pipeline, frame.command_buffer, &self.vertex_buffer, image_index as usize)?;
 
             let frame_submit_info = create_submit_info(frame);
             let submit_infos = frame_submit_info.submit_infos();
@@ -227,7 +251,7 @@ impl Renderer {
             )?;
 
             let present_wait_semaphores = [frame.render_finished_semaphore];
-            let swapchains = [self.swapchain_info.swapchain];
+            let swapchains = [self.swapchain_manager.swapchain];
             let image_indices = [image_index];
 
             let present_info = vk::PresentInfoKHR::default()
@@ -235,10 +259,10 @@ impl Renderer {
                 .swapchains(&swapchains)
                 .image_indices(&image_indices);
 
-            match self.swapchain_info.swapchain_loader.queue_present(self.device.present_queue, &present_info) {
+            match self.swapchain_manager.swapchain_loader.queue_present(self.device.present_queue, &present_info) {
                 Ok(present_suboptimal) => {
                     if suboptimal || present_suboptimal {
-                        self.swapchain_info.recreate(
+                        self.swapchain_manager.recreate(
                             &mut self.pipeline_bundle,
                             &mut self.device,
                             &self.vk_instance,
@@ -249,7 +273,7 @@ impl Renderer {
                     }
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    self.swapchain_info.recreate(
+                    self.swapchain_manager.recreate(
                         &mut self.pipeline_bundle,
                         &mut self.device,
                         &self.vk_instance,
@@ -267,7 +291,7 @@ impl Renderer {
     }
 
     pub fn request_swapchain_recreation(&mut self) {
-        self.swapchain_info.dirty = true;
+        self.swapchain_manager.dirty = true;
     }
 }
 
@@ -286,11 +310,11 @@ impl Drop for Renderer {
                 self.device.logical_device.destroy_fence(frame.in_flight_fence, None);
             }
 
-            for &view in &self.swapchain_info.image_views {
+            for &view in &self.swapchain_manager.image_views {
                 self.device.logical_device.destroy_image_view(view, None);
             }
-            self.swapchain_info.swapchain_loader
-                .destroy_swapchain(self.swapchain_info.swapchain, None);
+            self.swapchain_manager.swapchain_loader
+                .destroy_swapchain(self.swapchain_manager.swapchain, None);
             ManuallyDrop::drop(&mut self.device);
             self.surface_loader.destroy_surface(self.surface, None);
             self.vk_instance.destroy_instance(None);

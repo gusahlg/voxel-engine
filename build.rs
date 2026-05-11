@@ -1,36 +1,66 @@
 use std::{fs, path::Path, process::Command};
 
+struct Shader<'a> {
+    src: &'a str,
+    stage: &'a str,
+    entry: &'a str,
+    dst: &'a str,
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=shaders");
+    println!("cargo:rerun-if-env-changed=PATH");
 
     let out_dir = Path::new("shaders_spv");
     fs::create_dir_all(out_dir).unwrap();
 
-    for (src, stage, dst_name) in [
-        ("shaders/tri.vert.slang", "vertex", "tri.vert.spv"),
-        ("shaders/tri.frag.slang", "fragment", "tri.frag.spv"),
-    ] {
-        let dst = out_dir.join(dst_name);
+    let shaders = [
+        Shader {
+            src: "shaders/tri.vert.slang",
+            stage: "vertex",
+            entry: "vertexMain",
+            dst: "tri.vert.spv",
+        },
+        Shader {
+            src: "shaders/tri.frag.slang",
+            stage: "fragment",
+            entry: "fragmentMain",
+            dst: "tri.frag.spv",
+        },
+    ];
 
-        let status = Command::new("slangc")
+    for shader in shaders {
+        let dst_path = out_dir.join(shader.dst);
+
+        let output = Command::new("slangc")
             .args([
-                src,
+                shader.src,
                 "-target",
                 "spirv",
                 "-profile",
                 "spirv_1_3",
                 "-entry",
-                "main",
+                shader.entry,
                 "-stage",
-                stage,
+                shader.stage,
                 "-o",
             ])
-            .arg(&dst)
-            .status()
-            .expect("failed to run slangc (is Slang installed?)");
+            .arg(&dst_path)
+            .output()
+            .expect("failed to run slangc; is Slang installed and in PATH?");
 
-        assert!(status.success(), "slangc failed on {}", src);
+        if !output.status.success() {
+            eprintln!("slangc failed while compiling {}", shader.src);
+            eprintln!("stage: {}", shader.stage);
+            eprintln!("entry: {}", shader.entry);
+            eprintln!("output: {}", dst_path.display());
+            eprintln!();
+            eprintln!("--- stdout ---");
+            eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+            eprintln!("--- stderr ---");
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+
+            panic!("shader compilation failed");
+        }
     }
-
-    println!("cargo:rerun-if-env-changed=PATH");
 }

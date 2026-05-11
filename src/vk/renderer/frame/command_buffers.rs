@@ -1,13 +1,15 @@
 /// Provides helpers for command buffers
 use ash::vk;
 
+use crate::vk::renderer::resources::Buffer as VertexBuffer;
 use crate::vk::renderer::swapchain::SwapchainManager;
 use crate::vk::renderer::device::Device;
 
 pub fn record_command_buffer(device: &Device,
-                            swapchain_info: &SwapchainManager,
+                            swapchain_manager: &SwapchainManager,
                             graphics_pipeline: vk::Pipeline,
                             command_buffer: vk::CommandBuffer, 
+                            vertex_buffer: &VertexBuffer,
                             image_index: usize,
                             ) -> Result<(), vk::Result> {
     let begin_info = vk::CommandBufferBeginInfo::default();
@@ -24,7 +26,7 @@ pub fn record_command_buffer(device: &Device,
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(swapchain_info.images[image_index])
+            .image(swapchain_manager.images[image_index])
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
@@ -40,7 +42,7 @@ pub fn record_command_buffer(device: &Device,
         );
 
         let color_attachment = [vk::RenderingAttachmentInfo::default()
-            .image_view(swapchain_info.image_views[image_index])
+            .image_view(swapchain_manager.image_views[image_index])
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
@@ -53,7 +55,7 @@ pub fn record_command_buffer(device: &Device,
         let rendering_info = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
-                extent: swapchain_info.extent,
+                extent: swapchain_manager.extent,
             })
             .layer_count(1)
             .color_attachments(&color_attachment);
@@ -66,7 +68,14 @@ pub fn record_command_buffer(device: &Device,
             graphics_pipeline,
         );
 
-        device.logical_device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        device.logical_device.cmd_bind_vertex_buffers(
+            command_buffer,
+            0,
+            &[vertex_buffer.buffer],
+            &[0],
+        );
+
+        device.logical_device.cmd_draw(command_buffer, vertex_buffer.vertex_count, 1, 0, 0);
 
         device.logical_device.cmd_end_rendering(command_buffer);
 
@@ -79,7 +88,7 @@ pub fn record_command_buffer(device: &Device,
             .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(swapchain_info.images[image_index])
+            .image(swapchain_manager.images[image_index])
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
