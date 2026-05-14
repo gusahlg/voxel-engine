@@ -63,8 +63,8 @@ impl SwapchainManager {
         // Recreate this too since it depends on the swapchain
         let new_pipeline_bundle = RenderingBundle::new(
             &device.logical_device,
-            self.format,
-            self.extent,
+            new_swapchain_manager.format,
+            new_swapchain_manager.extent,
         );
 
         // In with the new
