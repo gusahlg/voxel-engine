@@ -72,6 +72,13 @@ impl Buffer {
             vertex_count,
         })
     }
+
+    pub unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+    }
 }
 
 #[repr(C)]

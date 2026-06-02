@@ -315,6 +315,7 @@ impl Drop for Renderer {
             }
             self.swapchain_manager.swapchain_loader
                 .destroy_swapchain(self.swapchain_manager.swapchain, None);
+            self.vertex_buffer.destroy(&self.device.logical_device);
             ManuallyDrop::drop(&mut self.device);
             self.surface_loader.destroy_surface(self.surface, None);
             self.vk_instance.destroy_instance(None);

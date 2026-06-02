@@ -71,10 +71,6 @@ impl RenderingBundle {
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
             .primitive_restart_enable(false);
 
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-            .primitive_restart_enable(false);
-
         let viewport = vk::Viewport {
             x: 0.0,
             y: 0.0,
