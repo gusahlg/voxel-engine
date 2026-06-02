@@ -75,7 +75,7 @@ pub fn record_command_buffer(device: &Device,
             &[0],
         );
 
-        device.logical_device.cmd_draw(command_buffer, vertex_buffer.vertex_count, 1, 0, 0);
+        device.logical_device.cmd_draw(command_buffer, vertex_buffer.element_count, 1, 0, 0);
 
         device.logical_device.cmd_end_rendering(command_buffer);
 

@@ -22,6 +22,7 @@ mod resources;
 use resources::*;
 
 use crate::vertex_buffer;
+use crate::index_buffer;
 
 // Holds all core Vulkan state and the window. Created in App::resumed() once
 // the event loop is active and we can obtain platform display/window handles.
@@ -47,6 +48,7 @@ pub struct Renderer {
 
     // Frame data
     vertex_buffer: Buffer,
+    index_buffer: Buffer,
 
     // For interacting with the screen
     surface_loader: ash::khr::surface::Instance,
@@ -162,7 +164,7 @@ impl Renderer {
         }
 
         let ctx = BufferContext::new(&instance, &device.logical_device, device.physical_device);
-        let vertex_buffer = vertex_buffer!(ctx,
+        let vertex_buffer = vertex_buffer!(&ctx,
             Vertex { pos: [-0.5,-0.5], color: [1.0,0.0,0.0] },
             Vertex { pos: [0.5,-0.5],  color: [0.0,1.0,0.0] },
             Vertex { pos: [-0.5,0.5],  color: [0.0,0.0,1.0] },
@@ -173,8 +175,12 @@ impl Renderer {
 
             Vertex { pos: [0.5,-0.5],  color: [0.0,1.0,0.0] },
             Vertex { pos: [0.5,0.5],   color: [1.0,0.0,1.0] },
-            Vertex { pos: [0.8,0.0],  color: [0.1,1.0,1.0] },
+            Vertex { pos: [0.8,0.0],   color: [0.1,1.0,1.0] },
         ).expect("Failed to create a vertex buffer");
+
+        let index_buffer = index_buffer!(&ctx,
+            0, 1, 2, 3, 4, 5, 6, 7, 8,
+        ).expect("Failed to create index buffer");
 
         Self {
             _vk_entry: entry,
@@ -184,6 +190,7 @@ impl Renderer {
             frames, 
             current_frame: 0,
             vertex_buffer,
+            index_buffer,
             surface_loader,
             surface,
             window,

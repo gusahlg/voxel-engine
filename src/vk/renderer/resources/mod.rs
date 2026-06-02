@@ -8,17 +8,17 @@ pub struct Buffer {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
     pub size: vk::DeviceSize,
-    pub vertex_count: u32,
+    pub element_count: u32,
 }
 impl Buffer {
     pub fn new<T>(
-        ctx: BufferContext,
+        ctx: &BufferContext,
         data: &[T],
         usage: vk::BufferUsageFlags,
     ) -> Result<Self, vk::Result> {
         let size = std::mem::size_of_val(data) as vk::DeviceSize;
 
-        let vertex_count = data.len() as u32;
+        let element_count = data.len() as u32;
 
         // Creating the buffer (handle)
         let buffer_info = vk::BufferCreateInfo::default()
@@ -69,7 +69,7 @@ impl Buffer {
             buffer,
             memory,
             size,
-            vertex_count,
+            element_count,
         })
     }
 
@@ -116,6 +116,18 @@ macro_rules! vertex_buffer {
     }};
 }
 
+#[macro_export]
+macro_rules! index_buffer {
+    ($ctx:expr, $($index:expr),* $(,)?) => {{
+        let data = vec![$($index),*];
+
+        Buffer::new(
+            $ctx,
+            &data,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+        )
+    }};
+}
 fn find_memory_type(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
