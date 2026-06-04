@@ -47,9 +47,13 @@ impl Device {
         let (indices, physical_device) = queue_indices;
 
         // Extensions
-        let device_extensions = [
+        let mut device_extensions = vec![
             ash::khr::swapchain::NAME.as_ptr(),
         ];
+        // A portability physical device (MoltenVK on macOS) requires the
+        // VK_KHR_portability_subset device extension to be enabled.
+        #[cfg(target_os = "macos")]
+        device_extensions.push(ash::khr::portability_subset::NAME.as_ptr());
 
         // Device features
         let device_features = vk::PhysicalDeviceFeatures::default();

@@ -73,9 +73,22 @@ impl Renderer {
             .engine_version(ash::vk::make_api_version(0, 0, 1, 0))
             .api_version(ash::vk::API_VERSION_1_3);
 
+        // On macOS the only Vulkan driver is MoltenVK, which is a non-conformant
+        // "portability" implementation. The loader hides such drivers unless the
+        // instance opts in via VK_KHR_portability_enumeration + the enumerate flag.
+        let mut enabled_extensions = extensions.to_vec();
+        let mut create_flags = ash::vk::InstanceCreateFlags::empty();
+        #[cfg(target_os = "macos")]
+        {
+            enabled_extensions.push(ash::khr::portability_enumeration::NAME.as_ptr());
+            enabled_extensions.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
+            create_flags |= ash::vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+        }
+
         let create_info = ash::vk::InstanceCreateInfo::default()
             .application_info(&app_info)
-            .enabled_extension_names(extensions);
+            .enabled_extension_names(&enabled_extensions)
+            .flags(create_flags);
 
         let instance = unsafe {
             entry.create_instance(&create_info, None)
