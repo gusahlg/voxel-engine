@@ -84,7 +84,7 @@ impl Buffer {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Vertex {
-    pub pos: [f32; 2],
+    pub pos: [f32; 3],
     pub color: [f32; 3],
 }
 

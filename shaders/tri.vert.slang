@@ -3,7 +3,7 @@
 struct VertexInput
 {
     [[vk::location(0)]]
-    float2 position;
+    float3 position;
 
     [[vk::location(1)]]
     float3 color;
@@ -22,7 +22,7 @@ VertexOutput vertexMain(VertexInput input)
 {
     VertexOutput output;
 
-    output.position = float4(input.position, 0.0, 1.0);
+    output.position = float4(input.position, 1.0);
     output.color = input.color;
 
     return output;

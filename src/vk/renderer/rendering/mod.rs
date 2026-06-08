@@ -48,18 +48,19 @@ impl RenderingBundle {
             }
         ];
 
+        // These define the per vertex position and colour data that goes into the vertex shader
         let vertex_attribute_descriptions = [
             vk::VertexInputAttributeDescription {
                 binding: 0,
                 location: 0,
-                format: vk::Format::R32G32_SFLOAT,
+                format: vk::Format::R32G32B32_SFLOAT,
                 offset: 0,
             },
             vk::VertexInputAttributeDescription {
                 binding: 0,
                 location: 1,
                 format: vk::Format::R32G32B32_SFLOAT,
-                offset: std::mem::size_of::<[f32; 2]>() as u32,
+                offset: std::mem::size_of::<[f32; 3]>() as u32,
             },
         ];
 
