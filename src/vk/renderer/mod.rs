@@ -178,21 +178,17 @@ impl Renderer {
 
         let ctx = BufferContext::new(&instance, &device.logical_device, device.physical_device);
         let vertex_buffer = vertex_buffer!(&ctx,
-            Vertex { pos: [-0.5,-0.5], color: [1.0,0.0,0.0] },
-            Vertex { pos: [0.5,-0.5],  color: [0.0,1.0,0.0] },
-            Vertex { pos: [-0.5,0.5],  color: [0.0,0.0,1.0] },
-
-            Vertex { pos: [0.5,-0.5],  color: [0.0,1.0,0.0] },
-            Vertex { pos: [-0.5,0.5],  color: [0.0,0.0,1.0] },
-            Vertex { pos: [0.5,0.5],   color: [1.0,0.0,1.0] },
-
-            Vertex { pos: [0.5,-0.5],  color: [0.0,1.0,0.0] },
-            Vertex { pos: [0.5,0.5],   color: [1.0,0.0,1.0] },
-            Vertex { pos: [0.8,0.0],   color: [0.1,1.0,1.0] },
+            Vertex { pos: [-0.5,-0.5], color: [1.0,0.0,0.0] }, // 0
+            Vertex { pos: [0.5,-0.5],  color: [0.0,1.0,0.0] }, // 1
+            Vertex { pos: [-0.5,0.5],  color: [0.0,0.0,1.0] }, // 2
+            Vertex { pos: [0.5,0.5],   color: [1.0,0.0,1.0] }, // 3
+            Vertex { pos: [0.8,0.0],   color: [0.1,1.0,1.0] }, // 4
         ).expect("Failed to create a vertex buffer");
 
         let index_buffer = index_buffer!(&ctx,
-            0, 1, 2, 3, 4, 5, 6, 7, 8,
+            0, 1, 2,
+            1, 2, 3,
+            1, 3, 4,
         ).expect("Failed to create index buffer");
 
         Self {
