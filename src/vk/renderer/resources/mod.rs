@@ -119,7 +119,7 @@ macro_rules! vertex_buffer {
 #[macro_export]
 macro_rules! index_buffer {
     ($ctx:expr, $($index:expr),* $(,)?) => {{
-        let data = vec![$($index),*];
+        let data = vec![$($index as u32),*];
 
         Buffer::new(
             $ctx,

@@ -251,7 +251,6 @@ impl Renderer {
                 Err(err) => return Err(err),
             };
 
-            // Maybe make resets a function
             self.device.logical_device.reset_fences(&[frame.in_flight_fence])?;
 
             self.device.logical_device.reset_command_buffer(
@@ -259,7 +258,7 @@ impl Renderer {
                 vk::CommandBufferResetFlags::empty(),
             )?;
 
-            record_command_buffer(&self.device, &self.swapchain_manager, self.pipeline_bundle.graphics_pipeline, frame.command_buffer, &self.vertex_buffer, image_index as usize)?;
+            record_command_buffer(&self.device, &self.swapchain_manager, self.pipeline_bundle.graphics_pipeline, frame.command_buffer, &self.vertex_buffer, &self.index_buffer, image_index as usize)?;
 
             let frame_submit_info = create_submit_info(frame);
             let submit_infos = frame_submit_info.submit_infos();
@@ -336,6 +335,7 @@ impl Drop for Renderer {
             self.swapchain_manager.swapchain_loader
                 .destroy_swapchain(self.swapchain_manager.swapchain, None);
             self.vertex_buffer.destroy(&self.device.logical_device);
+            self.index_buffer.destroy(&self.device.logical_device);
             ManuallyDrop::drop(&mut self.device);
             self.surface_loader.destroy_surface(self.surface, None);
             self.vk_instance.destroy_instance(None);

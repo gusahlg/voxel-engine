@@ -1,7 +1,7 @@
 /// Provides helpers for command buffers
 use ash::vk;
 
-use crate::vk::renderer::resources::Buffer as VertexBuffer;
+use crate::vk::renderer::resources::Buffer;
 use crate::vk::renderer::swapchain::SwapchainManager;
 use crate::vk::renderer::device::Device;
 
@@ -9,7 +9,8 @@ pub fn record_command_buffer(device: &Device,
                             swapchain_manager: &SwapchainManager,
                             graphics_pipeline: vk::Pipeline,
                             command_buffer: vk::CommandBuffer, 
-                            vertex_buffer: &VertexBuffer,
+                            vertex_buffer: &Buffer,
+                            index_buffer: &Buffer,
                             image_index: usize,
                             ) -> Result<(), vk::Result> {
     let begin_info = vk::CommandBufferBeginInfo::default();
@@ -68,6 +69,7 @@ pub fn record_command_buffer(device: &Device,
             graphics_pipeline,
         );
 
+        device.logical_device.cmd_bind_index_buffer(command_buffer, index_buffer.buffer, 0, vk::IndexType::UINT32);
         device.logical_device.cmd_bind_vertex_buffers(
             command_buffer,
             0,
@@ -75,7 +77,7 @@ pub fn record_command_buffer(device: &Device,
             &[0],
         );
 
-        device.logical_device.cmd_draw(command_buffer, vertex_buffer.element_count, 1, 0, 0);
+        device.logical_device.cmd_draw_indexed(command_buffer, index_buffer.element_count, 1, 0, 0, 0);
 
         device.logical_device.cmd_end_rendering(command_buffer);
 
