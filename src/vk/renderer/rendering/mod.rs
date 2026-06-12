@@ -7,6 +7,9 @@ use std::ffi::CString;
 mod shader_helpers;
 use shader_helpers::*;
 
+mod render_targets;
+pub use render_targets::*;
+
 use super::resources::Vertex;
 
 pub struct RenderingBundle {

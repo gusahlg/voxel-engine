@@ -9,6 +9,8 @@ ash = "0.38"
 ash-window = "0.13"
 winit = { version = "0.30", features = ["wayland", "x11"] }
 raw-window-handle = "0.6"
+glam = { version = "0.32.1", features = ["bytemuck"] }
+bytemuck = { version = "1.23", features = ["derive"] }
 
 log = "0.4"
 env_logger = "0.11"
