@@ -447,9 +447,13 @@ impl Renderer {
                     .get_fence_status(self.copy_fence)
                     .expect("fence status failed");
             if copy_ready {
+                // vsync on: block for an image so a copy is ALWAYS submitted
+                // and the copy-fence wait below actually paces the loop at
+                // refresh. vsync off: never wait — drop the present instead.
+                let timeout = if self.vsync { u64::MAX } else { 0 };
                 match self.swapchain.loader.acquire_next_image(
                     self.swapchain.swapchain,
-                    0,
+                    timeout,
                     frame.image_available,
                     vk::Fence::null(),
                 ) {
@@ -1062,6 +1066,7 @@ impl Renderer {
             self.present_semaphores =
                 create_present_semaphores(&self.device.device, self.swapchain.images.len());
 
+            self.present_interval = display_refresh_interval(&self.window);
             self.needs_recreate = false;
         }
     }
@@ -1130,8 +1135,8 @@ fn display_refresh_interval(window: &winit::window::Window) -> std::time::Durati
     let millihertz = window
         .current_monitor()
         .and_then(|m| m.refresh_rate_millihertz())
-        .unwrap_or(120_000)
-        .max(1);
+        .filter(|&mhz| mhz > 0) // Some(0) = unknown on some X11/VM backends
+        .unwrap_or(120_000);
     std::time::Duration::from_secs_f64(1000.0 / millihertz as f64)
 }
 

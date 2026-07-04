@@ -315,6 +315,7 @@ pub fn run(config: Config, frame_callback: impl FnMut(&mut Engine) -> bool) {
         engine: None,
         callback: frame_callback,
         finished: false,
+        ran_this_cycle: false,
     };
     event_loop.run_app(&mut app).expect("Event loop failed");
 }
@@ -326,6 +327,9 @@ struct EngineApp<F> {
     /// Set once the callback returns false; queued events after `exit()` must
     /// not run another frame (or the last frame's output would repeat).
     finished: bool,
+    /// One frame per event-loop cycle: an OS-delivered RedrawRequested
+    /// (expose, live-resize) and about_to_wait must not both run a frame.
+    ran_this_cycle: bool,
 }
 
 impl<F: FnMut(&mut Engine) -> bool> EngineApp<F> {
@@ -334,9 +338,10 @@ impl<F: FnMut(&mut Engine) -> bool> EngineApp<F> {
     /// `RedrawRequested` is throttled to the display refresh on macOS, which
     /// would cap an uncapped game at ~60-120 fps regardless of present mode.
     fn run_frame(&mut self, event_loop: &ActiveEventLoop) {
-        if self.finished {
+        if self.finished || self.ran_this_cycle {
             return;
         }
+        self.ran_this_cycle = true;
         let Some(engine) = self.engine.as_mut() else {
             return;
         };
@@ -354,6 +359,10 @@ impl<F: FnMut(&mut Engine) -> bool> EngineApp<F> {
 }
 
 impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        self.ran_this_cycle = false;
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.engine.is_some() {
             return;
