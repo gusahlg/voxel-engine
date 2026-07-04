@@ -55,10 +55,13 @@ impl Swapchain {
                 .get_physical_device_surface_present_modes(device.physical, surface)
                 .expect("Failed to get present modes")
         };
+        // vsync-off prefers IMMEDIATE: on MoltenVK (and some Wayland stacks)
+        // MAILBOX still syncs presentation to the display refresh, capping an
+        // uncapped game at ~60-120 fps. IMMEDIATE is the only true uncap.
         let present_mode = if vsync {
             vk::PresentModeKHR::FIFO
         } else {
-            [vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::IMMEDIATE]
+            [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX]
                 .into_iter()
                 .find(|m| present_modes.contains(m))
                 .unwrap_or(vk::PresentModeKHR::FIFO)
@@ -102,7 +105,10 @@ impl Swapchain {
             .image_color_space(surface_format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            // TRANSFER_DST: presentation copies the offscreen render target
+            // into the swapchain image (COLOR_ATTACHMENT — the only usage
+            // guaranteed by the spec — is kept as a harmless fallback).
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(present_mode)
@@ -122,6 +128,14 @@ impl Swapchain {
                 .create_swapchain(&create_info, None)
                 .expect("Failed to create swapchain")
         };
+        log::info!(
+            "swapchain: {:?} {}x{} x{} images, {:?}",
+            surface_format.format,
+            extent.width,
+            extent.height,
+            image_count,
+            present_mode
+        );
 
         let images = unsafe {
             loader

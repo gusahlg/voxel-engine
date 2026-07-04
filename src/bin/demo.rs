@@ -97,6 +97,9 @@ fn main() {
         Config {
             title: "voxel_engine demo".into(),
             target_fps: 0,
+            // Benchmark-flavored demo: fully uncapped by default (V toggles
+            // vsync back on at runtime).
+            vsync: false,
             ..Config::default()
         },
         move |eng| {

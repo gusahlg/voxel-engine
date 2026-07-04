@@ -26,6 +26,13 @@ pub struct Config {
     pub height: u32,
     /// 0 = uncapped.
     pub target_fps: u32,
+    /// Rendering is decoupled from presentation (manual mailbox): every
+    /// frame renders offscreen and is only copied to the screen when the
+    /// presentation engine can take it. With vsync on, presentation
+    /// backpressure paces the frame loop at the display refresh (the classic
+    /// vsync feel, tear-free). With vsync off, the loop is fully uncapped:
+    /// frames that outrun the display are rendered but dropped, and
+    /// `target_fps` is the only pacing.
     pub vsync: bool,
     pub msaa: u32,
     pub resizable: bool,
@@ -298,12 +305,16 @@ impl Engine {
 /// Runs the engine's event loop until the callback returns `false` (or the
 /// process is asked to quit and the callback honors `should_close`).
 pub fn run(config: Config, frame_callback: impl FnMut(&mut Engine) -> bool) {
+    // The engine reports everything through `log`; give binaries that never
+    // set up a logger a working RUST_LOG path (no-op if one exists).
+    let _ = env_logger::try_init();
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = EngineApp {
         config,
         engine: None,
         callback: frame_callback,
+        finished: false,
     };
     event_loop.run_app(&mut app).expect("Event loop failed");
 }
@@ -312,6 +323,34 @@ struct EngineApp<F> {
     config: Config,
     engine: Option<Engine>,
     callback: F,
+    /// Set once the callback returns false; queued events after `exit()` must
+    /// not run another frame (or the last frame's output would repeat).
+    finished: bool,
+}
+
+impl<F: FnMut(&mut Engine) -> bool> EngineApp<F> {
+    /// One full game frame: timing, callback (which draws), input reset,
+    /// pacing. Driven from `about_to_wait` — every poll iteration — because
+    /// `RedrawRequested` is throttled to the display refresh on macOS, which
+    /// would cap an uncapped game at ~60-120 fps regardless of present mode.
+    fn run_frame(&mut self, event_loop: &ActiveEventLoop) {
+        if self.finished {
+            return;
+        }
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
+        engine.tick_timing();
+        if !(self.callback)(engine) {
+            self.finished = true;
+            event_loop.exit();
+            return;
+        }
+        // Reset edges/chars/delta AFTER the game consumed them; new events
+        // accumulate for the next frame (raylib poll model).
+        engine.input.begin_frame();
+        engine.pace();
+    }
 }
 
 impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
@@ -344,17 +383,10 @@ impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
         match event {
             WindowEvent::CloseRequested => engine.should_close = true,
             WindowEvent::Resized(_) => engine.renderer.request_recreate(),
-            WindowEvent::RedrawRequested => {
-                engine.tick_timing();
-                if !(self.callback)(engine) {
-                    event_loop.exit();
-                    return;
-                }
-                // Reset edges/chars/delta AFTER the game consumed them; new
-                // events accumulate for the next frame (raylib poll model).
-                engine.input.begin_frame();
-                engine.pace();
-            }
+            // Frames are driven from about_to_wait; the OS-requested redraw
+            // (expose, live-resize) still renders so the window never shows
+            // stale content mid-drag.
+            WindowEvent::RedrawRequested => self.run_frame(event_loop),
             other => engine.input.on_window_event(&other),
         }
     }
@@ -370,9 +402,7 @@ impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(engine) = &self.engine {
-            engine.renderer.window.request_redraw();
-        }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.run_frame(event_loop);
     }
 }

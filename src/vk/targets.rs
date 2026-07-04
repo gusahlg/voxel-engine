@@ -1,7 +1,11 @@
-/// Render targets that live alongside the swapchain: the depth buffer and,
+/// Render targets that live alongside the swapchain: the depth buffer, the
+/// per-frame-slot offscreen color images that all rendering targets (the
+/// swapchain image is only ever a copy destination at present time), and,
 /// when MSAA is enabled, the multisampled color image that resolves into the
-/// swapchain. Recreated on resize and on MSAA changes.
+/// offscreen image. Recreated on resize and on MSAA changes.
 use ash::vk;
+
+use super::buffers::FRAMES_IN_FLIGHT;
 
 pub struct RenderTargets {
     pub depth_image: vk::Image,
@@ -12,6 +16,13 @@ pub struct RenderTargets {
     pub msaa_image: vk::Image,
     pub msaa_memory: vk::DeviceMemory,
     pub msaa_view: vk::ImageView,
+    /// Per-slot offscreen color targets (swapchain format/extent, single
+    /// sampled): each frame draws — or MSAA-resolves — into
+    /// `offscreen[slot]`, and presentation is a separate copy from it into a
+    /// swapchain image. TRANSFER_SRC for that copy.
+    pub offscreen_images: [vk::Image; FRAMES_IN_FLIGHT as usize],
+    pub offscreen_memory: [vk::DeviceMemory; FRAMES_IN_FLIGHT as usize],
+    pub offscreen_views: [vk::ImageView; FRAMES_IN_FLIGHT as usize],
     pub samples: vk::SampleCountFlags,
 }
 
@@ -66,6 +77,20 @@ impl RenderTargets {
             )
         };
 
+        let offscreen: [(vk::Image, vk::DeviceMemory, vk::ImageView); FRAMES_IN_FLIGHT as usize] =
+            std::array::from_fn(|_| {
+                create_image(
+                    instance,
+                    device,
+                    physical,
+                    extent,
+                    color_format,
+                    vk::SampleCountFlags::TYPE_1,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+                    vk::ImageAspectFlags::COLOR,
+                )
+            });
+
         Self {
             depth_image,
             depth_memory,
@@ -74,6 +99,9 @@ impl RenderTargets {
             msaa_image,
             msaa_memory,
             msaa_view,
+            offscreen_images: offscreen.map(|(image, _, _)| image),
+            offscreen_memory: offscreen.map(|(_, memory, _)| memory),
+            offscreen_views: offscreen.map(|(_, _, view)| view),
             samples,
         }
     }
@@ -91,6 +119,11 @@ impl RenderTargets {
                 device.destroy_image_view(self.msaa_view, None);
                 device.destroy_image(self.msaa_image, None);
                 device.free_memory(self.msaa_memory, None);
+            }
+            for i in 0..FRAMES_IN_FLIGHT as usize {
+                device.destroy_image_view(self.offscreen_views[i], None);
+                device.destroy_image(self.offscreen_images[i], None);
+                device.free_memory(self.offscreen_memory[i], None);
             }
         }
     }
