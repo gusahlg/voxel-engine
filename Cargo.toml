@@ -1,8 +1,16 @@
 [package]
-name = "vk_rust_renderer"
+name = "voxel_engine"
 version = "0.1.0"
 edition = "2024"
 build = "build.rs"
+
+[lib]
+name = "voxel_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "demo"
+path = "src/bin/demo.rs"
 
 [dependencies]
 ash = "0.38"
@@ -16,3 +24,10 @@ log = "0.4"
 env_logger = "0.11"
 
 [build-dependencies]
+
+# The game links this crate; keep its release profile aggressive so `cargo run
+# --release` in either repo gets the same fully-inlined engine.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

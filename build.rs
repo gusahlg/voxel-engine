@@ -1,4 +1,4 @@
-use std::{fs, path::Path, process::Command};
+use std::{env, fs, path::Path, path::PathBuf, process::Command};
 
 struct Shader<'a> {
     src: &'a str,
@@ -7,30 +7,46 @@ struct Shader<'a> {
     dst: &'a str,
 }
 
+const SHADERS: &[Shader] = &[
+    Shader { src: "shaders/mesh3d.vert.slang", stage: "vertex", entry: "vertexMain", dst: "mesh3d.vert.spv" },
+    Shader { src: "shaders/mesh3d.frag.slang", stage: "fragment", entry: "fragmentMain", dst: "mesh3d.frag.spv" },
+    Shader { src: "shaders/tris2d.vert.slang", stage: "vertex", entry: "vertexMain", dst: "tris2d.vert.spv" },
+    Shader { src: "shaders/tris2d.frag.slang", stage: "fragment", entry: "fragmentMain", dst: "tris2d.frag.spv" },
+];
+
+fn have_slangc() -> bool {
+    Command::new("slangc")
+        .arg("-v")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=shaders");
-    println!("cargo:rerun-if-env-changed=PATH");
+    println!("cargo:rerun-if-changed=shaders_spv");
 
-    let out_dir = Path::new("shaders_spv");
-    fs::create_dir_all(out_dir).unwrap();
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    // Checked-in fallback so the crate builds without a Slang toolchain
+    // (e.g. inside `nix build` sandboxes). Refreshed whenever slangc is around.
+    let fallback_dir = Path::new("shaders_spv");
+    fs::create_dir_all(fallback_dir).unwrap();
 
-    let shaders = [
-        Shader {
-            src: "shaders/tri.vert.slang",
-            stage: "vertex",
-            entry: "vertexMain",
-            dst: "tri.vert.spv",
-        },
-        Shader {
-            src: "shaders/tri.frag.slang",
-            stage: "fragment",
-            entry: "fragmentMain",
-            dst: "tri.frag.spv",
-        },
-    ];
+    let slangc = have_slangc();
 
-    for shader in shaders {
-        let dst_path = out_dir.join(shader.dst);
+    for shader in SHADERS {
+        let out_path = out_dir.join(shader.dst);
+        let fallback_path = fallback_dir.join(shader.dst);
+
+        if !slangc {
+            assert!(
+                fallback_path.exists(),
+                "slangc not found and no prebuilt {} — install Slang or restore shaders_spv/",
+                fallback_path.display()
+            );
+            fs::copy(&fallback_path, &out_path).unwrap();
+            continue;
+        }
 
         let output = Command::new("slangc")
             .args([
@@ -43,24 +59,20 @@ fn main() {
                 shader.entry,
                 "-stage",
                 shader.stage,
+                "-matrix-layout-column-major",
                 "-o",
             ])
-            .arg(&dst_path)
+            .arg(&out_path)
             .output()
-            .expect("failed to run slangc; is Slang installed and in PATH?");
+            .expect("failed to run slangc");
 
         if !output.status.success() {
             eprintln!("slangc failed while compiling {}", shader.src);
-            eprintln!("stage: {}", shader.stage);
-            eprintln!("entry: {}", shader.entry);
-            eprintln!("output: {}", dst_path.display());
-            eprintln!();
-            eprintln!("--- stdout ---");
-            eprintln!("{}", String::from_utf8_lossy(&output.stdout));
-            eprintln!("--- stderr ---");
-            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
-
+            eprintln!("--- stdout ---\n{}", String::from_utf8_lossy(&output.stdout));
+            eprintln!("--- stderr ---\n{}", String::from_utf8_lossy(&output.stderr));
             panic!("shader compilation failed");
         }
+
+        let _ = fs::copy(&out_path, &fallback_path);
     }
 }
