@@ -795,7 +795,9 @@ impl Renderer {
             let to_copy_src = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                 .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                // ALL_TRANSFER, not COPY: the present step is a BLIT when
+                // render_scale != 1, and sync2's COPY stage does not cover it.
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
                 .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -880,9 +882,9 @@ impl Renderer {
             // chains with the acquire semaphore wait (also at COPY). Old
             // contents are discarded.
             let to_dst = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
                 .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -950,7 +952,7 @@ impl Renderer {
             }
 
             let to_present = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::NONE)
                 .dst_access_mask(vk::AccessFlags2::NONE)
@@ -969,10 +971,10 @@ impl Renderer {
             let wait_info = [
                 vk::SemaphoreSubmitInfo::default()
                     .semaphore(self.frames[slot].image_available)
-                    .stage_mask(vk::PipelineStageFlags2::COPY),
+                    .stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER),
                 vk::SemaphoreSubmitInfo::default()
                     .semaphore(self.frames[slot].render_done)
-                    .stage_mask(vk::PipelineStageFlags2::COPY),
+                    .stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER),
             ];
             let signal_info = [vk::SemaphoreSubmitInfo::default()
                 .semaphore(self.present_semaphores[image_index as usize])
