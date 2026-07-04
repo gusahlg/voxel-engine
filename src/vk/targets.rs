@@ -59,7 +59,11 @@ impl RenderTargets {
                 vk::ImageAspectFlags::COLOR,
             )
         } else {
-            (vk::Image::null(), vk::DeviceMemory::null(), vk::ImageView::null())
+            (
+                vk::Image::null(),
+                vk::DeviceMemory::null(),
+                vk::ImageView::null(),
+            )
         };
 
         Self {

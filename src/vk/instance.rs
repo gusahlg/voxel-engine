@@ -127,7 +127,11 @@ impl InstanceBundle {
             None
         };
 
-        Self { entry, instance, debug }
+        Self {
+            entry,
+            instance,
+            debug,
+        }
     }
 
     pub unsafe fn destroy(&mut self) {

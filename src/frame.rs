@@ -177,13 +177,16 @@ impl Frame3D<'_, '_> {
     pub fn draw_cube(&mut self, center: Vec3, size: Vec3, color: Color) {
         let min = center - size * 0.5;
         let max = center + size * 0.5;
-        let c = [color.r, color.g, color.b, color.a];
+        // uv (0,0) + layer 0 (always white) = flat vertex color. Nothing is
+        // lost dropping color.a here: the 3D pipelines never blended alpha.
+        let c = [color.r, color.g, color.b, 0];
         let verts = &mut self.frame.eng.lists.cube_verts;
         // 6 faces, each two triangles, corners wound CCW seen from outside.
         for face in cube_faces(min, max) {
             for idx in [0usize, 1, 2, 0, 2, 3] {
                 verts.push(Vertex {
                     pos: face[idx],
+                    uv: [0.0, 0.0],
                     color: c,
                 });
             }
@@ -193,7 +196,8 @@ impl Frame3D<'_, '_> {
     pub fn draw_cube_wires(&mut self, center: Vec3, size: Vec3, color: Color) {
         let min = center - size * 0.5;
         let max = center + size * 0.5;
-        let c = [color.r, color.g, color.b, color.a];
+        // Layer 0 = white; see draw_cube.
+        let c = [color.r, color.g, color.b, 0];
         let corners = [
             [min.x, min.y, min.z],
             [max.x, min.y, min.z],
@@ -222,10 +226,12 @@ impl Frame3D<'_, '_> {
         for (a, b) in EDGES {
             verts.push(Vertex {
                 pos: corners[a],
+                uv: [0.0, 0.0],
                 color: c,
             });
             verts.push(Vertex {
                 pos: corners[b],
+                uv: [0.0, 0.0],
                 color: c,
             });
         }
@@ -246,15 +252,39 @@ fn push_quad_2d(
     let (u0, v0) = (uv_min[0], uv_min[1]);
     let (u1, v1) = (uv_max[0], uv_max[1]);
     let quad = [
-        Vertex2D { pos: [x0, y0], uv: [u0, v0], color: c },
-        Vertex2D { pos: [x0, y1], uv: [u0, v1], color: c },
-        Vertex2D { pos: [x1, y1], uv: [u1, v1], color: c },
+        Vertex2D {
+            pos: [x0, y0],
+            uv: [u0, v0],
+            color: c,
+        },
+        Vertex2D {
+            pos: [x0, y1],
+            uv: [u0, v1],
+            color: c,
+        },
+        Vertex2D {
+            pos: [x1, y1],
+            uv: [u1, v1],
+            color: c,
+        },
     ];
     verts.extend_from_slice(&quad);
     let quad = [
-        Vertex2D { pos: [x0, y0], uv: [u0, v0], color: c },
-        Vertex2D { pos: [x1, y1], uv: [u1, v1], color: c },
-        Vertex2D { pos: [x1, y0], uv: [u1, v0], color: c },
+        Vertex2D {
+            pos: [x0, y0],
+            uv: [u0, v0],
+            color: c,
+        },
+        Vertex2D {
+            pos: [x1, y1],
+            uv: [u1, v1],
+            color: c,
+        },
+        Vertex2D {
+            pos: [x1, y0],
+            uv: [u1, v0],
+            color: c,
+        },
     ];
     verts.extend_from_slice(&quad);
 }

@@ -8,10 +8,30 @@ struct Shader<'a> {
 }
 
 const SHADERS: &[Shader] = &[
-    Shader { src: "shaders/mesh3d.vert.slang", stage: "vertex", entry: "vertexMain", dst: "mesh3d.vert.spv" },
-    Shader { src: "shaders/mesh3d.frag.slang", stage: "fragment", entry: "fragmentMain", dst: "mesh3d.frag.spv" },
-    Shader { src: "shaders/tris2d.vert.slang", stage: "vertex", entry: "vertexMain", dst: "tris2d.vert.spv" },
-    Shader { src: "shaders/tris2d.frag.slang", stage: "fragment", entry: "fragmentMain", dst: "tris2d.frag.spv" },
+    Shader {
+        src: "shaders/mesh3d.vert.slang",
+        stage: "vertex",
+        entry: "vertexMain",
+        dst: "mesh3d.vert.spv",
+    },
+    Shader {
+        src: "shaders/mesh3d.frag.slang",
+        stage: "fragment",
+        entry: "fragmentMain",
+        dst: "mesh3d.frag.spv",
+    },
+    Shader {
+        src: "shaders/tris2d.vert.slang",
+        stage: "vertex",
+        entry: "vertexMain",
+        dst: "tris2d.vert.spv",
+    },
+    Shader {
+        src: "shaders/tris2d.frag.slang",
+        stage: "fragment",
+        entry: "fragmentMain",
+        dst: "tris2d.frag.spv",
+    },
 ];
 
 fn have_slangc() -> bool {
@@ -68,8 +88,14 @@ fn main() {
 
         if !output.status.success() {
             eprintln!("slangc failed while compiling {}", shader.src);
-            eprintln!("--- stdout ---\n{}", String::from_utf8_lossy(&output.stdout));
-            eprintln!("--- stderr ---\n{}", String::from_utf8_lossy(&output.stderr));
+            eprintln!(
+                "--- stdout ---\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            eprintln!(
+                "--- stderr ---\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             panic!("shader compilation failed");
         }
 

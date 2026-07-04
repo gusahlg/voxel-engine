@@ -1,10 +1,12 @@
 //! voxel_engine — a small, fast Vulkan 1.3 renderer for voxel games.
 //!
 //! Design goals: raylib-shaped polling API on top of winit + ash, unlit
-//! vertex-color rendering (16-byte vertices), device-local suballocated mesh
-//! memory with same-frame uploads and deferred frees, reversed-Z depth,
-//! automatic frustum culling, an embedded 8x8 font for the 2D overlay, and
-//! runtime graphics settings (fullscreen, vsync, MSAA).
+//! textured rendering (24-byte vertices: pos + uv + rgb shade, with the
+//! vertex alpha channel selecting a layer of a runtime-swappable block
+//! texture array — see [`Engine::set_block_textures`]), device-local
+//! suballocated mesh memory with same-frame uploads and deferred frees,
+//! reversed-Z depth, automatic frustum culling, an embedded 8x8 font for the
+//! 2D overlay, and runtime graphics settings (fullscreen, vsync, MSAA).
 //!
 //! Entry point: [`run`] with a per-frame callback over [`Engine`].
 

@@ -21,13 +21,63 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 /// Physical keyboard keys the engine exposes (raylib-style names).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Key {
-    A, B, C, D, E, F, G, H, I, J, K, L, M,
-    N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
-    Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9,
-    Space, Enter, Escape, Backspace, Tab,
-    LeftShift, RightShift, LeftControl, RightControl, LeftAlt,
-    Slash, Period, Comma, Minus, Equal, Apostrophe, Semicolon,
-    Up, Down, Left, Right,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+    Num0,
+    Num1,
+    Num2,
+    Num3,
+    Num4,
+    Num5,
+    Num6,
+    Num7,
+    Num8,
+    Num9,
+    Space,
+    Enter,
+    Escape,
+    Backspace,
+    Tab,
+    LeftShift,
+    RightShift,
+    LeftControl,
+    RightControl,
+    LeftAlt,
+    Slash,
+    Period,
+    Comma,
+    Minus,
+    Equal,
+    Apostrophe,
+    Semicolon,
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
 /// Mouse buttons the engine exposes. Other buttons are ignored.
@@ -79,15 +129,17 @@ impl InputState {
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key
-                    && let Some(key) = map_key(code) {
-                        self.key_event(key, event.state.is_pressed(), event.repeat);
-                    }
+                    && let Some(key) = map_key(code)
+                {
+                    self.key_event(key, event.state.is_pressed(), event.repeat);
+                }
                 // Text is layout-aware and fires on repeats too, independent
                 // of whether we map the physical key.
                 if event.state.is_pressed()
-                    && let Some(text) = &event.text {
-                        self.text_input(text.as_str());
-                    }
+                    && let Some(text) = &event.text
+                {
+                    self.text_input(text.as_str());
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let b = match button {

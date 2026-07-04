@@ -2,8 +2,9 @@
 /// (never rebuilt on resize — only on MSAA changes), reversed-Z depth, and
 /// SPIR-V embedded at compile time.
 ///
-/// - `mesh3d`:  triangle list, Vertex{pos f32x3, color u8x4}, depth RW, cull back
-/// - `lines3d`: line list, same vertex, depth read only, no cull
+/// - `mesh3d`:  triangle list, Vertex{pos f32x3, uv f32x2, color u8x4}, depth
+///   RW, cull back; samples the block texture array (set 0)
+/// - `lines3d`: line list, same vertex/set, depth read only, no cull
 /// - `tris2d`:  triangle list, Vertex2D{pos px, uv, color}, no depth, alpha blend
 use ash::vk;
 use std::io::Cursor;
@@ -42,13 +43,17 @@ impl Pipelines {
         depth_format: vk::Format,
         samples: vk::SampleCountFlags,
         atlas_set_layout: vk::DescriptorSetLayout,
+        block_set_layout: vk::DescriptorSetLayout,
     ) -> Self {
         // Layouts
         let push_3d = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
             .offset(0)
             .size(PUSH_BYTES_3D)];
-        let layout_3d_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_3d);
+        let set_layouts_3d = [block_set_layout];
+        let layout_3d_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts_3d)
+            .push_constant_ranges(&push_3d);
         let layout_3d = unsafe {
             device
                 .create_pipeline_layout(&layout_3d_info, None)
@@ -85,8 +90,14 @@ impl Pipelines {
             vk::VertexInputAttributeDescription {
                 binding: 0,
                 location: 1,
-                format: vk::Format::R8G8B8A8_UNORM,
+                format: vk::Format::R32G32_SFLOAT,
                 offset: 12,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 2,
+                format: vk::Format::R8G8B8A8_UNORM,
+                offset: 20,
             },
         ];
 
@@ -252,8 +263,8 @@ impl PipelineBuilder<'_> {
             .cull_mode(cull)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE);
 
-        let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(self.samples);
+        let multisampling =
+            vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(self.samples);
 
         let color_attachment = if blend {
             vk::PipelineColorBlendAttachmentState::default()

@@ -20,8 +20,13 @@ pub const FRAMES_IN_FLIGHT: u64 = 2;
 pub struct GpuMesh {
     alloc: Allocation,
     pub index_count: u32,
+    /// Absolute u32 index into the block buffer (index buffer bound at 0).
     pub first_index: u32,
-    pub vertex_offset: i32,
+    /// Byte offset of this mesh's vertex data in the block buffer. The
+    /// renderer binds the vertex buffer AT this offset per mesh (the 24-byte
+    /// vertex stride does not divide the 256-aligned suballocation offsets,
+    /// so a shared bind-at-0 + `vertex_offset` scheme no longer works).
+    pub vtx_byte_offset: u64,
     pub aabb_min: Vec3,
     pub aabb_max: Vec3,
 }
@@ -130,18 +135,22 @@ impl MeshRegistry {
             aabb_max = aabb_max.max(p);
         }
 
-        // Suballocation offsets are 256-aligned, so they are exact multiples
-        // of the vertex stride (16) and index size (4) — lets every mesh in a
-        // block share one vertex/index buffer bind.
-        debug_assert_eq!(alloc.offset % 16, 0);
-        let vertex_offset = (alloc.offset / 16) as i32;
+        // Suballocation offsets are 256-aligned. Index data stays 4-aligned
+        // (256-aligned base + 4-aligned index_start), so every mesh in a
+        // block shares one index-buffer bind at offset 0 with an absolute
+        // first_index. Vertex data starts at the (256-aligned) allocation
+        // offset, which is NOT a multiple of the 24-byte stride — the
+        // renderer instead binds the vertex buffer at `vtx_byte_offset` per
+        // mesh and draws with vertex_offset 0.
+        debug_assert_eq!((alloc.offset + index_start) % 4, 0);
+        let vtx_byte_offset = alloc.offset;
         let first_index = ((alloc.offset + index_start) / 4) as u32;
 
         let mesh = GpuMesh {
             alloc,
             index_count: data.indices.len() as u32,
             first_index,
-            vertex_offset,
+            vtx_byte_offset,
             aabb_min,
             aabb_max,
         };

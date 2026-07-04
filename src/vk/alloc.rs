@@ -46,7 +46,10 @@ impl FreeList {
         Self {
             capacity,
             used: 0,
-            free: vec![FreeRange { offset: 0, size: capacity }],
+            free: vec![FreeRange {
+                offset: 0,
+                size: capacity,
+            }],
         }
     }
 
@@ -75,12 +78,20 @@ impl FreeList {
                 }
                 (true, false) => self.free[i].size = pad,
                 (false, true) => {
-                    self.free[i] = FreeRange { offset: aligned + size, size: tail };
+                    self.free[i] = FreeRange {
+                        offset: aligned + size,
+                        size: tail,
+                    };
                 }
                 (true, true) => {
                     self.free[i].size = pad;
-                    self.free
-                        .insert(i + 1, FreeRange { offset: aligned + size, size: tail });
+                    self.free.insert(
+                        i + 1,
+                        FreeRange {
+                            offset: aligned + size,
+                            size: tail,
+                        },
+                    );
                 }
             }
             self.used += size;
@@ -97,8 +108,7 @@ impl FreeList {
         debug_assert!(offset + size <= self.capacity, "free out of bounds");
         debug_assert!(self.used >= size, "free exceeds used bytes");
         let idx = self.free.partition_point(|r| r.offset < offset);
-        let merges_prev =
-            idx > 0 && self.free[idx - 1].offset + self.free[idx - 1].size == offset;
+        let merges_prev = idx > 0 && self.free[idx - 1].offset + self.free[idx - 1].size == offset;
         let merges_next = idx < self.free.len() && offset + size == self.free[idx].offset;
         match (merges_prev, merges_next) {
             (true, true) => {
@@ -209,8 +219,10 @@ impl GpuAllocator {
             const MIN_UNIFIED_HEAP: u64 = 1 << 30; // 1 GiB
             memory_props.memory_heaps[heap_of(i)].size >= MIN_UNIFIED_HEAP
         };
-        let mut device_type_prefs: Vec<u32> =
-            types_with(unified).into_iter().filter(|&i| big_enough(i)).collect();
+        let mut device_type_prefs: Vec<u32> = types_with(unified)
+            .into_iter()
+            .filter(|&i| big_enough(i))
+            .collect();
         for i in types_with(vk::MemoryPropertyFlags::DEVICE_LOCAL) {
             if !device_type_prefs.contains(&i) {
                 device_type_prefs.push(i);
@@ -411,7 +423,8 @@ unsafe fn create_block(
 
     let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
 
-    let Some(type_index) = pick_memory_type(memory_props, type_prefs, requirements.memory_type_bits)
+    let Some(type_index) =
+        pick_memory_type(memory_props, type_prefs, requirements.memory_type_bits)
     else {
         unsafe { device.destroy_buffer(buffer, None) };
         log::error!(
@@ -445,8 +458,7 @@ unsafe fn create_block(
 
     // Map once for the block's lifetime; never unmapped.
     let mapped = if host_visible {
-        match unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }
-        {
+        match unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) } {
             Ok(ptr) => NonNull::new(ptr.cast::<u8>()),
             Err(err) => {
                 unsafe {
@@ -516,7 +528,13 @@ mod tests {
         assert_eq!(fl.used(), 100);
         fl.free(a, 100);
         assert_eq!(fl.used(), 0);
-        assert_eq!(fl.free, vec![FreeRange { offset: 0, size: 1024 }]);
+        assert_eq!(
+            fl.free,
+            vec![FreeRange {
+                offset: 0,
+                size: 1024
+            }]
+        );
         // The full capacity is allocatable again.
         assert_eq!(fl.alloc(1024, 1), Some(0));
     }
@@ -550,7 +568,13 @@ mod tests {
         let _c = fl.alloc(100, 1).unwrap();
         fl.free(a, 100); // [0, 100)
         fl.free(b, 100); // merges into the left neighbour
-        assert_eq!(fl.free, vec![FreeRange { offset: 0, size: 200 }]);
+        assert_eq!(
+            fl.free,
+            vec![FreeRange {
+                offset: 0,
+                size: 200
+            }]
+        );
     }
 
     #[test]
@@ -561,7 +585,13 @@ mod tests {
         let _c = fl.alloc(100, 1).unwrap();
         fl.free(b, 100); // [100, 200)
         fl.free(a, 100); // merges into the right neighbour
-        assert_eq!(fl.free, vec![FreeRange { offset: 0, size: 200 }]);
+        assert_eq!(
+            fl.free,
+            vec![FreeRange {
+                offset: 0,
+                size: 200
+            }]
+        );
     }
 
     #[test]
@@ -574,7 +604,13 @@ mod tests {
         fl.free(c, 100); // [0, 100) and [200, 300)
         assert_eq!(fl.free.len(), 2);
         fl.free(b, 100); // bridges both neighbours
-        assert_eq!(fl.free, vec![FreeRange { offset: 0, size: 300 }]);
+        assert_eq!(
+            fl.free,
+            vec![FreeRange {
+                offset: 0,
+                size: 300
+            }]
+        );
         assert_eq!(fl.used(), 0);
     }
 
@@ -620,6 +656,12 @@ mod tests {
             assert_eq!(fl.used(), expected_used);
         }
         assert_eq!(fl.used(), 0);
-        assert_eq!(fl.free, vec![FreeRange { offset: 0, size: 4096 }]);
+        assert_eq!(
+            fl.free,
+            vec![FreeRange {
+                offset: 0,
+                size: 4096
+            }]
+        );
     }
 }

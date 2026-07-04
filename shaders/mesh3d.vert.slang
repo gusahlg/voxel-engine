@@ -1,4 +1,5 @@
 // mesh3d.vert.slang — world-space vertices, single view_proj push constant.
+// Passes uv + color through; color.a carries the texture-array layer index.
 
 struct VertexInput
 {
@@ -6,7 +7,10 @@ struct VertexInput
     float3 position;
 
     [[vk::location(1)]]
-    float4 color; // R8G8B8A8_UNORM, arrives as 0..1
+    float2 uv;
+
+    [[vk::location(2)]]
+    float4 color; // R8G8B8A8_UNORM, arrives as 0..1; a = layer / 255
 };
 
 struct VertexOutput
@@ -14,6 +18,9 @@ struct VertexOutput
     float4 position : SV_Position;
 
     [[vk::location(0)]]
+    float2 uv;
+
+    [[vk::location(1)]]
     float4 color;
 };
 
@@ -30,6 +37,7 @@ VertexOutput vertexMain(VertexInput input)
 {
     VertexOutput output;
     output.position = mul(pc.view_proj, float4(input.position, 1.0));
+    output.uv = input.uv;
     output.color = input.color;
     return output;
 }

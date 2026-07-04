@@ -3,6 +3,7 @@
 /// dynamic rendering + synchronization2; 2 frames in flight; per-swapchain-
 /// image present semaphores; reversed-Z depth; optional MSAA with resolve.
 pub(crate) mod alloc;
+pub(crate) mod block_textures;
 pub(crate) mod buffers;
 pub(crate) mod device;
 pub(crate) mod instance;
@@ -18,6 +19,7 @@ use winit::event_loop::ActiveEventLoop;
 use crate::frame::DrawLists;
 use crate::mesh::{MeshData, MeshHandle};
 use alloc::GpuAllocator;
+use block_textures::BlockTextures;
 use buffers::{FRAMES_IN_FLIGHT, HostBuffer, MeshRegistry};
 use device::Device;
 use instance::InstanceBundle;
@@ -47,6 +49,13 @@ pub(crate) struct Renderer {
     targets: RenderTargets,
     pipelines: Pipelines,
     atlas: FontAtlas,
+    block_textures: BlockTextures,
+    /// Persistent descriptor machinery for the block texture array: created
+    /// once at init; `set_block_textures` only rewrites `block_set`, so
+    /// pipelines never need rebuilding for a texture swap.
+    block_set_layout: vk::DescriptorSetLayout,
+    block_pool: vk::DescriptorPool,
+    block_set: vk::DescriptorSet,
 
     frames: Vec<FrameSlot>,
     /// One per swapchain image: signaled by the render submit, waited by present.
@@ -143,12 +152,26 @@ impl Renderer {
             device.command_pool,
         );
 
+        // Default 1x1 white block texture array (before Pipelines::new: its
+        // persistent set layout feeds layout_3d).
+        let block_tex = BlockTextures::new_default(
+            &instance.instance,
+            &device.device,
+            device.physical,
+            device.graphics_queue,
+            device.command_pool,
+        );
+        let (block_set_layout, block_pool, block_set) =
+            block_textures::create_descriptor(&device.device);
+        block_textures::write_descriptor(&device.device, block_set, &block_tex);
+
         let pipelines = Pipelines::new(
             &device.device,
             swapchain.format,
             targets.depth_format,
             targets.samples,
             atlas.set_layout,
+            block_set_layout,
         );
 
         let cmd_info = vk::CommandBufferAllocateInfo::default()
@@ -195,6 +218,10 @@ impl Renderer {
             targets,
             pipelines,
             atlas,
+            block_textures: block_tex,
+            block_set_layout,
+            block_pool,
+            block_set,
             frames,
             present_semaphores,
             imm,
@@ -248,8 +275,12 @@ impl Renderer {
 
     pub fn upload_mesh(&mut self, data: &MeshData) -> Option<MeshHandle> {
         unsafe {
-            self.meshes
-                .upload(&self.device.device, &mut self.allocator, data, self.frame_no)
+            self.meshes.upload(
+                &self.device.device,
+                &mut self.allocator,
+                data,
+                self.frame_no,
+            )
         }
     }
 
@@ -259,6 +290,36 @@ impl Renderer {
 
     pub fn mesh_aabb(&self, handle: MeshHandle) -> Option<(glam::Vec3, glam::Vec3)> {
         self.meshes.get(handle).map(|m| (m.aabb_min, m.aabb_max))
+    }
+
+    /// Replaces the block texture array (RGBA8, `layers.len()` images of
+    /// `size*size*4` bytes each). Rare operation: waits for the GPU to go
+    /// idle, uploads the new array, and rewrites the persistent descriptor
+    /// set — pipelines are untouched.
+    pub fn set_block_textures(&mut self, size: u32, layers: &[Vec<u8>]) {
+        unsafe {
+            self.device
+                .device
+                .device_wait_idle()
+                .expect("device_wait_idle failed");
+            self.block_textures.destroy(&self.device.device);
+        }
+        self.block_textures = BlockTextures::upload(
+            &self.instance.instance,
+            &self.device.device,
+            self.device.physical,
+            self.device.graphics_queue,
+            self.device.command_pool,
+            size,
+            layers,
+        );
+        block_textures::write_descriptor(&self.device.device, self.block_set, &self.block_textures);
+        log::debug!(
+            "block textures swapped: {} layers of {}x{}",
+            self.block_textures.layers,
+            self.block_textures.size,
+            self.block_textures.size,
+        );
     }
 
     /// Records, submits, and presents one frame from the recorded draw lists.
@@ -476,6 +537,16 @@ impl Renderer {
                     0,
                     bytemuck::bytes_of(&lists.view_proj),
                 );
+                // Block texture array (set 0) for every 3D draw: meshes,
+                // immediate cubes, and lines all sample it (layer 0 = white).
+                device.cmd_bind_descriptor_sets(
+                    frame.cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipelines.layout_3d,
+                    0,
+                    &[self.block_set],
+                    &[],
+                );
 
                 if !lists.mesh_draws.is_empty() {
                     device.cmd_bind_pipeline(
@@ -483,16 +554,20 @@ impl Renderer {
                         vk::PipelineBindPoint::GRAPHICS,
                         self.pipelines.mesh3d,
                     );
-                    // One vertex/index bind per suballocation block; draws use
-                    // first_index/vertex_offset into the shared buffer.
+                    // Index buffer bound once per suballocation block (offsets
+                    // stay 4-aligned; first_index is absolute). The vertex
+                    // buffer is bound AT each mesh's byte offset: 256-aligned
+                    // suballocation offsets are not multiples of the 24-byte
+                    // vertex stride, so a shared vertex_offset can't address
+                    // them. Rebinding is cheap (~hundreds of meshes).
                     let mut bound = vk::Buffer::null();
+                    let mut bound_vtx_off = u64::MAX;
                     for &handle in &lists.mesh_draws {
                         let Some(mesh) = self.meshes.get(handle) else {
                             continue;
                         };
                         let buffer = mesh.buffer();
                         if buffer != bound {
-                            device.cmd_bind_vertex_buffers(frame.cmd, 0, &[buffer], &[0]);
                             device.cmd_bind_index_buffer(
                                 frame.cmd,
                                 buffer,
@@ -500,13 +575,23 @@ impl Renderer {
                                 vk::IndexType::UINT32,
                             );
                             bound = buffer;
+                            bound_vtx_off = u64::MAX;
+                        }
+                        if mesh.vtx_byte_offset != bound_vtx_off {
+                            device.cmd_bind_vertex_buffers(
+                                frame.cmd,
+                                0,
+                                &[buffer],
+                                &[mesh.vtx_byte_offset],
+                            );
+                            bound_vtx_off = mesh.vtx_byte_offset;
                         }
                         device.cmd_draw_indexed(
                             frame.cmd,
                             mesh.index_count,
                             1,
                             mesh.first_index,
-                            mesh.vertex_offset,
+                            0,
                             0,
                         );
                     }
@@ -725,6 +810,7 @@ impl Renderer {
                     self.targets.depth_format,
                     self.targets.samples,
                     self.atlas.set_layout,
+                    self.block_set_layout,
                 );
             }
 
@@ -748,6 +834,9 @@ impl Drop for Renderer {
 
             self.pipelines.destroy(device);
             self.atlas.destroy(device);
+            device.destroy_descriptor_pool(self.block_pool, None);
+            device.destroy_descriptor_set_layout(self.block_set_layout, None);
+            self.block_textures.destroy(device);
             self.targets.destroy(device);
             for imm in &mut self.imm {
                 imm.destroy(device);

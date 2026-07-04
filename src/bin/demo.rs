@@ -1,27 +1,90 @@
 /// Visual smoke test for the engine: a sine-hill field of colored cubes as a
-/// retained mesh, an orbiting camera, immediate cubes/wires, and the 2D
-/// overlay. Keys: F fullscreen, V vsync, M cycle MSAA, Esc quit.
+/// retained mesh (textured with a checker on layer 1 of the block texture
+/// array), an orbiting camera, immediate cubes/wires, and the 2D overlay.
+/// Keys: F fullscreen, V vsync, M cycle MSAA, Esc quit.
 use voxel_engine::{Camera3D, Color, Config, Key, MeshData, Vec3, Vertex};
 
+/// Texture layer sampled by the demo terrain (layer 0 is the white layer).
+const CHECKER_LAYER: u8 = 1;
+
 fn push_cube(data: &mut MeshData, min: Vec3, max: Vec3, color: Color) {
-    let c = [color.r, color.g, color.b, color.a];
+    let rgb = [color.r, color.g, color.b];
     // Same CCW-from-outside winding the engine uses for immediate cubes.
-    let faces: [[[f32; 3]; 4]; 6] = [
-        [[min.x, max.y, min.z], [min.x, max.y, max.z], [max.x, max.y, max.z], [max.x, max.y, min.z]],
-        [[min.x, min.y, min.z], [max.x, min.y, min.z], [max.x, min.y, max.z], [min.x, min.y, max.z]],
-        [[max.x, min.y, min.z], [max.x, max.y, min.z], [max.x, max.y, max.z], [max.x, min.y, max.z]],
-        [[min.x, min.y, min.z], [min.x, min.y, max.z], [min.x, max.y, max.z], [min.x, max.y, min.z]],
-        [[min.x, min.y, max.z], [max.x, min.y, max.z], [max.x, max.y, max.z], [min.x, max.y, max.z]],
-        [[min.x, min.y, min.z], [min.x, max.y, min.z], [max.x, max.y, min.z], [max.x, min.y, min.z]],
+    // uv = the face's two varying world coords (exactly what the game's
+    // mesher will emit), so REPEAT tiling exercises real texturing.
+    type Corner = ([f32; 3], [f32; 2]);
+    let faces: [[Corner; 4]; 6] = [
+        // +Y: uv (x, z)
+        [
+            ([min.x, max.y, min.z], [min.x, min.z]),
+            ([min.x, max.y, max.z], [min.x, max.z]),
+            ([max.x, max.y, max.z], [max.x, max.z]),
+            ([max.x, max.y, min.z], [max.x, min.z]),
+        ],
+        // -Y: uv (x, z)
+        [
+            ([min.x, min.y, min.z], [min.x, min.z]),
+            ([max.x, min.y, min.z], [max.x, min.z]),
+            ([max.x, min.y, max.z], [max.x, max.z]),
+            ([min.x, min.y, max.z], [min.x, max.z]),
+        ],
+        // +X: uv (z, y)
+        [
+            ([max.x, min.y, min.z], [min.z, min.y]),
+            ([max.x, max.y, min.z], [min.z, max.y]),
+            ([max.x, max.y, max.z], [max.z, max.y]),
+            ([max.x, min.y, max.z], [max.z, min.y]),
+        ],
+        // -X: uv (z, y)
+        [
+            ([min.x, min.y, min.z], [min.z, min.y]),
+            ([min.x, min.y, max.z], [max.z, min.y]),
+            ([min.x, max.y, max.z], [max.z, max.y]),
+            ([min.x, max.y, min.z], [min.z, max.y]),
+        ],
+        // +Z: uv (x, y)
+        [
+            ([min.x, min.y, max.z], [min.x, min.y]),
+            ([max.x, min.y, max.z], [max.x, min.y]),
+            ([max.x, max.y, max.z], [max.x, max.y]),
+            ([min.x, max.y, max.z], [min.x, max.y]),
+        ],
+        // -Z: uv (x, y)
+        [
+            ([min.x, min.y, min.z], [min.x, min.y]),
+            ([min.x, max.y, min.z], [min.x, max.y]),
+            ([max.x, max.y, min.z], [max.x, max.y]),
+            ([max.x, min.y, min.z], [max.x, min.y]),
+        ],
     ];
     for face in faces {
         let base = data.vertices.len() as u32;
-        for corner in face {
-            data.vertices.push(Vertex { pos: corner, color: c });
+        for (pos, uv) in face {
+            data.vertices
+                .push(Vertex::textured(pos, uv, rgb, CHECKER_LAYER));
         }
         data.indices
             .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
+}
+
+/// Layer 0: all white (the engine contract). Layer 1: a 4x4-cell two-tone
+/// checker so texturing is visible on the terrain.
+fn block_texture_layers(size: u32) -> Vec<Vec<u8>> {
+    let n = (size * size * 4) as usize;
+    let white = vec![255u8; n];
+    let mut checker = Vec::with_capacity(n);
+    for y in 0..size {
+        for x in 0..size {
+            let v = if ((x / 4) + (y / 4)) % 2 == 0 {
+                255
+            } else {
+                150
+            };
+            checker.extend_from_slice(&[v, v, v, 255]);
+        }
+    }
+    vec![white, checker]
 }
 
 fn main() {
@@ -49,11 +112,18 @@ fn main() {
                 eng.set_vsync(now);
             }
             if eng.is_key_pressed(Key::M) {
-                let next = if eng.msaa() >= eng.max_msaa() { 1 } else { eng.msaa() * 2 };
+                let next = if eng.msaa() >= eng.max_msaa() {
+                    1
+                } else {
+                    eng.msaa() * 2
+                };
                 eng.set_msaa(next);
             }
 
             if terrain.is_none() {
+                // Once at startup: white layer 0 + checker layer 1.
+                eng.set_block_textures(16, &block_texture_layers(16));
+
                 let mut data = MeshData::default();
                 for x in -24i32..24 {
                     for z in -24i32..24 {
@@ -106,7 +176,13 @@ fn main() {
                 16,
                 Color::RAYWHITE,
             );
-            frame.draw_text("F fullscreen  V vsync  M msaa  Esc quit", 16, 60, 16, Color::GRAY);
+            frame.draw_text(
+                "F fullscreen  V vsync  M msaa  Esc quit",
+                16,
+                60,
+                16,
+                Color::GRAY,
+            );
             true
         },
     );

@@ -216,6 +216,21 @@ impl Engine {
         self.renderer.free_mesh(handle);
     }
 
+    // ---- textures ----
+
+    /// Replaces the block texture array sampled by all 3D geometry
+    /// ([`Vertex`](crate::Vertex) `color.a` selects the layer). `layers` are
+    /// RGBA8 images of `size*size*4` bytes each; the engine builds mip chains
+    /// (box filter) CPU-side and uploads a fresh device-local texture array.
+    ///
+    /// Rare operation (world load / palette growth): waits for the GPU to go
+    /// idle. Contract: layer 0 must render pure white — the engine's
+    /// immediate cubes/wires always draw with layer 0. Before the first call
+    /// a default 1x1 all-white single-layer array is bound.
+    pub fn set_block_textures(&mut self, size: u32, layers: &[Vec<u8>]) {
+        self.renderer.set_block_textures(size, layers);
+    }
+
     // ---- text / math ----
 
     pub fn measure_text(&self, text: &str, font_size: i32) -> i32 {
