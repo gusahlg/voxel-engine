@@ -78,18 +78,16 @@ impl InputState {
     pub fn on_window_event(&mut self, event: &WindowEvent) {
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    if let Some(key) = map_key(code) {
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && let Some(key) = map_key(code) {
                         self.key_event(key, event.state.is_pressed(), event.repeat);
                     }
-                }
                 // Text is layout-aware and fires on repeats too, independent
                 // of whether we map the physical key.
-                if event.state.is_pressed() {
-                    if let Some(text) = &event.text {
+                if event.state.is_pressed()
+                    && let Some(text) = &event.text {
                         self.text_input(text.as_str());
                     }
-                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let b = match button {

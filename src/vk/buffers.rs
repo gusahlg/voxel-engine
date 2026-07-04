@@ -94,9 +94,14 @@ impl MeshRegistry {
                 );
             }
         } else {
-            let staging = unsafe { allocator.alloc_staging(device, total, 4) }
-                .map_err(|err| log::error!("staging allocation failed: {err:?}"))
-                .ok()?;
+            let staging = match unsafe { allocator.alloc_staging(device, total, 4) } {
+                Ok(staging) => staging,
+                Err(err) => {
+                    log::error!("staging allocation failed: {err:?}");
+                    unsafe { allocator.free(alloc) };
+                    return None;
+                }
+            };
             let mapped = staging
                 .mapped
                 .expect("staging memory is always host-visible");
@@ -218,6 +223,23 @@ impl MeshRegistry {
             self.retire.push_back((frame_no, copy.staging));
         }
         true
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub fn has_garbage(&self) -> bool {
+        !self.retire.is_empty()
+    }
+
+    /// Frees every retired allocation. Only valid when the GPU is provably
+    /// idle for all our submissions AND no pending copy still targets a
+    /// retired region (i.e. after flushing copies).
+    pub unsafe fn collect_all(&mut self, allocator: &mut GpuAllocator) {
+        for (_, alloc) in self.retire.drain(..) {
+            unsafe { allocator.free(alloc) };
+        }
     }
 
     /// Frees retired allocations whose last possible GPU use has completed.

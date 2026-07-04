@@ -193,7 +193,13 @@ pub fn white_uv() -> [f32; 2] {
 /// Pixel width of `text` at `font_size`: glyphs draw as font_size x font_size
 /// squares, so width is simply the char count times the size.
 pub fn measure_text(text: &str, font_size: i32) -> i32 {
-    text.chars().count() as i32 * font_size
+    // Width of the widest line — matches draw_text, which treats '\n' as a
+    // zero-width line break.
+    text.split('\n')
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0) as i32
+        * font_size
 }
 
 #[cfg(test)]
@@ -236,7 +242,7 @@ mod tests {
         assert!(space.iter().all(|&b| b == 0), "space cell must be blank");
         // 'A' is index 33 -> cell (col 1, row 2) -> pixels (8, 16).
         let a = atlas_cell(&atlas, 8, 16);
-        assert!(a.iter().any(|&b| b == 255), "'A' cell must have set pixels");
+        assert!(a.contains(&255), "'A' cell must have set pixels");
     }
 
     #[test]

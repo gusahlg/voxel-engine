@@ -200,7 +200,17 @@ impl GpuAllocator {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
         // Device pool: unified-memory types first, then plain DEVICE_LOCAL.
-        let mut device_type_prefs = types_with(unified);
+        // A DEVICE_LOCAL|HOST_VISIBLE type only counts as "unified" when its
+        // heap is genuinely large: discrete GPUs without resizable BAR expose
+        // a ~256 MiB DEVICE_LOCAL|HOST_VISIBLE window that must NOT become the
+        // main mesh pool (it would exhaust long before VRAM does).
+        let heap_of = |i: u32| memory_props.memory_types[i as usize].heap_index as usize;
+        let big_enough = |i: u32| {
+            const MIN_UNIFIED_HEAP: u64 = 1 << 30; // 1 GiB
+            memory_props.memory_heaps[heap_of(i)].size >= MIN_UNIFIED_HEAP
+        };
+        let mut device_type_prefs: Vec<u32> =
+            types_with(unified).into_iter().filter(|&i| big_enough(i)).collect();
         for i in types_with(vk::MemoryPropertyFlags::DEVICE_LOCAL) {
             if !device_type_prefs.contains(&i) {
                 device_type_prefs.push(i);

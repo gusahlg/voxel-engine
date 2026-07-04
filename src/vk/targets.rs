@@ -13,7 +13,6 @@ pub struct RenderTargets {
     pub msaa_memory: vk::DeviceMemory,
     pub msaa_view: vk::ImageView,
     pub samples: vk::SampleCountFlags,
-    pub extent: vk::Extent2D,
 }
 
 pub fn sample_count_flag(samples: u32) -> vk::SampleCountFlags {
@@ -72,7 +71,6 @@ impl RenderTargets {
             msaa_memory,
             msaa_view,
             samples,
-            extent,
         }
     }
 

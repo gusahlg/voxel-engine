@@ -15,7 +15,6 @@ use ash::{khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::event_loop::ActiveEventLoop;
 
-use crate::color::Color;
 use crate::frame::DrawLists;
 use crate::mesh::{MeshData, MeshHandle};
 use alloc::GpuAllocator;
@@ -106,7 +105,7 @@ impl Renderer {
         };
 
         let device = Device::new(&instance.instance, &surface_loader, surface);
-        let mut allocator = unsafe { GpuAllocator::new(&instance.instance, device.physical) };
+        let allocator = unsafe { GpuAllocator::new(&instance.instance, device.physical) };
         if allocator.unified_memory() {
             log::info!("Unified memory detected: mesh uploads bypass staging");
         }
@@ -218,7 +217,9 @@ impl Renderer {
     }
 
     pub fn set_vsync(&mut self, on: bool) {
-        if on != self.vsync && self.pending_vsync != Some(on) {
+        // Compare against the EFFECTIVE value (pending included) so a change
+        // can also be cancelled back to the current state before it applies.
+        if on != self.vsync() {
             self.pending_vsync = Some(on);
             self.needs_recreate = true;
         }
@@ -230,7 +231,7 @@ impl Renderer {
 
     pub fn set_msaa(&mut self, samples: u32) -> u32 {
         let clamped = clamp_msaa(samples, self.device.max_msaa());
-        if clamped != self.msaa && self.pending_msaa != Some(clamped) {
+        if clamped != self.msaa() {
             self.pending_msaa = Some(clamped);
             self.needs_recreate = true;
         }
@@ -264,7 +265,11 @@ impl Renderer {
     pub fn draw_frame(&mut self, lists: &DrawLists) {
         let size = self.window.inner_size();
         if size.width == 0 || size.height == 0 {
-            return; // minimized
+            // Minimized: no rendering, but the game keeps running (remote
+            // edits keep remeshing chunks), so uploads and frees must not
+            // accumulate unboundedly until restore.
+            unsafe { self.reclaim_while_idle() };
+            return;
         }
         if self.needs_recreate {
             unsafe { self.apply_pending() };
@@ -615,6 +620,51 @@ impl Renderer {
         self.slot = (self.slot + 1) % self.frames.len();
     }
 
+    /// While no frames are being submitted (minimized window): waits out the
+    /// in-flight fences, flushes any staged mesh copies with a standalone
+    /// submit, and frees the whole retire queue.
+    unsafe fn reclaim_while_idle(&mut self) {
+        if !self.meshes.has_pending() && !self.meshes.has_garbage() {
+            return;
+        }
+        let device = &self.device.device;
+        unsafe {
+            let fences: Vec<vk::Fence> = self.frames.iter().map(|f| f.fence).collect();
+            device
+                .wait_for_fences(&fences, true, u64::MAX)
+                .expect("fence wait failed");
+
+            if self.meshes.has_pending() {
+                // Reuse slot 0's command buffer — its fence is signaled and
+                // nothing else records until the next real frame.
+                let cmd = self.frames[0].cmd;
+                device
+                    .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                    .expect("command buffer reset failed");
+                let begin = vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+                device
+                    .begin_command_buffer(cmd, &begin)
+                    .expect("begin command buffer failed");
+                self.meshes.flush_copies(device, cmd, self.frame_no);
+                device
+                    .end_command_buffer(cmd)
+                    .expect("end command buffer failed");
+                let cmd_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+                let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
+                device
+                    .queue_submit2(self.device.graphics_queue, &submit, vk::Fence::null())
+                    .expect("queue submit failed");
+                device
+                    .queue_wait_idle(self.device.graphics_queue)
+                    .expect("queue wait failed");
+            }
+
+            // GPU idle + copies flushed: everything retired is reclaimable.
+            self.meshes.collect_all(&mut self.allocator);
+        }
+    }
+
     /// Applies pending vsync/MSAA changes and rebuilds swapchain-sized state.
     unsafe fn apply_pending(&mut self) {
         unsafe {
@@ -691,6 +741,7 @@ impl Renderer {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
+        log::debug!("GPU memory at shutdown: {:?}", self.allocator.stats());
         unsafe {
             let device = &self.device.device;
             let _ = device.device_wait_idle();

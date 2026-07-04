@@ -1,31 +1,58 @@
 {
-  description = "voxel-engine dev shell";
+  description = "voxel_engine — a small, fast Vulkan 1.3 voxel renderer (library + demo)";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    flake-utils.url = "github:numtide/flake-utils";
+  };
 
-  outputs = { self, nixpkgs }:
-    let
-      system = "x86_64-linux";
-      pkgs = import nixpkgs { inherit system; };
-    in {
-      devShells.${system}.default = pkgs.mkShell {
-        packages = with pkgs; [
-          rustc
-          cargo
-          pkg-config
-          shader-slang
-          wayland
-          libxkbcommon
-          vulkan-loader
-          vulkan-headers
-          vulkan-tools
-        ];
+  outputs = { self, nixpkgs, flake-utils }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = import nixpkgs { inherit system; };
+        isLinux = pkgs.stdenv.isLinux;
 
-        LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
-          pkgs.wayland
-          pkgs.libxkbcommon
-          pkgs.vulkan-loader
-        ];
-      };
-    };
+        # ash dlopens the Vulkan loader; winit dlopens the windowing stack.
+        runtimeLibs = with pkgs; [ vulkan-loader libxkbcommon ]
+          ++ pkgs.lib.optionals isLinux [
+            wayland
+            xorg.libX11
+            xorg.libXcursor
+            xorg.libXrandr
+            xorg.libXi
+          ];
+      in
+      {
+        devShells.default = pkgs.mkShell {
+          packages = with pkgs; [
+            rustc
+            cargo
+            rustfmt
+            clippy
+            shader-slang
+            vulkan-headers
+            vulkan-tools
+            vulkan-validation-layers
+          ] ++ runtimeLibs;
+
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
+          VK_LAYER_PATH =
+            "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
+        };
+
+        packages.default = pkgs.rustPlatform.buildRustPackage {
+          pname = "voxel_engine-demo";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+
+          nativeBuildInputs = [ pkgs.shader-slang ];
+
+          postFixup = pkgs.lib.optionalString isLinux ''
+            patchelf --set-rpath "${pkgs.lib.makeLibraryPath runtimeLibs}" $out/bin/demo || true
+          '';
+
+          meta.mainProgram = "demo";
+        };
+      });
 }

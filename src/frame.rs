@@ -50,6 +50,10 @@ pub struct Frame<'e> {
 impl<'e> Frame<'e> {
     /// Starts the 3D pass. Drop the returned scope (or let it fall out of a
     /// block) before drawing 2D overlays on top.
+    ///
+    /// All 3D geometry in a frame shares one camera: calling `begin_3d` a
+    /// second time replaces the camera for every 3D draw already recorded
+    /// this frame (frustum culling, however, uses each scope's own camera).
     pub fn begin_3d(&mut self, cam: &Camera3D) -> Frame3D<'_, 'e> {
         let extent = self.eng.renderer.extent();
         let aspect = extent.width.max(1) as f32 / extent.height.max(1) as f32;
@@ -143,6 +147,11 @@ impl<'e> Frame<'e> {
 
 impl Drop for Frame<'_> {
     fn drop(&mut self) {
+        // Don't submit GPU work during a panic unwind: a failing Vulkan call
+        // here would double-panic and abort, hiding the original error.
+        if std::thread::panicking() {
+            return;
+        }
         self.eng.finish_frame();
     }
 }

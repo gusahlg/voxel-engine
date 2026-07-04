@@ -13,7 +13,6 @@ pub struct Device {
     pub graphics_family: u32,
     pub present_family: u32,
     pub command_pool: vk::CommandPool,
-    pub properties: vk::PhysicalDeviceProperties,
     /// Sample counts supported by BOTH color and depth framebuffer attachments.
     pub msaa_caps: vk::SampleCountFlags,
 }
@@ -111,7 +110,6 @@ impl Device {
             graphics_family: best.graphics_family,
             present_family: best.present_family,
             command_pool,
-            properties: best.properties,
             msaa_caps,
         }
     }
