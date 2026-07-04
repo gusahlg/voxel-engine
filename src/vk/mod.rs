@@ -103,6 +103,12 @@ pub(crate) struct Renderer {
     vsync: bool,
     msaa: u32,
     needs_recreate: bool,
+    /// Resolution scale for the 3D/UI render target relative to the window
+    /// (0.25..=2.0). The present copy becomes a filtered blit when != 1.
+    render_scale: f32,
+    pending_render_scale: Option<f32>,
+    /// The offscreen/depth/MSAA extent: swapchain extent * render_scale.
+    render_extent: vk::Extent2D,
     /// Present pacing for the vsync-off path: presents are attempted at the
     /// display's refresh cadence so queue_present never has to wait for a
     /// drawable; frames in between render unthrottled.
@@ -123,7 +129,9 @@ impl Renderer {
         fullscreen: bool,
         vsync: bool,
         msaa: u32,
+        render_scale: f32,
     ) -> Self {
+        let render_scale = render_scale.clamp(0.25, 2.0);
         let mut attrs = winit::window::WindowAttributes::default()
             .with_title(title)
             .with_inner_size(winit::dpi::LogicalSize::new(width, height))
@@ -176,11 +184,12 @@ impl Renderer {
         );
 
         let msaa = clamp_msaa(msaa, device.max_msaa());
+        let render_extent = scaled_extent(swapchain.extent, render_scale);
         let targets = RenderTargets::new(
             &instance.instance,
             &device.device,
             device.physical,
-            swapchain.extent,
+            render_extent,
             swapchain.format,
             msaa,
         );
@@ -289,6 +298,9 @@ impl Renderer {
             needs_recreate: false,
             pending_vsync: None,
             pending_msaa: None,
+            render_scale,
+            pending_render_scale: None,
+            render_extent,
             last_present: std::time::Instant::now(),
             present_interval,
             timing: FrameTiming::new(),
@@ -331,6 +343,21 @@ impl Renderer {
 
     pub fn max_msaa(&self) -> u32 {
         self.device.max_msaa()
+    }
+
+    /// Requests a render-resolution scale; returns the clamped value that
+    /// will apply at the next frame boundary.
+    pub fn set_render_scale(&mut self, scale: f32) -> f32 {
+        let clamped = scale.clamp(0.25, 2.0);
+        if (clamped - self.render_scale()).abs() > f32::EPSILON {
+            self.pending_render_scale = Some(clamped);
+            self.needs_recreate = true;
+        }
+        clamped
+    }
+
+    pub fn render_scale(&self) -> f32 {
+        self.pending_render_scale.unwrap_or(self.render_scale)
     }
 
     pub fn upload_mesh(&mut self, data: &MeshData) -> Option<MeshHandle> {
@@ -496,7 +523,10 @@ impl Renderer {
         }
 
         let frame = &self.frames[slot];
-        let extent = self.swapchain.extent;
+        // Rendering happens at the (possibly scaled) offscreen resolution;
+        // 2D coordinates stay in window pixels (NDC is resolution-free).
+        let extent = self.render_extent;
+        let window_extent = self.swapchain.extent;
         unsafe {
             device
                 .reset_fences(&[frame.fence])
@@ -743,7 +773,10 @@ impl Renderer {
                     &[self.atlas.set],
                     &[],
                 );
-                let pixels_to_ndc = [2.0 / extent.width as f32, 2.0 / extent.height as f32];
+                let pixels_to_ndc = [
+                    2.0 / window_extent.width as f32,
+                    2.0 / window_extent.height as f32,
+                ];
                 device.cmd_push_constants(
                     frame.cmd,
                     self.pipelines.layout_2d,
@@ -866,22 +899,55 @@ impl Renderer {
                 base_array_layer: 0,
                 layer_count: 1,
             };
-            let region = vk::ImageCopy::default()
-                .src_subresource(layers)
-                .dst_subresource(layers)
-                .extent(vk::Extent3D {
-                    width: extent.width,
-                    height: extent.height,
-                    depth: 1,
-                });
-            device.cmd_copy_image(
-                self.copy_cmd,
-                self.targets.offscreen_images[slot],
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                swap_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
+            let src_extent = self.render_extent;
+            if src_extent == extent {
+                let region = vk::ImageCopy::default()
+                    .src_subresource(layers)
+                    .dst_subresource(layers)
+                    .extent(vk::Extent3D {
+                        width: extent.width,
+                        height: extent.height,
+                        depth: 1,
+                    });
+                device.cmd_copy_image(
+                    self.copy_cmd,
+                    self.targets.offscreen_images[slot],
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    swap_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+            } else {
+                // Render scale != 1: filtered blit up/down to the window.
+                let blit = vk::ImageBlit::default()
+                    .src_subresource(layers)
+                    .dst_subresource(layers)
+                    .src_offsets([
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D {
+                            x: src_extent.width as i32,
+                            y: src_extent.height as i32,
+                            z: 1,
+                        },
+                    ])
+                    .dst_offsets([
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D {
+                            x: extent.width as i32,
+                            y: extent.height as i32,
+                            z: 1,
+                        },
+                    ]);
+                device.cmd_blit_image(
+                    self.copy_cmd,
+                    self.targets.offscreen_images[slot],
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    swap_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[blit],
+                    vk::Filter::LINEAR,
+                );
+            }
 
             let to_present = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COPY)
@@ -1032,13 +1098,17 @@ impl Renderer {
             if let Some(m) = new_msaa {
                 self.msaa = m;
             }
+            if let Some(scale) = self.pending_render_scale.take() {
+                self.render_scale = scale;
+            }
+            self.render_extent = scaled_extent(self.swapchain.extent, self.render_scale);
 
             self.targets.destroy(&self.device.device);
             self.targets = RenderTargets::new(
                 &self.instance.instance,
                 &self.device.device,
                 self.device.physical,
-                self.swapchain.extent,
+                self.render_extent,
                 self.swapchain.format,
                 self.msaa,
             );
@@ -1138,6 +1208,13 @@ fn display_refresh_interval(window: &winit::window::Window) -> std::time::Durati
         .filter(|&mhz| mhz > 0) // Some(0) = unknown on some X11/VM backends
         .unwrap_or(120_000);
     std::time::Duration::from_secs_f64(1000.0 / millihertz as f64)
+}
+
+fn scaled_extent(extent: vk::Extent2D, scale: f32) -> vk::Extent2D {
+    vk::Extent2D {
+        width: ((extent.width as f32 * scale) as u32).max(1),
+        height: ((extent.height as f32 * scale) as u32).max(1),
+    }
 }
 
 fn color_range() -> vk::ImageSubresourceRange {

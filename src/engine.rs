@@ -35,6 +35,8 @@ pub struct Config {
     /// `target_fps` is the only pacing.
     pub vsync: bool,
     pub msaa: u32,
+    /// Render-resolution scale relative to the window (0.25..=2.0).
+    pub render_scale: f32,
     pub resizable: bool,
     pub fullscreen: bool,
 }
@@ -48,6 +50,7 @@ impl Default for Config {
             target_fps: 0,
             vsync: true,
             msaa: 1,
+            render_scale: 1.0,
             resizable: true,
             fullscreen: false,
         }
@@ -160,6 +163,17 @@ impl Engine {
 
     pub fn max_msaa(&self) -> u32 {
         self.renderer.max_msaa()
+    }
+
+    /// Requests a render-resolution scale (0.25..=2.0); returns the value
+    /// that will apply. The 3D scene and UI rasterize at the scaled
+    /// resolution and are blitted to the window with linear filtering.
+    pub fn set_render_scale(&mut self, scale: f32) -> f32 {
+        self.renderer.set_render_scale(scale)
+    }
+
+    pub fn render_scale(&self) -> f32 {
+        self.renderer.render_scale()
     }
 
     // ---- input ----
@@ -376,6 +390,7 @@ impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
             self.config.fullscreen,
             self.config.vsync,
             self.config.msaa,
+            self.config.render_scale,
         );
         self.engine = Some(Engine::new(renderer, &self.config));
     }
