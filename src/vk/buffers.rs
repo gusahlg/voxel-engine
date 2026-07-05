@@ -14,19 +14,29 @@ use super::alloc::{Allocation, GpuAllocator};
 use super::targets::find_memory_type;
 use crate::mesh::{MeshData, MeshHandle};
 
-const MESH_ALIGN: u64 = 256;
+/// Suballocation alignment: lcm(256, 24) so every mesh's vertex data starts
+/// at a whole multiple of the 24-byte vertex stride. That makes
+/// `vertex_offset = byte_offset / 24` exact, which is what lets the renderer
+/// bind each arena buffer ONCE at offset 0 and address meshes purely through
+/// `VkDrawIndexedIndirectCommand::vertexOffset` (batched indirect draws).
+/// Costs ~384 B average padding per mesh — negligible against multi-KB
+/// chunk meshes.
+const MESH_ALIGN: u64 = 768;
 pub const FRAMES_IN_FLIGHT: u64 = 2;
+
+/// Vertex stride shared by the mesh pipelines (must divide [`MESH_ALIGN`]).
+const VERTEX_STRIDE: u64 = std::mem::size_of::<crate::mesh::Vertex>() as u64;
 
 pub struct GpuMesh {
     alloc: Allocation,
     pub index_count: u32,
     /// Absolute u32 index into the block buffer (index buffer bound at 0).
     pub first_index: u32,
-    /// Byte offset of this mesh's vertex data in the block buffer. The
-    /// renderer binds the vertex buffer AT this offset per mesh (the 24-byte
-    /// vertex stride does not divide the 256-aligned suballocation offsets,
-    /// so a shared bind-at-0 + `vertex_offset` scheme no longer works).
-    pub vtx_byte_offset: u64,
+    /// This mesh's first vertex, in vertices, from the start of the block
+    /// buffer (vertex buffer bound at 0; exact because MESH_ALIGN is a
+    /// multiple of the vertex stride). Goes into the indirect command's
+    /// `vertex_offset`.
+    pub vertex_offset: i32,
     pub aabb_min: Vec3,
     pub aabb_max: Vec3,
 }
@@ -135,22 +145,22 @@ impl MeshRegistry {
             aabb_max = aabb_max.max(p);
         }
 
-        // Suballocation offsets are 256-aligned. Index data stays 4-aligned
-        // (256-aligned base + 4-aligned index_start), so every mesh in a
-        // block shares one index-buffer bind at offset 0 with an absolute
-        // first_index. Vertex data starts at the (256-aligned) allocation
-        // offset, which is NOT a multiple of the 24-byte stride — the
-        // renderer instead binds the vertex buffer at `vtx_byte_offset` per
-        // mesh and draws with vertex_offset 0.
+        // Suballocation offsets are 768-aligned = a multiple of BOTH the
+        // 4-byte index size and the 24-byte vertex stride, so every mesh in
+        // a block shares one index-buffer bind at 0 (absolute first_index)
+        // AND one vertex-buffer bind at 0 (exact vertex_offset in vertices).
+        const _: () =
+            assert!(MESH_ALIGN.is_multiple_of(VERTEX_STRIDE) && MESH_ALIGN.is_multiple_of(256));
+        debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
         debug_assert_eq!((alloc.offset + index_start) % 4, 0);
-        let vtx_byte_offset = alloc.offset;
+        let vertex_offset = (alloc.offset / VERTEX_STRIDE) as i32;
         let first_index = ((alloc.offset + index_start) / 4) as u32;
 
         let mesh = GpuMesh {
             alloc,
             index_count: data.indices.len() as u32,
             first_index,
-            vtx_byte_offset,
+            vertex_offset,
             aabb_min,
             aabb_max,
         };
@@ -288,15 +298,18 @@ const IMM_MIN_CAPACITY: u64 = 64 * 1024;
 /// window's high-water mark for this many consecutive frames.
 const IMM_SHRINK_WINDOW: u32 = 600;
 
-/// A growable host-visible vertex buffer for immediate geometry (cubes,
-/// lines, 2D overlay), one per frame-in-flight. Growing (or the decay
-/// shrink) destroys the old buffer immediately — safe because the owning
-/// frame slot's fence has already been waited when the buffer is written.
+/// A growable host-visible buffer written fresh every frame, one per
+/// frame-in-flight: immediate geometry (VERTEX_BUFFER), per-draw offsets
+/// (STORAGE_BUFFER), indirect commands (INDIRECT_BUFFER). Growing (or the
+/// decay shrink) destroys the old buffer immediately — safe because the
+/// owning frame slot's fence has already been waited when the buffer is
+/// written.
 pub struct HostBuffer {
     pub buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: *mut u8,
     capacity: u64,
+    usage: vk::BufferUsageFlags,
     /// Largest `needed` seen in the current decay window.
     window_peak: u64,
     /// Frames elapsed in the current decay window.
@@ -304,12 +317,13 @@ pub struct HostBuffer {
 }
 
 impl HostBuffer {
-    pub fn new() -> Self {
+    pub fn new(usage: vk::BufferUsageFlags) -> Self {
         Self {
             buffer: vk::Buffer::null(),
             memory: vk::DeviceMemory::null(),
             mapped: std::ptr::null_mut(),
             capacity: 0,
+            usage,
             window_peak: 0,
             window_frames: 0,
         }
@@ -324,13 +338,19 @@ impl HostBuffer {
     /// Must be called at the point where the owning frame slot's fence has
     /// just been waited (the GPU no longer reads this buffer), because both
     /// growth and decay destroy the old buffer immediately.
+    ///
+    /// Returns `true` when the `buffer` handle changed (created, recreated,
+    /// or destroyed) so callers holding descriptors pointing at it can
+    /// rewrite them. Handle-value comparison would be wrong here: Vulkan may
+    /// reuse a destroyed handle's value for the next buffer.
     pub unsafe fn maintain(
         &mut self,
         instance: &ash::Instance,
         device: &ash::Device,
         physical: vk::PhysicalDevice,
         needed: u64,
-    ) {
+    ) -> bool {
+        let mut changed = false;
         if needed > self.window_peak {
             self.window_peak = needed;
         }
@@ -342,6 +362,7 @@ impl HostBuffer {
             if let Some(target) = shrink_capacity(self.capacity, peak) {
                 unsafe {
                     self.destroy(device);
+                    changed = true;
                     if target > 0 {
                         self.ensure_capacity(instance, device, physical, target);
                     }
@@ -349,8 +370,9 @@ impl HostBuffer {
             }
         }
         if needed > 0 {
-            unsafe { self.ensure_capacity(instance, device, physical, needed) };
+            changed |= unsafe { self.ensure_capacity(instance, device, physical, needed) };
         }
+        changed
     }
 
     unsafe fn ensure_capacity(
@@ -359,9 +381,9 @@ impl HostBuffer {
         device: &ash::Device,
         physical: vk::PhysicalDevice,
         needed: u64,
-    ) {
+    ) -> bool {
         if needed <= self.capacity {
-            return;
+            return false;
         }
         let new_capacity = needed.next_power_of_two().max(IMM_MIN_CAPACITY);
         unsafe {
@@ -369,7 +391,7 @@ impl HostBuffer {
 
             let info = vk::BufferCreateInfo::default()
                 .size(new_capacity)
-                .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                .usage(self.usage)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let buffer = device
                 .create_buffer(&info, None)
@@ -398,6 +420,7 @@ impl HostBuffer {
             self.mapped = mapped;
             self.capacity = new_capacity;
         }
+        true
     }
 
     pub unsafe fn write(&mut self, offset: u64, bytes: &[u8]) {
@@ -425,6 +448,89 @@ impl HostBuffer {
     }
 }
 
+/// `VkDrawIndexedIndirectCommand` as a Pod struct (identical 20-byte layout,
+/// asserted in tests) so a frame's command array is one `cast_slice` write
+/// into the indirect [`HostBuffer`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DrawIndexedIndirect {
+    pub index_count: u32,
+    pub instance_count: u32,
+    pub first_index: u32,
+    pub vertex_offset: i32,
+    /// Doubles as the draw's slot in the offsets SSBO: the vertex shader
+    /// reads `draw_offsets[InstanceIndex]` and InstanceIndex starts at
+    /// `first_instance` (instance_count is always 1).
+    pub first_instance: u32,
+}
+
+/// Descriptor machinery for the per-draw offsets SSBO: one set layout
+/// (binding 0, storage buffer, vertex stage) and one set per frame-in-flight
+/// slot, each pointing at that slot's offsets [`HostBuffer`]. Sets are
+/// rewritten by [`write_offsets_descriptor`] whenever the underlying buffer
+/// is recreated (growth/decay) — safe at the maintain() point because the
+/// slot's fence was just waited, so no pending command buffer uses the set.
+pub fn create_offsets_descriptors(
+    device: &ash::Device,
+    count: u32,
+) -> (
+    vk::DescriptorSetLayout,
+    vk::DescriptorPool,
+    Vec<vk::DescriptorSet>,
+) {
+    let bindings = [vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::VERTEX)];
+    let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    let set_layout = unsafe {
+        device
+            .create_descriptor_set_layout(&layout_info, None)
+            .expect("Failed to create offsets set layout")
+    };
+
+    let pool_sizes = [vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(count)];
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(count)
+        .pool_sizes(&pool_sizes);
+    let pool = unsafe {
+        device
+            .create_descriptor_pool(&pool_info, None)
+            .expect("Failed to create offsets descriptor pool")
+    };
+
+    let layouts = vec![set_layout; count as usize];
+    let set_alloc = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(pool)
+        .set_layouts(&layouts);
+    let sets = unsafe {
+        device
+            .allocate_descriptor_sets(&set_alloc)
+            .expect("Failed to allocate offsets descriptor sets")
+    };
+
+    (set_layout, pool, sets)
+}
+
+/// Points `set` at `buffer` (whole range). Only call when no in-flight
+/// command buffer references the set (post-fence, same rule as the buffer
+/// recreation that triggers this).
+pub fn write_offsets_descriptor(device: &ash::Device, set: vk::DescriptorSet, buffer: vk::Buffer) {
+    let buffer_infos = [vk::DescriptorBufferInfo::default()
+        .buffer(buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE)];
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(&buffer_infos)];
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
+}
+
 /// Decay rule for [`HostBuffer::maintain`]: given the current capacity and
 /// the window's high-water mark, returns the capacity to recreate at
 /// (0 = destroy only; the buffer went unused all window), or `None` to keep
@@ -441,7 +547,40 @@ fn shrink_capacity(capacity: u64, peak: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IMM_MIN_CAPACITY, shrink_capacity};
+    use super::{DrawIndexedIndirect, IMM_MIN_CAPACITY, MESH_ALIGN, shrink_capacity};
+
+    /// The struct is memcpy'd into an INDIRECT_BUFFER: its layout must match
+    /// VkDrawIndexedIndirectCommand exactly (20 bytes, field-for-field).
+    #[test]
+    fn indirect_command_matches_vulkan_layout() {
+        assert_eq!(std::mem::size_of::<DrawIndexedIndirect>(), 20);
+        assert_eq!(std::mem::offset_of!(DrawIndexedIndirect, index_count), 0);
+        assert_eq!(std::mem::offset_of!(DrawIndexedIndirect, instance_count), 4);
+        assert_eq!(std::mem::offset_of!(DrawIndexedIndirect, first_index), 8);
+        assert_eq!(std::mem::offset_of!(DrawIndexedIndirect, vertex_offset), 12);
+        assert_eq!(
+            std::mem::offset_of!(DrawIndexedIndirect, first_instance),
+            16
+        );
+        let reference = ash::vk::DrawIndexedIndirectCommand::default();
+        assert_eq!(
+            std::mem::size_of_val(&reference),
+            std::mem::size_of::<DrawIndexedIndirect>()
+        );
+    }
+
+    /// MESH_ALIGN must keep suballocated vertex data stride-aligned (exact
+    /// indirect vertex_offset) and index data 4-aligned (absolute
+    /// first_index).
+    #[test]
+    fn mesh_align_is_lcm_of_stride_and_256() {
+        assert_eq!(
+            MESH_ALIGN % std::mem::size_of::<crate::mesh::Vertex>() as u64,
+            0
+        );
+        assert_eq!(MESH_ALIGN % 256, 0);
+        assert_eq!(MESH_ALIGN, 768);
+    }
 
     #[test]
     fn shrink_decay_rules() {

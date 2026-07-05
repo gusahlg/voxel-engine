@@ -11,7 +11,7 @@ use std::io::Cursor;
 
 use crate::mesh::Vertex;
 
-pub const PUSH_BYTES_3D: u32 = 80; // Mat4 view_proj + vec4 per-draw offset
+pub const PUSH_BYTES_3D: u32 = 64; // Mat4 view_proj (per-draw offsets live in the set-0 SSBO)
 pub const PUSH_BYTES_2D: u32 = 8; // vec2 pixels_to_ndc
 
 /// 2D overlay vertex: pixel position, atlas UV, RGBA8 color.
@@ -45,14 +45,17 @@ impl Pipelines {
         depth_format: vk::Format,
         samples: vk::SampleCountFlags,
         atlas_set_layout: vk::DescriptorSetLayout,
+        offsets_set_layout: vk::DescriptorSetLayout,
         block_set_layout: vk::DescriptorSetLayout,
     ) -> Self {
-        // Layouts
+        // Layouts. 3D sets: 0 = per-draw offsets SSBO (vertex), 1 = block
+        // texture array (fragment). The 2D layout separately owns set 0 for
+        // its atlas — different pipeline layout, no conflict.
         let push_3d = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
             .offset(0)
             .size(PUSH_BYTES_3D)];
-        let set_layouts_3d = [block_set_layout];
+        let set_layouts_3d = [offsets_set_layout, block_set_layout];
         let layout_3d_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts_3d)
             .push_constant_ranges(&push_3d);

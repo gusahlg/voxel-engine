@@ -15,6 +15,15 @@ pub struct Device {
     pub command_pool: vk::CommandPool,
     /// Sample counts supported by BOTH color and depth framebuffer attachments.
     pub msaa_caps: vk::SampleCountFlags,
+    /// `multiDrawIndirect` enabled: one indirect call may carry drawCount > 1.
+    /// When false the renderer loops drawCount=1 indirect calls instead
+    /// (no feature needed for those).
+    pub multi_draw_indirect: bool,
+    /// `drawIndirectFirstInstance` enabled: indirect commands may carry a
+    /// non-zero firstInstance (the per-draw SSBO index). When false the
+    /// renderer falls back to direct `cmd_draw_indexed` calls, whose
+    /// firstInstance parameter needs no feature.
+    pub draw_indirect_first_instance: bool,
 }
 
 struct Candidate {
@@ -22,6 +31,8 @@ struct Candidate {
     graphics_family: u32,
     present_family: u32,
     properties: vk::PhysicalDeviceProperties,
+    multi_draw_indirect: bool,
+    draw_indirect_first_instance: bool,
     score: u32,
 }
 
@@ -73,7 +84,18 @@ impl Device {
         let mut vulkan_13_features = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true);
-        let device_features = vk::PhysicalDeviceFeatures::default();
+        // Batched indirect draws want both; each is optional with a fallback
+        // draw path in the renderer, so enable exactly what the device has.
+        let device_features = vk::PhysicalDeviceFeatures::default()
+            .multi_draw_indirect(best.multi_draw_indirect)
+            .draw_indirect_first_instance(best.draw_indirect_first_instance);
+        if !best.multi_draw_indirect || !best.draw_indirect_first_instance {
+            log::info!(
+                "indirect draw features: multiDrawIndirect={} drawIndirectFirstInstance={} (using fallback draw path)",
+                best.multi_draw_indirect,
+                best.draw_indirect_first_instance,
+            );
+        }
 
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
@@ -111,6 +133,8 @@ impl Device {
             present_family: best.present_family,
             command_pool,
             msaa_caps,
+            multi_draw_indirect: best.multi_draw_indirect,
+            draw_indirect_first_instance: best.draw_indirect_first_instance,
         }
     }
 
@@ -155,6 +179,8 @@ fn evaluate(
     let mut vulkan_13_features = vk::PhysicalDeviceVulkan13Features::default();
     let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan_13_features);
     unsafe { instance.get_physical_device_features2(physical, &mut features2) };
+    let multi_draw_indirect = features2.features.multi_draw_indirect == vk::TRUE;
+    let draw_indirect_first_instance = features2.features.draw_indirect_first_instance == vk::TRUE;
     if vulkan_13_features.dynamic_rendering != vk::TRUE
         || vulkan_13_features.synchronization2 != vk::TRUE
     {
@@ -207,6 +233,8 @@ fn evaluate(
         graphics_family: graphics_family?,
         present_family: present_family?,
         properties,
+        multi_draw_indirect,
+        draw_indirect_first_instance,
         score,
     })
 }

@@ -1,8 +1,19 @@
-/// Visual smoke test for the engine: a sine-hill field of colored cubes as a
-/// retained mesh (textured with a checker on layer 1 of the block texture
-/// array), an orbiting camera, immediate cubes/wires, and the 2D overlay.
-/// Keys: F fullscreen, V vsync, M cycle MSAA, Esc quit.
+/// Visual smoke test for the engine: a sine-hill field of colored cubes as
+/// TWO retained meshes (textured with a checker on layer 1 of the block
+/// texture array), an orbiting camera, immediate cubes/wires, and the 2D
+/// overlay. Keys: F fullscreen, V vsync, M cycle MSAA, Esc quit.
+///
+/// The terrain split doubles as the per-draw offset verification for the
+/// batched indirect path: the east half is built in shifted local
+/// coordinates and drawn with a compensating non-zero offset, so the two
+/// halves only tile seamlessly if each draw reads ITS OWN offsets-SSBO slot
+/// via first_instance (raw InstanceIndex in the shader). A wrong instance
+/// index would leave a 48-unit gap/overlap — instantly visible.
 use voxel_engine::{Camera3D, Color, Config, Key, MeshData, Vec3, Vertex};
+
+/// How far the east terrain half's local coordinates are shifted west (and
+/// its draw offset compensates east).
+const EAST_SHIFT: f32 = 48.0;
 
 /// Texture layer sampled by the demo terrain (layer 0 is the white layer).
 const CHECKER_LAYER: u8 = 1;
@@ -90,7 +101,7 @@ fn block_texture_layers(size: u32) -> Vec<Vec<u8>> {
 fn main() {
     env_logger::init();
 
-    let mut terrain = None;
+    let mut terrain: Option<[voxel_engine::MeshHandle; 2]> = None;
     let mut angle = 0.0f32;
 
     voxel_engine::run(
@@ -127,7 +138,11 @@ fn main() {
                 // Once at startup: white layer 0 + checker layer 1.
                 eng.set_block_textures(16, &block_texture_layers(16));
 
-                let mut data = MeshData::default();
+                // West half in world coordinates (offset ZERO); east half in
+                // local coordinates shifted by -EAST_SHIFT, drawn back at
+                // +EAST_SHIFT — the seam at x = 0 verifies per-draw offsets.
+                let mut west = MeshData::default();
+                let mut east = MeshData::default();
                 for x in -24i32..24 {
                     for z in -24i32..24 {
                         let h = ((x as f32 * 0.35).sin() + (z as f32 * 0.3).cos()) * 3.0;
@@ -138,15 +153,22 @@ fn main() {
                         } else {
                             Color::new(50, shade, 80, 255)
                         };
+                        let (data, base_x) = if x < 0 {
+                            (&mut west, x as f32)
+                        } else {
+                            (&mut east, x as f32 - EAST_SHIFT)
+                        };
                         push_cube(
-                            &mut data,
-                            Vec3::new(x as f32, h - 1.0, z as f32),
-                            Vec3::new(x as f32 + 1.0, h, z as f32 + 1.0),
+                            data,
+                            Vec3::new(base_x, h - 1.0, z as f32),
+                            Vec3::new(base_x + 1.0, h, z as f32 + 1.0),
                             color,
                         );
                     }
                 }
-                terrain = eng.upload_mesh(&data);
+                let west = eng.upload_mesh(&west).expect("west terrain upload");
+                let east = eng.upload_mesh(&east).expect("east terrain upload");
+                terrain = Some([west, east]);
             }
 
             angle += eng.frame_time() * 0.4;
@@ -164,8 +186,9 @@ fn main() {
             let mut frame = eng.begin_frame(Color::SKYBLUE);
             {
                 let mut f3 = frame.begin_3d(&cam);
-                if let Some(handle) = terrain {
-                    f3.draw_mesh(handle, Vec3::ZERO);
+                if let Some([west, east]) = terrain {
+                    f3.draw_mesh(west, Vec3::ZERO);
+                    f3.draw_mesh(east, Vec3::new(EAST_SHIFT, 0.0, 0.0));
                 }
                 f3.draw_cube(Vec3::new(0.0, 8.0, 0.0), Vec3::splat(2.0), Color::RED);
                 f3.draw_cube_wires(Vec3::new(0.0, 8.0, 0.0), Vec3::splat(2.2), Color::BLACK);

@@ -12,7 +12,8 @@ struct FragmentInput
     float4 color;
 };
 
-[[vk::binding(0, 0)]]
+// Set 1: set 0 on the 3D layout is the vertex stage's per-draw offsets SSBO.
+[[vk::binding(0, 1)]]
 Sampler2DArray blockTex;
 
 [shader("fragment")]

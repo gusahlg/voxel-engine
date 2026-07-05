@@ -29,7 +29,7 @@ use crate::frame::DrawLists;
 use crate::mesh::{MeshData, MeshHandle};
 use alloc::GpuAllocator;
 use block_textures::BlockTextures;
-use buffers::{FRAMES_IN_FLIGHT, HostBuffer, MeshRegistry};
+use buffers::{DrawIndexedIndirect, FRAMES_IN_FLIGHT, HostBuffer, MeshRegistry};
 use device::Device;
 use instance::InstanceBundle;
 use pipeline::Pipelines;
@@ -64,6 +64,25 @@ struct ImmOffsets {
     d2: u64,
 }
 
+/// One resolved mesh draw, pre-sort scratch for [`Renderer::prepare_mesh_draws`].
+#[derive(Clone, Copy)]
+struct DrawEntry {
+    buffer: vk::Buffer,
+    index_count: u32,
+    first_index: u32,
+    vertex_offset: i32,
+    offset: glam::Vec3,
+}
+
+/// A contiguous range of indirect commands that all draw from one arena
+/// buffer: one vertex/index bind + one indirect call each.
+#[derive(Clone, Copy)]
+struct DrawRun {
+    buffer: vk::Buffer,
+    first: u32,
+    count: u32,
+}
+
 pub(crate) struct Renderer {
     pub window: winit::window::Window,
 
@@ -94,6 +113,27 @@ pub(crate) struct Renderer {
     /// One per swapchain image: signaled by the copy submit, waited by present.
     present_semaphores: Vec<vk::Semaphore>,
     imm: Vec<HostBuffer>,
+    /// Per-slot per-draw offsets SSBO (one vec4 per draw; slot 0 is a
+    /// reserved zero vec4 so immediates draw with first_instance 0 and the
+    /// shader path stays uniform).
+    offsets: Vec<HostBuffer>,
+    /// Per-slot indirect command buffer (20-byte VkDrawIndexedIndirectCommand
+    /// per mesh draw, instance_count 1, first_instance = SSBO slot).
+    indirect: Vec<HostBuffer>,
+    /// Descriptor machinery for `offsets`: one set per slot, rewritten when
+    /// that slot's SSBO buffer handle changes (growth/decay recreation).
+    offsets_set_layout: vk::DescriptorSetLayout,
+    offsets_pool: vk::DescriptorPool,
+    offsets_sets: Vec<vk::DescriptorSet>,
+
+    /// Frame scratch (persistent capacity): resolved draws, sorted by arena.
+    draw_scratch: Vec<DrawEntry>,
+    /// Frame scratch: the offsets SSBO contents ([0] = zero vec4).
+    draw_offsets_data: Vec<[f32; 4]>,
+    /// Frame scratch: indirect commands, arena-contiguous.
+    draw_commands: Vec<DrawIndexedIndirect>,
+    /// Frame scratch: one entry per arena buffer with visible draws.
+    draw_runs: Vec<DrawRun>,
 
     /// Command buffer for the offscreen->swapchain present copy. A single
     /// one suffices: at most one copy is ever in flight, guarded by
@@ -226,6 +266,9 @@ impl Renderer {
             block_textures::create_descriptor(&device.device);
         block_textures::write_descriptor(&device.device, block_set, &block_tex);
 
+        let (offsets_set_layout, offsets_pool, offsets_sets) =
+            buffers::create_offsets_descriptors(&device.device, FRAMES_IN_FLIGHT as u32);
+
         let pipeline_cache = create_pipeline_cache(&device.device);
         let pipelines = Pipelines::new(
             &device.device,
@@ -234,6 +277,7 @@ impl Renderer {
             targets.depth_format,
             targets.samples,
             atlas.set_layout,
+            offsets_set_layout,
             block_set_layout,
         );
 
@@ -280,7 +324,15 @@ impl Renderer {
 
         let present_semaphores = create_present_semaphores(&device.device, swapchain.images.len());
         let present_interval = display_refresh_interval(&window);
-        let imm = (0..FRAMES_IN_FLIGHT).map(|_| HostBuffer::new()).collect();
+        let imm = (0..FRAMES_IN_FLIGHT)
+            .map(|_| HostBuffer::new(vk::BufferUsageFlags::VERTEX_BUFFER))
+            .collect();
+        let offsets = (0..FRAMES_IN_FLIGHT)
+            .map(|_| HostBuffer::new(vk::BufferUsageFlags::STORAGE_BUFFER))
+            .collect();
+        let indirect = (0..FRAMES_IN_FLIGHT)
+            .map(|_| HostBuffer::new(vk::BufferUsageFlags::INDIRECT_BUFFER))
+            .collect();
 
         Self {
             window,
@@ -302,6 +354,15 @@ impl Renderer {
             frames,
             present_semaphores,
             imm,
+            offsets,
+            indirect,
+            offsets_set_layout,
+            offsets_pool,
+            offsets_sets,
+            draw_scratch: Vec::new(),
+            draw_offsets_data: Vec::new(),
+            draw_commands: Vec::new(),
+            draw_runs: Vec::new(),
             copy_cmd,
             copy_fence,
             copy_slot: None,
@@ -463,6 +524,7 @@ impl Renderer {
 
         let t0 = std::time::Instant::now();
         let offsets = self.write_immediates(slot, lists);
+        self.prepare_mesh_draws(slot, lists);
         self.record_render(slot, lists, offsets);
         self.timing.record = t0.elapsed();
 
@@ -581,6 +643,107 @@ impl Renderer {
             }
         }
         ImmOffsets { line, d2 }
+    }
+
+    /// Resolves this frame's mesh draws, groups them by arena buffer, and
+    /// writes the per-draw offsets SSBO + indirect command buffer for the
+    /// slot, so `record_render` can issue ONE indirect call per arena
+    /// instead of a bind+push+draw per mesh (the MoltenVK command-encode
+    /// cost in queue_submit scaled with per-draw commands).
+    ///
+    /// SSBO layout: slot 0 = zero vec4 (immediate cubes/lines draw with
+    /// first_instance 0), slots 1.. = mesh offsets, indexed by each draw's
+    /// first_instance via the shader's raw InstanceIndex builtin.
+    ///
+    /// Same safe point as `write_immediates` for buffer growth/decay; a
+    /// recreated SSBO also gets its per-slot descriptor set rewritten here
+    /// (the slot's fence was waited, so no pending commands use the set).
+    fn prepare_mesh_draws(&mut self, slot: usize, lists: &DrawLists) {
+        use ash::vk::Handle;
+
+        self.draw_scratch.clear();
+        self.draw_offsets_data.clear();
+        self.draw_commands.clear();
+        self.draw_runs.clear();
+
+        if lists.has_3d {
+            self.draw_offsets_data.push([0.0; 4]); // reserved zero slot
+            for &(handle, off) in &lists.mesh_draws {
+                let Some(mesh) = self.meshes.get(handle) else {
+                    continue;
+                };
+                self.draw_scratch.push(DrawEntry {
+                    buffer: mesh.buffer(),
+                    index_count: mesh.index_count,
+                    first_index: mesh.first_index,
+                    vertex_offset: mesh.vertex_offset,
+                    offset: off,
+                });
+            }
+            // Group by arena buffer so each arena becomes one contiguous
+            // command range. Order within the mesh pass is free to change:
+            // opaque, depth-tested geometry.
+            self.draw_scratch
+                .sort_unstable_by_key(|entry| entry.buffer.as_raw());
+
+            for entry in &self.draw_scratch {
+                let ssbo_slot = self.draw_offsets_data.len() as u32;
+                let command_index = self.draw_commands.len() as u32;
+                self.draw_offsets_data
+                    .push([entry.offset.x, entry.offset.y, entry.offset.z, 0.0]);
+                self.draw_commands.push(DrawIndexedIndirect {
+                    index_count: entry.index_count,
+                    instance_count: 1,
+                    first_index: entry.first_index,
+                    vertex_offset: entry.vertex_offset,
+                    first_instance: ssbo_slot,
+                });
+                match self.draw_runs.last_mut() {
+                    Some(run) if run.buffer == entry.buffer => run.count += 1,
+                    _ => self.draw_runs.push(DrawRun {
+                        buffer: entry.buffer,
+                        first: command_index,
+                        count: 1,
+                    }),
+                }
+            }
+        }
+
+        let offsets_bytes: &[u8] = bytemuck::cast_slice(&self.draw_offsets_data);
+        let indirect_bytes: &[u8] = bytemuck::cast_slice(&self.draw_commands);
+        unsafe {
+            let ssbo = &mut self.offsets[slot];
+            let recreated = ssbo.maintain(
+                &self.instance.instance,
+                &self.device.device,
+                self.device.physical,
+                offsets_bytes.len() as u64,
+            );
+            if !offsets_bytes.is_empty() {
+                ssbo.write(0, offsets_bytes);
+            }
+            // Recreate-on-grow (or decay): retarget this slot's descriptor.
+            // The set is only ever referenced by this slot's command buffer,
+            // whose fence was just waited.
+            if recreated && ssbo.buffer != vk::Buffer::null() {
+                buffers::write_offsets_descriptor(
+                    &self.device.device,
+                    self.offsets_sets[slot],
+                    ssbo.buffer,
+                );
+            }
+
+            let indirect = &mut self.indirect[slot];
+            indirect.maintain(
+                &self.instance.instance,
+                &self.device.device,
+                self.device.physical,
+                indirect_bytes.len() as u64,
+            );
+            if !indirect_bytes.is_empty() {
+                indirect.write(0, indirect_bytes);
+            }
+        }
     }
 
     /// Resets and records the slot's command buffer: staged mesh copies,
@@ -746,86 +909,81 @@ impl Renderer {
                     0,
                     bytemuck::bytes_of(&lists.view_proj),
                 );
-                // Block texture array (set 0) for every 3D draw: meshes,
-                // immediate cubes, and lines all sample it (layer 0 = white).
+                // Every 3D draw uses both sets: 0 = per-draw offsets SSBO
+                // (immediates read the zero slot), 1 = block texture array
+                // (layer 0 = white). Bound once for the whole 3D pass.
                 device.cmd_bind_descriptor_sets(
                     frame.cmd,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.pipelines.layout_3d,
                     0,
-                    &[self.block_set],
+                    &[self.offsets_sets[slot], self.block_set],
                     &[],
                 );
 
-                if !lists.mesh_draws.is_empty() {
+                if !self.draw_runs.is_empty() {
                     device.cmd_bind_pipeline(
                         frame.cmd,
                         vk::PipelineBindPoint::GRAPHICS,
                         self.pipelines.mesh3d,
                     );
-                    // Index buffer bound once per suballocation block (offsets
-                    // stay 4-aligned; first_index is absolute). The vertex
-                    // buffer is bound AT each mesh's byte offset: 256-aligned
-                    // suballocation offsets are not multiples of the 24-byte
-                    // vertex stride, so a shared vertex_offset can't address
-                    // them. Rebinding is cheap (~hundreds of meshes).
-                    let mut bound = vk::Buffer::null();
-                    let mut bound_vtx_off = u64::MAX;
-                    for &(handle, off) in &lists.mesh_draws {
-                        let Some(mesh) = self.meshes.get(handle) else {
-                            continue;
-                        };
-                        let buffer = mesh.buffer();
-                        if buffer != bound {
-                            device.cmd_bind_index_buffer(
-                                frame.cmd,
-                                buffer,
-                                0,
-                                vk::IndexType::UINT32,
-                            );
-                            bound = buffer;
-                            bound_vtx_off = u64::MAX;
-                        }
-                        if mesh.vtx_byte_offset != bound_vtx_off {
-                            device.cmd_bind_vertex_buffers(
-                                frame.cmd,
-                                0,
-                                &[buffer],
-                                &[mesh.vtx_byte_offset],
-                            );
-                            bound_vtx_off = mesh.vtx_byte_offset;
-                        }
-                        // Per-draw camera-relative offset, after the Mat4 at 0.
-                        device.cmd_push_constants(
+                    // One vertex + index bind per arena buffer, both at
+                    // offset 0: MESH_ALIGN keeps suballocations exact in
+                    // whole vertices (command vertex_offset) and indices
+                    // (absolute first_index). Then a single indirect call
+                    // draws the arena's whole contiguous command range —
+                    // with per-draw offsets fetched from the SSBO by
+                    // first_instance, nothing is pushed between draws.
+                    let indirect_buffer = self.indirect[slot].buffer;
+                    const STRIDE: u64 = std::mem::size_of::<DrawIndexedIndirect>() as u64;
+                    for run in &self.draw_runs {
+                        device.cmd_bind_index_buffer(
                             frame.cmd,
-                            self.pipelines.layout_3d,
-                            vk::ShaderStageFlags::VERTEX,
-                            64,
-                            bytemuck::bytes_of(&[off.x, off.y, off.z, 0.0f32]),
-                        );
-                        device.cmd_draw_indexed(
-                            frame.cmd,
-                            mesh.index_count,
-                            1,
-                            mesh.first_index,
+                            run.buffer,
                             0,
-                            0,
+                            vk::IndexType::UINT32,
                         );
+                        device.cmd_bind_vertex_buffers(frame.cmd, 0, &[run.buffer], &[0]);
+                        if self.device.multi_draw_indirect
+                            && self.device.draw_indirect_first_instance
+                        {
+                            device.cmd_draw_indexed_indirect(
+                                frame.cmd,
+                                indirect_buffer,
+                                run.first as u64 * STRIDE,
+                                run.count,
+                                STRIDE as u32,
+                            );
+                        } else if self.device.draw_indirect_first_instance {
+                            // No multiDrawIndirect: drawCount=1 indirect
+                            // calls need no feature and still skip the
+                            // per-draw binds/pushes.
+                            for i in run.first..run.first + run.count {
+                                device.cmd_draw_indexed_indirect(
+                                    frame.cmd,
+                                    indirect_buffer,
+                                    i as u64 * STRIDE,
+                                    1,
+                                    STRIDE as u32,
+                                );
+                            }
+                        } else {
+                            // No drawIndirectFirstInstance: direct draws may
+                            // always carry firstInstance, so replay the
+                            // commands CPU-side (still bind/push-free).
+                            let range = run.first as usize..(run.first + run.count) as usize;
+                            for c in &self.draw_commands[range] {
+                                device.cmd_draw_indexed(
+                                    frame.cmd,
+                                    c.index_count,
+                                    c.instance_count,
+                                    c.first_index,
+                                    c.vertex_offset,
+                                    c.first_instance,
+                                );
+                            }
+                        }
                     }
-                }
-
-                if !lists.cube_verts.is_empty() || !lists.line_verts.is_empty() {
-                    // Immediate cubes and lines are already camera-relative
-                    // small values: zero the per-draw offset once. Both draws
-                    // share layout_3d and nothing pushes in between, so one
-                    // push covers both.
-                    device.cmd_push_constants(
-                        frame.cmd,
-                        self.pipelines.layout_3d,
-                        vk::ShaderStageFlags::VERTEX,
-                        64,
-                        bytemuck::bytes_of(&[0.0f32; 4]),
-                    );
                 }
 
                 if !lists.cube_verts.is_empty() {
@@ -1220,6 +1378,7 @@ impl Renderer {
                     self.targets.depth_format,
                     self.targets.samples,
                     self.atlas.set_layout,
+                    self.offsets_set_layout,
                     self.block_set_layout,
                 );
             }
@@ -1249,10 +1408,17 @@ impl Drop for Renderer {
             self.atlas.destroy(device);
             device.destroy_descriptor_pool(self.block_pool, None);
             device.destroy_descriptor_set_layout(self.block_set_layout, None);
+            device.destroy_descriptor_pool(self.offsets_pool, None);
+            device.destroy_descriptor_set_layout(self.offsets_set_layout, None);
             self.block_textures.destroy(device);
             self.targets.destroy(device);
-            for imm in &mut self.imm {
-                imm.destroy(device);
+            for buffer in self
+                .imm
+                .iter_mut()
+                .chain(&mut self.offsets)
+                .chain(&mut self.indirect)
+            {
+                buffer.destroy(device);
             }
             self.meshes.destroy_all(&mut self.allocator);
             self.allocator.destroy(device);
