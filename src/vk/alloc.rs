@@ -57,6 +57,12 @@ impl FreeList {
         self.used
     }
 
+    /// True when no bytes are allocated: the whole capacity is free again
+    /// (coalescing guarantees a single full-range entry in that case).
+    fn is_empty(&self) -> bool {
+        self.used == 0
+    }
+
     /// First-fit allocation of `size` bytes at a multiple of `align`.
     /// Returns the offset, or `None` if no hole is large enough.
     fn alloc(&mut self, size: u64, align: u64) -> Option<u64> {
@@ -183,8 +189,11 @@ pub struct GpuAllocator {
     staging_type_prefs: Vec<u32>,
     /// Whether the device pool's preferred type is host-visible.
     device_host_visible: bool,
-    device_blocks: Vec<Block>,
-    staging_blocks: Vec<Block>,
+    /// Slot vectors so `Allocation::block` indices stay stable when a block
+    /// is destroyed (staging shrink): destroyed blocks leave a `None` slot
+    /// that the next block creation reuses.
+    device_blocks: Vec<Option<Block>>,
+    staging_blocks: Vec<Option<Block>>,
 }
 
 impl GpuAllocator {
@@ -307,8 +316,9 @@ impl GpuAllocator {
         }
     }
 
-    /// Returns the range to its block's free list. Empty blocks are kept —
-    /// chunk churn reuses them almost immediately.
+    /// Returns the range to its block's free list. Empty DEVICE blocks are
+    /// kept — chunk churn reuses them almost immediately. Empty STAGING
+    /// blocks are reclaimed by [`Self::shrink_staging`].
     pub unsafe fn free(&mut self, allocation: Allocation) {
         let blocks = match allocation.pool {
             Pool::Device => &mut self.device_blocks,
@@ -316,6 +326,7 @@ impl GpuAllocator {
         };
         let block = blocks
             .get_mut(allocation.block)
+            .and_then(|slot| slot.as_mut())
             .expect("allocation refers to an unknown block (freed after destroy?)");
         debug_assert_eq!(
             block.buffer, allocation.buffer,
@@ -324,12 +335,46 @@ impl GpuAllocator {
         block.free_list.free(allocation.offset, allocation.size);
     }
 
+    /// Destroys completely-free staging blocks beyond the first (one stays
+    /// warm for the next upload burst). Staging only matters on discrete
+    /// GPUs — unified-memory devices never create staging blocks — but after
+    /// a burst (world load) the blocks would otherwise be held forever.
+    /// Called from the renderer's collect-time housekeeping; steady-state
+    /// cost is a scan over a handful of blocks.
+    ///
+    /// Safety: an empty block has no live allocations — pending copies and
+    /// retired-but-unfreed allocations still count as used — so the GPU
+    /// provably no longer reads it.
+    ///
+    /// TEST NOTE: the Vulkan-level destruction path has no automated test
+    /// (it needs a discrete GPU; unified-memory devices never populate the
+    /// staging pool). Verify manually on such a GPU with RUST_LOG=debug and
+    /// look for "destroyed empty staging block" after a world load. The
+    /// selection bookkeeping is unit-tested (`staging_shrink_keeps_one_warm`).
+    pub unsafe fn shrink_staging(&mut self, device: &ash::Device) {
+        for index in empty_blocks_beyond_first(&self.staging_blocks) {
+            let block = self.staging_blocks[index]
+                .take()
+                .expect("selected slot holds a block");
+            // Freeing the memory implicitly unmaps the persistent mapping.
+            unsafe {
+                device.destroy_buffer(block.buffer, None);
+                device.free_memory(block.memory, None);
+            }
+            log::debug!(
+                "destroyed empty staging block ({} MiB)",
+                block.memory_size / (1024 * 1024)
+            );
+        }
+    }
+
     /// Destroy all blocks. Caller guarantees the GPU is idle.
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         for block in self
             .device_blocks
             .drain(..)
             .chain(self.staging_blocks.drain(..))
+            .flatten()
         {
             // Freeing the memory implicitly unmaps the persistent mapping.
             unsafe {
@@ -341,12 +386,12 @@ impl GpuAllocator {
 
     pub fn stats(&self) -> AllocatorStats {
         let mut stats = AllocatorStats::default();
-        for block in &self.device_blocks {
+        for block in self.device_blocks.iter().flatten() {
             stats.device_blocks += 1;
             stats.device_reserved += block.memory_size;
             stats.device_used += block.free_list.used();
         }
-        for block in &self.staging_blocks {
+        for block in self.staging_blocks.iter().flatten() {
             stats.staging_blocks += 1;
             stats.staging_reserved += block.memory_size;
             stats.staging_used += block.free_list.used();
@@ -355,11 +400,31 @@ impl GpuAllocator {
     }
 }
 
+/// Indices of the completely-free blocks in `blocks`, minus the first one
+/// (which is kept warm). Returns an empty Vec — no heap allocation — in the
+/// steady state where at most one empty block exists.
+fn empty_blocks_beyond_first(blocks: &[Option<Block>]) -> Vec<usize> {
+    let mut extra = Vec::new();
+    let mut kept_one = false;
+    for (index, slot) in blocks.iter().enumerate() {
+        let Some(block) = slot else { continue };
+        if !block.free_list.is_empty() {
+            continue;
+        }
+        if kept_one {
+            extra.push(index);
+        } else {
+            kept_one = true;
+        }
+    }
+    extra
+}
+
 /// Allocates from `blocks`, creating a new block when no existing block has
 /// a large enough hole.
 #[allow(clippy::too_many_arguments)]
 unsafe fn alloc_from_pool(
-    blocks: &mut Vec<Block>,
+    blocks: &mut Vec<Option<Block>>,
     type_prefs: &[u32],
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     usage: vk::BufferUsageFlags,
@@ -371,16 +436,26 @@ unsafe fn alloc_from_pool(
     debug_assert!(size > 0, "zero-size GPU allocation");
     let size = size.max(1);
 
-    for (index, block) in blocks.iter_mut().enumerate() {
+    for (index, slot) in blocks.iter_mut().enumerate() {
+        let Some(block) = slot else { continue };
         if let Some(offset) = block.free_list.alloc(size, align) {
             return Ok(make_allocation(block, index, offset, size, pool));
         }
     }
 
     let block = unsafe { create_block(device, memory_props, type_prefs, usage, size)? };
-    blocks.push(block);
-    let index = blocks.len() - 1;
-    let block = &mut blocks[index];
+    // Reuse a destroyed block's slot so existing Allocation indices stay valid.
+    let index = match blocks.iter().position(|slot| slot.is_none()) {
+        Some(index) => {
+            blocks[index] = Some(block);
+            index
+        }
+        None => {
+            blocks.push(Some(block));
+            blocks.len() - 1
+        }
+    };
+    let block = blocks[index].as_mut().expect("slot was just filled");
     let offset = block
         .free_list
         .alloc(size, align)
@@ -518,7 +593,61 @@ fn pick_memory_type(
 
 #[cfg(test)]
 mod tests {
-    use super::{FreeList, FreeRange};
+    use super::{Block, FreeList, FreeRange, empty_blocks_beyond_first};
+
+    /// A GPU-less block (null handles) for pure bookkeeping tests.
+    fn dummy_block(capacity: u64, used: u64) -> Option<Block> {
+        let mut free_list = FreeList::new(capacity);
+        if used > 0 {
+            free_list.alloc(used, 1).expect("fits");
+        }
+        Some(Block {
+            buffer: ash::vk::Buffer::null(),
+            memory: ash::vk::DeviceMemory::null(),
+            memory_size: capacity,
+            mapped: None,
+            free_list,
+        })
+    }
+
+    #[test]
+    fn free_list_empty_detection() {
+        let mut fl = FreeList::new(1024);
+        assert!(fl.is_empty());
+        let a = fl.alloc(64, 1).expect("fits");
+        assert!(!fl.is_empty());
+        fl.free(a, 64);
+        assert!(fl.is_empty());
+        // Fully free again means the whole capacity is one range.
+        assert_eq!(
+            fl.free,
+            vec![FreeRange {
+                offset: 0,
+                size: 1024
+            }]
+        );
+    }
+
+    #[test]
+    fn staging_shrink_keeps_one_warm() {
+        // No blocks / a single empty block: nothing to destroy.
+        assert!(empty_blocks_beyond_first(&[]).is_empty());
+        assert!(empty_blocks_beyond_first(&[dummy_block(1024, 0)]).is_empty());
+
+        // In-use blocks are never selected, however many are empty.
+        let blocks = vec![dummy_block(1024, 100), dummy_block(1024, 1)];
+        assert!(empty_blocks_beyond_first(&blocks).is_empty());
+
+        // More than one empty: the FIRST empty stays warm, the rest go.
+        let blocks = vec![
+            dummy_block(1024, 100), // in use — kept
+            dummy_block(1024, 0),   // first empty — kept warm
+            dummy_block(1024, 0),   // destroyed
+            None,                   // already-destroyed slot — skipped
+            dummy_block(1024, 0),   // destroyed
+        ];
+        assert_eq!(empty_blocks_beyond_first(&blocks), vec![2, 4]);
+    }
 
     #[test]
     fn alloc_free_roundtrip() {

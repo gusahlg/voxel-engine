@@ -56,6 +56,14 @@ struct FrameSlot {
     render_done: vk::Semaphore,
 }
 
+/// Byte offsets of the line and 2D sections inside a frame's packed
+/// immediate buffer (cube verts start at offset 0).
+#[derive(Clone, Copy)]
+struct ImmOffsets {
+    line: u64,
+    d2: u64,
+}
+
 pub(crate) struct Renderer {
     pub window: winit::window::Window,
 
@@ -70,6 +78,9 @@ pub(crate) struct Renderer {
     swapchain: Swapchain,
     targets: RenderTargets,
     pipelines: Pipelines,
+    /// Disk-backed pipeline cache (see [`pipeline_cache_path`]): loaded at
+    /// init, passed to every pipeline build, written back on Drop.
+    pipeline_cache: vk::PipelineCache,
     atlas: FontAtlas,
     block_textures: BlockTextures,
     /// Persistent descriptor machinery for the block texture array: created
@@ -215,8 +226,10 @@ impl Renderer {
             block_textures::create_descriptor(&device.device);
         block_textures::write_descriptor(&device.device, block_set, &block_tex);
 
+        let pipeline_cache = create_pipeline_cache(&device.device);
         let pipelines = Pipelines::new(
             &device.device,
+            pipeline_cache,
             swapchain.format,
             targets.depth_format,
             targets.samples,
@@ -280,6 +293,7 @@ impl Renderer {
             swapchain,
             targets,
             pipelines,
+            pipeline_cache,
             atlas,
             block_textures: block_tex,
             block_set_layout,
@@ -412,6 +426,15 @@ impl Renderer {
     /// Records and submits one frame from the recorded draw lists, and
     /// presents it when the presentation engine can keep up (manual
     /// mailbox: frames that outrun presentation are rendered but dropped).
+    ///
+    /// Frame anatomy, top-down (each phase is its own helper below and its
+    /// own [`FrameTiming`] span):
+    /// 1. [`Self::wait_slot_and_reclaim`] — frame fence + deferred frees
+    /// 2. [`Self::decide_present`]        — copy-fence check + acquire
+    /// 3. [`Self::write_immediates`]      — pack cube/line/2D verts
+    /// 4. [`Self::record_render`]         — barriers, rendering, draws
+    /// 5. [`Self::submit_render`]         — render queue submit (fence)
+    /// 6. [`Self::present`]               — copy submit + queue_present
     pub fn draw_frame(&mut self, lists: &DrawLists) {
         let size = self.window.inner_size();
         if size.width == 0 || size.height == 0 {
@@ -428,14 +451,43 @@ impl Renderer {
             }
         }
 
-        let device = &self.device.device;
         let slot = self.slot;
-        let frame = &self.frames[slot];
 
         let t0 = std::time::Instant::now();
+        self.wait_slot_and_reclaim(slot);
+        self.timing.fence = t0.elapsed();
+
+        let t0 = std::time::Instant::now();
+        let present_target = self.decide_present(slot);
+        self.timing.acquire = t0.elapsed();
+
+        let t0 = std::time::Instant::now();
+        let offsets = self.write_immediates(slot, lists);
+        self.record_render(slot, lists, offsets);
+        self.timing.record = t0.elapsed();
+
+        let t0 = std::time::Instant::now();
+        self.submit_render(slot, present_target.is_some());
+        self.timing.submit = t0.elapsed();
+
+        let t0 = std::time::Instant::now();
+        self.present(slot, present_target);
+        self.timing.present = t0.elapsed();
+
+        self.timing.tick();
+
+        self.frame_no += 1;
+        self.slot = (self.slot + 1) % self.frames.len();
+    }
+
+    /// Waits the slot's frame fence (the GPU is done with this slot's
+    /// command buffer and immediate buffer), then reclaims retired GPU
+    /// memory whose last possible use has completed.
+    fn wait_slot_and_reclaim(&mut self, slot: usize) {
+        let device = &self.device.device;
         unsafe {
             device
-                .wait_for_fences(&[frame.fence], true, u64::MAX)
+                .wait_for_fences(&[self.frames[slot].fence], true, u64::MAX)
                 .expect("fence wait failed");
             // The in-flight present copy may still be reading this slot's
             // offscreen image, which the render below overwrites. Rare (the
@@ -448,17 +500,17 @@ impl Renderer {
                 self.copy_slot = None;
             }
             self.meshes.collect(&mut self.allocator, self.frame_no);
+            self.allocator.shrink_staging(device);
         }
-        let t_fence = t0.elapsed();
+    }
 
-        // Present eligibility, decided before the render submit so that
-        // render_done is only signaled when the copy submit will consume it
-        // (see FrameSlot::render_done). Strict ordering: the copy_fence
-        // status check comes first, the acquire is only attempted once we
-        // know a copy can be submitted, and a successful acquire is ALWAYS
-        // followed by the copy + present below — never skipped after.
-        let t0 = std::time::Instant::now();
-        let mut present_target = None;
+    /// Present eligibility, decided before the render submit so that
+    /// render_done is only signaled when the copy submit will consume it
+    /// (see FrameSlot::render_done). Strict ordering: the copy_fence
+    /// status check comes first, the acquire is only attempted once we
+    /// know a copy can be submitted, and a successful acquire is ALWAYS
+    /// followed by the copy + present in [`Self::present`] — never skipped.
+    fn decide_present(&mut self, slot: usize) -> Option<u32> {
         // With vsync off, pace PRESENTS to the display's refresh: presenting
         // faster than drawables recycle makes queue_present block for
         // milliseconds, throttling the whole loop. At refresh cadence a
@@ -466,11 +518,14 @@ impl Renderer {
         // every frame between them renders unthrottled.
         let present_due =
             self.vsync || self.last_present.elapsed() >= self.present_interval.mul_f32(0.9);
+        let mut present_target = None;
         unsafe {
             // Previous copy still in flight? Skip presenting this frame:
             // it is rendered, just never shown (the mailbox drop).
             let copy_ready = present_due
-                && device
+                && self
+                    .device
+                    .device
                     .get_fence_status(self.copy_fence)
                     .expect("fence status failed");
             if copy_ready {
@@ -481,7 +536,7 @@ impl Renderer {
                 match self.swapchain.loader.acquire_next_image(
                     self.swapchain.swapchain,
                     timeout,
-                    frame.image_available,
+                    self.frames[slot].image_available,
                     vk::Fence::null(),
                 ) {
                     Ok((image_index, suboptimal)) => {
@@ -497,31 +552,42 @@ impl Renderer {
                 }
             }
         }
-        let t_acquire = t0.elapsed();
-        let t0 = std::time::Instant::now();
+        present_target
+    }
 
-        // Immediate geometry for this frame, packed into one host buffer.
+    /// Packs this frame's immediate geometry (cubes, lines, 2D overlay) into
+    /// one host buffer and returns the section offsets. Also runs the
+    /// buffer's capacity decay — safe point: the slot's fence was just
+    /// waited in [`Self::wait_slot_and_reclaim`].
+    fn write_immediates(&mut self, slot: usize, lists: &DrawLists) -> ImmOffsets {
         let cube_bytes: &[u8] = bytemuck::cast_slice(&lists.cube_verts);
         let line_bytes: &[u8] = bytemuck::cast_slice(&lists.line_verts);
         let d2_bytes: &[u8] = bytemuck::cast_slice(&lists.verts_2d);
-        let line_off = (cube_bytes.len() as u64).next_multiple_of(16);
-        let d2_off = (line_off + line_bytes.len() as u64).next_multiple_of(16);
-        let imm_total = d2_off + d2_bytes.len() as u64;
+        let line = (cube_bytes.len() as u64).next_multiple_of(16);
+        let d2 = (line + line_bytes.len() as u64).next_multiple_of(16);
+        let total = d2 + d2_bytes.len() as u64;
+        let imm = &mut self.imm[slot];
         unsafe {
-            let imm = &mut self.imm[slot];
-            if imm_total > 0 {
-                imm.ensure_capacity(
-                    &self.instance.instance,
-                    device,
-                    self.device.physical,
-                    imm_total,
-                );
+            imm.maintain(
+                &self.instance.instance,
+                &self.device.device,
+                self.device.physical,
+                total,
+            );
+            if total > 0 {
                 imm.write(0, cube_bytes);
-                imm.write(line_off, line_bytes);
-                imm.write(d2_off, d2_bytes);
+                imm.write(line, line_bytes);
+                imm.write(d2, d2_bytes);
             }
         }
+        ImmOffsets { line, d2 }
+    }
 
+    /// Resets and records the slot's command buffer: staged mesh copies,
+    /// attachment layout transitions, the dynamic-rendering pass with all
+    /// draws, and the hand-off barrier to the present copy.
+    fn record_render(&mut self, slot: usize, lists: &DrawLists, offsets: ImmOffsets) {
+        let device = &self.device.device;
         let frame = &self.frames[slot];
         // Rendering happens at the (possibly scaled) offscreen resolution;
         // 2D coordinates stay in window pixels (NDC is resolution-free).
@@ -547,49 +613,51 @@ impl Renderer {
             // in-flight copy must NOT be waited on (its src stage is COPY,
             // deliberately excluded) or presentation backpressure would leak
             // back into rendering.
+            // Fixed-size barrier array: no per-frame heap allocation in the
+            // steady-state draw path.
             let offscreen_image = self.targets.offscreen_images[slot];
-            let mut image_barriers = vec![
-                vk::ImageMemoryBarrier2::default()
+            let mut image_barriers = [vk::ImageMemoryBarrier2::default(); 3];
+            image_barriers[0] = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .image(offscreen_image)
+                .subresource_range(color_range());
+            image_barriers[1] = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                )
+                .dst_access_mask(
+                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                )
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .image(self.targets.depth_image)
+                .subresource_range(depth_range());
+            let mut barrier_count = 2;
+            if self.targets.multisampled() {
+                image_barriers[2] = vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .src_access_mask(vk::AccessFlags2::NONE)
                     .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .image(offscreen_image)
-                    .subresource_range(color_range()),
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(
-                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    )
-                    .dst_access_mask(
-                        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                    )
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                    .image(self.targets.depth_image)
-                    .subresource_range(depth_range()),
-            ];
-            if self.targets.multisampled() {
-                image_barriers.push(
-                    vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                        .src_access_mask(vk::AccessFlags2::NONE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                        .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                        .image(self.targets.msaa_image)
-                        .subresource_range(color_range()),
-                );
+                    .image(self.targets.msaa_image)
+                    .subresource_range(color_range());
+                barrier_count = 3;
             }
             device.cmd_pipeline_barrier2(
                 frame.cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&image_barriers),
+                &vk::DependencyInfo::default()
+                    .image_memory_barriers(&image_barriers[..barrier_count]),
             );
 
             let clear_color = vk::ClearValue {
@@ -754,7 +822,7 @@ impl Renderer {
                         vk::PipelineBindPoint::GRAPHICS,
                         self.pipelines.lines3d,
                     );
-                    device.cmd_bind_vertex_buffers(frame.cmd, 0, &[imm_buffer], &[line_off]);
+                    device.cmd_bind_vertex_buffers(frame.cmd, 0, &[imm_buffer], &[offsets.line]);
                     device.cmd_draw(frame.cmd, lists.line_verts.len() as u32, 1, 0, 0);
                 }
             }
@@ -784,7 +852,7 @@ impl Renderer {
                     0,
                     bytemuck::cast_slice(&pixels_to_ndc),
                 );
-                device.cmd_bind_vertex_buffers(frame.cmd, 0, &[imm_buffer], &[d2_off]);
+                device.cmd_bind_vertex_buffers(frame.cmd, 0, &[imm_buffer], &[offsets.d2]);
                 device.cmd_draw(frame.cmd, lists.verts_2d.len() as u32, 1, 0, 0);
             }
 
@@ -811,27 +879,36 @@ impl Renderer {
             device
                 .end_command_buffer(frame.cmd)
                 .expect("end command buffer failed");
+        }
+    }
 
-            // Render submit: no waits (nothing renders into the swapchain
-            // anymore); the frame fence keeps its pacing role unchanged.
-            let signal_info = [vk::SemaphoreSubmitInfo::default()
-                .semaphore(frame.render_done)
-                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-            let cmd_info = [vk::CommandBufferSubmitInfo::default().command_buffer(frame.cmd)];
-            let mut submit_info = vk::SubmitInfo2::default().command_buffer_infos(&cmd_info);
-            if present_target.is_some() {
-                submit_info = submit_info.signal_semaphore_infos(&signal_info);
-            }
-            let submit = [submit_info];
-            self.timing.record = t0.elapsed();
-            let t_submit = std::time::Instant::now();
-            device
+    /// Submits the recorded command buffer, signaling the slot's fence and —
+    /// only on frames that will present — render_done (a binary-semaphore
+    /// signal with no consumer would make the slot's next signal invalid).
+    fn submit_render(&mut self, slot: usize, will_present: bool) {
+        let frame = &self.frames[slot];
+        // Render submit: no waits (nothing renders into the swapchain
+        // anymore); the frame fence keeps its pacing role unchanged.
+        let signal_info = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(frame.render_done)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let cmd_info = [vk::CommandBufferSubmitInfo::default().command_buffer(frame.cmd)];
+        let mut submit_info = vk::SubmitInfo2::default().command_buffer_infos(&cmd_info);
+        if will_present {
+            submit_info = submit_info.signal_semaphore_infos(&signal_info);
+        }
+        let submit = [submit_info];
+        unsafe {
+            self.device
+                .device
                 .queue_submit2(self.device.graphics_queue, &submit, frame.fence)
                 .expect("queue submit failed");
-            self.timing.submit = t_submit.elapsed();
         }
+    }
 
-        let t_present = std::time::Instant::now();
+    /// Copies the finished frame into the acquired swapchain image (when one
+    /// was acquired in [`Self::decide_present`]) and queues the present.
+    fn present(&mut self, slot: usize, present_target: Option<u32>) {
         if let Some(image_index) = present_target {
             unsafe { self.submit_present_copy(slot, image_index) };
             self.last_present = std::time::Instant::now();
@@ -848,14 +925,6 @@ impl Renderer {
                     .expect("copy fence wait failed");
             }
         }
-        self.timing.present = t_present.elapsed();
-
-        self.timing.fence = t_fence;
-        self.timing.acquire = t_acquire;
-        self.timing.tick();
-
-        self.frame_no += 1;
-        self.slot = (self.slot + 1) % self.frames.len();
     }
 
     /// Records and submits the offscreen[slot] -> swapchain copy, then
@@ -1124,6 +1193,7 @@ impl Renderer {
                 self.pipelines.destroy(&self.device.device);
                 self.pipelines = Pipelines::new(
                     &self.device.device,
+                    self.pipeline_cache,
                     self.swapchain.format,
                     self.targets.depth_format,
                     self.targets.samples,
@@ -1152,6 +1222,8 @@ impl Drop for Renderer {
             let _ = device.device_wait_idle();
 
             self.pipelines.destroy(device);
+            save_pipeline_cache(device, self.pipeline_cache);
+            device.destroy_pipeline_cache(self.pipeline_cache, None);
             self.atlas.destroy(device);
             device.destroy_descriptor_pool(self.block_pool, None);
             device.destroy_descriptor_set_layout(self.block_set_layout, None);
@@ -1187,6 +1259,47 @@ fn clamp_msaa(requested: u32, max: u32) -> u32 {
         _ => 8,
     };
     requested.min(max)
+}
+
+/// Where the pipeline cache lives on disk. The OS temp dir was chosen over
+/// "next to the executable" because it is per-user writable everywhere (an
+/// installed game may sit in a read-only location) and the cache is a
+/// machine-local driver artifact, not user data — losing it on a temp clean
+/// only costs one warm-up compile.
+fn pipeline_cache_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("voxel_engine_pipeline.cache")
+}
+
+/// Creates the renderer's pipeline cache, seeded from disk when a previous
+/// run saved one. Stale or corrupt data is harmless: the driver validates
+/// the blob's header (UUID etc.) and falls back to an empty cache, and any
+/// create error falls back to an empty cache too.
+fn create_pipeline_cache(device: &ash::Device) -> vk::PipelineCache {
+    let data = std::fs::read(pipeline_cache_path()).unwrap_or_default();
+    if !data.is_empty() {
+        let info = vk::PipelineCacheCreateInfo::default().initial_data(&data);
+        if let Ok(cache) = unsafe { device.create_pipeline_cache(&info, None) } {
+            log::debug!("pipeline cache loaded ({} bytes)", data.len());
+            return cache;
+        }
+        log::warn!("saved pipeline cache rejected; starting empty");
+    }
+    unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) }
+        .expect("Failed to create pipeline cache")
+}
+
+/// Best-effort write-back of the pipeline cache; a failure only costs the
+/// next run's warm start.
+fn save_pipeline_cache(device: &ash::Device, cache: vk::PipelineCache) {
+    match unsafe { device.get_pipeline_cache_data(cache) } {
+        Ok(data) if !data.is_empty() => {
+            if let Err(err) = std::fs::write(pipeline_cache_path(), &data) {
+                log::debug!("pipeline cache not saved: {err}");
+            }
+        }
+        Ok(_) => {}
+        Err(err) => log::debug!("pipeline cache data unavailable: {err:?}"),
+    }
 }
 
 fn create_present_semaphores(device: &ash::Device, count: usize) -> Vec<vk::Semaphore> {

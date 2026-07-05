@@ -282,15 +282,25 @@ impl MeshRegistry {
     }
 }
 
+/// Smallest immediate-buffer capacity (also the floor the decay stops at).
+const IMM_MIN_CAPACITY: u64 = 64 * 1024;
+/// Frames per decay window: capacity shrinks only when it stayed > 4x the
+/// window's high-water mark for this many consecutive frames.
+const IMM_SHRINK_WINDOW: u32 = 600;
+
 /// A growable host-visible vertex buffer for immediate geometry (cubes,
-/// lines, 2D overlay), one per frame-in-flight. Growing destroys the old
-/// buffer immediately — safe because the owning frame slot's fence has
-/// already been waited when the buffer is written.
+/// lines, 2D overlay), one per frame-in-flight. Growing (or the decay
+/// shrink) destroys the old buffer immediately — safe because the owning
+/// frame slot's fence has already been waited when the buffer is written.
 pub struct HostBuffer {
     pub buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: *mut u8,
     capacity: u64,
+    /// Largest `needed` seen in the current decay window.
+    window_peak: u64,
+    /// Frames elapsed in the current decay window.
+    window_frames: u32,
 }
 
 impl HostBuffer {
@@ -300,10 +310,50 @@ impl HostBuffer {
             memory: vk::DeviceMemory::null(),
             mapped: std::ptr::null_mut(),
             capacity: 0,
+            window_peak: 0,
+            window_frames: 0,
         }
     }
 
-    pub unsafe fn ensure_capacity(
+    /// Per-frame capacity guarantee plus a gentle decay, so a one-off burst
+    /// (a menu full of text) doesn't pin a huge buffer forever: when the
+    /// capacity exceeded 4x the high-water mark of the last
+    /// [`IMM_SHRINK_WINDOW`] frames, the buffer is recreated at 2x that mark.
+    /// Steady-state cost: one compare, one increment, one compare.
+    ///
+    /// Must be called at the point where the owning frame slot's fence has
+    /// just been waited (the GPU no longer reads this buffer), because both
+    /// growth and decay destroy the old buffer immediately.
+    pub unsafe fn maintain(
+        &mut self,
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical: vk::PhysicalDevice,
+        needed: u64,
+    ) {
+        if needed > self.window_peak {
+            self.window_peak = needed;
+        }
+        self.window_frames += 1;
+        if self.window_frames >= IMM_SHRINK_WINDOW {
+            let peak = self.window_peak;
+            self.window_frames = 0;
+            self.window_peak = 0;
+            if let Some(target) = shrink_capacity(self.capacity, peak) {
+                unsafe {
+                    self.destroy(device);
+                    if target > 0 {
+                        self.ensure_capacity(instance, device, physical, target);
+                    }
+                }
+            }
+        }
+        if needed > 0 {
+            unsafe { self.ensure_capacity(instance, device, physical, needed) };
+        }
+    }
+
+    unsafe fn ensure_capacity(
         &mut self,
         instance: &ash::Instance,
         device: &ash::Device,
@@ -313,7 +363,7 @@ impl HostBuffer {
         if needed <= self.capacity {
             return;
         }
-        let new_capacity = needed.next_power_of_two().max(64 * 1024);
+        let new_capacity = needed.next_power_of_two().max(IMM_MIN_CAPACITY);
         unsafe {
             self.destroy(device);
 
@@ -372,5 +422,43 @@ impl HostBuffer {
             self.mapped = std::ptr::null_mut();
             self.capacity = 0;
         }
+    }
+}
+
+/// Decay rule for [`HostBuffer::maintain`]: given the current capacity and
+/// the window's high-water mark, returns the capacity to recreate at
+/// (0 = destroy only; the buffer went unused all window), or `None` to keep
+/// the buffer as is.
+fn shrink_capacity(capacity: u64, peak: u64) -> Option<u64> {
+    if capacity <= IMM_MIN_CAPACITY {
+        return None; // already at (or below) the floor
+    }
+    if peak == 0 {
+        return Some(0);
+    }
+    (capacity > peak.saturating_mul(4)).then(|| peak.saturating_mul(2))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IMM_MIN_CAPACITY, shrink_capacity};
+
+    #[test]
+    fn shrink_decay_rules() {
+        // At or below the floor: never shrink, even when idle.
+        assert_eq!(shrink_capacity(IMM_MIN_CAPACITY, 0), None);
+        assert_eq!(shrink_capacity(0, 0), None);
+        // A whole window with zero usage: destroy outright.
+        assert_eq!(shrink_capacity(1 << 20, 0), Some(0));
+        // Capacity within 4x of the mark: keep.
+        assert_eq!(shrink_capacity(1 << 20, 1 << 18), None); // exactly 4x
+        assert_eq!(shrink_capacity(1 << 20, (1 << 18) + 1), None);
+        assert_eq!(shrink_capacity(1 << 20, 1 << 19), None);
+        // Way oversized: recreate at 2x the mark.
+        assert_eq!(shrink_capacity(1 << 20, (1 << 18) - 1), Some((1 << 19) - 2));
+        assert_eq!(shrink_capacity(16 << 20, 100 << 10), Some(200 << 10));
+        // The 2x target is always strictly below the old capacity.
+        let target = shrink_capacity(16 << 20, 100 << 10).unwrap();
+        assert!(target.next_power_of_two().max(IMM_MIN_CAPACITY) < 16 << 20);
     }
 }

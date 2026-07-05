@@ -37,8 +37,10 @@ pub struct Pipelines {
 }
 
 impl Pipelines {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &ash::Device,
+        cache: vk::PipelineCache,
         color_format: vk::Format,
         depth_format: vk::Format,
         samples: vk::SampleCountFlags,
@@ -134,6 +136,7 @@ impl Pipelines {
 
         let builder = PipelineBuilder {
             device,
+            cache,
             color_format,
             depth_format,
             samples,
@@ -210,6 +213,8 @@ enum DepthMode {
 
 struct PipelineBuilder<'a> {
     device: &'a ash::Device,
+    /// Renderer-owned, disk-backed cache; null is valid (no caching).
+    cache: vk::PipelineCache,
     color_format: vk::Format,
     depth_format: vk::Format,
     samples: vk::SampleCountFlags,
@@ -317,7 +322,7 @@ impl PipelineBuilder<'_> {
 
         unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .create_graphics_pipelines(self.cache, &[pipeline_info], None)
                 .map_err(|(_, err)| err)
                 .expect("Failed to create graphics pipeline")[0]
         }
