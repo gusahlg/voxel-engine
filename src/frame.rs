@@ -15,7 +15,7 @@ pub(crate) struct DrawLists {
     pub clear: Color,
     pub view_proj: Mat4,
     pub has_3d: bool,
-    pub mesh_draws: Vec<MeshHandle>,
+    pub mesh_draws: Vec<(MeshHandle, Vec3)>,
     pub cube_verts: Vec<Vertex>,
     pub line_verts: Vec<Vertex>,
     pub verts_2d: Vec<Vertex2D>,
@@ -162,16 +162,21 @@ pub struct Frame3D<'f, 'e> {
 }
 
 impl Frame3D<'_, '_> {
-    /// Draws an uploaded mesh; skipped automatically when its AABB is
-    /// outside the view frustum.
-    pub fn draw_mesh(&mut self, handle: MeshHandle) {
+    /// Draws an uploaded mesh translated by `offset` (applied GPU-side, so
+    /// meshes can stay in small local coordinates for camera-relative
+    /// rendering); skipped automatically when its translated AABB is outside
+    /// the view frustum.
+    pub fn draw_mesh(&mut self, handle: MeshHandle, offset: Vec3) {
         let Some((aabb_min, aabb_max)) = self.frame.eng.renderer.mesh_aabb(handle) else {
             return;
         };
-        if !self.frustum.intersects_aabb(aabb_min, aabb_max) {
+        if !self
+            .frustum
+            .intersects_aabb(aabb_min + offset, aabb_max + offset)
+        {
             return;
         }
-        self.frame.eng.lists.mesh_draws.push(handle);
+        self.frame.eng.lists.mesh_draws.push((handle, offset));
     }
 
     pub fn draw_cube(&mut self, center: Vec3, size: Vec3, color: Color) {

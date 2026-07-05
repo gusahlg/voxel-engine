@@ -771,7 +771,7 @@ impl Renderer {
                     // them. Rebinding is cheap (~hundreds of meshes).
                     let mut bound = vk::Buffer::null();
                     let mut bound_vtx_off = u64::MAX;
-                    for &handle in &lists.mesh_draws {
+                    for &(handle, off) in &lists.mesh_draws {
                         let Some(mesh) = self.meshes.get(handle) else {
                             continue;
                         };
@@ -795,6 +795,14 @@ impl Renderer {
                             );
                             bound_vtx_off = mesh.vtx_byte_offset;
                         }
+                        // Per-draw camera-relative offset, after the Mat4 at 0.
+                        device.cmd_push_constants(
+                            frame.cmd,
+                            self.pipelines.layout_3d,
+                            vk::ShaderStageFlags::VERTEX,
+                            64,
+                            bytemuck::bytes_of(&[off.x, off.y, off.z, 0.0f32]),
+                        );
                         device.cmd_draw_indexed(
                             frame.cmd,
                             mesh.index_count,
@@ -804,6 +812,20 @@ impl Renderer {
                             0,
                         );
                     }
+                }
+
+                if !lists.cube_verts.is_empty() || !lists.line_verts.is_empty() {
+                    // Immediate cubes and lines are already camera-relative
+                    // small values: zero the per-draw offset once. Both draws
+                    // share layout_3d and nothing pushes in between, so one
+                    // push covers both.
+                    device.cmd_push_constants(
+                        frame.cmd,
+                        self.pipelines.layout_3d,
+                        vk::ShaderStageFlags::VERTEX,
+                        64,
+                        bytemuck::bytes_of(&[0.0f32; 4]),
+                    );
                 }
 
                 if !lists.cube_verts.is_empty() {

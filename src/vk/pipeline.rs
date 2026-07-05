@@ -11,7 +11,7 @@ use std::io::Cursor;
 
 use crate::mesh::Vertex;
 
-pub const PUSH_BYTES_3D: u32 = 64; // Mat4
+pub const PUSH_BYTES_3D: u32 = 80; // Mat4 view_proj + vec4 per-draw offset
 pub const PUSH_BYTES_2D: u32 = 8; // vec2 pixels_to_ndc
 
 /// 2D overlay vertex: pixel position, atlas UV, RGBA8 color.

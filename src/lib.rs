@@ -23,7 +23,7 @@ pub use camera::{Camera3D, Frustum, Z_NEAR, world_to_screen};
 pub use color::Color;
 pub use engine::{Config, Engine, run};
 pub use frame::{Frame, Frame3D};
-pub use glam::{Mat4, Vec2, Vec3};
+pub use glam::{DVec2, DVec3, Mat4, Vec2, Vec3};
 pub use input::{Key, MouseButton};
 pub use mesh::{MeshData, MeshHandle, Vertex};
 

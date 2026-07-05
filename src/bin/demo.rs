@@ -165,7 +165,7 @@ fn main() {
             {
                 let mut f3 = frame.begin_3d(&cam);
                 if let Some(handle) = terrain {
-                    f3.draw_mesh(handle);
+                    f3.draw_mesh(handle, Vec3::ZERO);
                 }
                 f3.draw_cube(Vec3::new(0.0, 8.0, 0.0), Vec3::splat(2.0), Color::RED);
                 f3.draw_cube_wires(Vec3::new(0.0, 8.0, 0.0), Vec3::splat(2.2), Color::BLACK);

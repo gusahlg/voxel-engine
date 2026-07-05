@@ -1,4 +1,6 @@
-// mesh3d.vert.slang — world-space vertices, single view_proj push constant.
+// mesh3d.vert.slang — camera-relative vertices: a per-draw float4 offset is
+// added to the input position before the view_proj multiply, so meshes can
+// carry small local-space coordinates while the world spans huge distances.
 // Passes uv + color through; color.a carries the texture-array layer index.
 
 struct VertexInput
@@ -27,6 +29,7 @@ struct VertexOutput
 struct PushConstants
 {
     float4x4 view_proj;
+    float4 offset; // per-draw translation; .w unused
 };
 
 [[vk::push_constant]]
@@ -36,7 +39,7 @@ ConstantBuffer<PushConstants> pc;
 VertexOutput vertexMain(VertexInput input)
 {
     VertexOutput output;
-    output.position = mul(pc.view_proj, float4(input.position, 1.0));
+    output.position = mul(pc.view_proj, float4(input.position + pc.offset.xyz, 1.0));
     output.uv = input.uv;
     output.color = input.color;
     return output;
