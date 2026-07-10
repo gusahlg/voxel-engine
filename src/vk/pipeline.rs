@@ -524,6 +524,7 @@ impl Pipelines {
 
         unsafe {
             device.destroy_shader_module(tonemap_vert, None);
+            device.destroy_shader_module(tonemap_frag, None);
             device.destroy_shader_module(mesh_vert, None);
             device.destroy_shader_module(mesh_frag, None);
             device.destroy_shader_module(surface_vert, None);
