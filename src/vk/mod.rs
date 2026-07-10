@@ -263,7 +263,6 @@ pub(crate) struct Renderer {
     /// drawable; frames in between render unthrottled.
     last_present: std::time::Instant,
     present_interval: std::time::Duration,
-    timing: FrameTiming,
     gpu_timer: GpuTimer,
 }
 
@@ -472,7 +471,6 @@ impl Renderer {
             render_extent,
             last_present: std::time::Instant::now(),
             present_interval,
-            timing: FrameTiming::new(),
             gpu_timer,
         }
     }
@@ -602,7 +600,7 @@ impl Renderer {
     /// mailbox: frames that outrun presentation are rendered but dropped).
     ///
     /// Frame anatomy, top-down (each phase is its own helper below and its
-    /// own [`FrameTiming`] span):
+    /// own [`crate::profile`] meter):
     /// 1. [`Self::wait_slot_and_reclaim`] — frame fence + deferred frees
     /// 2. [`Self::decide_present`]        — copy-fence check + acquire
     /// 3. [`Self::write_immediates`]      — pack cube/line/2D verts
@@ -626,31 +624,40 @@ impl Renderer {
         }
 
         let slot = self.slot;
+        use crate::profile::{Meter, scope};
 
-        let t0 = std::time::Instant::now();
-        self.wait_slot_and_reclaim(slot);
-        self.timing.record(Phase::Fence, t0.elapsed());
+        {
+            let _p = scope(Meter::Fence);
+            self.wait_slot_and_reclaim(slot);
+        }
 
-        let t0 = std::time::Instant::now();
-        let present_target = self.decide_present(slot);
-        let guard = self.acquire_slot(slot);
-        self.timing.record(Phase::Acquire, t0.elapsed());
+        let present_target;
+        let guard = {
+            let _p = scope(Meter::Acquire);
+            present_target = self.decide_present(slot);
+            self.acquire_slot(slot)
+        };
 
-        let t0 = std::time::Instant::now();
-        let offsets = self.write_immediates(slot, lists);
-        self.prepare_mesh_draws(slot, lists);
-        let rs = self.record_render(&guard, lists, offsets);
-        self.timing.record(Phase::Record, t0.elapsed());
+        let offsets = {
+            let _p = scope(Meter::Pack);
+            let offsets = self.write_immediates(slot, lists);
+            self.prepare_mesh_draws(slot, lists);
+            offsets
+        };
+        let rs = {
+            let _p = scope(Meter::Record);
+            self.record_render(&guard, lists, offsets)
+        };
 
-        let t0 = std::time::Instant::now();
-        self.submit_render(rs, slot);
-        self.timing.record(Phase::Submit, t0.elapsed());
+        {
+            let _p = scope(Meter::Submit);
+            self.submit_render(rs, slot);
+        }
 
-        let t0 = std::time::Instant::now();
-        self.present(slot, present_target);
-        self.timing.record(Phase::Present, t0.elapsed());
-
-        self.timing.tick();
+        {
+            let _p = scope(Meter::Present);
+            self.present(slot, present_target);
+        }
 
         self.slot = (self.slot + 1) % self.frames.len();
     }
@@ -923,10 +930,14 @@ impl Renderer {
         let cmd = self.frames[slot].cmd;
         // Read the prior render-pass GPU time for this slot before its queries
         // are reset below (the slot's fence was already waited this frame).
-        let profiling = self.timing.enabled;
+        let profiling = crate::profile::is_enabled();
         if profiling {
-            if let Some(ms) = unsafe { self.gpu_timer.read_ms(&self.device.device, slot) } {
-                self.timing.add_gpu(ms);
+            let mut passes = [0.0f64; GpuPass::COUNT];
+            if unsafe { self.gpu_timer.read_into(&self.device.device, slot, &mut passes) }.is_some()
+            {
+                for pass in GpuPass::ALL {
+                    crate::profile::add_ms(pass.meter(), passes[pass as usize]);
+                }
             }
         }
         // Begin render submission; this gets the timeline value to stamp mesh copies.
@@ -958,6 +969,12 @@ impl Renderer {
             && self.targets.msaa.is_none()
             && self.vrs_depth_ready[slot];
 
+        let device = &self.device.device;
+        let stamp = |p| {
+            if profiling {
+                unsafe { self.gpu_timer.mark(device, cmd, slot, p) };
+            }
+        };
         let pass = unsafe { RenderPass::begin(self, cmd, slot, lists, offsets, do_vrs) };
         if lists.has_3d {
             // Transparency forces an interleave: all opaque geometry (mesh runs
@@ -965,6 +982,7 @@ impl Renderer {
             // mesh run tests against it.
             unsafe {
                 pass.record_mesh_indirect(Pass::Opaque);
+                stamp(GpuPass::Opaque);
                 // Sky fills the background (uncovered pixels) right after opaque
                 // depth is laid down. It must precede the immediate debug
                 // cubes/lines: the highlight lines are depth read-only (no depth
@@ -972,26 +990,30 @@ impl Renderer {
                 // depth cleared there — drawing sky afterward would overpaint it.
                 // Debug geometry and transparent water both composite over the sky.
                 pass.record_sky();
+                stamp(GpuPass::Sky);
                 pass.record_immediate_cubes();
+                stamp(GpuPass::Cubes);
                 pass.record_lines();
+                stamp(GpuPass::Lines);
                 // Contact shadows: translucent, blended over the opaque terrain
                 // depth just laid down, before transparent water.
                 pass.record_shadows();
+                stamp(GpuPass::Shadows);
                 pass.record_mesh_indirect(Pass::Transparent);
+                stamp(GpuPass::Transparent);
             }
         }
         unsafe {
             pass.record_2d();
+            stamp(GpuPass::Overlay);
             pass.end();
         }
+        self.gpu_timer.finish(slot);
         // The main pass just wrote (and stored) this slot's depth, so a later
         // cycle reusing this slot may read it for VRS classification.
         self.vrs_depth_ready[slot] = true;
 
         unsafe {
-            if profiling {
-                self.gpu_timer.end(&self.device.device, cmd, slot);
-            }
             self.device
                 .device
                 .end_command_buffer(cmd)
@@ -2363,49 +2385,68 @@ fn depth_range() -> vk::ImageSubresourceRange {
     }
 }
 
-/// The phases a frame is timed across, in execution order. The enum ordinal
-/// indexes every per-phase array, so the label and the accumulator can never
-/// drift out of sync.
-#[derive(Clone, Copy)]
-enum Phase {
-    Fence,
-    Acquire,
-    Record,
-    Submit,
-    Present,
+/// A GPU render pass boundary, in record order. The variant ordinal indexes the
+/// per-pass accumulator (same drift-proof invariant as [`crate::profile::Meter`]).
+#[derive(Clone, Copy, PartialEq)]
+enum GpuPass {
+    Opaque,
+    Sky,
+    Cubes,
+    Lines,
+    Shadows,
+    Transparent,
+    Overlay,
 }
 
-impl Phase {
-    const ALL: [Phase; 5] = [
-        Phase::Fence,
-        Phase::Acquire,
-        Phase::Record,
-        Phase::Submit,
-        Phase::Present,
+impl GpuPass {
+    const ALL: [GpuPass; 7] = [
+        GpuPass::Opaque,
+        GpuPass::Sky,
+        GpuPass::Cubes,
+        GpuPass::Lines,
+        GpuPass::Shadows,
+        GpuPass::Transparent,
+        GpuPass::Overlay,
     ];
     const COUNT: usize = Self::ALL.len();
 
-    fn label(self) -> &'static str {
+    fn meter(self) -> crate::profile::Meter {
+        use crate::profile::Meter;
         match self {
-            Phase::Fence => "fence",
-            Phase::Acquire => "acquire",
-            Phase::Record => "record",
-            Phase::Submit => "submit",
-            Phase::Present => "present",
+            GpuPass::Opaque => Meter::GpuOpaque,
+            GpuPass::Sky => Meter::GpuSky,
+            GpuPass::Cubes => Meter::GpuCubes,
+            GpuPass::Lines => Meter::GpuLines,
+            GpuPass::Shadows => Meter::GpuShadows,
+            GpuPass::Transparent => Meter::GpuTransparent,
+            GpuPass::Overlay => Meter::GpuOverlay,
         }
     }
 }
 
-/// GPU render-pass timing via a timestamp query pool: two timestamps per
-/// frame-in-flight bracket the recorded work. A slot's result is read one
-/// cycle later, after its fence is waited, so the read never stalls. A null
-/// pool (hardware without timestamp support) makes every method a no-op.
+/// One start timestamp plus one boundary per pass.
+const GPU_STAMPS: usize = GpuPass::COUNT + 1;
+
+/// Per-pass GPU timing via a timestamp query pool: a start timestamp plus one
+/// after each recorded pass. Only the passes that actually run write a stamp,
+/// and the label written alongside each stamp keeps deltas attributable even
+/// when a frame skips passes (no 3D, VRS off). A slot's results are read one
+/// cycle later, after its fence is waited, so the read never stalls.
+///
+/// `count`/`label` are [`Cell`]s so a mark needs only `&self`: the render pass
+/// holds an immutable `&Renderer` while recording, and all timer state is
+/// touched on the single render thread. A null pool (hardware without timestamp
+/// support) makes every method a no-op.
 struct GpuTimer {
     pool: vk::QueryPool,
     /// Nanoseconds per tick (`limits.timestampPeriod`).
     period_ns: f32,
-    /// Whether each slot holds a completed timestamp pair to read back.
+    /// Whether each slot holds completed timestamps to read back.
     primed: [bool; FRAMES_IN_FLIGHT as usize],
+    /// Stamps written for each slot's most recent recording (incl. the start).
+    count: [std::cell::Cell<u32>; FRAMES_IN_FLIGHT as usize],
+    /// The pass that ended at each stamp (index `i` labels the span `i-1..i`).
+    label: [[std::cell::Cell<GpuPass>; GPU_STAMPS]; FRAMES_IN_FLIGHT as usize],
 }
 
 impl GpuTimer {
@@ -2413,7 +2454,7 @@ impl GpuTimer {
         let pool = if supported {
             let info = vk::QueryPoolCreateInfo::default()
                 .query_type(vk::QueryType::TIMESTAMP)
-                .query_count(2 * FRAMES_IN_FLIGHT as u32);
+                .query_count(GPU_STAMPS as u32 * FRAMES_IN_FLIGHT as u32);
             unsafe {
                 device
                     .create_query_pool(&info, None)
@@ -2426,6 +2467,10 @@ impl GpuTimer {
             pool,
             period_ns,
             primed: [false; FRAMES_IN_FLIGHT as usize],
+            count: std::array::from_fn(|_| std::cell::Cell::new(0)),
+            label: std::array::from_fn(|_| {
+                std::array::from_fn(|_| std::cell::Cell::new(GpuPass::Opaque))
+            }),
         }
     }
 
@@ -2433,24 +2478,34 @@ impl GpuTimer {
         self.pool != vk::QueryPool::null()
     }
 
-    /// Reads `slot`'s prior render-pass duration (ms). The caller must have
-    /// waited `slot`'s fence, so the result is ready without a GPU stall.
-    unsafe fn read_ms(&self, device: &ash::Device, slot: usize) -> Option<f64> {
+    /// Reads `slot`'s prior render-pass per-pass durations (ms), adding each to
+    /// `sink`. The caller must have waited `slot`'s fence, so the result is
+    /// ready without a GPU stall. Returns the summed render-pass time (ms).
+    unsafe fn read_into(&self, device: &ash::Device, slot: usize, sink: &mut [f64]) -> Option<f64> {
         if !self.enabled() || !self.primed[slot] {
             return None;
         }
-        let mut ts = [0u64; 2];
+        let n = self.count[slot].get() as usize;
+        if n < 2 {
+            return None;
+        }
+        let mut ts = [0u64; GPU_STAMPS];
         unsafe {
             device.get_query_pool_results(
                 self.pool,
-                slot as u32 * 2,
-                &mut ts,
+                slot as u32 * GPU_STAMPS as u32,
+                &mut ts[..n],
                 vk::QueryResultFlags::TYPE_64,
             )
         }
         .ok()?;
-        let ticks = ts[1].wrapping_sub(ts[0]);
-        Some(ticks as f64 * self.period_ns as f64 / 1.0e6)
+        let mut total = 0.0;
+        for i in 1..n {
+            let ms = ts[i].wrapping_sub(ts[i - 1]) as f64 * self.period_ns as f64 / 1.0e6;
+            sink[self.label[slot][i].get() as usize] += ms;
+            total += ms;
+        }
+        Some(total)
     }
 
     /// Resets `slot`'s queries and writes the start timestamp. Must be recorded
@@ -2459,16 +2514,28 @@ impl GpuTimer {
         if !self.enabled() {
             return;
         }
-        let base = slot as u32 * 2;
+        let base = slot as u32 * GPU_STAMPS as u32;
         unsafe {
-            device.cmd_reset_query_pool(cmd, self.pool, base, 2);
+            device.cmd_reset_query_pool(cmd, self.pool, base, GPU_STAMPS as u32);
             device.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, self.pool, base);
         }
+        self.count[slot].set(1);
     }
 
-    /// Writes `slot`'s end timestamp and marks it readable next cycle.
-    unsafe fn end(&mut self, device: &ash::Device, cmd: vk::CommandBuffer, slot: usize) {
+    /// Writes a boundary timestamp closing `pass` for `slot`. Recorded inside
+    /// the render pass; needs only `&self` (interior-mutable bookkeeping).
+    unsafe fn mark(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        pass: GpuPass,
+    ) {
         if !self.enabled() {
+            return;
+        }
+        let i = self.count[slot].get();
+        if i as usize >= GPU_STAMPS {
             return;
         }
         unsafe {
@@ -2476,10 +2543,18 @@ impl GpuTimer {
                 cmd,
                 vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
                 self.pool,
-                slot as u32 * 2 + 1,
+                slot as u32 * GPU_STAMPS as u32 + i,
             );
         }
-        self.primed[slot] = true;
+        self.label[slot][i as usize].set(pass);
+        self.count[slot].set(i + 1);
+    }
+
+    /// Marks `slot` readable next cycle. Call after the render pass ends.
+    fn finish(&mut self, slot: usize) {
+        if self.enabled() {
+            self.primed[slot] = true;
+        }
     }
 
     unsafe fn destroy(&mut self, device: &ash::Device) {
@@ -2488,18 +2563,6 @@ impl GpuTimer {
             self.pool = vk::QueryPool::null();
         }
     }
-}
-
-/// Per-phase frame timers (enabled by `VOXEL_ENGINE_TIMING=1`).
-struct FrameTiming {
-    enabled: bool,
-    spans: [std::time::Duration; Phase::COUNT],
-    sum: [std::time::Duration; Phase::COUNT],
-    frames: u32,
-    /// GPU render-pass time (ms) summed over the window; `gpu_frames` counts
-    /// the frames that contributed (early frames have no prior result yet).
-    gpu_sum: f64,
-    gpu_frames: u32,
 }
 
 #[cfg(test)]
@@ -2629,57 +2692,3 @@ mod tests {
     }
 }
 
-impl FrameTiming {
-    fn new() -> Self {
-        Self {
-            enabled: std::env::var("VOXEL_ENGINE_TIMING").is_ok_and(|v| v != "0"),
-            spans: Default::default(),
-            sum: Default::default(),
-            frames: 0,
-            gpu_sum: 0.0,
-            gpu_frames: 0,
-        }
-    }
-
-    fn record(&mut self, phase: Phase, elapsed: std::time::Duration) {
-        self.spans[phase as usize] = elapsed;
-    }
-
-    /// Adds one GPU render-pass sample (milliseconds) to the current window.
-    fn add_gpu(&mut self, ms: f64) {
-        self.gpu_sum += ms;
-        self.gpu_frames += 1;
-    }
-
-    fn tick(&mut self) {
-        if !self.enabled {
-            return;
-        }
-        for i in 0..Phase::COUNT {
-            self.sum[i] += self.spans[i];
-        }
-        self.frames += 1;
-        if self.frames >= 240 {
-            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / self.frames as f64;
-            let mut line = String::from("frame phases avg:");
-            for phase in Phase::ALL {
-                line.push_str(&format!(
-                    " {} {:.3}ms",
-                    phase.label(),
-                    ms(self.sum[phase as usize])
-                ));
-            }
-            if self.gpu_frames > 0 {
-                line.push_str(&format!(
-                    " | gpu {:.3}ms",
-                    self.gpu_sum / self.gpu_frames as f64
-                ));
-            }
-            log::info!("{line}");
-            self.sum = Default::default();
-            self.frames = 0;
-            self.gpu_sum = 0.0;
-            self.gpu_frames = 0;
-        }
-    }
-}

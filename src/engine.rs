@@ -390,6 +390,7 @@ impl<F: FnMut(&mut Engine) -> bool> EngineApp<F> {
         // Reset edges/chars/delta AFTER the game consumed them; new events
         // accumulate for the next frame (raylib poll model).
         engine.input.begin_frame();
+        crate::profile::frame_end();
         engine.pace();
     }
 }

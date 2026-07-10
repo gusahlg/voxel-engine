@@ -16,6 +16,7 @@ mod font;
 mod frame;
 mod input;
 mod mesh;
+pub mod profile;
 mod screenshot;
 mod vk;
 
