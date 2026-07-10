@@ -3,11 +3,14 @@
 /// into reused CPU lists; submission happens when the `Frame` drops.
 use glam::{Mat3, Mat4, Vec2, Vec3};
 
-use crate::camera::{Camera3D, Frustum};
+use std::num::NonZeroU32;
+
+use crate::camera::{Camera3D, Frustum, WarpParams};
 use crate::color::Color;
 use crate::engine::Engine;
 use crate::font;
-use crate::mesh::{DebugVertex, MeshHandle};
+use crate::mesh::{DebugVertex, MeshHandle, Pass};
+use crate::surface::SurfaceHandle;
 use crate::vk::pipeline::{SkyLight, Vertex2D};
 
 /// Palette-only description of the procedural sky, set by the app inside a
@@ -32,6 +35,42 @@ pub struct SkyDesc {
     pub sun_angular_radius: f32,
 }
 
+/// A fully-resolved mesh draw: identity + culling metadata + placement, with NO
+/// Vulkan handle. Recorded on the main thread (culling reads the main-owned
+/// [`HandleAllocator`](crate::vk::buffers::HandleAllocator) metadata) and
+/// consumed by the render path, which resolves `slot`/`generation` against its
+/// residency mirror. `Send` POD so the whole [`DrawLists`] crosses threads.
+#[derive(Clone, Copy)]
+pub(crate) struct MeshDraw {
+    /// Validated against the render-side generation mirror at resolve time.
+    pub slot: u32,
+    pub generation: NonZeroU32,
+    /// World-space (local) AABB, for the render-side six-way face cull.
+    pub aabb_min: Vec3,
+    pub aabb_max: Vec3,
+    pub bounds: [u32; 7],
+    pub vertex_offset: i32,
+    pub pass: Pass,
+    pub offset: Vec3,
+    pub scale: f32,
+    /// Depth-biased opaque pipeline (far-LOD tiles).
+    pub biased: bool,
+}
+
+/// A fully-resolved colored-surface draw (Zone-3 far skin). Surface analogue of
+/// [`MeshDraw`]; frustum-culled at record time so the render path only resolves
+/// the buffer and issues the draw.
+#[derive(Clone, Copy)]
+pub(crate) struct SurfaceDraw {
+    pub slot: u32,
+    pub generation: NonZeroU32,
+    pub index_first: u32,
+    pub index_count: u32,
+    pub vertex_offset: i32,
+    pub offset: Vec3,
+    pub scale: f32,
+}
+
 /// CPU-side draw lists for one frame. Vec capacities persist across frames.
 pub(crate) struct DrawLists {
     pub clear: Color,
@@ -46,6 +85,10 @@ pub(crate) struct DrawLists {
     /// `tan(fovy/2)` for the current 3D camera; the renderer derives the
     /// vertical focal length (`0.5·height/tan_half`) for VRS depth thresholding.
     pub fovy_tan_half: f32,
+    /// High-FOV nonlinear projection for the current 3D scope. Its
+    /// `cylindrical_ratio` rides the otherwise-unused `ambient.w` push lane into
+    /// every 3D vertex shader; [`WarpParams::IDENTITY`] leaves rendering linear.
+    pub warp: WarpParams,
     pub has_3d: bool,
     /// Procedural sky palette for this frame's background pass, or `None` to
     /// leave the flat clear colour showing. Set via [`Frame3D::set_sky`].
@@ -54,7 +97,14 @@ pub(crate) struct DrawLists {
     /// (`1.0` for near chunks, `2^k` for LOD tiles). The `bool` selects the
     /// depth-biased opaque pipeline (far-LOD tiles), so full-res chunks win at
     /// coincident depth without z-fighting.
-    pub mesh_draws: Vec<(MeshHandle, Vec3, f32, bool)>,
+    pub mesh_draws: Vec<MeshDraw>,
+    /// Retained colored-surface draws (Zone-3 far skin): resolved snapshot.
+    /// Recorded after the opaque mesh runs, before sky.
+    pub surface_draws: Vec<SurfaceDraw>,
+    /// Horizontal radius (metres) within which the Zone-3 skin fragments are
+    /// discarded, so the skin renders only BEYOND the near zones (chunks + LOD
+    /// tiles) instead of poking through them. `0.0` (default) clips nothing.
+    pub skin_clip: f32,
     pub cube_verts: Vec<DebugVertex>,
     pub line_verts: Vec<DebugVertex>,
     /// Translucent ground decals (contact shadows), drawn with the blended,
@@ -73,9 +123,12 @@ impl DrawLists {
             sky_light: SkyLight::IDENTITY,
             cam_pos: Vec3::ZERO,
             fovy_tan_half: 1.0,
+            warp: WarpParams::IDENTITY,
             has_3d: false,
             sky: None,
             mesh_draws: Vec::new(),
+            surface_draws: Vec::new(),
+            skin_clip: 0.0,
             cube_verts: Vec::new(),
             line_verts: Vec::new(),
             shadow_verts: Vec::new(),
@@ -87,8 +140,11 @@ impl DrawLists {
     pub fn reset(&mut self) {
         self.has_3d = false;
         self.sky = None;
+        self.warp = WarpParams::IDENTITY;
         self.sky_light = SkyLight::IDENTITY;
         self.mesh_draws.clear();
+        self.surface_draws.clear();
+        self.skin_clip = 0.0;
         self.cube_verts.clear();
         self.line_verts.clear();
         self.shadow_verts.clear();
@@ -109,13 +165,15 @@ impl<'e> Frame<'e> {
     /// second time replaces the camera for every 3D draw already recorded
     /// this frame (frustum culling, however, uses each scope's own camera).
     pub fn begin_3d(&mut self, cam: &Camera3D) -> Frame3D<'_, 'e> {
-        let extent = self.eng.renderer.extent();
-        let aspect = extent.width.max(1) as f32 / extent.height.max(1) as f32;
+        let w = self.eng.client.screen_width().max(1) as f32;
+        let h = self.eng.client.screen_height().max(1) as f32;
+        let aspect = w / h;
         let view_proj = cam.view_proj(aspect);
         let frustum = Frustum::from_view_proj(&view_proj);
         self.eng.lists.view_proj = view_proj;
         self.eng.lists.cam_pos = cam.position;
         self.eng.lists.fovy_tan_half = (cam.fovy.to_radians() * 0.5).tan();
+        self.eng.lists.warp = cam.warp;
         self.eng.lists.has_3d = true;
         Frame3D {
             frame: self,
@@ -260,10 +318,47 @@ impl Frame3D<'_, '_> {
         self.push_mesh(handle, offset, scale, true);
     }
 
-    fn push_mesh(&mut self, handle: MeshHandle, offset: Vec3, scale: f32, biased: bool) {
-        let Some((aabb_min, aabb_max)) = self.frame.eng.renderer.mesh_aabb(handle) else {
+    /// Records a retained colored-surface draw (Zone-3 far skin) at `offset`
+    /// with uniform `scale`, applied GPU-side so the surface stays in small
+    /// camera-relative coordinates. Skipped when its scaled, translated AABB is
+    /// outside the view frustum.
+    /// Sets the horizontal radius (metres, camera-relative) within which the
+    /// Zone-3 skin is discarded in the fragment shader, so the far grey skin
+    /// renders only BEYOND the near zones (full-res chunks + LOD tiles) instead
+    /// of poking through them. Call once inside the `begin_3d` scope with the
+    /// tile ring's outer radius; `0.0` (default) draws the whole skin.
+    pub fn set_skin_clip(&mut self, radius: f32) {
+        self.frame.eng.lists.skin_clip = radius.max(0.0);
+    }
+
+    pub fn draw_surface(&mut self, handle: SurfaceHandle, offset: Vec3, scale: f32) {
+        let Some(meta) = self.frame.eng.client.surface_meta(handle) else {
             return;
         };
+        let (aabb_min, aabb_max) = meta.aabb();
+        // Cull using the scaled AABB to avoid false culls at view edges.
+        if !self
+            .frustum
+            .intersects_aabb(aabb_min * scale + offset, aabb_max * scale + offset)
+        {
+            return;
+        }
+        self.frame.eng.lists.surface_draws.push(SurfaceDraw {
+            slot: handle.slot,
+            generation: handle.generation,
+            index_first: meta.index_first,
+            index_count: meta.index_count,
+            vertex_offset: meta.vertex_offset,
+            offset,
+            scale,
+        });
+    }
+
+    fn push_mesh(&mut self, handle: MeshHandle, offset: Vec3, scale: f32, biased: bool) {
+        let Some(meta) = self.frame.eng.client.mesh_meta(handle) else {
+            return;
+        };
+        let (aabb_min, aabb_max) = meta.aabb();
         // The scale must thread into the frustum test too: a scaled tile's
         // world AABB is `local * scale + offset`, and using the unscaled box
         // would mis-cull it near the view edges.
@@ -273,11 +368,18 @@ impl Frame3D<'_, '_> {
         {
             return;
         }
-        self.frame
-            .eng
-            .lists
-            .mesh_draws
-            .push((handle, offset, scale, biased));
+        self.frame.eng.lists.mesh_draws.push(MeshDraw {
+            slot: handle.slot,
+            generation: handle.generation,
+            aabb_min,
+            aabb_max,
+            bounds: meta.bounds,
+            vertex_offset: meta.vertex_offset,
+            pass: meta.pass,
+            offset,
+            scale,
+            biased,
+        });
     }
 
     /// Sets the sky lighting and fog applied to every mesh drawn this frame.

@@ -11,6 +11,8 @@ struct FragmentInput
     float2 ndc;
 };
 
+#include "warp.slang"
+
 struct PushConstants
 {
     float4x4 inv_view_proj; // camera rebased to origin: (ndc,0,1) → view ray
@@ -23,7 +25,7 @@ struct PushConstants
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc;
 
-// Cheap hash → [0,1); used only for sub-LSB dither, quality is irrelevant.
+// Cheap hash in range 0–1; used only for sub-LSB dither, quality is irrelevant.
 float hash12(float2 p)
 {
     float3 p3 = frac(float3(p.xyx) * 0.1031);
@@ -41,8 +43,10 @@ float3 srgbToLinear(float3 c)
 [shader("fragment")]
 float4 fragmentMain(FragmentInput input) : SV_Target
 {
-    // Reconstruct the world-space view ray.
-    float4 far = mul(pc.inv_view_proj, float4(input.ndc, 0.0, 1.0));
+    // Undo the terrain's high-FOV warp (zenith.w = strength) so each pixel's
+    // sky ray matches the warped terrain shown there, then reconstruct it.
+    float2 ndc = inverseWarpNdc(input.ndc, pc.zenith.w);
+    float4 far = mul(pc.inv_view_proj, float4(ndc, 0.0, 1.0));
     float3 ray = normalize(far.xyz);
 
     // CPU colours arrive sRGB-encoded; the sky composites in linear light
@@ -55,8 +59,8 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     float3 col = lerp(horizon, zenith, t);
 
     // Horizon glow banded toward the sun's azimuth, strongest at the horizon.
-    // The ray's horizontal component is deliberately NOT normalized: its length
-    // (cos of elevation) makes the glow fade toward the zenith AND the nadir,
+    // The ray's horizontal component is deliberately NOT normalized: its magnitude
+    // makes the glow fade toward the zenith AND the nadir,
     // and avoids normalize(0) when looking straight up/down. Normalizing it
     // kept the glow at full strength below the horizon, where a near-vertical
     // ray's azimuth swings wildly across neighbouring pixels — the smear

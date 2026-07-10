@@ -18,15 +18,17 @@ mod input;
 mod mesh;
 pub mod profile;
 mod screenshot;
+mod surface;
 mod vk;
 
-pub use camera::{Camera3D, Frustum, Z_NEAR, world_to_screen};
+pub use camera::{Camera3D, Frustum, WarpParams, Z_NEAR, world_to_screen};
 pub use color::Color;
 pub use engine::{Config, Engine, run};
 pub use frame::{Frame, Frame3D, SkyDesc};
 pub use glam::{DVec2, DVec3, IVec2, Mat3, Mat4, Vec2, Vec3};
 pub use input::{Key, MouseButton};
 pub use mesh::{Ao, DebugVertex, Light, MeshData, MeshHandle, MeshVertex, Normal, Pass};
+pub use surface::{SurfaceData, SurfaceHandle, SurfaceVertex};
 pub use vk::RENDER_SCALE_RANGE;
 
 /// Text metrics for the embedded font, usable without an [`Engine`].

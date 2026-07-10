@@ -18,7 +18,7 @@ use crate::vk::device::FragmentShadingRate;
 use crate::vk::vertex_input::{VertexInput, vertex_struct};
 
 pub const PUSH_BYTES_3D: u32 = size_of::<Mesh3dPush>() as u32; // view_proj + SkyLight
-pub const PUSH_BYTES_DEBUG: u32 = size_of::<Mat4>() as u32; // view_proj only (unlit)
+pub const PUSH_BYTES_DEBUG: u32 = size_of::<DebugPush>() as u32; // view_proj + warp
 pub const PUSH_BYTES_2D: u32 = size_of::<[f32; 2]>() as u32; // pixels_to_ndc
 pub const PUSH_BYTES_SKY: u32 = size_of::<SkyParams>() as u32; // full 128-byte sky block
 pub const PUSH_BYTES_TONEMAP: u32 = size_of::<f32>() as u32; // exposure
@@ -53,6 +53,19 @@ pub struct Mesh3dPush {
     pub sky: SkyLight,
 }
 
+/// The debug/immediate-geometry pipeline's push constant: the camera matrix
+/// plus the high-FOV warp so debug cubes/lines/decals stay registered with the
+/// warped terrain. `warp.x` is the cylindrical ratio (0 = linear); `.yzw` pad
+/// the struct to a clean 16-byte multiple (no bytemuck padding). Mirrors the
+/// `ambient.w` lane the mesh pipeline uses, kept in its own field here because
+/// the debug layout carries no `SkyLight`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DebugPush {
+    pub view_proj: Mat4,
+    pub warp: [f32; 4],
+}
+
 /// The sky background pass's push constant, exactly 128 bytes (the guaranteed
 /// `maxPushConstantsSize` minimum). Scalars ride in the `.w` lanes rather than
 /// adding fields. Composed by the engine at record time from a [`SkyDesc`];
@@ -68,7 +81,7 @@ pub struct SkyParams {
 }
 
 impl SkyParams {
-    pub fn compose(inv_view_proj: Mat4, desc: &SkyDesc) -> Self {
+    pub fn compose(inv_view_proj: Mat4, desc: &SkyDesc, cylindrical_ratio: f32) -> Self {
         let n = |c: crate::color::Color| [c.r, c.g, c.b].map(|v| v as f32 / 255.0);
         let s = desc.sun_dir.normalize_or_zero();
         let [zr, zg, zb] = n(desc.zenith);
@@ -78,7 +91,10 @@ impl SkyParams {
         Self {
             inv_view_proj,
             sun: [s.x, s.y, s.z, desc.exposure],
-            zenith: [zr, zg, zb, 0.0],
+            // zenith.w carries the high-FOV warp strength so the sky fragment
+            // can inverse-warp each NDC pixel before reconstructing its ray,
+            // keeping the sky registered with the warped terrain (0 = linear).
+            zenith: [zr, zg, zb, cylindrical_ratio],
             horizon: [hr, hg, hb, r.cos()],
             sun_tint: [tr, tg, tb, (r * 2.0).cos()],
         }
@@ -96,6 +112,8 @@ vertex_struct! {
 
 const MESH3D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d.vert.spv"));
 const MESH3D_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d.frag.spv"));
+const SURFACE3D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/surface3d.vert.spv"));
+const SURFACE3D_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/surface3d.frag.spv"));
 const DEBUG_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.vert.spv"));
 const DEBUG_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.frag.spv"));
 const TRIS2D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tris2d.vert.spv"));
@@ -128,8 +146,13 @@ pub struct Pipelines {
     /// coincident depth. Selected per-draw via `DrawEntry::biased`.
     pub mesh3d_biased: vk::Pipeline,
     /// Same vertex/fragment modules and `layout_3d` as `mesh3d`, but alpha
-    /// blends and reads (never writes) depth. Selected for [`Pass::Transparent`].
+    /// blends and reads (never writes) depth. Selected for [`Pass::Blend`].
     pub mesh3d_transparent: vk::Pipeline,
+    /// Retained colored-surface pipeline (Zone-3 far skin): `SurfaceVertex`
+    /// attributes, reuses `layout_3d` (per-draw offset SSBO + `Mesh3dPush` fog),
+    /// double-sided, VRS, biased deeper than `mesh3d_biased`. STAGE 1: `null`
+    /// until E1 builds it in Stage 2.
+    pub surface3d: vk::Pipeline,
     pub debug_tris: vk::Pipeline,
     /// Same debug modules/layout as `debug_tris`, but alpha blends and reads
     /// (never writes) depth — for translucent ground decals (contact shadows).
@@ -281,6 +304,8 @@ impl Pipelines {
 
         let mesh_vert = create_shader_module(device, MESH3D_VERT);
         let mesh_frag = create_shader_module(device, MESH3D_FRAG);
+        let surface_vert = create_shader_module(device, SURFACE3D_VERT);
+        let surface_frag = create_shader_module(device, SURFACE3D_FRAG);
         let debug_vert = create_shader_module(device, DEBUG_VERT);
         let debug_frag = create_shader_module(device, DEBUG_FRAG);
         let tri2d_vert = create_shader_module(device, TRIS2D_VERT);
@@ -329,8 +354,32 @@ impl Pipelines {
                 depth_bias: Some((-2.0, -1.0)),
             },
         );
-        // Transparent world geometry: same modules/layout, alpha blend, depth
-        // read-only (all opaque wrote depth first; water tests but never writes).
+        // Zone-3 far skin: unpacked colored surface, reuses `layout_3d` (per-draw
+        // offset SSBO + Mesh3dPush fog). Double-sided (cull NONE), biased deeper
+        // than mesh3d_biased so the skin always loses the depth test to chunks AND
+        // tiles at coincident depth, leaving it visible only where nothing drew.
+        let surface_bindings = [crate::surface::SurfaceVertex::binding()];
+        let surface_attributes = crate::surface::SurfaceVertex::ATTRIBUTES;
+        let surface3d = builder.build(
+            surface_vert,
+            surface_frag,
+            &surface_bindings,
+            surface_attributes,
+            layout_3d,
+            PipelineConfig {
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                depth: DepthMode::ReadWrite,
+                cull: vk::CullModeFlags::NONE,
+                blend: false,
+                vrs: true,
+                depth_bias: Some((-4.0, -2.0)),
+            },
+        );
+        // Blend world geometry: same modules/layout, alpha blend, depth read-only
+        // (all opaque wrote depth first; blend tests but never writes). Double-sided
+        // (cull NONE): the mesher emits translucent bodies as open shells (interior
+        // and against-opaque faces culled), so a single kept face — e.g. a water
+        // surface — must show from both sides, notably from underwater.
         let mesh3d_transparent = builder.build(
             mesh_vert,
             mesh_frag,
@@ -340,7 +389,7 @@ impl Pipelines {
             PipelineConfig {
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 depth: DepthMode::ReadOnly,
-                cull: vk::CullModeFlags::BACK,
+                cull: vk::CullModeFlags::NONE,
                 blend: true,
                 vrs: true,
                 depth_bias: None,
@@ -477,6 +526,8 @@ impl Pipelines {
             device.destroy_shader_module(tonemap_vert, None);
             device.destroy_shader_module(mesh_vert, None);
             device.destroy_shader_module(mesh_frag, None);
+            device.destroy_shader_module(surface_vert, None);
+            device.destroy_shader_module(surface_frag, None);
             device.destroy_shader_module(debug_vert, None);
             device.destroy_shader_module(debug_frag, None);
             device.destroy_shader_module(tri2d_vert, None);
@@ -496,6 +547,7 @@ impl Pipelines {
             mesh3d,
             mesh3d_biased,
             mesh3d_transparent,
+            surface3d,
             debug_tris,
             debug_tris_blend,
             debug_lines,
@@ -515,7 +567,10 @@ impl Pipelines {
     pub fn pipeline_for(&self, pass: Pass) -> vk::Pipeline {
         match pass {
             Pass::Opaque => self.mesh3d,
-            Pass::Transparent => self.mesh3d_transparent,
+            // Reserved: shares the opaque pipeline (depth write, cull back) until a
+            // `discard` frag variant lands. Sound because nothing emits Cutout yet.
+            Pass::Cutout => self.mesh3d,
+            Pass::Blend => self.mesh3d_transparent,
         }
     }
 
@@ -530,6 +585,8 @@ impl Pipelines {
             device.destroy_pipeline(self.mesh3d, None);
             device.destroy_pipeline(self.mesh3d_biased, None);
             device.destroy_pipeline(self.mesh3d_transparent, None);
+            // `null` in Stage 1 (destroying VK_NULL_HANDLE is a documented no-op).
+            device.destroy_pipeline(self.surface3d, None);
             device.destroy_pipeline(self.debug_tris, None);
             device.destroy_pipeline(self.debug_tris_blend, None);
             device.destroy_pipeline(self.debug_lines, None);

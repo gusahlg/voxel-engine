@@ -9,7 +9,7 @@
 /// Keys: F fullscreen, V vsync, M cycle MSAA, Esc quit.
 use voxel_engine::{
     Ao, Camera3D, Color, Config, Key, Light, MeshData, MeshHandle, MeshVertex, Normal, Pass,
-    SkyDesc, Vec3,
+    SkyDesc, SurfaceData, SurfaceHandle, SurfaceVertex, Vec3,
 };
 
 const CHUNK: u8 = 16;
@@ -112,7 +112,7 @@ fn build_chunk() -> MeshData {
 /// lifted to `WATER_LEVEL` by the per-draw offset. Drawn after all opaque
 /// geometry so it blends over the terrain.
 fn build_water() -> MeshData {
-    let mut data = MeshData::new(Pass::Transparent);
+    let mut data = MeshData::new(Pass::Blend);
     push_quad(
         &mut data,
         [[0, 0, 0], [0, 0, CHUNK], [CHUNK, 0, CHUNK], [CHUNK, 0, 0]],
@@ -145,12 +145,51 @@ fn block_texture_layers(size: u32) -> Vec<Vec<u8>> {
     vec![white, checker, water]
 }
 
+/// Surface-lane smoke test: a small grey heightfield patch built from the
+/// retained colored-surface API (`SurfaceVertex` + `SurfaceData::quad`). Exists
+/// only to exercise the Zone-3 far-skin lane end to end in the demo binary —
+/// upload, AABB query, and per-frame `draw_surface`. A 3×3 grid of unit cells
+/// with a shallow sine bump, all flat grey.
+fn build_surface() -> SurfaceData {
+    const N: i32 = 3;
+    const GREY: [u8; 4] = [128, 128, 128, 255];
+    let h = |x: i32, z: i32| ((x as f32 * 0.7).sin() + (z as f32 * 0.7).cos()) * 0.5;
+    let mut data = SurfaceData::new();
+    for x in 0..N {
+        for z in 0..N {
+            let corner = |cx: i32, cz: i32| SurfaceVertex {
+                pos: [cx as f32, h(cx, cz), cz as f32],
+                color: GREY,
+            };
+            // CCW seen from above (+Y up).
+            data.quad([
+                corner(x, z),
+                corner(x, z + 1),
+                corner(x + 1, z + 1),
+                corner(x + 1, z),
+            ]);
+        }
+    }
+    data
+}
+
 fn main() {
     env_logger::init();
 
     let mut chunk: Option<MeshHandle> = None;
     let mut water: Option<MeshHandle> = None;
+    let mut surface: Option<SurfaceHandle> = None;
     let mut angle = 0.0f32;
+    // High-FOV cylindrical warp strength, cycled with G. Seeded from VOXEL_WARP
+    // so headless screenshot runs can pick a value without a keypress.
+    let mut warp_ratio: f32 = std::env::var("VOXEL_WARP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    // VOXEL_AUTOSHOT=1: grab one screenshot after warm-up, then quit — used to
+    // verify the warp offscreen. Off by default (interactive run).
+    let autoshot = std::env::var("VOXEL_AUTOSHOT").is_ok();
+    let mut frame_n: u32 = 0;
 
     voxel_engine::run(
         Config {
@@ -162,6 +201,20 @@ fn main() {
         move |eng| {
             if eng.should_close() || eng.is_key_pressed(Key::Escape) {
                 return false;
+            }
+            // Headless verification: request a capture of the settled scene
+            // (queued now, written when this frame submits), then quit shortly
+            // after. `eng` is unborrowed here, before `begin_frame`.
+            frame_n += 1;
+            if autoshot {
+                if frame_n == 30 {
+                    if let Some(p) = eng.screenshot() {
+                        log::info!("autoshot -> {}", p.display());
+                    }
+                }
+                if frame_n >= 36 {
+                    return false;
+                }
             }
             if eng.is_key_pressed(Key::F) {
                 let now = !eng.fullscreen();
@@ -183,11 +236,28 @@ fn main() {
                 let now = !eng.cull_faces();
                 eng.set_cull_faces(now);
             }
+            if eng.is_key_pressed(Key::G) {
+                // Cycle 0 → 0.5 → 1.0 → 0 …
+                warp_ratio = match warp_ratio {
+                    r if r < 0.25 => 0.5,
+                    r if r < 0.75 => 1.0,
+                    _ => 0.0,
+                };
+            }
 
             if chunk.is_none() {
                 eng.set_block_textures(16, &block_texture_layers(16));
                 chunk = Some(eng.upload_mesh(&build_chunk()).expect("chunk upload"));
                 water = Some(eng.upload_mesh(&build_water()).expect("water upload"));
+                // Surface-lane smoke test: upload the grey patch and assert its
+                // GPU AABB comes back finite before we ever try to draw it.
+                let handle = eng.upload_surface(&build_surface()).expect("surface upload");
+                let (lo, hi) = eng.surface_aabb(handle).expect("surface aabb");
+                assert!(
+                    lo.is_finite() && hi.is_finite(),
+                    "surface aabb must be finite: {lo:?}..{hi:?}"
+                );
+                surface = Some(handle);
             }
 
             angle += eng.frame_time() * 0.4;
@@ -197,6 +267,7 @@ fn main() {
                 target: center + Vec3::new(0.0, 8.0, 0.0),
                 up: Vec3::Y,
                 fovy: 70.0,
+                warp: voxel_engine::WarpParams::new(warp_ratio),
             };
 
             let vsync = eng.vsync();
@@ -249,6 +320,12 @@ fn main() {
                         }
                     }
                 }
+                // Surface-lane smoke test: record the grey patch each frame so
+                // the retained colored-surface path (upload → cull → draw) is
+                // covered by a demo run. Offset it clear of the chunk grid.
+                if let Some(handle) = surface {
+                    f3.draw_surface(handle, Vec3::new(0.0, 2.0, -6.0), 1.0);
+                }
                 f3.draw_cube(
                     center + Vec3::new(0.0, 10.0, 0.0),
                     Vec3::splat(2.0),
@@ -270,7 +347,7 @@ fn main() {
                 Color::RAYWHITE,
             );
             frame.draw_text(
-                "F fullscreen  V vsync  M msaa  C cull  Esc quit",
+                &format!("F fullscreen  V vsync  M msaa  C cull  G warp {warp_ratio:.1}  Esc quit"),
                 16,
                 60,
                 16,

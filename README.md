@@ -5,7 +5,7 @@ library with a raylib-shaped polling API. Written to power
 [project_watt_cubed](../project_watt_cubed), usable by any voxel game.
 
 ```rust
-use voxel_engine::{run, Config, Camera3D, Color, Key, Vec3};
+use voxel_engine::{run, Config, Camera3D, Color, Key, Vec3, WarpParams};
 
 fn main() {
     voxel_engine::run(Config::default(), move |eng| {
@@ -13,7 +13,8 @@ fn main() {
             return false;
         }
         let cam = Camera3D { position: Vec3::new(0.0, 10.0, 20.0),
-                             target: Vec3::ZERO, up: Vec3::Y, fovy: 70.0 };
+                             target: Vec3::ZERO, up: Vec3::Y, fovy: 70.0,
+                             warp: WarpParams::IDENTITY };
         let mut f = eng.begin_frame(Color::SKYBLUE);
         {
             let mut f3 = f.begin_3d(&cam);

@@ -108,7 +108,13 @@ impl RenderTargets {
             )
         });
 
-        let vrs = fsr.map(|f| super::vrs::Vrs::new(device, &memory_props, f, extent));
+        // Variable-rate shading is opt-in: `VOXEL_VRS=1` enables it where the
+        // hardware supports it. Otherwise the rate image is never allocated, so
+        // `do_vrs` (which gates on `targets.vrs.is_some()`) stays false and the
+        // full-rate path runs.
+        let vrs = fsr
+            .filter(|_| matches!(std::env::var("VOXEL_VRS").as_deref(), Ok("1")))
+            .map(|f| super::vrs::Vrs::new(device, &memory_props, f, extent));
 
         Self {
             depth,

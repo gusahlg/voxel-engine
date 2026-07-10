@@ -13,6 +13,7 @@ pub(crate) mod image_upload;
 pub(crate) mod instance;
 pub(crate) mod minimap;
 pub(crate) mod pipeline;
+pub(crate) mod render_client;
 pub(crate) mod swapchain;
 pub(crate) mod targets;
 pub(crate) mod texture;
@@ -20,16 +21,20 @@ pub(crate) mod timeline;
 pub(crate) mod vertex_input;
 pub(crate) mod vrs;
 
+use std::num::NonZeroU32;
+use std::sync::mpsc::Sender;
+
 use ash::{khr, vk};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use winit::event_loop::ActiveEventLoop;
 
 use crate::frame::DrawLists;
-use crate::mesh::{MeshData, MeshHandle, Pass};
-use alloc::GpuAllocator;
+use crate::mesh::Pass;
 use block_textures::BlockTextures;
-use buffers::{DrawIndexedIndirect, DrawOffset, FRAMES_IN_FLIGHT, HostBuffer, MeshRegistry};
+use buffers::{
+    DrawIndexedIndirect, DrawOffset, FRAMES_IN_FLIGHT, GpuResident, HostBuffer, MeshResidency,
+    SurfaceResidency,
+};
 use device::Device;
+use render_client::{DeviceCaps, DeviceLeftovers, InitReply, RenderConfig, RenderReturn};
 use instance::InstanceBundle;
 use minimap::MinimapTexture;
 use pipeline::Pipelines;
@@ -111,6 +116,19 @@ struct DrawEntry {
     dist2: f32,
 }
 
+/// One resolved surface draw (handle → GpuSurface), copied out so the
+/// `surfaces` borrow is released before the shared command/offset buffers are
+/// mutated. Always opaque, one index range, camera-relative offset + scale.
+#[derive(Clone, Copy)]
+struct SurfaceEntry {
+    buffer: vk::Buffer,
+    first: u32,
+    count: u32,
+    vertex_offset: i32,
+    offset: glam::Vec3,
+    scale: f32,
+}
+
 /// A contiguous range of indirect commands sharing one arena buffer AND one
 /// pass: one pipeline bind (on pass change) + one vertex/index bind + one
 /// indirect call each.
@@ -168,15 +186,23 @@ fn contiguous_runs(vis: [bool; 6]) -> ([(u8, u8); 3], usize) {
 pub(crate) const MINIMAP_SIZE: u32 = 256;
 
 pub(crate) struct Renderer {
-    pub window: winit::window::Window,
-
     instance: InstanceBundle,
     surface_loader: khr::surface::Instance,
     surface: vk::SurfaceKHR,
     device: Device,
 
-    allocator: GpuAllocator,
-    meshes: MeshRegistry,
+    /// Render-side residency mirrors (device buffers, staged copies, retire).
+    /// Fed by the ordered command stream; freed allocations return to main.
+    mesh_res: MeshResidency,
+    /// Retained colored surfaces (Zone-3 far grey skin), drawn through the
+    /// `surface3d` lane. Shares the offsets SSBO + indirect buffers with meshes.
+    surface_res: SurfaceResidency,
+    /// Returns freed allocations (freelist recycling) to the main-owned
+    /// allocator. The render loop uses its own clone for frame-buffer recycling.
+    ret: Sender<RenderReturn>,
+    /// Window/present size, updated by `RenderCmd::Resize` — replaces the old
+    /// `window.inner_size()` reads now the window lives on main.
+    size: vk::Extent2D,
 
     swapchain: Swapchain,
     targets: RenderTargets,
@@ -186,6 +212,10 @@ pub(crate) struct Renderer {
     pipeline_cache: vk::PipelineCache,
     atlas: FontAtlas,
     block_textures: BlockTextures,
+    /// Old block-texture arrays retired on palette growth, destroyed once the
+    /// timeline proves every in-flight frame that could sample them is done —
+    /// avoids a load-time `device_wait_idle` stall (mirrors the mesh retire path).
+    retired_textures: buffers::RetireQueue<BlockTextures>,
     /// The minimap texture (per-slot double buffer), sampled by `tris2d_tex`.
     minimap: MinimapTexture,
 
@@ -215,6 +245,11 @@ pub(crate) struct Renderer {
     draw_commands: Vec<DrawIndexedIndirect>,
     /// Frame scratch: one entry per (pass, arena) group with visible draws.
     draw_runs: Vec<DrawRun>,
+    /// Frame scratch: resolved surface draws (handle → GpuSurface), in the order
+    /// the app recorded them. Cleared each frame.
+    surface_scratch: Vec<SurfaceEntry>,
+    /// Frame scratch: contiguous runs of surface commands keyed by surface buffer.
+    surface_runs: Vec<DrawRun>,
 
     /// Opt-in six-way face culling. Off (default) → one draw per mesh, byte
     /// identical to a single coalesced run. On → per-mesh, the ≤3 maximal
@@ -275,66 +310,43 @@ struct Readback {
 }
 
 impl Renderer {
-    pub fn new(
-        event_loop: &ActiveEventLoop,
-        title: &str,
-        width: u32,
-        height: u32,
-        resizable: bool,
-        fullscreen: bool,
-        vsync: bool,
-        msaa: u32,
-        render_scale: f32,
-    ) -> Self {
+    /// Builds the renderer ON the render thread from the main-created instance +
+    /// surface (a `!Send` window handle never crosses). Returns the renderer and
+    /// the [`InitReply`] main uses to build its allocator. The window itself
+    /// stays on main.
+    pub(crate) fn build(
+        instance: InstanceBundle,
+        surface_loader: khr::surface::Instance,
+        surface: vk::SurfaceKHR,
+        cfg: RenderConfig,
+        ret: Sender<RenderReturn>,
+    ) -> (Self, InitReply) {
+        let RenderConfig {
+            vsync,
+            msaa,
+            render_scale,
+            size: win_size,
+            present_interval,
+        } = cfg;
         let render_scale = Scale::new(render_scale).as_f32();
-        let mut attrs = winit::window::WindowAttributes::default()
-            .with_title(title)
-            .with_inner_size(winit::dpi::LogicalSize::new(width, height))
-            .with_resizable(resizable);
-        if fullscreen {
-            attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
-        }
-        let window = event_loop
-            .create_window(attrs)
-            .expect("Failed to create window");
-
-        let instance = InstanceBundle::new(
-            event_loop
-                .display_handle()
-                .expect("no display handle")
-                .as_raw(),
-        );
-
-        let surface_loader = khr::surface::Instance::new(&instance.entry, &instance.instance);
-        let surface = unsafe {
-            ash_window::create_surface(
-                &instance.entry,
-                &instance.instance,
-                window.display_handle().unwrap().as_raw(),
-                window.window_handle().unwrap().as_raw(),
-                None,
-            )
-            .expect("Failed to create Vulkan surface")
-        };
 
         let device = Device::new(&instance.instance, &surface_loader, surface);
-        let allocator =
-            unsafe { GpuAllocator::new(&instance.instance, device.physical, device.memory_budget) };
-        if allocator.unified_memory() {
-            log::info!("Unified memory detected: mesh uploads bypass staging");
-        }
-        let meshes = MeshRegistry::new();
+        // The block-suballocating allocator lives on MAIN; the render side only
+        // installs pre-built residents. Mesh uploads bypass staging on unified
+        // memory (logged main-side is fine, but keep the hint here too).
+        let mesh_res = MeshResidency::new();
+        let surface_res = SurfaceResidency::new();
 
-        let size = window.inner_size();
+        let size = vk::Extent2D {
+            width: win_size.width,
+            height: win_size.height,
+        };
         let swapchain = Swapchain::new(
             &instance.instance,
             &device,
             &surface_loader,
             surface,
-            vk::Extent2D {
-                width: size.width,
-                height: size.height,
-            },
+            size,
             vsync,
             vk::SwapchainKHR::null(),
         );
@@ -417,7 +429,6 @@ impl Renderer {
             .collect();
 
         let present_semaphores = create_present_semaphores(&device.device, swapchain.images.len());
-        let present_interval = display_refresh_interval(&window);
         let imm = std::array::from_fn(|_| HostBuffer::new(vk::BufferUsageFlags::VERTEX_BUFFER));
         let offsets =
             std::array::from_fn(|_| HostBuffer::new(vk::BufferUsageFlags::STORAGE_BUFFER));
@@ -430,20 +441,33 @@ impl Renderer {
             device.timestamp_period_ns,
         );
 
-        Self {
-            window,
+        let caps = DeviceCaps {
+            max_msaa: device.max_msaa(),
+        };
+        let reply = InitReply {
+            instance: instance.instance.clone(),
+            physical: device.physical,
+            memory_budget: device.memory_budget,
+            device: device.device.clone(),
+            caps,
+        };
+
+        let renderer = Self {
             instance,
             surface_loader,
             surface,
             device,
-            allocator,
-            meshes,
+            mesh_res,
+            surface_res,
+            ret,
+            size,
             swapchain,
             targets,
             pipelines,
             pipeline_cache,
             atlas,
             block_textures: block_tex,
+            retired_textures: buffers::RetireQueue::new(),
             minimap,
             frames,
             present_semaphores,
@@ -456,6 +480,8 @@ impl Renderer {
             cull_faces: false,
             draw_commands: Vec::new(),
             draw_runs: Vec::new(),
+            surface_scratch: Vec::new(),
+            surface_runs: Vec::new(),
             copy_cmd,
             timeline,
             last_copy_value: TimelineValue::START,
@@ -472,25 +498,27 @@ impl Renderer {
             last_present: std::time::Instant::now(),
             present_interval,
             gpu_timer,
-        }
+        };
+        (renderer, reply)
     }
 
-    pub fn extent(&self) -> vk::Extent2D {
-        self.swapchain.extent
-    }
-
-    pub fn request_recreate(&mut self) {
+    /// Updates the present size from a resize event and flags a swapchain rebuild.
+    pub(crate) fn on_resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        self.size = vk::Extent2D {
+            width: size.width,
+            height: size.height,
+        };
         self.needs_recreate = true;
     }
+
+    // Setters are driven by the ordered command stream (`RenderCmd`); the
+    // matching getters live on `RenderClient`, which caches the requested state
+    // main-side, so the renderer exposes no getters of its own.
 
     pub fn set_vsync(&mut self, on: bool) {
         if self.vsync.set(on) {
             self.needs_recreate = true;
         }
-    }
-
-    pub fn vsync(&self) -> bool {
-        self.vsync.effective()
     }
 
     pub fn set_msaa(&mut self, samples: u32) -> u32 {
@@ -501,20 +529,8 @@ impl Renderer {
         resolved.as_u32()
     }
 
-    pub fn msaa(&self) -> u32 {
-        self.msaa.effective().as_u32()
-    }
-
-    pub fn max_msaa(&self) -> u32 {
-        self.device.max_msaa()
-    }
-
     pub fn set_cull_faces(&mut self, on: bool) {
         self.cull_faces = on;
-    }
-
-    pub fn cull_faces(&self) -> bool {
-        self.cull_faces
     }
 
     /// Requests a render-resolution scale; returns the clamped value that
@@ -528,19 +544,37 @@ impl Renderer {
         clamped
     }
 
-    pub fn render_scale(&self) -> f32 {
-        self.render_scale.effective()
+    /// Installs a main-built mesh resident into the residency mirror (from the
+    /// ordered command stream). Identity/meta live on main; the mirror carries
+    /// only the device buffer + staged copy.
+    pub(crate) fn apply_upload_mesh(
+        &mut self,
+        slot: u32,
+        generation: NonZeroU32,
+        resident: GpuResident,
+    ) {
+        self.mesh_res.apply_upload(slot, generation, resident);
     }
 
-    pub fn upload_mesh(&mut self, data: &MeshData) -> Option<MeshHandle> {
-        unsafe {
-            self.meshes
-                .upload(&self.device.device, &mut self.allocator, data)
-        }
+    /// Retires a mesh resident past the latest submitted timeline value. The
+    /// render thread stamps `done_at` here (main has no timeline to read).
+    pub(crate) fn apply_free_mesh(&mut self, slot: u32, generation: NonZeroU32) {
+        self.mesh_res
+            .apply_free(slot, generation, self.last_render_value);
     }
 
-    pub fn free_mesh(&mut self, handle: MeshHandle) {
-        self.meshes.free(handle, self.last_render_value);
+    pub(crate) fn apply_upload_surface(
+        &mut self,
+        slot: u32,
+        generation: NonZeroU32,
+        resident: GpuResident,
+    ) {
+        self.surface_res.apply_upload(slot, generation, resident);
+    }
+
+    pub(crate) fn apply_free_surface(&mut self, slot: u32, generation: NonZeroU32) {
+        self.surface_res
+            .apply_free(slot, generation, self.last_render_value);
     }
 
     /// Requests that the next presented frame be saved to `path` as a PNG.
@@ -551,23 +585,14 @@ impl Renderer {
         self.pending_screenshot = Some(path);
     }
 
-    pub fn mesh_aabb(&self, handle: MeshHandle) -> Option<(glam::Vec3, glam::Vec3)> {
-        self.meshes.get(handle).map(|m| m.aabb())
-    }
-
     /// Replaces the block texture array (RGBA8, `layers.len()` images of
-    /// `size*size*4` bytes each). Rare operation: waits for the GPU to go idle
-    /// (in-flight frames pushed the old image) before destroying the old
-    /// array, then uploads the new one — pipelines and descriptors untouched,
-    /// since the current texture is pushed afresh each frame.
+    /// `size*size*4` bytes each). Rare operation: the new array is uploaded and
+    /// swapped in immediately, and the old array is retired through the timeline
+    /// (destroyed once every in-flight frame that could sample it is done),
+    /// avoiding a load-time `device_wait_idle` stall — pipelines and descriptors
+    /// untouched, since the current texture is pushed afresh each frame.
     pub fn set_block_textures(&mut self, size: u32, layers: &[Vec<u8>]) {
-        unsafe {
-            self.device
-                .device
-                .device_wait_idle()
-                .expect("device_wait_idle failed");
-        }
-        // Build new array before destroying old to avoid double-free on panic.
+        // Build new array before swapping out old to avoid double-free on panic.
         let new_textures = BlockTextures::upload(
             &self.instance.instance,
             &self.device.device,
@@ -578,10 +603,11 @@ impl Renderer {
             size,
             layers,
         );
-        let mut old_textures = std::mem::replace(&mut self.block_textures, new_textures);
-        unsafe {
-            old_textures.destroy(&self.device.device);
-        }
+        let old_textures = std::mem::replace(&mut self.block_textures, new_textures);
+        // The old array may still be sampled by frames already submitted; retire
+        // it past the highest reserved timeline value so it outlives them.
+        let done_at = self.timeline.last_reserved();
+        self.retired_textures.push(done_at, old_textures);
         log::debug!(
             "block textures swapped: {} layers of {}x{}",
             self.block_textures.layers,
@@ -607,8 +633,8 @@ impl Renderer {
     /// 4. [`Self::record_render`]         — barriers, rendering, draws
     /// 5. [`Self::submit_render`]         — render queue submit (fence)
     /// 6. [`Self::present`]               — copy submit + queue_present
-    pub fn draw_frame(&mut self, lists: &DrawLists) {
-        let size = self.window.inner_size();
+    pub(crate) fn draw_frame(&mut self, lists: &DrawLists) {
+        let size = self.size;
         if size.width == 0 || size.height == 0 {
             // Minimized: no rendering, but the game keeps running (remote
             // edits keep remeshing chunks), so uploads and frees must not
@@ -681,8 +707,15 @@ impl Renderer {
         unsafe {
             self.timeline.wait(device, self.frames[slot].render_value);
             let current = self.timeline.counter(device);
-            self.meshes.collect(&mut self.allocator, current);
-            self.allocator.shrink_staging(device);
+            // Retired allocations return to the main-owned allocator freelist;
+            // staging-block shrink happens main-side after it reclaims them.
+            let ret = &self.ret;
+            self.mesh_res
+                .collect(current, &mut |a| drop(ret.send(RenderReturn::FreeAlloc(a))));
+            self.surface_res
+                .collect(current, &mut |a| drop(ret.send(RenderReturn::FreeAlloc(a))));
+            self.retired_textures
+                .collect(current, |mut tex| tex.destroy(device));
         }
     }
 
@@ -800,16 +833,20 @@ impl Renderer {
         self.draw_offsets_data.clear();
         self.draw_commands.clear();
         self.draw_runs.clear();
+        self.surface_scratch.clear();
+        self.surface_runs.clear();
 
         if lists.has_3d {
-            for &(handle, offset, scale, biased) in &lists.mesh_draws {
-                let Some(mesh) = self.meshes.get(handle) else {
+            for d in &lists.mesh_draws {
+                // Gen-checked resolve against the residency mirror: Option-skip a
+                // stale snapshot referencing a since-freed/realloc'd slot.
+                let Some(buffer) = self.mesh_res.resolve(d) else {
                     continue;
                 };
-                let buffer = mesh.buffer();
-                let pass = mesh.pass();
-                let vertex_offset = mesh.vertex_offset();
-                let (amin, amax) = mesh.aabb();
+                let (offset, scale, biased) = (d.offset, d.scale, d.biased);
+                let (pass, vertex_offset) = (d.pass, d.vertex_offset);
+                let (amin, amax) = (d.aabb_min, d.aabb_max);
+                let bounds = d.bounds;
                 let center = offset + (amin + amax) * 0.5 * scale;
                 let dist2 = (center - lists.cam_pos).length_squared();
                 let mut emit = |range: std::ops::Range<u32>| {
@@ -835,24 +872,25 @@ impl Renderer {
                     let vis = visible_dirs(cam_local, amin * scale, amax * scale);
                     let (runs, n) = contiguous_runs(vis);
                     for &(start, end) in &runs[..n] {
-                        emit(mesh.run_range(start as usize, end as usize));
+                        emit(bounds[start as usize]..bounds[end as usize]);
                     }
                 } else {
-                    emit(mesh.all_range());
+                    emit(bounds[0]..bounds[6]);
                 }
             }
             self.draw_scratch.sort_unstable_by(|a, b| {
                 a.pass
-                    .cmp(&b.pass) // opaque prefix, transparent suffix (unchanged invariant)
+                    .cmp(&b.pass) // opaque prefix, transparent suffix
                     // Non-biased opaque (full-res chunks) before biased (far-LOD
                     // tiles): chunks fill depth first so the tile backdrop is
                     // early-Z rejected where it's occluded.
                     .then_with(|| a.biased.cmp(&b.biased))
                     .then_with(|| match a.pass {
-                        // Opaque near→far: reversed-Z early-Z rejects occluded fragments.
-                        Pass::Opaque => a.dist2.total_cmp(&b.dist2),
-                        // Transparent far→near: correct back-to-front alpha compositing.
-                        Pass::Transparent => b.dist2.total_cmp(&a.dist2),
+                        // Opaque/cutout near→far: reversed-Z early-Z rejects occluded
+                        // fragments (both write depth).
+                        Pass::Opaque | Pass::Cutout => a.dist2.total_cmp(&b.dist2),
+                        // Blend far→near: correct back-to-front alpha compositing.
+                        Pass::Blend => b.dist2.total_cmp(&a.dist2),
                     })
                     // Deterministic tiebreak; keeps equidistant same-arena draws batched.
                     .then_with(|| a.buffer.as_raw().cmp(&b.buffer.as_raw()))
@@ -885,6 +923,52 @@ impl Renderer {
                         buffer: entry.buffer,
                         pass: entry.pass,
                         biased: entry.biased,
+                        first: command_index,
+                        count: 1,
+                    }),
+                }
+            }
+
+            // Resolve the surface lane (Zone-3 far skin). Frustum culling already
+            // happened app-side; here just resolve handle→GpuSurface (skip if
+            // missing) and copy out the fields so the `surfaces` borrow is
+            // released before the shared command/offset buffers are mutated.
+            for d in &lists.surface_draws {
+                let Some(buffer) = self.surface_res.resolve(d) else {
+                    continue;
+                };
+                self.surface_scratch.push(SurfaceEntry {
+                    buffer,
+                    first: d.index_first,
+                    count: d.index_count,
+                    vertex_offset: d.vertex_offset,
+                    offset: d.offset,
+                    scale: d.scale,
+                });
+            }
+            // Append surface offsets AND commands to the SAME host buffers AFTER
+            // the voxel ones so the addressing scheme stays consistent. Runs are keyed by surface buffer.
+            for entry in &self.surface_scratch {
+                let ssbo_slot = self.draw_offsets_data.len() as u32;
+                let command_index = self.draw_commands.len() as u32;
+                debug_assert_eq!(ssbo_slot, command_index, "offset slot must track command");
+                self.draw_offsets_data.push(DrawOffset {
+                    offset: entry.offset.to_array(),
+                    scale: entry.scale,
+                });
+                self.draw_commands.push(DrawIndexedIndirect {
+                    index_count: entry.count,
+                    instance_count: 1,
+                    first_index: entry.first,
+                    vertex_offset: entry.vertex_offset,
+                    first_instance: ssbo_slot,
+                });
+                match self.surface_runs.last_mut() {
+                    Some(run) if run.buffer == entry.buffer => run.count += 1,
+                    _ => self.surface_runs.push(DrawRun {
+                        buffer: entry.buffer,
+                        pass: Pass::Opaque,
+                        biased: false,
                         first: command_index,
                         count: 1,
                     }),
@@ -952,7 +1036,8 @@ impl Renderer {
                 .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
                 .expect("begin command buffer failed");
 
-            self.meshes.flush_copies(device, cmd, done_at);
+            self.mesh_res.flush_copies(device, cmd, done_at);
+            self.surface_res.flush_copies(device, cmd, done_at);
             // Upload this slot's minimap texture (if its version is stale) on the
             // live frame command buffer, before the render pass begins.
             self.minimap.sync(device, cmd, slot);
@@ -982,7 +1067,13 @@ impl Renderer {
             // mesh run tests against it.
             unsafe {
                 pass.record_mesh_indirect(Pass::Opaque);
+                // Cutout writes depth like opaque, so it belongs in the opaque
+                // prefix (before sky). Dormant until a block emits it.
+                pass.record_mesh_indirect(Pass::Cutout);
                 stamp(GpuPass::Opaque);
+                // Zone-3 far skin: after chunks/tiles laid opaque depth (they
+                // early-Z the hidden parts), before sky fills behind the edge.
+                pass.record_surface_indirect();
                 // Sky fills the background (uncovered pixels) right after opaque
                 // depth is laid down. It must precede the immediate debug
                 // cubes/lines: the highlight lines are depth read-only (no depth
@@ -999,7 +1090,7 @@ impl Renderer {
                 // depth just laid down, before transparent water.
                 pass.record_shadows();
                 stamp(GpuPass::Shadows);
-                pass.record_mesh_indirect(Pass::Transparent);
+                pass.record_mesh_indirect(Pass::Blend);
                 stamp(GpuPass::Transparent);
             }
         }
@@ -1489,7 +1580,11 @@ impl Renderer {
     /// in-flight fences, flushes any staged mesh copies with a standalone
     /// submit, and frees the whole retire queue.
     unsafe fn reclaim_while_idle(&mut self) {
-        if !self.meshes.has_pending() && !self.meshes.has_garbage() {
+        if !self.mesh_res.has_pending()
+            && !self.mesh_res.has_garbage()
+            && !self.surface_res.has_pending()
+            && !self.surface_res.has_garbage()
+        {
             return;
         }
         let device = &self.device.device;
@@ -1498,7 +1593,7 @@ impl Renderer {
             self.timeline.wait(device, self.timeline.last_reserved());
             self.copy_slot = None;
 
-            if self.meshes.has_pending() {
+            if self.mesh_res.has_pending() || self.surface_res.has_pending() {
                 // Reuse slot 0's command buffer.
                 let cmd = self.frames[0].cmd;
                 device
@@ -1509,7 +1604,9 @@ impl Renderer {
                 device
                     .begin_command_buffer(cmd, &begin)
                     .expect("begin command buffer failed");
-                self.meshes
+                self.mesh_res
+                    .flush_copies(device, cmd, self.last_render_value);
+                self.surface_res
                     .flush_copies(device, cmd, self.last_render_value);
                 device
                     .end_command_buffer(cmd)
@@ -1524,8 +1621,12 @@ impl Renderer {
                     .expect("queue wait failed");
             }
 
-            // GPU idle + copies flushed: everything retired is reclaimable.
-            self.meshes.collect_all(&mut self.allocator);
+            // GPU idle + copies flushed: everything retired returns to main.
+            let ret = &self.ret;
+            self.mesh_res
+                .collect_all(&mut |a| drop(ret.send(RenderReturn::FreeAlloc(a))));
+            self.surface_res
+                .collect_all(&mut |a| drop(ret.send(RenderReturn::FreeAlloc(a))));
         }
     }
 
@@ -1537,7 +1638,7 @@ impl Renderer {
                 .device_wait_idle()
                 .expect("device_wait_idle failed");
 
-            let size = self.window.inner_size();
+            let size = self.size;
             if size.width == 0 || size.height == 0 {
                 // Still minimized: can't rebuild swapchain yet.
                 return;
@@ -1551,10 +1652,7 @@ impl Renderer {
                 &self.device,
                 &self.surface_loader,
                 self.surface,
-                vk::Extent2D {
-                    width: size.width,
-                    height: size.height,
-                },
+                size,
                 self.vsync.effective(),
                 self.swapchain.swapchain,
             );
@@ -1602,7 +1700,6 @@ impl Renderer {
             self.present_semaphores =
                 create_present_semaphores(&self.device.device, self.swapchain.images.len());
 
-            self.present_interval = display_refresh_interval(&self.window);
             self.needs_recreate = false;
         }
     }
@@ -1811,10 +1908,13 @@ impl<'a> RenderPass<'a> {
     unsafe fn bind_mesh3d_state(&self) {
         let r = self.r;
         let cmd = self.cmd;
-        let push = pipeline::Mesh3dPush {
+        let mut push = pipeline::Mesh3dPush {
             view_proj: self.lists.view_proj,
             sky: self.lists.sky_light,
         };
+        // High-FOV warp strength rides the unused `ambient.w` lane (see
+        // camera::WarpParams); the vertex shader applies it, 0.0 = linear.
+        push.sky.ambient[3] = self.lists.warp.cylindrical_ratio;
         unsafe {
             r.device.device.cmd_push_constants(
                 cmd,
@@ -1906,17 +2006,106 @@ impl<'a> RenderPass<'a> {
         }
     }
 
+    /// Issues the retained colored-surface draws (Zone-3 far skin) through the
+    /// `surface3d` pipeline. Reuses `layout_3d` state via [`bind_mesh3d_state`]
+    /// (valid because `surface3d` uses `layout_3d`); the surface commands were
+    /// appended to the shared indirect/offset buffers after the mesh ones, so
+    /// their `first_instance` still indexes the offsets SSBO correctly. Only
+    /// called when `lists.has_3d`. Recorded after opaque meshes/tiles (they
+    /// early-Z the hidden parts) and before sky (which fills behind the edge).
+    unsafe fn record_surface_indirect(&self) {
+        if self.r.surface_runs.is_empty() {
+            return;
+        }
+        // Re-establish layout_3d push constants + descriptors (the opaque mesh
+        // pass bound the same layout, but keep this self-contained/robust to
+        // recording order).
+        unsafe { self.bind_mesh3d_state() };
+        let device = &self.r.device.device;
+        let cmd = self.cmd;
+        unsafe {
+            let indirect_buffer = self.r.indirect[self.slot].buffer;
+            const STRIDE: u64 = std::mem::size_of::<DrawIndexedIndirect>() as u64;
+            device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.r.pipelines.surface3d,
+            );
+            // Surface-specific push: carry the skin clip radius in the otherwise
+            // unused `sun_light.w` lane (mesh passes ignore it). The fragment
+            // discards skin within this horizontal radius so the far grey skin
+            // renders only BEYOND the near zones, never poking through them.
+            let mut push = pipeline::Mesh3dPush {
+                view_proj: self.lists.view_proj,
+                sky: self.lists.sky_light,
+            };
+            push.sky.sun_light[3] = self.lists.skin_clip;
+            // Same high-FOV warp lane as the mesh pass (ambient.w); keeps the
+            // far skin registered with the warped terrain.
+            push.sky.ambient[3] = self.lists.warp.cylindrical_ratio;
+            device.cmd_push_constants(
+                cmd,
+                self.r.pipelines.layout_3d,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                bytemuck::bytes_of(&push),
+            );
+            for run in &self.r.surface_runs {
+                // Index and vertex data share one VkBuffer: indices bound at
+                // offset 0 (first_index in the command), vertices via the
+                // command's vertex_offset — mirroring MeshRegistry's layout.
+                device.cmd_bind_index_buffer(cmd, run.buffer, 0, vk::IndexType::UINT32);
+                device.cmd_bind_vertex_buffers(cmd, 0, &[run.buffer], &[0]);
+                if self.r.device.multi_draw_indirect && self.r.device.draw_indirect_first_instance {
+                    device.cmd_draw_indexed_indirect(
+                        cmd,
+                        indirect_buffer,
+                        run.first as u64 * STRIDE,
+                        run.count,
+                        STRIDE as u32,
+                    );
+                } else if self.r.device.draw_indirect_first_instance {
+                    for i in run.first..run.first + run.count {
+                        device.cmd_draw_indexed_indirect(
+                            cmd,
+                            indirect_buffer,
+                            i as u64 * STRIDE,
+                            1,
+                            STRIDE as u32,
+                        );
+                    }
+                } else {
+                    let range = run.first as usize..(run.first + run.count) as usize;
+                    for c in &self.r.draw_commands[range] {
+                        device.cmd_draw_indexed(
+                            cmd,
+                            c.index_count,
+                            c.instance_count,
+                            c.first_index,
+                            c.vertex_offset,
+                            c.first_instance,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Pushes `view_proj` to `layout_debug` for the immediate debug geometry.
     /// Done per debug pass because the mesh passes bind `layout_3d`, whose
     /// incompatible push-constant range disturbs this value.
     unsafe fn push_debug_view_proj(&self) {
+        let push = pipeline::DebugPush {
+            view_proj: self.lists.view_proj,
+            warp: [self.lists.warp.cylindrical_ratio, 0.0, 0.0, 0.0],
+        };
         unsafe {
             self.r.device.device.cmd_push_constants(
                 self.cmd,
                 self.r.pipelines.layout_debug,
                 vk::ShaderStageFlags::VERTEX,
                 0,
-                bytemuck::bytes_of(&self.lists.view_proj),
+                bytemuck::bytes_of(&push),
             );
         }
     }
@@ -2000,7 +2189,11 @@ impl<'a> RenderPass<'a> {
         };
         let device = &self.r.device.device;
         let cmd = self.cmd;
-        let params = pipeline::SkyParams::compose(self.lists.view_proj.inverse(), &desc);
+        let params = pipeline::SkyParams::compose(
+            self.lists.view_proj.inverse(),
+            &desc,
+            self.lists.warp.cylindrical_ratio,
+        );
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.r.pipelines.sky);
             device.cmd_push_constants(
@@ -2120,9 +2313,12 @@ impl Drop for RenderPass<'_> {
     }
 }
 
-impl Drop for Renderer {
-    fn drop(&mut self) {
-        log::debug!("GPU memory at shutdown: {:?}", self.allocator.stats());
+impl Renderer {
+    /// Destroys every render-owned resource (GPU idle first) and hands the
+    /// device/instance/surface back to main, which destroys the allocator
+    /// buffers and then `vkDestroyDevice` in the correct order. Consuming `self`
+    /// (rather than `Drop`) is what lets those fields move out to main.
+    pub(crate) fn teardown(mut self) -> DeviceLeftovers {
         unsafe {
             let device = &self.device.device;
             let _ = device.device_wait_idle();
@@ -2134,6 +2330,8 @@ impl Drop for Renderer {
             self.minimap.destroy(device);
             device.destroy_descriptor_set_layout(self.mesh3d_set_layout, None);
             self.block_textures.destroy(device);
+            self.retired_textures
+                .collect_all(|mut tex| tex.destroy(device));
             self.gpu_timer.destroy(device);
             self.targets.destroy(device);
             for buffer in self
@@ -2144,8 +2342,11 @@ impl Drop for Renderer {
             {
                 buffer.destroy(device);
             }
-            self.meshes.destroy_all(&mut self.allocator);
-            self.allocator.destroy(device);
+            // The residents' allocations belong to the main-owned allocator
+            // (destroyed there after this returns); just drop them — no Vulkan
+            // calls, GPU already idle.
+            self.mesh_res.destroy_all(&mut |_a| {});
+            self.surface_res.destroy_all(&mut |_a| {});
             for &sem in &self.present_semaphores {
                 sem.destroy(device);
             }
@@ -2154,9 +2355,12 @@ impl Drop for Renderer {
                 frame.image_available.destroy(device);
             }
             self.swapchain.destroy(device);
-            self.device.destroy();
-            self.surface_loader.destroy_surface(self.surface, None);
-            self.instance.destroy();
+        }
+        DeviceLeftovers {
+            instance: self.instance,
+            surface_loader: self.surface_loader,
+            surface: self.surface,
+            device: self.device,
         }
     }
 }
@@ -2348,8 +2552,14 @@ fn create_present_semaphores(device: &ash::Device, count: usize) -> Vec<BinarySe
         .collect()
 }
 
+/// Clamps an MSAA request to a supported {1,2,4,8} sample count (as a `u32`),
+/// mirroring [`Renderer::set_msaa`] so the client can clamp locally.
+pub(crate) fn clamp_msaa(requested: u32, max: u32) -> u32 {
+    SampleCount::nearest_supported(requested, max).0.as_u32()
+}
+
 /// Display refresh interval; falls back to 60 Hz if unavailable.
-fn display_refresh_interval(window: &winit::window::Window) -> std::time::Duration {
+pub(crate) fn display_refresh_interval(window: &winit::window::Window) -> std::time::Duration {
     let millihertz = window
         .current_monitor()
         .and_then(|m| m.refresh_rate_millihertz())
@@ -2386,7 +2596,7 @@ fn depth_range() -> vk::ImageSubresourceRange {
 }
 
 /// A GPU render pass boundary, in record order. The variant ordinal indexes the
-/// per-pass accumulator (same drift-proof invariant as [`crate::profile::Meter`]).
+/// per-pass accumulator (matches the tracking in [`crate::profile::Meter`]).
 #[derive(Clone, Copy, PartialEq)]
 enum GpuPass {
     Opaque,

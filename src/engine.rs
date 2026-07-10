@@ -18,8 +18,10 @@ use crate::font;
 use crate::frame::{DrawLists, Frame};
 use crate::input::{InputState, Key, MouseButton};
 use crate::mesh::{MeshData, MeshHandle};
-use crate::vk::Renderer;
+use crate::surface::{SurfaceData, SurfaceHandle};
+use crate::vk::render_client::RenderClient;
 
+#[derive(Clone)]
 pub struct Config {
     pub title: String,
     pub width: u32,
@@ -58,9 +60,13 @@ impl Default for Config {
 }
 
 pub struct Engine {
-    pub(crate) renderer: Renderer,
+    pub(crate) client: RenderClient,
+    /// The window lives on the main thread; only the `Renderer` moved to the
+    /// render thread. Window-touching methods read this directly.
+    pub(crate) window: winit::window::Window,
     pub(crate) input: InputState,
-    pub(crate) lists: DrawLists,
+    /// The frame being recorded; swapped with a pooled buffer each frame.
+    pub(crate) lists: Box<DrawLists>,
 
     target_fps: u32,
     frame_start: Instant,
@@ -73,11 +79,13 @@ pub struct Engine {
 }
 
 impl Engine {
-    fn new(renderer: Renderer, config: &Config) -> Self {
+    fn new(window: winit::window::Window, mut client: RenderClient, config: &Config) -> Self {
+        let lists = client.take_frame();
         Self {
-            renderer,
+            client,
+            window,
             input: InputState::new(),
-            lists: DrawLists::new(),
+            lists,
             target_fps: config.target_fps,
             frame_start: Instant::now(),
             dt: 0.0,
@@ -91,11 +99,11 @@ impl Engine {
     // ---- window / timing ----
 
     pub fn screen_width(&self) -> i32 {
-        self.renderer.extent().width as i32
+        self.client.screen_width()
     }
 
     pub fn screen_height(&self) -> i32 {
-        self.renderer.extent().height as i32
+        self.client.screen_height()
     }
 
     /// Seconds the previous frame took (including pacing sleep).
@@ -130,56 +138,57 @@ impl Engine {
             return;
         }
         let mode = on.then(|| winit::window::Fullscreen::Borderless(None));
-        self.renderer.window.set_fullscreen(mode);
-        self.renderer.request_recreate();
+        self.window.set_fullscreen(mode);
+        // A fullscreen toggle changes the window size; the ensuing Resized event
+        // ships the new size + recreate to the render thread.
     }
 
     pub fn fullscreen(&self) -> bool {
-        self.renderer.window.fullscreen().is_some()
+        self.window.fullscreen().is_some()
     }
 
     pub fn set_vsync(&mut self, on: bool) {
-        self.renderer.set_vsync(on);
+        self.client.set_vsync(on);
     }
 
     pub fn vsync(&self) -> bool {
-        self.renderer.vsync()
+        self.client.vsync()
     }
 
     /// Requests an MSAA sample count; returns the value actually applied
     /// (clamped to hardware support).
     pub fn set_msaa(&mut self, samples: u32) -> u32 {
-        self.renderer.set_msaa(samples)
+        self.client.set_msaa(samples)
     }
 
     pub fn msaa(&self) -> u32 {
-        self.renderer.msaa()
+        self.client.msaa()
     }
 
     pub fn max_msaa(&self) -> u32 {
-        self.renderer.max_msaa()
+        self.client.max_msaa()
     }
 
     /// Enables opt-in six-way face culling: each mesh submits only its
     /// camera-facing direction buckets. Off by default (one draw per mesh);
     /// earns its keep only under heavy vertex load.
     pub fn set_cull_faces(&mut self, on: bool) {
-        self.renderer.set_cull_faces(on);
+        self.client.set_cull_faces(on);
     }
 
     pub fn cull_faces(&self) -> bool {
-        self.renderer.cull_faces()
+        self.client.cull_faces()
     }
 
     /// Requests a render-resolution scale (0.25..=2.0); returns the value
     /// that will apply. The 3D scene and UI rasterize at the scaled
     /// resolution and are blitted to the window with linear filtering.
     pub fn set_render_scale(&mut self, scale: f32) -> f32 {
-        self.renderer.set_render_scale(scale)
+        self.client.set_render_scale(scale)
     }
 
     pub fn render_scale(&self) -> f32 {
-        self.renderer.render_scale()
+        self.client.render_scale()
     }
 
     // ---- input ----
@@ -212,7 +221,7 @@ impl Engine {
     /// keep flowing.
     pub fn disable_cursor(&mut self) {
         use winit::window::CursorGrabMode;
-        let window = &self.renderer.window;
+        let window = &self.window;
         if window
             .set_cursor_grab(CursorGrabMode::Locked)
             .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
@@ -224,7 +233,7 @@ impl Engine {
     }
 
     pub fn enable_cursor(&mut self) {
-        let window = &self.renderer.window;
+        let window = &self.window;
         let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
         window.set_cursor_visible(true);
     }
@@ -233,12 +242,30 @@ impl Engine {
 
     /// Uploads a mesh; drawable in the same frame. Returns None for empty data.
     pub fn upload_mesh(&mut self, data: &MeshData) -> Option<MeshHandle> {
-        self.renderer.upload_mesh(data)
+        self.client.upload_mesh(data)
     }
 
     /// Frees a mesh. Safe while the GPU still uses it (deferred internally).
     pub fn free_mesh(&mut self, handle: MeshHandle) {
-        self.renderer.free_mesh(handle);
+        self.client.free_mesh(handle);
+    }
+
+    // ---- retained colored surfaces (Zone-3 far skin) ----
+
+    /// Uploads a colored surface mesh; drawable the same frame. Returns `None`
+    /// on allocation failure (the app leaves the column unclaimed and retries).
+    pub fn upload_surface(&mut self, data: &SurfaceData) -> Option<SurfaceHandle> {
+        self.client.upload_surface(data)
+    }
+
+    /// Frees a surface mesh. Safe while the GPU still uses it (deferred).
+    pub fn free_surface(&mut self, handle: SurfaceHandle) {
+        self.client.free_surface(handle);
+    }
+
+    /// The surface's local-space AABB (`min`, `max`), or `None` if freed.
+    pub fn surface_aabb(&self, handle: SurfaceHandle) -> Option<(Vec3, Vec3)> {
+        self.client.surface_aabb(handle)
     }
 
     // ---- screenshots ----
@@ -249,7 +276,7 @@ impl Engine {
     /// `None` if the directory can't be created.
     pub fn screenshot(&mut self) -> Option<std::path::PathBuf> {
         let path = crate::screenshot::next_path()?;
-        self.renderer.request_screenshot(path.clone());
+        self.client.request_screenshot(path.clone());
         Some(path)
     }
 
@@ -266,12 +293,12 @@ impl Engine {
     /// immediate cubes/wires always draw with layer 0. Before the first call
     /// a default 1x1 all-white single-layer array is bound.
     pub fn set_block_textures(&mut self, size: u32, layers: &[Vec<u8>]) {
-        self.renderer.set_block_textures(size, layers);
+        self.client.set_block_textures(size, layers);
     }
 
     /// Uploads minimap pixels (synced per-slot, version-gated).
     pub fn update_minimap(&mut self, rgba: &[u8]) {
-        self.renderer.update_minimap(rgba);
+        self.client.update_minimap(rgba);
     }
 
     // ---- text / math ----
@@ -283,12 +310,11 @@ impl Engine {
     /// Projects a world point to screen pixels with the same matrices used
     /// for rendering. Callers filter points behind the camera (raylib parity).
     pub fn world_to_screen(&self, p: Vec3, cam: &Camera3D) -> Vec2 {
-        let extent = self.renderer.extent();
         camera::world_to_screen(
             p,
             cam,
-            extent.width.max(1) as f32,
-            extent.height.max(1) as f32,
+            self.client.screen_width().max(1) as f32,
+            self.client.screen_height().max(1) as f32,
         )
     }
 
@@ -300,8 +326,14 @@ impl Engine {
     }
 
     pub(crate) fn finish_frame(&mut self) {
-        self.renderer.draw_frame(&self.lists);
+        // Recycle returned buffers/allocations, then swap the recorded snapshot
+        // for a fresh pooled one (this take_frame blocks when the pool is empty,
+        // which is the present-pacing) and submit the recorded one.
+        self.client.drain_returns();
+        let next = self.client.take_frame();
+        let filled = std::mem::replace(&mut self.lists, next);
         self.lists.reset();
+        self.client.submit_frame(filled);
     }
 
     fn tick_timing(&mut self) {
@@ -318,23 +350,15 @@ impl Engine {
         }
     }
 
-    /// raylib-style frame cap: sleep most of the remainder, spin the tail.
-    fn pace(&self) {
+    /// Event-driven cadence: the deadline at which the next sim frame must run
+    /// if no OS event wakes us first. `None` when uncapped (run every cycle).
+    /// `frame_start` was stamped in [`Self::tick_timing`] this cycle.
+    fn next_deadline(&self) -> Option<Instant> {
         if self.target_fps == 0 {
-            return;
+            return None;
         }
         let budget = Duration::from_secs_f64(1.0 / self.target_fps as f64);
-        let elapsed = self.frame_start.elapsed();
-        if elapsed >= budget {
-            return;
-        }
-        let remaining = budget - elapsed;
-        if remaining > Duration::from_millis(2) {
-            std::thread::sleep(remaining - Duration::from_millis(1));
-        }
-        while self.frame_start.elapsed() < budget {
-            std::hint::spin_loop();
-        }
+        Some(self.frame_start + budget)
     }
 }
 
@@ -391,7 +415,13 @@ impl<F: FnMut(&mut Engine) -> bool> EngineApp<F> {
         // accumulate for the next frame (raylib poll model).
         engine.input.begin_frame();
         crate::profile::frame_end();
-        engine.pace();
+        // Event-first wake: sleep until the sim deadline, but any window/device
+        // event wakes the loop immediately (input cadence is event-driven, not
+        // frame-capped). Uncapped → Poll (run every cycle).
+        match engine.next_deadline() {
+            Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
+            None => event_loop.set_control_flow(ControlFlow::Poll),
+        }
     }
 }
 
@@ -404,18 +434,11 @@ impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
         if self.engine.is_some() {
             return;
         }
-        let renderer = Renderer::new(
-            event_loop,
-            &self.config.title,
-            self.config.width,
-            self.config.height,
-            self.config.resizable,
-            self.config.fullscreen,
-            self.config.vsync,
-            self.config.msaa,
-            self.config.render_scale,
-        );
-        self.engine = Some(Engine::new(renderer, &self.config));
+        // Window + instance + surface are created on main; the render thread is
+        // spawned and builds the Renderer, then replies so the client can build
+        // its allocator. The window stays on main (in `Engine`).
+        let (window, client) = RenderClient::spawn(event_loop, &self.config);
+        self.engine = Some(Engine::new(window, client, &self.config));
     }
 
     fn window_event(
@@ -429,7 +452,7 @@ impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
         };
         match event {
             WindowEvent::CloseRequested => engine.should_close = true,
-            WindowEvent::Resized(_) => engine.renderer.request_recreate(),
+            WindowEvent::Resized(size) => engine.client.resize(size),
             // Frames are driven from about_to_wait; the OS-requested redraw
             // (expose, live-resize) still renders so the window never shows
             // stale content mid-drag.

@@ -18,6 +18,8 @@
 // derived from position + normal (the sampler is REPEAT, so greedy quads tile);
 // per-face directional shade is derived from the normal.
 
+#include "warp.slang"
+
 [[vk::binding(0, 0)]]
 StructuredBuffer<float4> draw_offsets;
 
@@ -80,7 +82,7 @@ VertexOutput vertexMain(VertexInput input)
     uint sky = (w1 >> 2) & 0xF;
     uint block = (w1 >> 6) & 0xF;
 
-    // UV axes: ±X → (z,y), ±Y → (x,z), ±Z → (x,y).
+    // UV mapping: X face (z,y), Y face (x,z), Z face (x,y).
     float2 uv;
     if (normal < 2)
         uv = float2(z, y);
@@ -115,10 +117,16 @@ VertexOutput vertexMain(VertexInput input)
     float3 world = float3(x, y, z) * placement.w + placement.xyz;
 
     VertexOutput output;
-    output.position = mul(pc.view_proj, float4(world, 1.0));
-    output.uv = uv;
+    // ambient.w carries the high-FOV cylindrical warp strength (0 = linear).
+    output.position = applyWarp(mul(pc.view_proj, float4(world, 1.0)), pc.ambient.w);
+    // Counter-scale UV by the per-draw scale so texel density stays locked to
+    // world metres: a full-res chunk (scale 1) tiles once per block, and a
+    // coarse LOD tile (scale 2^k) tiles 2^k times per cell — still once per
+    // metre — instead of stretching one block texel across the whole cell. Keeps
+    // far LOD terrain texturally faithful to the full-res band it abuts.
+    output.uv = uv * placement.w;
     output.layer = layer;
     output.light = shade * ao_factor * lit;
-    output.dist = length(world); // camera sits at the origin, so |world| = depth
+    output.dist = length(world); // camera sits at the origin, so depth = distance to world
     return output;
 }

@@ -122,7 +122,7 @@ impl MeshVertex {
     }
 
     const fn pack(pos: [u8; 3], normal: Normal, layer: u8, ao: u8, sky: u8, block: u8) -> Self {
-        // Contract: chunk-local coords are 0..=16. The 5-bit field also holds
+        // Chunk-local coords must be 0..=16. The 5-bit field also holds
         // 17..=31, so an out-of-range coord stores silently at the wrong
         // position rather than corrupting a neighbor — caught in debug only.
         debug_assert!(
@@ -200,17 +200,34 @@ vertex_struct! {
     }
 }
 
-/// Which draw pass a whole mesh belongs to. A property OF a mesh, not a
-/// sub-range within one: the world meshes opaque and translucent geometry into
-/// separate [`MeshData`]s, so a mesh is uniformly one pass. Drives both the
-/// pipeline ([`Pass::Opaque`] → depth read/write, no blend; [`Pass::Transparent`]
-/// → depth read-only, alpha blend) and draw order (opaque before transparent).
-/// Extensible: a `Cutout = 2` alpha-test variant is a future `+1`.
+/// Which draw *technique* a whole mesh belongs to — a property OF a mesh, not a
+/// sub-range within one: the world meshes each technique into a separate
+/// [`MeshData`], so a mesh is uniformly one pass. The set is closed (there are
+/// only three ways a face ever reaches the GPU), so keying on technique — not on
+/// material identity — scales with a fixed 3, never with block count. Discriminant
+/// order is also draw order (opaque → cutout → blend last):
+///
+/// - [`Pass::Opaque`] — depth read/write, no blend, cull back. ~99% of geometry.
+/// - [`Pass::Cutout`] — depth read/write, alpha *test* (`discard`), cull back.
+///   Binary see-through (atlas holes: leaves/grates); writes depth so it needs no
+///   sort. Reserved: no block sources per-texel alpha yet, so nothing emits it.
+/// - [`Pass::Blend`] — depth read-only, alpha *over*, back-to-front. Tinted
+///   see-through you look *through* (water/stained glass/ice).
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Pass {
     Opaque = 0,
-    Transparent = 1,
+    Cutout = 1,
+    Blend = 2,
+}
+
+impl Pass {
+    /// Every pass in discriminant (= draw) order. The single source of both the
+    /// pass set and its width: containers key on `Pass::COUNT` so they follow the
+    /// enum by construction and never widen by hand.
+    pub const ALL: [Pass; 3] = [Pass::Opaque, Pass::Cutout, Pass::Blend];
+    /// Number of passes — the width of any per-pass container.
+    pub const COUNT: usize = Self::ALL.len();
 }
 
 /// Triangle mesh built one quad at a time, indices bucketed by face direction.
@@ -288,10 +305,14 @@ impl MeshData {
 
 /// Generational handle to a GPU mesh. Cheap to copy; freeing is explicit via
 /// `Engine::free_mesh` (deferred internally until the GPU is done with it).
+///
+/// `generation` is a [`NonZeroU32`] so `Option<MeshHandle>` occupies the niche
+/// and stays 8 bytes (the streaming lane stores millions of them). Generations
+/// are therefore 1-based and never reach 0.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct MeshHandle {
-    pub(crate) index: u32,
-    pub(crate) generation: u32,
+    pub(crate) slot: u32,
+    pub(crate) generation: std::num::NonZeroU32,
 }
 
 impl MeshHandle {
@@ -299,9 +320,15 @@ impl MeshHandle {
     /// need to populate handle-carrying state (e.g. mesh-lifecycle transitions)
     /// without a live GPU — the fields are otherwise crate-private. NOT for
     /// production use: a fabricated handle indexes no real GPU mesh.
+    ///
+    /// `generation` is 1-based (0 is the reserved niche); passing 0 panics.
     #[doc(hidden)]
     pub fn from_raw_parts(index: u32, generation: u32) -> Self {
-        Self { index, generation }
+        Self {
+            slot: index,
+            generation: std::num::NonZeroU32::new(generation)
+                .expect("generation is 1-based"),
+        }
     }
 }
 
@@ -396,12 +423,12 @@ mod tests {
 
     #[test]
     fn clear_keeps_pass_and_empties_buckets() {
-        let mut data = MeshData::new(Pass::Transparent);
+        let mut data = MeshData::new(Pass::Blend);
         data.quad(quad_for(Normal::PosY));
         assert!(!data.is_empty());
         data.clear();
         assert!(data.is_empty());
-        assert_eq!(data.pass(), Pass::Transparent);
+        assert_eq!(data.pass(), Pass::Blend);
         assert!(data.buckets.iter().all(|b| b.is_empty()));
     }
 }

@@ -164,6 +164,22 @@ pub(crate) enum Pool {
     Staging,
 }
 
+/// A persistently-mapped device pointer. Vulkan persistent mappings are
+/// process-wide valid; this pointer is only ever written/freed on the main
+/// thread and never dereferenced on the render thread, so crossing threads is
+/// sound. Wrapping [`NonNull`] this way is what makes [`Allocation`] `Send`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MappedPtr(NonNull<u8>);
+
+// SAFETY: see the type doc — the pointer is only ever used on the main thread.
+unsafe impl Send for MappedPtr {}
+
+impl MappedPtr {
+    pub(crate) fn as_ptr(self) -> *mut u8 {
+        self.0.as_ptr()
+    }
+}
+
 /// A sub-range of a pooled buffer. Bind `buffer` with `offset`; `mapped`
 /// points at this allocation's bytes when the block is host-visible.
 ///
@@ -176,7 +192,7 @@ pub struct Allocation {
     pub offset: u64,
     pub size: u64,
     /// This allocation's bytes when the block memory is host-visible.
-    pub mapped: Option<NonNull<u8>>,
+    pub mapped: Option<MappedPtr>,
     block: usize,
     pool: Pool,
 }
@@ -497,7 +513,7 @@ fn make_allocation(block: &Block, index: usize, offset: u64, size: u64, pool: Po
     let mapped = block.mapped.map(|base| {
         // SAFETY: `offset + size` fits in the block, whose whole range is
         // mapped, so the derived pointer is in bounds and non-null.
-        unsafe { NonNull::new_unchecked(base.as_ptr().add(offset as usize)) }
+        MappedPtr(unsafe { NonNull::new_unchecked(base.as_ptr().add(offset as usize)) })
     });
     Allocation {
         buffer: block.buffer,

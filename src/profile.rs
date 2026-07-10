@@ -59,13 +59,14 @@ pub enum Meter {
     // Tier::Workers — off-thread chunk jobs; the tile stages are sub-timings
     WorkGenerate,
     WorkMesh,
+    WorkLight,
     WorkTile,
     TileSample,
     TileMesh,
 }
 
 impl Meter {
-    const ALL: [Meter; 28] = [
+    const ALL: [Meter; 29] = [
         Meter::NetEvents,
         Meter::Physics,
         Meter::StreamDrain,
@@ -91,6 +92,7 @@ impl Meter {
         Meter::GpuOverlay,
         Meter::WorkGenerate,
         Meter::WorkMesh,
+        Meter::WorkLight,
         Meter::WorkTile,
         Meter::TileSample,
         Meter::TileMesh,
@@ -124,6 +126,7 @@ impl Meter {
             Meter::GpuOverlay => "overlay",
             Meter::WorkGenerate => "generate",
             Meter::WorkMesh => "mesh",
+            Meter::WorkLight => "light",
             Meter::WorkTile => "tile",
             Meter::TileSample => "tile.sample",
             Meter::TileMesh => "tile.mesh",
@@ -155,6 +158,7 @@ impl Meter {
             | Meter::GpuOverlay => Tier::Gpu,
             Meter::WorkGenerate
             | Meter::WorkMesh
+            | Meter::WorkLight
             | Meter::WorkTile
             | Meter::TileSample
             | Meter::TileMesh => Tier::Workers,

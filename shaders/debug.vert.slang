@@ -19,9 +19,12 @@ struct VertexOutput
     float4 color;
 };
 
+#include "warp.slang"
+
 struct PushConstants
 {
     float4x4 view_proj;
+    float4 warp; // x = cylindrical warp strength (0 = linear); yzw pad
 };
 
 [[vk::push_constant]]
@@ -31,7 +34,9 @@ ConstantBuffer<PushConstants> pc;
 VertexOutput vertexMain(VertexInput input)
 {
     VertexOutput output;
-    output.position = mul(pc.view_proj, float4(input.pos, 1.0));
+    // Same warp as the mesh pipelines, so debug geometry stays registered with
+    // the warped terrain.
+    output.position = applyWarp(mul(pc.view_proj, float4(input.pos, 1.0)), pc.warp.x);
     output.color = input.color;
     return output;
 }
