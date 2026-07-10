@@ -1,63 +1,288 @@
 /// CPU-side mesh data and the opaque handle to its GPU copy.
 ///
-/// The engine is unlit but textured: a vertex is a world-space position, a
-/// texture UV, and an RGBA8 color (24 bytes). `color.rgb` multiplies the
-/// sampled texel (the game bakes per-face directional shade into it);
-/// `color.a` is NOT alpha — it is the block-texture-array LAYER index
-/// (the 3D pipeline never blends). Layer 0 is guaranteed all-white, so
-/// `uv == [0,0]` + `color.a == 0` renders plain flat vertex color.
-use bytemuck::{Pod, Zeroable};
+/// A [`MeshVertex`] is 8 bytes: two `u32`s packing a chunk-local integer
+/// position, a face normal, a texture-array layer, and reserved AO/light bits.
+/// The vertex stores NO uv and NO color — the shader derives uv from the
+/// position + normal (the sampler is REPEAT, so greedy quads tile) and derives
+/// per-face directional shade from the normal. See the bit table below; the
+/// `SHIFT_*`/`MASK_*` consts are mirrored in `shaders/mesh3d.vert.slang`.
+///
+/// Word 0: x[0..5] y[5..10] z[10..15] normal[15..18] layer[18..26]
+/// Word 1: ao[0..2] skylight[2..6] blocklight[6..10]
+///
+/// Immediate debug geometry uses the separate unpacked [`DebugVertex`].
+use crate::vk::vertex_input::vertex_struct;
 
-use crate::color::Color;
+// Bit shifts, mirrored by the Slang unpack in mesh3d.vert.slang.
+pub const SHIFT_X: u32 = 0;
+pub const SHIFT_Y: u32 = 5;
+pub const SHIFT_Z: u32 = 10;
+pub const SHIFT_NORMAL: u32 = 15;
+pub const SHIFT_LAYER: u32 = 18;
+pub const SHIFT_AO: u32 = 0;
+pub const SHIFT_SKY: u32 = 2;
+pub const SHIFT_BLOCK: u32 = 6;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
-pub struct Vertex {
-    pub pos: [f32; 3],
-    pub uv: [f32; 2],
-    /// rgb = color multiplier, a = texture array layer (not alpha).
-    pub color: [u8; 4],
+// Field masks (applied on pack so a debug-only out-of-range value can never
+// corrupt an adjacent field; the typed API keeps values in range anyway).
+const MASK_COORD: u32 = 0x1F; // 5 bits, holds 0..=16
+const MASK_NORMAL: u32 = 0x7; // 3 bits
+const MASK_LAYER: u32 = 0xFF; // 8 bits (full u8)
+const MASK_AO: u32 = 0x3; // 2 bits
+const MASK_LIGHT: u32 = 0xF; // 4 bits
+
+/// Face normal. The discriminant IS the 3-bit index stored in the vertex and
+/// decoded by the shader: `0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z`.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Normal {
+    PosX = 0,
+    NegX = 1,
+    PosY = 2,
+    NegY = 3,
+    PosZ = 4,
+    NegZ = 5,
 }
 
-impl Vertex {
-    /// Flat-colored vertex: uv `[0,0]`, `color.a` passed through as the
-    /// texture layer. For pure flat color the caller must supply
-    /// `color.a == 0` (layer 0 is always white).
-    pub fn new(pos: [f32; 3], color: Color) -> Self {
-        Self {
-            pos,
-            uv: [0.0, 0.0],
-            color: [color.r, color.g, color.b, color.a],
+impl Normal {
+    /// Unit direction as integer components.
+    pub const fn direction(self) -> [i8; 3] {
+        match self {
+            Normal::PosX => [1, 0, 0],
+            Normal::NegX => [-1, 0, 0],
+            Normal::PosY => [0, 1, 0],
+            Normal::NegY => [0, -1, 0],
+            Normal::PosZ => [0, 0, 1],
+            Normal::NegZ => [0, 0, -1],
         }
     }
 
-    /// Textured vertex: `rgb_shade` multiplies the sampled texel, `layer`
-    /// selects the block-texture-array layer.
-    pub fn textured(pos: [f32; 3], uv: [f32; 2], rgb_shade: [u8; 3], layer: u8) -> Self {
-        Self {
-            pos,
-            uv,
-            color: [rgb_shade[0], rgb_shade[1], rgb_shade[2], layer],
+    /// Inverse of the discriminant index. The 3-bit field only ever holds a
+    /// value written from a [`Normal`], so the panic arm is unreachable in
+    /// practice; it exists so an out-of-range decode fails loudly.
+    pub(crate) const fn from_index(i: u8) -> Normal {
+        match i {
+            0 => Normal::PosX,
+            1 => Normal::NegX,
+            2 => Normal::PosY,
+            3 => Normal::NegY,
+            4 => Normal::PosZ,
+            5 => Normal::NegZ,
+            _ => panic!("normal index out of range"),
         }
     }
 }
 
-/// Triangle mesh with u32 indices. Reusable as a scratch buffer: `clear`
-/// keeps the allocations.
-#[derive(Default)]
+/// Ambient-occlusion level, `0..=3`. `NONE` (3) means no occlusion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Ao(u8);
+
+impl Ao {
+    pub const NONE: Ao = Ao(3);
+
+    pub fn new(v: u8) -> Ao {
+        debug_assert!(v <= 3, "AO out of range 0..=3");
+        Ao(v)
+    }
+}
+
+/// Skylight + blocklight, each `0..=15`. `FULL` is full-bright.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Light {
+    sky: u8,
+    block: u8,
+}
+
+impl Light {
+    /// Full-bright: a torch on every vertex. Rarely what terrain wants — see [`Self::DAY`].
+    pub const FULL: Light = Light { sky: 15, block: 15 };
+    /// Outdoor daylight: full sky, no blocklight, so the shader keeps the sun/ambient
+    /// tint instead of clamping to white. The correct "unlit surface" light.
+    pub const DAY: Light = Light { sky: 15, block: 0 };
+
+    pub fn new(sky: u8, block: u8) -> Light {
+        debug_assert!(sky <= 15 && block <= 15, "light out of range 0..=15");
+        Light { sky, block }
+    }
+}
+
+vertex_struct! {
+    /// 8-byte packed world-mesh vertex. Build via [`MeshVertex::new`] — the sole
+    /// constructor, which demands AO and light so no path can leave them unstated.
+    pub struct MeshVertex {
+        packed: [u32; 2],
+    }
+}
+
+impl MeshVertex {
+    /// The sole vertex constructor: AO and light are non-optional, so no mesher
+    /// can silently default them (the bug that washed out far LOD tiles).
+    pub fn new(pos: [u8; 3], normal: Normal, layer: u8, ao: Ao, light: Light) -> Self {
+        Self::pack(pos, normal, layer, ao.0, light.sky, light.block)
+    }
+
+    const fn pack(pos: [u8; 3], normal: Normal, layer: u8, ao: u8, sky: u8, block: u8) -> Self {
+        // Contract: chunk-local coords are 0..=16. The 5-bit field also holds
+        // 17..=31, so an out-of-range coord stores silently at the wrong
+        // position rather than corrupting a neighbor — caught in debug only.
+        debug_assert!(
+            pos[0] <= 16 && pos[1] <= 16 && pos[2] <= 16,
+            "coord out of range 0..=16"
+        );
+        let w0 = (pos[0] as u32 & MASK_COORD) << SHIFT_X
+            | (pos[1] as u32 & MASK_COORD) << SHIFT_Y
+            | (pos[2] as u32 & MASK_COORD) << SHIFT_Z
+            | ((normal as u32) & MASK_NORMAL) << SHIFT_NORMAL
+            | ((layer as u32) & MASK_LAYER) << SHIFT_LAYER;
+        let w1 = ((ao as u32) & MASK_AO) << SHIFT_AO
+            | ((sky as u32) & MASK_LIGHT) << SHIFT_SKY
+            | ((block as u32) & MASK_LIGHT) << SHIFT_BLOCK;
+        Self { packed: [w0, w1] }
+    }
+
+    /// Decodes the chunk-local integer position as floats (for CPU-side AABBs).
+    pub fn local_pos(&self) -> [f32; 3] {
+        let ([x, y, z], ..) = unpack(self.packed);
+        [x as f32, y as f32, z as f32]
+    }
+
+    /// Decodes the face normal — how [`MeshData::quad`] routes a quad into its
+    /// direction bucket without the caller passing the normal twice.
+    pub fn normal(&self) -> Normal {
+        let (_, ni, ..) = unpack(self.packed);
+        Normal::from_index(ni)
+    }
+
+    /// Decodes the texture-array layer.
+    pub fn layer(&self) -> u8 {
+        let (.., layer, _, _, _) = unpack(self.packed);
+        layer
+    }
+
+    /// Decodes the ambient-occlusion level (`0..=3`).
+    pub fn ao(&self) -> Ao {
+        let (.., ao, _, _) = unpack(self.packed);
+        Ao(ao)
+    }
+
+    /// Decodes the baked skylight + blocklight.
+    pub fn light(&self) -> Light {
+        let (.., sky, block) = unpack(self.packed);
+        Light { sky, block }
+    }
+}
+
+/// The sole CPU-side mirror of the Slang unpack in `mesh3d.vert.slang`. Returns
+/// raw field integers (`pos`, normal index, layer, ao, sky, block); typed
+/// callers map from there. Keeping one decoder means the shift/mask consts are
+/// applied in exactly one place per direction (pack/unpack).
+const fn unpack(packed: [u32; 2]) -> ([u32; 3], u8, u8, u8, u8, u8) {
+    let [w0, w1] = packed;
+    let pos = [
+        (w0 >> SHIFT_X) & MASK_COORD,
+        (w0 >> SHIFT_Y) & MASK_COORD,
+        (w0 >> SHIFT_Z) & MASK_COORD,
+    ];
+    let normal = ((w0 >> SHIFT_NORMAL) & MASK_NORMAL) as u8;
+    let layer = ((w0 >> SHIFT_LAYER) & MASK_LAYER) as u8;
+    let ao = ((w1 >> SHIFT_AO) & MASK_AO) as u8;
+    let sky = ((w1 >> SHIFT_SKY) & MASK_LIGHT) as u8;
+    let block = ((w1 >> SHIFT_BLOCK) & MASK_LIGHT) as u8;
+    (pos, normal, layer, ao, sky, block)
+}
+
+vertex_struct! {
+    /// Immediate debug vertex: world-space position + RGBA8 color. Used by
+    /// `draw_cube`/`draw_cube_wires`; rendered by the debug pipelines.
+    pub struct DebugVertex {
+        pub pos: [f32; 3],
+        pub color: [u8; 4],
+    }
+}
+
+/// Which draw pass a whole mesh belongs to. A property OF a mesh, not a
+/// sub-range within one: the world meshes opaque and translucent geometry into
+/// separate [`MeshData`]s, so a mesh is uniformly one pass. Drives both the
+/// pipeline ([`Pass::Opaque`] → depth read/write, no blend; [`Pass::Transparent`]
+/// → depth read-only, alpha blend) and draw order (opaque before transparent).
+/// Extensible: a `Cutout = 2` alpha-test variant is a future `+1`.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Pass {
+    Opaque = 0,
+    Transparent = 1,
+}
+
+/// Triangle mesh built one quad at a time, indices bucketed by face direction.
+///
+/// Six [`Normal`]-indexed index buckets share one vertex array; [`Self::quad`]
+/// routes each quad by its normal and emits correctly wound indices, so
+/// direction mis-sorting and winding bugs are unrepresentable at the call site.
+/// Upload concatenates the buckets in `Normal` order into one index blob and
+/// records the per-direction boundaries, which the renderer uses for optional
+/// six-way face culling. Reusable as scratch: [`Self::clear`] keeps capacity.
 pub struct MeshData {
-    pub vertices: Vec<Vertex>,
-    pub indices: Vec<u32>,
+    pub(crate) vertices: Vec<MeshVertex>,
+    /// Indices per face direction, indexed by `Normal as usize`. Concatenated
+    /// in that order at upload. Each entry references the shared `vertices`.
+    pub(crate) buckets: [Vec<u32>; 6],
+    pub(crate) pass: Pass,
 }
 
 impl MeshData {
+    /// An empty mesh tagged with its draw pass.
+    pub fn new(pass: Pass) -> Self {
+        Self {
+            vertices: Vec::new(),
+            buckets: std::array::from_fn(|_| Vec::new()),
+            pass,
+        }
+    }
+
+    /// Appends one quad: four corners wound CCW as seen from outside → four
+    /// vertices plus six indices (two triangles, `0,1,2` + `0,2,3`) routed into
+    /// the bucket for `corners[0]`'s face normal. All four corners are expected
+    /// to share that normal (greedy quads do).
+    pub fn quad(&mut self, corners: [MeshVertex; 4]) {
+        let dir = corners[0].normal() as usize;
+        let base = self.vertices.len() as u32;
+        self.vertices.extend_from_slice(&corners);
+        self.buckets[dir].extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    /// The mesh's draw pass.
+    pub fn pass(&self) -> Pass {
+        self.pass
+    }
+
+    /// Clears all geometry but keeps every allocation (vertices and buckets)
+    /// and the pass tag, for reuse as a scratch buffer.
     pub fn clear(&mut self) {
         self.vertices.clear();
-        self.indices.clear();
+        for bucket in &mut self.buckets {
+            bucket.clear();
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
+        self.vertices.is_empty()
+    }
+
+    /// The packed vertices, for tests in dependent crates that assert on emitted
+    /// geometry (greedy-mesh area vs a reference sweep, byte-identical far
+    /// chunks). `#[doc(hidden)]` and read-only — mirrors the
+    /// [`MeshHandle::from_raw_parts`] "for dependent-crate tests" precedent; NOT
+    /// a production surface (build geometry with [`Self::quad`]).
+    #[doc(hidden)]
+    pub fn vertices(&self) -> &[MeshVertex] {
+        &self.vertices
+    }
+
+    /// The six per-direction index buckets (concatenated in [`Normal`] order at
+    /// upload). `#[doc(hidden)]` — dependent-crate tests only, as [`Self::vertices`].
+    #[doc(hidden)]
+    pub fn buckets(&self) -> &[Vec<u32>; 6] {
+        &self.buckets
     }
 }
 
@@ -69,29 +294,114 @@ pub struct MeshHandle {
     pub(crate) generation: u32,
 }
 
+impl MeshHandle {
+    /// Construct a handle from raw parts. For tests in dependent crates that
+    /// need to populate handle-carrying state (e.g. mesh-lifecycle transitions)
+    /// without a live GPU — the fields are otherwise crate-private. NOT for
+    /// production use: a fabricated handle indexes no real GPU mesh.
+    #[doc(hidden)]
+    pub fn from_raw_parts(index: u32, generation: u32) -> Self {
+        Self { index, generation }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Vertex;
+    use super::*;
 
-    #[test]
-    fn vertex_is_24_bytes_no_padding() {
-        assert_eq!(std::mem::size_of::<Vertex>(), 24);
-        assert_eq!(std::mem::offset_of!(Vertex, pos), 0);
-        assert_eq!(std::mem::offset_of!(Vertex, uv), 12);
-        assert_eq!(std::mem::offset_of!(Vertex, color), 20);
+    /// Types the shared raw [`unpack`] back into the API surface — the one
+    /// check no validation layer can do: that pack/unpack (and thus the
+    /// const-fn shifts and the documented table) agree.
+    fn typed_unpack(v: MeshVertex) -> ([u8; 3], Normal, u8, u8, u8, u8) {
+        let ([x, y, z], ni, layer, ao, sky, block) = unpack(v.packed);
+        (
+            [x as u8, y as u8, z as u8],
+            Normal::from_index(ni),
+            layer,
+            ao,
+            sky,
+            block,
+        )
     }
 
     #[test]
-    fn textured_packs_layer_in_alpha() {
-        let v = Vertex::textured([1.0, 2.0, 3.0], [0.5, 0.25], [10, 20, 30], 7);
-        assert_eq!(v.color, [10, 20, 30, 7]);
-        assert_eq!(v.uv, [0.5, 0.25]);
+    fn round_trip_over_representative_sweep() {
+        let normals = [
+            Normal::PosX,
+            Normal::NegX,
+            Normal::PosY,
+            Normal::NegY,
+            Normal::PosZ,
+            Normal::NegZ,
+        ];
+        for pos in [[0, 0, 0], [16, 16, 16], [1, 7, 15], [16, 0, 9]] {
+            for normal in normals {
+                for layer in [0u8, 1, 127, 255] {
+                    for ao in [0u8, 1, 3] {
+                        for (sky, block) in [(0u8, 15u8), (15, 0), (7, 8), (15, 15)] {
+                            let v = MeshVertex::new(
+                                pos,
+                                normal,
+                                layer,
+                                Ao::new(ao),
+                                Light::new(sky, block),
+                            );
+                            assert_eq!(typed_unpack(v), (pos, normal, layer, ao, sky, block));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn new_zeroes_uv() {
-        let v = Vertex::new([0.0; 3], crate::color::Color::new(1, 2, 3, 0));
-        assert_eq!(v.uv, [0.0, 0.0]);
-        assert_eq!(v.color, [1, 2, 3, 0]);
+    fn day_light_keeps_sky_drops_block() {
+        let v = MeshVertex::new([2, 3, 4], Normal::PosY, 5, Ao::NONE, Light::DAY);
+        assert_eq!(typed_unpack(v), ([2, 3, 4], Normal::PosY, 5, 3, 15, 0));
+    }
+
+    /// A quad wound `[0,1,2,0,2,3]` seen from outside, layer irrelevant.
+    fn quad_for(normal: Normal) -> [MeshVertex; 4] {
+        std::array::from_fn(|i| MeshVertex::new([i as u8, 0, 0], normal, 0, Ao::NONE, Light::FULL))
+    }
+
+    #[test]
+    fn quad_routes_by_normal_with_correct_winding() {
+        let mut data = MeshData::new(Pass::Opaque);
+        // Two +X quads, one -Z quad: buckets fill by Normal index; others empty.
+        data.quad(quad_for(Normal::PosX));
+        data.quad(quad_for(Normal::PosX));
+        data.quad(quad_for(Normal::NegZ));
+
+        assert_eq!(data.vertices.len(), 12);
+        assert_eq!(data.buckets[Normal::PosX as usize].len(), 12); // 2 quads × 6
+        assert_eq!(data.buckets[Normal::NegZ as usize].len(), 6);
+        for empty in [Normal::NegX, Normal::PosY, Normal::NegY, Normal::PosZ] {
+            assert!(data.buckets[empty as usize].is_empty());
+        }
+        // First quad: base 0, second quad: base 4 — winding preserved per quad.
+        assert_eq!(
+            &data.buckets[Normal::PosX as usize][..6],
+            &[0, 1, 2, 0, 2, 3]
+        );
+        assert_eq!(
+            &data.buckets[Normal::PosX as usize][6..],
+            &[4, 5, 6, 4, 6, 7]
+        );
+        assert_eq!(
+            &data.buckets[Normal::NegZ as usize][..],
+            &[8, 9, 10, 8, 10, 11]
+        );
+    }
+
+    #[test]
+    fn clear_keeps_pass_and_empties_buckets() {
+        let mut data = MeshData::new(Pass::Transparent);
+        data.quad(quad_for(Normal::PosY));
+        assert!(!data.is_empty());
+        data.clear();
+        assert!(data.is_empty());
+        assert_eq!(data.pass(), Pass::Transparent);
+        assert!(data.buckets.iter().all(|b| b.is_empty()));
     }
 }

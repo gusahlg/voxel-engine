@@ -1,23 +1,65 @@
 /// Per-frame draw recording: `Frame` (2D overlay + frame lifecycle) and
 /// `Frame3D` (world rendering inside a `begin_3d` scope). Everything records
 /// into reused CPU lists; submission happens when the `Frame` drops.
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat3, Mat4, Vec2, Vec3};
 
 use crate::camera::{Camera3D, Frustum};
 use crate::color::Color;
 use crate::engine::Engine;
 use crate::font;
-use crate::mesh::{MeshHandle, Vertex};
-use crate::vk::pipeline::Vertex2D;
+use crate::mesh::{DebugVertex, MeshHandle};
+use crate::vk::pipeline::{SkyLight, Vertex2D};
+
+/// Palette-only description of the procedural sky, set by the app inside a
+/// `begin_3d` scope. The engine composes the GPU push constant (adding the
+/// inverse view-projection and deriving the sun-disc cosines) at record time,
+/// so the app never touches a matrix. Colours are the two anchors the fragment
+/// shader interpolates by ray elevation — sampled from the app's single
+/// radiance source of truth, not re-derived on the GPU.
+#[derive(Clone, Copy)]
+pub struct SkyDesc {
+    pub sun_dir: Vec3,
+    /// Sky colour looking straight up.
+    pub zenith: Color,
+    /// Sky colour at the horizon (matches terrain fog for a seamless edge).
+    pub horizon: Color,
+    /// Warm glow colour smeared along the horizon toward the sun's azimuth.
+    pub sun_tint: Color,
+    /// Linear exposure multiplier applied to the whole sky.
+    pub exposure: f32,
+    /// Angular radius of the sun disc, in radians; the engine derives the
+    /// inner/outer edge cosines for the analytic disc from it.
+    pub sun_angular_radius: f32,
+}
 
 /// CPU-side draw lists for one frame. Vec capacities persist across frames.
 pub(crate) struct DrawLists {
     pub clear: Color,
     pub view_proj: Mat4,
+    /// Sky lighting/fog for the mesh pipeline. The default [`SkyLight::IDENTITY`]
+    /// (white sun, black ambient, fog density 0) renders exactly as an unlit
+    /// scene (`light = shade·ao·max(sky,block)`, no fog).
+    pub sky_light: SkyLight,
+    /// Camera world position for the current 3D scope; feeds six-way face
+    /// culling (which needs the camera in each mesh's local frame).
+    pub cam_pos: Vec3,
+    /// `tan(fovy/2)` for the current 3D camera; the renderer derives the
+    /// vertical focal length (`0.5·height/tan_half`) for VRS depth thresholding.
+    pub fovy_tan_half: f32,
     pub has_3d: bool,
-    pub mesh_draws: Vec<(MeshHandle, Vec3)>,
-    pub cube_verts: Vec<Vertex>,
-    pub line_verts: Vec<Vertex>,
+    /// Procedural sky palette for this frame's background pass, or `None` to
+    /// leave the flat clear colour showing. Set via [`Frame3D::set_sky`].
+    pub sky: Option<SkyDesc>,
+    /// Each draw: mesh handle, camera-relative offset, and uniform scale
+    /// (`1.0` for near chunks, `2^k` for LOD tiles). The `bool` selects the
+    /// depth-biased opaque pipeline (far-LOD tiles), so full-res chunks win at
+    /// coincident depth without z-fighting.
+    pub mesh_draws: Vec<(MeshHandle, Vec3, f32, bool)>,
+    pub cube_verts: Vec<DebugVertex>,
+    pub line_verts: Vec<DebugVertex>,
+    /// Translucent ground decals (contact shadows), drawn with the blended,
+    /// depth-read-only debug pipeline after the opaque cubes.
+    pub shadow_verts: Vec<DebugVertex>,
     pub verts_2d: Vec<Vertex2D>,
 }
 
@@ -26,19 +68,27 @@ impl DrawLists {
         Self {
             clear: Color::BLACK,
             view_proj: Mat4::IDENTITY,
+            sky_light: SkyLight::IDENTITY,
+            cam_pos: Vec3::ZERO,
+            fovy_tan_half: 1.0,
             has_3d: false,
+            sky: None,
             mesh_draws: Vec::new(),
             cube_verts: Vec::new(),
             line_verts: Vec::new(),
+            shadow_verts: Vec::new(),
             verts_2d: Vec::new(),
         }
     }
 
     pub fn reset(&mut self) {
         self.has_3d = false;
+        self.sky = None;
+        self.sky_light = SkyLight::IDENTITY;
         self.mesh_draws.clear();
         self.cube_verts.clear();
         self.line_verts.clear();
+        self.shadow_verts.clear();
         self.verts_2d.clear();
     }
 }
@@ -60,6 +110,8 @@ impl<'e> Frame<'e> {
         let view_proj = cam.view_proj(aspect);
         let frustum = Frustum::from_view_proj(&view_proj);
         self.eng.lists.view_proj = view_proj;
+        self.eng.lists.cam_pos = cam.position;
+        self.eng.lists.fovy_tan_half = (cam.fovy.to_radians() * 0.5).tan();
         self.eng.lists.has_3d = true;
         Frame3D {
             frame: self,
@@ -162,47 +214,151 @@ pub struct Frame3D<'f, 'e> {
 }
 
 impl Frame3D<'_, '_> {
-    /// Draws an uploaded mesh translated by `offset` (applied GPU-side, so
-    /// meshes can stay in small local coordinates for camera-relative
-    /// rendering); skipped automatically when its translated AABB is outside
-    /// the view frustum.
-    pub fn draw_mesh(&mut self, handle: MeshHandle, offset: Vec3) {
+    /// Draws an uploaded mesh scaled by `scale` about its local origin then
+    /// translated by `offset` (both applied GPU-side, so meshes stay in small
+    /// local coordinates for camera-relative rendering). `scale` is `1.0` for a
+    /// near chunk and `2^k` for a coarser LOD tile. Skipped automatically when
+    /// its scaled, translated AABB is outside the view frustum.
+    pub fn draw_mesh(&mut self, handle: MeshHandle, offset: Vec3, scale: f32) {
+        self.push_mesh(handle, offset, scale, false);
+    }
+
+    /// Like [`draw_mesh`](Self::draw_mesh) but draws through the depth-biased
+    /// opaque pipeline: fragments are pushed slightly toward the reversed-Z far
+    /// plane so normal opaque meshes win at coincident depth. Used for far-LOD
+    /// terrain tiles that sit behind full-res chunks over the same ground.
+    pub fn draw_mesh_biased(&mut self, handle: MeshHandle, offset: Vec3, scale: f32) {
+        self.push_mesh(handle, offset, scale, true);
+    }
+
+    fn push_mesh(&mut self, handle: MeshHandle, offset: Vec3, scale: f32, biased: bool) {
         let Some((aabb_min, aabb_max)) = self.frame.eng.renderer.mesh_aabb(handle) else {
             return;
         };
+        // The scale must thread into the frustum test too: a scaled tile's
+        // world AABB is `local * scale + offset`, and using the unscaled box
+        // would mis-cull it near the view edges.
         if !self
             .frustum
-            .intersects_aabb(aabb_min + offset, aabb_max + offset)
+            .intersects_aabb(aabb_min * scale + offset, aabb_max * scale + offset)
         {
             return;
         }
-        self.frame.eng.lists.mesh_draws.push((handle, offset));
+        self.frame
+            .eng
+            .lists
+            .mesh_draws
+            .push((handle, offset, scale, biased));
+    }
+
+    /// Sets the sky lighting and fog applied to every mesh drawn this frame.
+    ///
+    /// `sun_light` tints the sky-lit portion of each face, `ambient` is the
+    /// unlit floor (block-lit torches are unaffected by either), and geometry
+    /// fades toward `fog` with `exp(-distance · fog_density)`. Call once inside
+    /// the `begin_3d` scope; the defaults (white sun, black ambient, zero
+    /// density) reproduce the unlit look when never called.
+    pub fn set_sky_light(&mut self, sun_light: Color, ambient: Color, fog: Color, fog_density: f32) {
+        let n = |c: Color| [c.r, c.g, c.b].map(|v| v as f32 / 255.0);
+        let [sr, sg, sb] = n(sun_light);
+        let [ar, ag, ab] = n(ambient);
+        let [fr, fg, fb] = n(fog);
+        self.frame.eng.lists.sky_light = SkyLight {
+            sun_light: [sr, sg, sb, 1.0],
+            ambient: [ar, ag, ab, 1.0],
+            fog: [fr, fg, fb, fog_density],
+        };
+    }
+
+    /// Sets the procedural sky drawn behind this frame's geometry. The
+    /// background pass shades only pixels the terrain did not cover (a
+    /// reversed-Z depth trick), so it is near-free. Call once inside the
+    /// `begin_3d` scope; leaving it unset shows the flat clear colour.
+    pub fn set_sky(&mut self, desc: SkyDesc) {
+        self.frame.eng.lists.sky = Some(desc);
     }
 
     pub fn draw_cube(&mut self, center: Vec3, size: Vec3, color: Color) {
         let min = center - size * 0.5;
         let max = center + size * 0.5;
-        // uv (0,0) + layer 0 (always white) = flat vertex color. Nothing is
-        // lost dropping color.a here: the 3D pipelines never blended alpha.
-        let c = [color.r, color.g, color.b, 0];
+        let c = [color.r, color.g, color.b, color.a];
         let verts = &mut self.frame.eng.lists.cube_verts;
         // 6 faces, each two triangles, corners wound CCW seen from outside.
         for face in cube_faces(min, max) {
             for idx in [0usize, 1, 2, 0, 2, 3] {
-                verts.push(Vertex {
+                verts.push(DebugVertex {
                     pos: face[idx],
-                    uv: [0.0, 0.0],
                     color: c,
                 });
             }
         }
     }
 
+    /// Box centred at `center`, half-extents `half`, rotated by `rot`
+    /// (columns = local axes in world space). Each face is shaded by the frame's
+    /// sky key light (the same source terrain uses, see [`KeyLight`]) baked into
+    /// the vertex colour, so limbs read as 3D and track the time of day.
+    pub fn draw_box(&mut self, center: Vec3, half: Vec3, rot: Mat3, color: Color) {
+        let key = KeyLight::from_lists(&self.frame.eng.lists);
+        // Local-space corner layout and per-face normals share the cube ordering.
+        let faces = cube_faces(-half, half);
+        const NORMALS: [Vec3; 6] = [
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, -1.0),
+        ];
+        let verts = &mut self.frame.eng.lists.cube_verts;
+        for (face, local_n) in faces.iter().zip(NORMALS) {
+            let n = (rot * local_n).normalize_or_zero();
+            let lit = key.ambient + key.sun * n.dot(key.dir).max(0.0);
+            let shaded = |v: u8, chan: f32| (v as f32 * chan).round().clamp(0.0, 255.0) as u8;
+            let c = [
+                shaded(color.r, lit.x),
+                shaded(color.g, lit.y),
+                shaded(color.b, lit.z),
+                color.a,
+            ];
+            for idx in [0usize, 1, 2, 0, 2, 3] {
+                let l = face[idx];
+                let world = center + rot * Vec3::new(l[0], l[1], l[2]);
+                verts.push(DebugVertex {
+                    pos: [world.x, world.y, world.z],
+                    color: c,
+                });
+            }
+        }
+    }
+
+    /// A flat, translucent ground decal centred at `center` (a contact shadow).
+    /// `radius` is the half-width of the square blob; `color`'s alpha controls
+    /// darkness. Drawn with the blended, depth-read-only debug pipeline, so it
+    /// blends over terrain without occluding geometry behind it. No sun offset:
+    /// a contact/AO blob sits directly under its owner.
+    pub fn draw_shadow(&mut self, center: Vec3, radius: f32, color: Color) {
+        let c = [color.r, color.g, color.b, color.a];
+        // A single ground quad in the XZ plane at `center.y`, wound CCW from above.
+        let corners = [
+            [center.x - radius, center.y, center.z - radius],
+            [center.x - radius, center.y, center.z + radius],
+            [center.x + radius, center.y, center.z + radius],
+            [center.x + radius, center.y, center.z - radius],
+        ];
+        let verts = &mut self.frame.eng.lists.shadow_verts;
+        for idx in [0usize, 1, 2, 0, 2, 3] {
+            verts.push(DebugVertex {
+                pos: corners[idx],
+                color: c,
+            });
+        }
+    }
+
     pub fn draw_cube_wires(&mut self, center: Vec3, size: Vec3, color: Color) {
         let min = center - size * 0.5;
         let max = center + size * 0.5;
-        // Layer 0 = white; see draw_cube.
-        let c = [color.r, color.g, color.b, 0];
+        let c = [color.r, color.g, color.b, color.a];
         let corners = [
             [min.x, min.y, min.z],
             [max.x, min.y, min.z],
@@ -229,14 +385,12 @@ impl Frame3D<'_, '_> {
         ];
         let verts = &mut self.frame.eng.lists.line_verts;
         for (a, b) in EDGES {
-            verts.push(Vertex {
+            verts.push(DebugVertex {
                 pos: corners[a],
-                uv: [0.0, 0.0],
                 color: c,
             });
-            verts.push(Vertex {
+            verts.push(DebugVertex {
                 pos: corners[b],
-                uv: [0.0, 0.0],
                 color: c,
             });
         }
@@ -340,4 +494,43 @@ fn cube_faces(min: Vec3, max: Vec3) -> [[[f32; 3]; 4]; 6] {
             [max.x, min.y, min.z],
         ],
     ]
+}
+
+/// The directional key light used to shade oriented boxes ([`Frame3D::draw_box`]).
+/// It is the single typed source of avatar shading: derived from the frame's sky
+/// state (the same `sky_light`/`sky` terrain reads), so a peer and the terrain
+/// around it can never be lit inconsistently. `sun`/`ambient` are per-channel RGB
+/// multipliers; `dir` points toward the light.
+struct KeyLight {
+    dir: Vec3,
+    sun: Vec3,
+    ambient: Vec3,
+}
+
+impl KeyLight {
+    /// Look with no sky set (e.g. `bin/demo.rs`): a fixed overhead key with an
+    /// ambient floor, matching the box shading before sky-matching landed.
+    const DEFAULT: KeyLight = KeyLight {
+        dir: Vec3::new(0.35, 0.85, 0.38),
+        sun: Vec3::splat(0.55),
+        ambient: Vec3::splat(0.55),
+    };
+
+    /// Derive the key from the frame's sky. When a procedural sky is set, take its
+    /// sun direction and the sky lighting colours the mesh pipeline uses; otherwise
+    /// fall back to [`KeyLight::DEFAULT`].
+    fn from_lists(lists: &DrawLists) -> Self {
+        match lists.sky {
+            Some(desc) => {
+                let [sr, sg, sb, _] = lists.sky_light.sun_light;
+                let [ar, ag, ab, _] = lists.sky_light.ambient;
+                KeyLight {
+                    dir: desc.sun_dir.normalize_or(Self::DEFAULT.dir),
+                    sun: Vec3::new(sr, sg, sb),
+                    ambient: Vec3::new(ar, ag, ab),
+                }
+            }
+            None => Self::DEFAULT,
+        }
+    }
 }

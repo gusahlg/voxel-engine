@@ -7,43 +7,126 @@
 /// frame's start (so a mesh uploaded mid-update is drawable the same frame).
 /// Frees are deferred until the GPU provably finished the last frame that
 /// could have referenced the mesh.
-use ash::vk;
+use ash::{khr, vk};
 use glam::Vec3;
 
-use super::alloc::{Allocation, GpuAllocator};
-use super::targets::find_memory_type;
-use crate::mesh::{MeshData, MeshHandle};
+use super::alloc::{Allocation, GpuAllocator, find_memory_type};
+use super::timeline::TimelineValue;
+use crate::mesh::{MeshData, MeshHandle, Pass};
 
-/// Suballocation alignment: lcm(256, 24) so every mesh's vertex data starts
-/// at a whole multiple of the 24-byte vertex stride. That makes
-/// `vertex_offset = byte_offset / 24` exact, which is what lets the renderer
-/// bind each arena buffer ONCE at offset 0 and address meshes purely through
-/// `VkDrawIndexedIndirectCommand::vertexOffset` (batched indirect draws).
-/// Costs ~384 B average padding per mesh — negligible against multi-KB
-/// chunk meshes.
-const MESH_ALIGN: u64 = 768;
+/// GPU storage-buffer offset alignment; the 256 half of `MESH_ALIGN`.
+const GPU_OFFSET_ALIGN: u64 = 256;
+
+const fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+/// Suballocation alignment: LCM of GPU offset alignment (256) and vertex stride.
+/// Aligns all vertex data to stride boundaries and allows binding at offset 0.
+const MESH_ALIGN: u64 = {
+    let stride = std::mem::size_of::<crate::mesh::MeshVertex>() as u64;
+    stride / gcd(stride, GPU_OFFSET_ALIGN) * GPU_OFFSET_ALIGN
+};
+const _: () = {
+    assert!(MESH_ALIGN % std::mem::size_of::<crate::mesh::MeshVertex>() as u64 == 0);
+    assert!(MESH_ALIGN % GPU_OFFSET_ALIGN == 0);
+};
 pub const FRAMES_IN_FLIGHT: u64 = 2;
 
+/// A deferred-reclaim queue: items stamped with their last possible GPU use.
+/// [`collect`](Self::collect) only reclaims items the GPU has provably passed.
+/// Allocator-agnostic: yields items for the caller to free.
+pub struct RetireQueue<T> {
+    entries: std::collections::VecDeque<(TimelineValue, T)>,
+}
+
+impl<T> RetireQueue<T> {
+    pub fn new() -> Self {
+        Self {
+            entries: std::collections::VecDeque::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Retires `item`, stamped with the timeline value that last could
+    /// reference it.
+    pub fn push(&mut self, done_at: TimelineValue, item: T) {
+        self.entries.push_back((done_at, item));
+    }
+
+    /// Drains entries whose GPU use has completed, calling `f` on each.
+    pub fn collect(&mut self, current: TimelineValue, mut f: impl FnMut(T)) {
+        while let Some((stamp, _)) = self.entries.front() {
+            if *stamp > current {
+                break;
+            }
+            let (_, item) = self.entries.pop_front().unwrap();
+            f(item);
+        }
+    }
+
+    /// Drains everything, calling `f` on each item.
+    pub fn collect_all(&mut self, mut f: impl FnMut(T)) {
+        for (_, item) in self.entries.drain(..) {
+            f(item);
+        }
+    }
+}
+
 /// Vertex stride shared by the mesh pipelines (must divide [`MESH_ALIGN`]).
-const VERTEX_STRIDE: u64 = std::mem::size_of::<crate::mesh::Vertex>() as u64;
+const VERTEX_STRIDE: u64 = std::mem::size_of::<crate::mesh::MeshVertex>() as u64;
 
 pub struct GpuMesh {
     alloc: Allocation,
-    pub index_count: u32,
-    /// Absolute u32 index into the block buffer (index buffer bound at 0).
-    pub first_index: u32,
-    /// This mesh's first vertex, in vertices, from the start of the block
-    /// buffer (vertex buffer bound at 0; exact because MESH_ALIGN is a
-    /// multiple of the vertex stride). Goes into the indirect command's
-    /// `vertex_offset`.
-    pub vertex_offset: i32,
-    pub aabb_min: Vec3,
-    pub aabb_max: Vec3,
+    /// Seven absolute first-index boundaries: `bounds[dir]..bounds[dir+1]` is
+    /// direction `dir`'s index range (in the same index space as the old
+    /// `first_index`), and `bounds[0]..bounds[6]` is the whole mesh. A
+    /// zero-length bucket has `bounds[dir] == bounds[dir+1]`. Monotonic
+    /// non-decreasing by construction (see [`MeshRegistry::upload`]).
+    bounds: [u32; 7],
+    /// This mesh's first vertex (in vertices from block start).
+    /// Used as the indirect command's `vertex_offset`.
+    vertex_offset: i32,
+    pass: Pass,
+    aabb_min: Vec3,
+    aabb_max: Vec3,
 }
 
 impl GpuMesh {
     pub fn buffer(&self) -> vk::Buffer {
         self.alloc.buffer
+    }
+
+    pub fn pass(&self) -> Pass {
+        self.pass
+    }
+
+    pub fn vertex_offset(&self) -> i32 {
+        self.vertex_offset
+    }
+
+    pub fn aabb(&self) -> (Vec3, Vec3) {
+        (self.aabb_min, self.aabb_max)
+    }
+
+    /// Index range covering directions `[start, end)` (both in `0..=6`) — one
+    /// coalesced run of adjacent buckets. `all_range()` is `run_range(0, 6)`.
+    pub fn run_range(&self, start: usize, end: usize) -> std::ops::Range<u32> {
+        debug_assert!(start <= end && end <= 6);
+        self.bounds[start]..self.bounds[end]
+    }
+
+    /// Index range covering the whole mesh (all six directions coalesced).
+    pub fn all_range(&self) -> std::ops::Range<u32> {
+        self.run_range(0, 6)
     }
 }
 
@@ -59,7 +142,7 @@ pub struct MeshRegistry {
     generations: Vec<u32>,
     free_slots: Vec<u32>,
     pending: Vec<PendingCopy>,
-    retire: std::collections::VecDeque<(u64, Allocation)>,
+    retire: RetireQueue<Allocation>,
     pub live_count: usize,
 }
 
@@ -70,44 +153,48 @@ impl MeshRegistry {
             generations: Vec::new(),
             free_slots: Vec::new(),
             pending: Vec::new(),
-            retire: std::collections::VecDeque::new(),
+            retire: RetireQueue::new(),
             live_count: 0,
         }
     }
 
-    /// Uploads mesh data; `frame_no` is the frame about to be submitted.
+    /// Uploads mesh data.
     pub unsafe fn upload(
         &mut self,
         device: &ash::Device,
         allocator: &mut GpuAllocator,
         data: &MeshData,
-        frame_no: u64,
     ) -> Option<MeshHandle> {
-        if data.indices.is_empty() || data.vertices.is_empty() {
+        let total_indices: usize = data.buckets.iter().map(Vec::len).sum();
+        if total_indices == 0 || data.vertices.is_empty() {
             return None;
         }
 
         let vertex_bytes: &[u8] = bytemuck::cast_slice(&data.vertices);
-        let index_bytes: &[u8] = bytemuck::cast_slice(&data.indices);
         // Index data starts 4-byte aligned right after the vertices.
         let index_start = (vertex_bytes.len() as u64).next_multiple_of(4);
-        let total = index_start + index_bytes.len() as u64;
+        let index_bytes_len = total_indices * std::mem::size_of::<u32>();
+        let total = index_start + index_bytes_len as u64;
 
         let alloc = unsafe { allocator.alloc_device(device, total, MESH_ALIGN) }
             .map_err(|err| log::error!("mesh allocation failed: {err:?}"))
             .ok()?;
 
+        // Writes vertices at 0, then the six index buckets concatenated in
+        // `Normal` order starting at `index_start` (one memcpy per bucket).
+        let write_into = |dst: *mut u8| unsafe {
+            std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), dst, vertex_bytes.len());
+            let mut cursor = index_start as usize;
+            for bucket in &data.buckets {
+                let bytes: &[u8] = bytemuck::cast_slice(bucket);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(cursor), bytes.len());
+                cursor += bytes.len();
+            }
+        };
+
         if let Some(mapped) = alloc.mapped {
             // Unified memory: write straight into the device-local block.
-            unsafe {
-                let dst = mapped.as_ptr();
-                std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), dst, vertex_bytes.len());
-                std::ptr::copy_nonoverlapping(
-                    index_bytes.as_ptr(),
-                    dst.add(index_start as usize),
-                    index_bytes.len(),
-                );
-            }
+            write_into(mapped.as_ptr());
         } else {
             let staging = match unsafe { allocator.alloc_staging(device, total, 4) } {
                 Ok(staging) => staging,
@@ -120,15 +207,7 @@ impl MeshRegistry {
             let mapped = staging
                 .mapped
                 .expect("staging memory is always host-visible");
-            unsafe {
-                let dst = mapped.as_ptr();
-                std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), dst, vertex_bytes.len());
-                std::ptr::copy_nonoverlapping(
-                    index_bytes.as_ptr(),
-                    dst.add(index_start as usize),
-                    index_bytes.len(),
-                );
-            }
+            write_into(mapped.as_ptr());
             self.pending.push(PendingCopy {
                 dst_buffer: alloc.buffer,
                 dst_offset: alloc.offset,
@@ -140,15 +219,12 @@ impl MeshRegistry {
         let mut aabb_min = Vec3::splat(f32::INFINITY);
         let mut aabb_max = Vec3::splat(f32::NEG_INFINITY);
         for v in &data.vertices {
-            let p = Vec3::from_array(v.pos);
+            let p = Vec3::from_array(v.local_pos());
             aabb_min = aabb_min.min(p);
             aabb_max = aabb_max.max(p);
         }
 
-        // Suballocation offsets are 768-aligned = a multiple of BOTH the
-        // 4-byte index size and the 24-byte vertex stride, so every mesh in
-        // a block shares one index-buffer bind at 0 (absolute first_index)
-        // AND one vertex-buffer bind at 0 (exact vertex_offset in vertices).
+        // All meshes share the same index and vertex buffer bindings.
         const _: () =
             assert!(MESH_ALIGN.is_multiple_of(VERTEX_STRIDE) && MESH_ALIGN.is_multiple_of(256));
         debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
@@ -156,11 +232,20 @@ impl MeshRegistry {
         let vertex_offset = (alloc.offset / VERTEX_STRIDE) as i32;
         let first_index = ((alloc.offset + index_start) / 4) as u32;
 
+        // Absolute first-index boundaries: bounds[0] = first_index, then a
+        // running sum of bucket lengths. Monotonic by construction.
+        let mut bounds = [first_index; 7];
+        for dir in 0..6 {
+            bounds[dir + 1] = bounds[dir] + data.buckets[dir].len() as u32;
+        }
+        debug_assert!(bounds.windows(2).all(|w| w[0] <= w[1]));
+        debug_assert_eq!(bounds[6], first_index + total_indices as u32);
+
         let mesh = GpuMesh {
             alloc,
-            index_count: data.indices.len() as u32,
-            first_index,
+            bounds,
             vertex_offset,
+            pass: data.pass,
             aabb_min,
             aabb_max,
         };
@@ -177,7 +262,6 @@ impl MeshRegistry {
             }
         };
         self.live_count += 1;
-        let _ = frame_no;
 
         Some(MeshHandle {
             index,
@@ -192,7 +276,7 @@ impl MeshRegistry {
         self.slots[handle.index as usize].as_ref()
     }
 
-    pub fn free(&mut self, handle: MeshHandle, frame_no: u64) {
+    pub fn free(&mut self, handle: MeshHandle, done_at: TimelineValue) {
         let Some(generation) = self.generations.get_mut(handle.index as usize) else {
             return;
         };
@@ -202,7 +286,7 @@ impl MeshRegistry {
         if let Some(mesh) = self.slots[handle.index as usize].take() {
             *generation = generation.wrapping_add(1);
             self.free_slots.push(handle.index);
-            self.retire.push_back((frame_no, mesh.alloc));
+            self.retire.push(done_at, mesh.alloc);
             self.live_count -= 1;
         }
     }
@@ -213,7 +297,7 @@ impl MeshRegistry {
         &mut self,
         device: &ash::Device,
         cmd: vk::CommandBuffer,
-        frame_no: u64,
+        done_at: TimelineValue,
     ) -> bool {
         if self.pending.is_empty() {
             return false;
@@ -239,7 +323,7 @@ impl MeshRegistry {
             );
         }
         for copy in self.pending.drain(..) {
-            self.retire.push_back((frame_no, copy.staging));
+            self.retire.push(done_at, copy.staging);
         }
         true
     }
@@ -252,28 +336,19 @@ impl MeshRegistry {
         !self.retire.is_empty()
     }
 
-    /// Frees every retired allocation. Only valid when the GPU is provably
-    /// idle for all our submissions AND no pending copy still targets a
-    /// retired region (i.e. after flushing copies).
+    /// Frees every retired allocation (GPU must be idle and copies flushed).
     pub unsafe fn collect_all(&mut self, allocator: &mut GpuAllocator) {
-        for (_, alloc) in self.retire.drain(..) {
-            unsafe { allocator.free(alloc) };
-        }
+        self.retire
+            .collect_all(|alloc| unsafe { allocator.free(alloc) });
     }
 
-    /// Frees retired allocations whose last possible GPU use has completed.
-    /// Call after waiting the frame slot's fence.
-    pub unsafe fn collect(&mut self, allocator: &mut GpuAllocator, frame_no: u64) {
-        while let Some((stamp, _)) = self.retire.front() {
-            if stamp + FRAMES_IN_FLIGHT > frame_no {
-                break;
-            }
-            let (_, alloc) = self.retire.pop_front().unwrap();
-            unsafe { allocator.free(alloc) };
-        }
+    /// Frees retired allocations based on the timeline's current value.
+    pub unsafe fn collect(&mut self, allocator: &mut GpuAllocator, current: TimelineValue) {
+        self.retire
+            .collect(current, |alloc| unsafe { allocator.free(alloc) });
     }
 
-    /// Returns every allocation to the allocator. GPU must be idle.
+    /// Frees all allocations (GPU must be idle).
     pub unsafe fn destroy_all(&mut self, allocator: &mut GpuAllocator) {
         unsafe {
             for slot in self.slots.iter_mut() {
@@ -281,9 +356,7 @@ impl MeshRegistry {
                     allocator.free(mesh.alloc);
                 }
             }
-            for (_, alloc) in self.retire.drain(..) {
-                allocator.free(alloc);
-            }
+            self.retire.collect_all(|alloc| allocator.free(alloc));
             for copy in self.pending.drain(..) {
                 allocator.free(copy.staging);
             }
@@ -298,12 +371,8 @@ const IMM_MIN_CAPACITY: u64 = 64 * 1024;
 /// window's high-water mark for this many consecutive frames.
 const IMM_SHRINK_WINDOW: u32 = 600;
 
-/// A growable host-visible buffer written fresh every frame, one per
-/// frame-in-flight: immediate geometry (VERTEX_BUFFER), per-draw offsets
-/// (STORAGE_BUFFER), indirect commands (INDIRECT_BUFFER). Growing (or the
-/// decay shrink) destroys the old buffer immediately — safe because the
-/// owning frame slot's fence has already been waited when the buffer is
-/// written.
+/// A growable host-visible buffer written each frame, one per frame-in-flight.
+/// Used for immediate geometry, offsets, and indirect commands.
 pub struct HostBuffer {
     pub buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -329,20 +398,9 @@ impl HostBuffer {
         }
     }
 
-    /// Per-frame capacity guarantee plus a gentle decay, so a one-off burst
-    /// (a menu full of text) doesn't pin a huge buffer forever: when the
-    /// capacity exceeded 4x the high-water mark of the last
-    /// [`IMM_SHRINK_WINDOW`] frames, the buffer is recreated at 2x that mark.
-    /// Steady-state cost: one compare, one increment, one compare.
-    ///
-    /// Must be called at the point where the owning frame slot's fence has
-    /// just been waited (the GPU no longer reads this buffer), because both
-    /// growth and decay destroy the old buffer immediately.
-    ///
-    /// Returns `true` when the `buffer` handle changed (created, recreated,
-    /// or destroyed) so callers holding descriptors pointing at it can
-    /// rewrite them. Handle-value comparison would be wrong here: Vulkan may
-    /// reuse a destroyed handle's value for the next buffer.
+    /// Ensures capacity and shrinks oversized buffers when needed.
+    /// Must be called after the frame fence is waited (GPU idle).
+    /// Returns `true` if the buffer handle changed.
     pub unsafe fn maintain(
         &mut self,
         instance: &ash::Instance,
@@ -397,11 +455,11 @@ impl HostBuffer {
                 .create_buffer(&info, None)
                 .expect("Failed to create immediate buffer");
             let requirements = device.get_buffer_memory_requirements(buffer);
+            let memory_props = instance.get_physical_device_memory_properties(physical);
             let alloc_info = vk::MemoryAllocateInfo::default()
                 .allocation_size(requirements.size)
                 .memory_type_index(find_memory_type(
-                    instance,
-                    physical,
+                    &memory_props,
                     requirements.memory_type_bits,
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 ));
@@ -424,7 +482,11 @@ impl HostBuffer {
     }
 
     pub unsafe fn write(&mut self, offset: u64, bytes: &[u8]) {
-        debug_assert!(offset + bytes.len() as u64 <= self.capacity);
+        assert!(
+            offset
+                .checked_add(bytes.len() as u64)
+                .is_some_and(|end| end <= self.capacity)
+        );
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
@@ -448,9 +510,21 @@ impl HostBuffer {
     }
 }
 
-/// `VkDrawIndexedIndirectCommand` as a Pod struct (identical 20-byte layout,
-/// asserted in tests) so a frame's command array is one `cast_slice` write
-/// into the indirect [`HostBuffer`].
+/// One per-draw offsets-SSBO element: a camera-relative translation plus a
+/// uniform scale, read per-vertex in the mesh vertex shader as
+/// `world = local * scale + offset`. Naming `scale` (vs a bare `[f32; 4]` w)
+/// keeps it from silently defaulting to zero. 16 bytes, `std430`-compatible.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DrawOffset {
+    pub offset: [f32; 3],
+    pub scale: f32,
+}
+
+/// `VkDrawIndexedIndirectCommand` as a Pod struct so a frame's command array
+/// is one `cast_slice` write into the indirect [`HostBuffer`]. ash's
+/// `vk::DrawIndexedIndirectCommand` is not `bytemuck::Pod`, hence this mirror;
+/// the `const _` below pins its layout to ash's at compile time.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrawIndexedIndirect {
@@ -464,77 +538,97 @@ pub struct DrawIndexedIndirect {
     pub first_instance: u32,
 }
 
-/// Descriptor machinery for the per-draw offsets SSBO: one set layout
-/// (binding 0, storage buffer, vertex stage) and one set per frame-in-flight
-/// slot, each pointing at that slot's offsets [`HostBuffer`]. Sets are
-/// rewritten by [`write_offsets_descriptor`] whenever the underlying buffer
-/// is recreated (growth/decay) — safe at the maintain() point because the
-/// slot's fence was just waited, so no pending command buffer uses the set.
-pub fn create_offsets_descriptors(
-    device: &ash::Device,
-    count: u32,
-) -> (
-    vk::DescriptorSetLayout,
-    vk::DescriptorPool,
-    Vec<vk::DescriptorSet>,
-) {
-    let bindings = [vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::VERTEX)];
-    let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-    let set_layout = unsafe {
+// Layout must match `VkDrawIndexedIndirectCommand` field-for-field so the
+// struct can be memcpy'd straight into the indirect buffer. Checked against
+// ash's own type at compile time (stronger than a size-only runtime test:
+// this also catches a transposed field).
+const _: () = {
+    use ash::vk::DrawIndexedIndirectCommand as Ash;
+    assert!(std::mem::size_of::<DrawIndexedIndirect>() == std::mem::size_of::<Ash>());
+    assert!(
+        std::mem::offset_of!(DrawIndexedIndirect, index_count)
+            == std::mem::offset_of!(Ash, index_count)
+    );
+    assert!(
+        std::mem::offset_of!(DrawIndexedIndirect, instance_count)
+            == std::mem::offset_of!(Ash, instance_count)
+    );
+    assert!(
+        std::mem::offset_of!(DrawIndexedIndirect, first_index)
+            == std::mem::offset_of!(Ash, first_index)
+    );
+    assert!(
+        std::mem::offset_of!(DrawIndexedIndirect, vertex_offset)
+            == std::mem::offset_of!(Ash, vertex_offset)
+    );
+    assert!(
+        std::mem::offset_of!(DrawIndexedIndirect, first_instance)
+            == std::mem::offset_of!(Ash, first_instance)
+    );
+};
+
+/// Single push-descriptor set layout for the 3D mesh pipeline: binding 0 =
+/// per-draw offsets SSBO (vertex stage), binding 1 = block texture array
+/// (fragment stage). Both live in one set because Vulkan permits at most one
+/// push-descriptor set per pipeline layout. No pool or set: the current
+/// frame's buffer and texture are pushed at record time.
+pub fn create_mesh3d_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout {
+    let bindings = [
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+    ];
+    let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+        .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+        .bindings(&bindings);
+    unsafe {
         device
             .create_descriptor_set_layout(&layout_info, None)
-            .expect("Failed to create offsets set layout")
-    };
-
-    let pool_sizes = [vk::DescriptorPoolSize::default()
-        .ty(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(count)];
-    let pool_info = vk::DescriptorPoolCreateInfo::default()
-        .max_sets(count)
-        .pool_sizes(&pool_sizes);
-    let pool = unsafe {
-        device
-            .create_descriptor_pool(&pool_info, None)
-            .expect("Failed to create offsets descriptor pool")
-    };
-
-    let layouts = vec![set_layout; count as usize];
-    let set_alloc = vk::DescriptorSetAllocateInfo::default()
-        .descriptor_pool(pool)
-        .set_layouts(&layouts);
-    let sets = unsafe {
-        device
-            .allocate_descriptor_sets(&set_alloc)
-            .expect("Failed to allocate offsets descriptor sets")
-    };
-
-    (set_layout, pool, sets)
+            .expect("Failed to create mesh3d set layout")
+    }
 }
 
-/// Points `set` at `buffer` (whole range). Only call when no in-flight
-/// command buffer references the set (post-fence, same rule as the buffer
-/// recreation that triggers this).
-pub fn write_offsets_descriptor(device: &ash::Device, set: vk::DescriptorSet, buffer: vk::Buffer) {
+/// Pushes the per-draw offsets SSBO (binding 0) and block texture array
+/// (binding 1) into set 0 of the bound 3D layout, in one call.
+pub fn push_mesh3d_descriptors(
+    push: &khr::push_descriptor::Device,
+    cmd: vk::CommandBuffer,
+    layout: vk::PipelineLayout,
+    offsets: vk::Buffer,
+    tex_sampler: vk::Sampler,
+    tex_view: vk::ImageView,
+) {
     let buffer_infos = [vk::DescriptorBufferInfo::default()
-        .buffer(buffer)
+        .buffer(offsets)
         .offset(0)
         .range(vk::WHOLE_SIZE)];
-    let writes = [vk::WriteDescriptorSet::default()
-        .dst_set(set)
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .buffer_info(&buffer_infos)];
-    unsafe { device.update_descriptor_sets(&writes, &[]) };
+    let image_infos = [vk::DescriptorImageInfo::default()
+        .sampler(tex_sampler)
+        .image_view(tex_view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buffer_infos),
+        vk::WriteDescriptorSet::default()
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&image_infos),
+    ];
+    unsafe {
+        push.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &writes);
+    }
 }
 
-/// Decay rule for [`HostBuffer::maintain`]: given the current capacity and
-/// the window's high-water mark, returns the capacity to recreate at
-/// (0 = destroy only; the buffer went unused all window), or `None` to keep
-/// the buffer as is.
+/// Shrink a buffer if it's oversized relative to usage.
 fn shrink_capacity(capacity: u64, peak: u64) -> Option<u64> {
     if capacity <= IMM_MIN_CAPACITY {
         return None; // already at (or below) the floor
@@ -547,39 +641,41 @@ fn shrink_capacity(capacity: u64, peak: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DrawIndexedIndirect, IMM_MIN_CAPACITY, MESH_ALIGN, shrink_capacity};
+    use super::super::timeline::TimelineValue;
+    use super::{IMM_MIN_CAPACITY, RetireQueue, shrink_capacity};
 
-    /// The struct is memcpy'd into an INDIRECT_BUFFER: its layout must match
-    /// VkDrawIndexedIndirectCommand exactly (20 bytes, field-for-field).
     #[test]
-    fn indirect_command_matches_vulkan_layout() {
-        assert_eq!(std::mem::size_of::<DrawIndexedIndirect>(), 20);
-        assert_eq!(std::mem::offset_of!(DrawIndexedIndirect, index_count), 0);
-        assert_eq!(std::mem::offset_of!(DrawIndexedIndirect, instance_count), 4);
-        assert_eq!(std::mem::offset_of!(DrawIndexedIndirect, first_index), 8);
-        assert_eq!(std::mem::offset_of!(DrawIndexedIndirect, vertex_offset), 12);
-        assert_eq!(
-            std::mem::offset_of!(DrawIndexedIndirect, first_instance),
-            16
-        );
-        let reference = ash::vk::DrawIndexedIndirectCommand::default();
-        assert_eq!(
-            std::mem::size_of_val(&reference),
-            std::mem::size_of::<DrawIndexedIndirect>()
-        );
-    }
+    fn retire_queue_reclaims_when_the_timeline_reaches_the_stamp() {
+        // An entry stamped at value N reclaims once the timeline counter has
+        // reached N (stamp <= current).
+        let v = TimelineValue::from_raw_for_test;
+        let mut q: RetireQueue<u32> = RetireQueue::new();
+        assert!(q.is_empty());
+        q.push(v(1), 100);
+        q.push(v(2), 101);
+        q.push(v(4), 103);
+        assert!(!q.is_empty());
 
-    /// MESH_ALIGN must keep suballocated vertex data stride-aligned (exact
-    /// indirect vertex_offset) and index data 4-aligned (absolute
-    /// first_index).
-    #[test]
-    fn mesh_align_is_lcm_of_stride_and_256() {
-        assert_eq!(
-            MESH_ALIGN % std::mem::size_of::<crate::mesh::Vertex>() as u64,
-            0
-        );
-        assert_eq!(MESH_ALIGN % 256, 0);
-        assert_eq!(MESH_ALIGN, 768);
+        // current = 0: nothing has completed yet.
+        let mut freed = Vec::new();
+        q.collect(v(0), |x| freed.push(x));
+        assert_eq!(freed, Vec::<u32>::new());
+
+        // current = 1: stamp 1 drains; stamp 2 stays.
+        let mut freed = Vec::new();
+        q.collect(v(1), |x| freed.push(x));
+        assert_eq!(freed, vec![100]);
+
+        // current = 3: stamp 2 (2 <= 3) drains; stamp 4 stays.
+        let mut freed = Vec::new();
+        q.collect(v(3), |x| freed.push(x));
+        assert_eq!(freed, vec![101]);
+
+        // collect_all drains the remainder (stamp 4, not yet reached).
+        let mut freed = Vec::new();
+        q.collect_all(|x| freed.push(x));
+        assert_eq!(freed, vec![103]);
+        assert!(q.is_empty());
     }
 
     #[test]

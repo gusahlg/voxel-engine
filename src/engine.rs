@@ -70,8 +70,6 @@ pub struct Engine {
     fps_cached: i32,
 
     should_close: bool,
-    fullscreen: bool,
-    cursor_disabled: bool,
 }
 
 impl Engine {
@@ -87,8 +85,6 @@ impl Engine {
             fps_window_frames: 0,
             fps_cached: 0,
             should_close: false,
-            fullscreen: config.fullscreen,
-            cursor_disabled: false,
         }
     }
 
@@ -130,17 +126,16 @@ impl Engine {
     // ---- graphics settings ----
 
     pub fn set_fullscreen(&mut self, on: bool) {
-        if on == self.fullscreen {
+        if on == self.fullscreen() {
             return;
         }
-        self.fullscreen = on;
         let mode = on.then(|| winit::window::Fullscreen::Borderless(None));
         self.renderer.window.set_fullscreen(mode);
         self.renderer.request_recreate();
     }
 
     pub fn fullscreen(&self) -> bool {
-        self.fullscreen
+        self.renderer.window.fullscreen().is_some()
     }
 
     pub fn set_vsync(&mut self, on: bool) {
@@ -163,6 +158,17 @@ impl Engine {
 
     pub fn max_msaa(&self) -> u32 {
         self.renderer.max_msaa()
+    }
+
+    /// Enables opt-in six-way face culling: each mesh submits only its
+    /// camera-facing direction buckets. Off by default (one draw per mesh);
+    /// earns its keep only under heavy vertex load.
+    pub fn set_cull_faces(&mut self, on: bool) {
+        self.renderer.set_cull_faces(on);
+    }
+
+    pub fn cull_faces(&self) -> bool {
+        self.renderer.cull_faces()
     }
 
     /// Requests a render-resolution scale (0.25..=2.0); returns the value
@@ -215,14 +221,12 @@ impl Engine {
             log::warn!("cursor grab not supported on this platform");
         }
         window.set_cursor_visible(false);
-        self.cursor_disabled = true;
     }
 
     pub fn enable_cursor(&mut self) {
         let window = &self.renderer.window;
         let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
         window.set_cursor_visible(true);
-        self.cursor_disabled = false;
     }
 
     // ---- meshes ----
@@ -237,10 +241,23 @@ impl Engine {
         self.renderer.free_mesh(handle);
     }
 
+    // ---- screenshots ----
+
+    /// Captures the next presented frame (exactly what is shown) to a
+    /// timestamped PNG under a cwd-relative `screenshots/` directory, never
+    /// overwriting an existing file. Returns the path that will be written, or
+    /// `None` if the directory can't be created.
+    pub fn screenshot(&mut self) -> Option<std::path::PathBuf> {
+        let path = crate::screenshot::next_path()?;
+        self.renderer.request_screenshot(path.clone());
+        Some(path)
+    }
+
     // ---- textures ----
 
     /// Replaces the block texture array sampled by all 3D geometry
-    /// ([`Vertex`](crate::Vertex) `color.a` selects the layer). `layers` are
+    /// ([`MeshVertex`](crate::MeshVertex)'s `layer` field selects the layer).
+    /// `layers` are
     /// RGBA8 images of `size*size*4` bytes each; the engine builds mip chains
     /// (box filter) CPU-side and uploads a fresh device-local texture array.
     ///

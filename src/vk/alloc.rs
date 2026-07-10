@@ -18,8 +18,30 @@ use std::ptr::NonNull;
 
 use ash::vk;
 
+use super::device::{BudgetSnapshot, MemoryBudget};
+
 /// Default block size; larger allocations get a dedicated, larger block.
 const BLOCK_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Whether the DEVICE pool is host-visible (unified memory).
+/// Decided at construction and never changes.
+#[derive(Clone, Copy)]
+struct UnifiedMemory(bool);
+
+/// A deferred `VK_EXT_memory_budget` query.
+/// `snapshot()` runs the driver query on demand at block creation, not per-allocation.
+#[derive(Clone)]
+struct BudgetQuery {
+    instance: ash::Instance,
+    physical: vk::PhysicalDevice,
+    token: MemoryBudget,
+}
+
+impl BudgetQuery {
+    fn snapshot(self) -> BudgetSnapshot {
+        unsafe { self.token.query(&self.instance, self.physical) }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // FreeList — pure offset/size suballocator, no Vulkan types (unit-testable).
@@ -57,8 +79,7 @@ impl FreeList {
         self.used
     }
 
-    /// True when no bytes are allocated: the whole capacity is free again
-    /// (coalescing guarantees a single full-range entry in that case).
+    /// True when no bytes are allocated.
     fn is_empty(&self) -> bool {
         self.used == 0
     }
@@ -182,23 +203,30 @@ pub struct AllocatorStats {
 }
 
 pub struct GpuAllocator {
+    /// Retained for budget queries at block-creation time.
+    instance: ash::Instance,
+    physical: vk::PhysicalDevice,
+    /// Enables `VK_EXT_memory_budget` queries, if available.
+    memory_budget: Option<MemoryBudget>,
     memory_props: vk::PhysicalDeviceMemoryProperties,
-    /// Candidate memory type indices for the device pool, best first.
+    /// Preferred memory type indices for the device pool, in order.
     device_type_prefs: Vec<u32>,
-    /// Candidate memory type indices for the staging pool, best first.
+    /// Preferred memory type indices for the staging pool, in order.
     staging_type_prefs: Vec<u32>,
-    /// Whether the device pool's preferred type is host-visible.
-    device_host_visible: bool,
-    /// Slot vectors so `Allocation::block` indices stay stable when a block
-    /// is destroyed (staging shrink): destroyed blocks leave a `None` slot
-    /// that the next block creation reuses.
+    /// Whether the device pool is host-visible (unified memory).
+    unified: UnifiedMemory,
+    /// Slot vectors allowing reuse of destroyed block indices.
     device_blocks: Vec<Option<Block>>,
     staging_blocks: Vec<Option<Block>>,
 }
 
 impl GpuAllocator {
     /// Captures memory properties; performs no allocations yet.
-    pub unsafe fn new(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Self {
+    pub unsafe fn new(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        memory_budget: Option<MemoryBudget>,
+    ) -> Self {
         let memory_props =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
@@ -239,11 +267,11 @@ impl GpuAllocator {
         }
         let staging_type_prefs = types_with(host_coherent);
 
-        let device_host_visible = device_type_prefs.first().is_some_and(|&i| {
+        let unified = UnifiedMemory(device_type_prefs.first().is_some_and(|&i| {
             memory_props.memory_types[i as usize]
                 .property_flags
                 .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
-        });
+        }));
 
         if device_type_prefs.is_empty() {
             // Spec guarantees a DEVICE_LOCAL type exists, but stay graceful:
@@ -255,10 +283,13 @@ impl GpuAllocator {
         }
 
         Self {
+            instance: instance.clone(),
+            physical: physical_device,
+            memory_budget,
             memory_props,
             device_type_prefs,
             staging_type_prefs,
-            device_host_visible,
+            unified,
             device_blocks: Vec::new(),
             staging_blocks: Vec::new(),
         }
@@ -268,7 +299,16 @@ impl GpuAllocator {
     /// memory): mesh data can be written through `Allocation::mapped`
     /// directly, no staging copy needed.
     pub fn unified_memory(&self) -> bool {
-        self.device_host_visible
+        self.unified.0
+    }
+
+    /// Build a budget query for this block creation.
+    fn budget_query(&self) -> Option<BudgetQuery> {
+        self.memory_budget.map(|token| BudgetQuery {
+            instance: self.instance.clone(),
+            physical: self.physical,
+            token,
+        })
     }
 
     /// Suballocates from the DEVICE pool (vertex/index/transfer-dst usage).
@@ -281,11 +321,13 @@ impl GpuAllocator {
         let usage = vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::INDEX_BUFFER
             | vk::BufferUsageFlags::TRANSFER_DST;
+        let budget = self.budget_query();
         unsafe {
             alloc_from_pool(
                 &mut self.device_blocks,
                 &self.device_type_prefs,
                 &self.memory_props,
+                budget,
                 usage,
                 Pool::Device,
                 device,
@@ -302,11 +344,13 @@ impl GpuAllocator {
         size: u64,
         align: u64,
     ) -> Result<Allocation, vk::Result> {
+        let budget = self.budget_query();
         unsafe {
             alloc_from_pool(
                 &mut self.staging_blocks,
                 &self.staging_type_prefs,
                 &self.memory_props,
+                budget,
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 Pool::Staging,
                 device,
@@ -316,9 +360,7 @@ impl GpuAllocator {
         }
     }
 
-    /// Returns the range to its block's free list. Empty DEVICE blocks are
-    /// kept — chunk churn reuses them almost immediately. Empty STAGING
-    /// blocks are reclaimed by [`Self::shrink_staging`].
+    /// Returns the range to its block's free list.
     pub unsafe fn free(&mut self, allocation: Allocation) {
         let blocks = match allocation.pool {
             Pool::Device => &mut self.device_blocks,
@@ -335,22 +377,10 @@ impl GpuAllocator {
         block.free_list.free(allocation.offset, allocation.size);
     }
 
-    /// Destroys completely-free staging blocks beyond the first (one stays
-    /// warm for the next upload burst). Staging only matters on discrete
-    /// GPUs — unified-memory devices never create staging blocks — but after
-    /// a burst (world load) the blocks would otherwise be held forever.
-    /// Called from the renderer's collect-time housekeeping; steady-state
-    /// cost is a scan over a handful of blocks.
+    /// Destroys completely-free staging blocks beyond the first.
+    /// Only applies on discrete GPUs (unified-memory devices skip staging).
     ///
-    /// Safety: an empty block has no live allocations — pending copies and
-    /// retired-but-unfreed allocations still count as used — so the GPU
-    /// provably no longer reads it.
-    ///
-    /// TEST NOTE: the Vulkan-level destruction path has no automated test
-    /// (it needs a discrete GPU; unified-memory devices never populate the
-    /// staging pool). Verify manually on such a GPU with RUST_LOG=debug and
-    /// look for "destroyed empty staging block" after a world load. The
-    /// selection bookkeeping is unit-tested (`staging_shrink_keeps_one_warm`).
+    /// Safety: an empty block has no live allocations.
     pub unsafe fn shrink_staging(&mut self, device: &ash::Device) {
         for index in empty_blocks_beyond_first(&self.staging_blocks) {
             let block = self.staging_blocks[index]
@@ -368,7 +398,7 @@ impl GpuAllocator {
         }
     }
 
-    /// Destroy all blocks. Caller guarantees the GPU is idle.
+    /// Destroy all blocks (GPU must be idle).
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         for block in self
             .device_blocks
@@ -400,9 +430,8 @@ impl GpuAllocator {
     }
 }
 
-/// Indices of the completely-free blocks in `blocks`, minus the first one
-/// (which is kept warm). Returns an empty Vec — no heap allocation — in the
-/// steady state where at most one empty block exists.
+/// Indices of completely-free blocks, excluding the first one (kept warm).
+/// Returns an empty Vec in typical steady state (at most one empty block).
 fn empty_blocks_beyond_first(blocks: &[Option<Block>]) -> Vec<usize> {
     let mut extra = Vec::new();
     let mut kept_one = false;
@@ -427,6 +456,7 @@ unsafe fn alloc_from_pool(
     blocks: &mut Vec<Option<Block>>,
     type_prefs: &[u32],
     memory_props: &vk::PhysicalDeviceMemoryProperties,
+    budget: Option<BudgetQuery>,
     usage: vk::BufferUsageFlags,
     pool: Pool,
     device: &ash::Device,
@@ -443,7 +473,7 @@ unsafe fn alloc_from_pool(
         }
     }
 
-    let block = unsafe { create_block(device, memory_props, type_prefs, usage, size)? };
+    let block = unsafe { create_block(device, memory_props, type_prefs, budget, usage, size)? };
     // Reuse a destroyed block's slot so existing Allocation indices stay valid.
     let index = match blocks.iter().position(|slot| slot.is_none()) {
         Some(index) => {
@@ -486,6 +516,7 @@ unsafe fn create_block(
     device: &ash::Device,
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     type_prefs: &[u32],
+    budget: Option<BudgetQuery>,
     usage: vk::BufferUsageFlags,
     min_size: u64,
 ) -> Result<Block, vk::Result> {
@@ -498,9 +529,13 @@ unsafe fn create_block(
 
     let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
 
-    let Some(type_index) =
-        pick_memory_type(memory_props, type_prefs, requirements.memory_type_bits)
-    else {
+    let Some(type_index) = pick_memory_type(
+        memory_props,
+        type_prefs,
+        requirements.memory_type_bits,
+        budget.map(BudgetQuery::snapshot),
+        requirements.size,
+    ) else {
         unsafe { device.destroy_buffer(buffer, None) };
         log::error!(
             "no compatible memory type for pool buffer (memory_type_bits = {:#b})",
@@ -563,28 +598,74 @@ unsafe fn create_block(
     })
 }
 
-/// Picks the first preferred type allowed by `memory_type_bits`, falling
-/// back to any compatible HOST_VISIBLE type.
+/// Selects a memory type matching `type_filter` and `properties`.
+pub fn find_memory_type(
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    type_filter: u32,
+    properties: vk::MemoryPropertyFlags,
+) -> u32 {
+    for i in 0..memory_props.memory_type_count {
+        let suitable = (type_filter & (1 << i)) != 0;
+        let has_props = memory_props.memory_types[i as usize]
+            .property_flags
+            .contains(properties);
+        if suitable && has_props {
+            return i;
+        }
+    }
+    panic!("No suitable memory type");
+}
+
+/// Picks a memory type from the preference list, respecting budget constraints.
+/// Falls back to less-preferred types if needed; budget limits are advisory.
 fn pick_memory_type(
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     type_prefs: &[u32],
     memory_type_bits: u32,
+    budget: Option<BudgetSnapshot>,
+    alloc_size: u64,
 ) -> Option<u32> {
-    for &i in type_prefs {
-        if memory_type_bits & (1 << i) != 0 {
-            return Some(i);
+    // Compatible types in preference order, then any host-visible fallback.
+    let mut candidates: Vec<u32> = type_prefs
+        .iter()
+        .copied()
+        .filter(|&i| memory_type_bits & (1 << i) != 0)
+        .collect();
+    for i in 0..memory_props.memory_type_count {
+        let compatible = memory_type_bits & (1 << i) != 0;
+        let host_visible = memory_props.memory_types[i as usize]
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
+        if compatible && host_visible && !candidates.contains(&i) {
+            candidates.push(i);
         }
     }
-    let fallback = (0..memory_props.memory_type_count).find(|&i| {
-        memory_type_bits & (1 << i) != 0
-            && memory_props.memory_types[i as usize]
-                .property_flags
-                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
-    });
-    if let Some(i) = fallback {
-        log::warn!("preferred memory types unavailable; falling back to host-visible type {i}");
+
+    let within_budget = |i: u32| match budget {
+        None => true,
+        Some(snapshot) => {
+            let heap = memory_props.memory_types[i as usize].heap_index as usize;
+            snapshot.heap_usage[heap].saturating_add(alloc_size) <= snapshot.heap_budget[heap]
+        }
+    };
+
+    // Prefer a type with budget headroom; fall back to the most-preferred anyway.
+    if let Some(&i) = candidates.iter().find(|&&i| within_budget(i)) {
+        return Some(i);
     }
-    fallback
+    if let Some(&i) = candidates.first() {
+        if budget.is_some() {
+            log::warn!(
+                "all compatible memory types report over budget for a {} MiB block; \
+                 attempting type {i} anyway",
+                alloc_size / (1024 * 1024)
+            );
+        } else {
+            log::warn!("preferred memory types unavailable; falling back to type {i}");
+        }
+        return Some(i);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -593,7 +674,69 @@ fn pick_memory_type(
 
 #[cfg(test)]
 mod tests {
-    use super::{Block, FreeList, FreeRange, empty_blocks_beyond_first};
+    use super::super::device::BudgetSnapshot;
+    use super::{Block, FreeList, FreeRange, empty_blocks_beyond_first, pick_memory_type};
+    use ash::vk;
+
+    /// Two memory types on two heaps: type 0 (preferred, heap 0) and a
+    /// host-visible type 1 (fallback, heap 1). Both compatible with any buffer.
+    fn two_heap_props() -> vk::PhysicalDeviceMemoryProperties {
+        let mut props = vk::PhysicalDeviceMemoryProperties::default();
+        props.memory_type_count = 2;
+        props.memory_types[0] = vk::MemoryType {
+            property_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            heap_index: 0,
+        };
+        props.memory_types[1] = vk::MemoryType {
+            property_flags: vk::MemoryPropertyFlags::HOST_VISIBLE
+                | vk::MemoryPropertyFlags::HOST_COHERENT,
+            heap_index: 1,
+        };
+        props.memory_heap_count = 2;
+        props
+    }
+
+    #[test]
+    fn budget_skips_full_heap() {
+        let props = two_heap_props();
+        let prefs = [0u32]; // prefer type 0 (heap 0)
+        let bits = 0b11; // both types compatible
+
+        // No budget info: always the preferred type.
+        assert_eq!(pick_memory_type(&props, &prefs, bits, None, 64), Some(0));
+
+        // Heap 0 has headroom: preferred type wins.
+        let ok = BudgetSnapshot {
+            heap_budget: [1000; vk::MAX_MEMORY_HEAPS],
+            heap_usage: [0; vk::MAX_MEMORY_HEAPS],
+        };
+        assert_eq!(
+            pick_memory_type(&props, &prefs, bits, Some(ok), 64),
+            Some(0)
+        );
+
+        // Heap 0 over budget, heap 1 has room: degrade to the host-visible type.
+        let mut tight = BudgetSnapshot {
+            heap_budget: [1000; vk::MAX_MEMORY_HEAPS],
+            heap_usage: [0; vk::MAX_MEMORY_HEAPS],
+        };
+        tight.heap_usage[0] = 990; // 990 + 64 > 1000
+        assert_eq!(
+            pick_memory_type(&props, &prefs, bits, Some(tight), 64),
+            Some(1)
+        );
+
+        // Every heap over budget: fall back to the most-preferred type anyway
+        // (budget is advisory; the OOM path is the real backstop).
+        let full = BudgetSnapshot {
+            heap_budget: [10; vk::MAX_MEMORY_HEAPS],
+            heap_usage: [10; vk::MAX_MEMORY_HEAPS],
+        };
+        assert_eq!(
+            pick_memory_type(&props, &prefs, bits, Some(full), 64),
+            Some(0)
+        );
+    }
 
     /// A GPU-less block (null handles) for pure bookkeeping tests.
     fn dummy_block(capacity: u64, used: u64) -> Option<Block> {

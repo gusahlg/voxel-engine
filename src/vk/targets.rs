@@ -5,34 +5,53 @@
 /// offscreen image. Recreated on resize and on MSAA changes.
 use ash::vk;
 
+use super::alloc::find_memory_type;
 use super::buffers::FRAMES_IN_FLIGHT;
 
-pub struct RenderTargets {
-    pub depth_image: vk::Image,
-    pub depth_memory: vk::DeviceMemory,
-    pub depth_view: vk::ImageView,
-    pub depth_format: vk::Format,
-    /// Present only when samples > 1.
-    pub msaa_image: vk::Image,
-    pub msaa_memory: vk::DeviceMemory,
-    pub msaa_view: vk::ImageView,
-    /// Per-slot offscreen color targets (swapchain format/extent, single
-    /// sampled): each frame draws — or MSAA-resolves — into
-    /// `offscreen[slot]`, and presentation is a separate copy from it into a
-    /// swapchain image. TRANSFER_SRC for that copy.
-    pub offscreen_images: [vk::Image; FRAMES_IN_FLIGHT as usize],
-    pub offscreen_memory: [vk::DeviceMemory; FRAMES_IN_FLIGHT as usize],
-    pub offscreen_views: [vk::ImageView; FRAMES_IN_FLIGHT as usize],
-    pub samples: vk::SampleCountFlags,
+/// Linear-HDR format for the offscreen/MSAA color targets. Rendering,
+/// lighting, and fog all happen here in linear space at float precision; a
+/// later tonemap pass encodes to the LDR swapchain. `R16G16B16A16_SFLOAT` is a
+/// mandatory-supported color-attachment + sampled + blit format in core Vulkan,
+/// so this needs no capability query and no fallback.
+pub const HDR_COLOR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
+/// One image + its backing memory + view, freed together.
+pub(crate) struct ImageResources {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
 }
 
-pub fn sample_count_flag(samples: u32) -> vk::SampleCountFlags {
-    match samples {
-        8 => vk::SampleCountFlags::TYPE_8,
-        4 => vk::SampleCountFlags::TYPE_4,
-        2 => vk::SampleCountFlags::TYPE_2,
-        _ => vk::SampleCountFlags::TYPE_1,
+impl ImageResources {
+    unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
     }
+}
+
+pub struct RenderTargets {
+    /// Per-slot so the VRS compute pass can sample this slot's depth from two
+    /// cycles ago (fence-synchronised) while the other slot is in flight.
+    pub(crate) depth: [ImageResources; FRAMES_IN_FLIGHT as usize],
+    pub depth_format: vk::Format,
+    /// `Some` only when multisampled; `None` is single-sampled (no MSAA image).
+    pub(crate) msaa: Option<ImageResources>,
+    /// Per-slot offscreen color targets (swapchain format/extent, single
+    /// sampled): each frame draws — or MSAA-resolves — into `offscreen[slot]`,
+    /// and presentation is a separate copy from it into a swapchain image.
+    /// TRANSFER_SRC for that copy.
+    pub(crate) offscreen: [ImageResources; FRAMES_IN_FLIGHT as usize],
+    pub samples: vk::SampleCountFlags,
+    /// The HDR format shared by `msaa` + `offscreen`; the geometry pipelines
+    /// must be built with this same format. Never the swapchain format.
+    pub color_format: vk::Format,
+    /// `Some` when attachment VRS is active. Owns the per-slot rate images and
+    /// their texel size as one consistent value — there is no way to have the
+    /// images without the size or vice versa.
+    pub(crate) vrs: Option<super::vrs::Vrs>,
 }
 
 impl RenderTargets {
@@ -41,93 +60,85 @@ impl RenderTargets {
         device: &ash::Device,
         physical: vk::PhysicalDevice,
         extent: vk::Extent2D,
-        color_format: vk::Format,
-        samples: u32,
+        samples: super::SampleCount,
+        fsr: Option<&super::device::FragmentShadingRate>,
     ) -> Self {
-        let samples = sample_count_flag(samples);
+        let color_format = HDR_COLOR_FORMAT;
+        let samples = samples.as_flags();
         let depth_format = pick_depth_format(instance, physical);
+        // Queried once and shared by every render-target image below.
+        let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
 
-        let (depth_image, depth_memory, depth_view) = create_image(
-            instance,
-            device,
-            physical,
-            extent,
-            depth_format,
-            samples,
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-            vk::ImageAspectFlags::DEPTH,
-        );
-
-        let (msaa_image, msaa_memory, msaa_view) = if samples != vk::SampleCountFlags::TYPE_1 {
+        let depth = std::array::from_fn(|_| {
             create_image(
-                instance,
                 device,
-                physical,
+                &memory_props,
+                extent,
+                depth_format,
+                samples,
+                // SAMPLED so the VRS compute classifier can read it.
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::DEPTH,
+            )
+        });
+
+        let msaa = (samples != vk::SampleCountFlags::TYPE_1).then(|| {
+            create_image(
+                device,
+                &memory_props,
                 extent,
                 color_format,
                 samples,
                 vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
                 vk::ImageAspectFlags::COLOR,
             )
-        } else {
-            (
-                vk::Image::null(),
-                vk::DeviceMemory::null(),
-                vk::ImageView::null(),
-            )
-        };
+        });
 
-        let offscreen: [(vk::Image, vk::DeviceMemory, vk::ImageView); FRAMES_IN_FLIGHT as usize] =
-            std::array::from_fn(|_| {
-                create_image(
-                    instance,
-                    device,
-                    physical,
-                    extent,
-                    color_format,
-                    vk::SampleCountFlags::TYPE_1,
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
-                    vk::ImageAspectFlags::COLOR,
-                )
-            });
+        let offscreen = std::array::from_fn(|_| {
+            create_image(
+                device,
+                &memory_props,
+                extent,
+                color_format,
+                vk::SampleCountFlags::TYPE_1,
+                // SAMPLED (not TRANSFER_SRC): the tonemap pass reads this as a
+                // texture; present is no longer a transfer copy.
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::COLOR,
+            )
+        });
+
+        let vrs = fsr.map(|f| super::vrs::Vrs::new(device, &memory_props, f, extent));
 
         Self {
-            depth_image,
-            depth_memory,
-            depth_view,
+            depth,
             depth_format,
-            msaa_image,
-            msaa_memory,
-            msaa_view,
-            offscreen_images: offscreen.map(|(image, _, _)| image),
-            offscreen_memory: offscreen.map(|(_, memory, _)| memory),
-            offscreen_views: offscreen.map(|(_, _, view)| view),
+            msaa,
+            offscreen,
             samples,
+            color_format,
+            vrs,
         }
-    }
-
-    pub fn multisampled(&self) -> bool {
-        self.samples != vk::SampleCountFlags::TYPE_1
     }
 
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe {
-            device.destroy_image_view(self.depth_view, None);
-            device.destroy_image(self.depth_image, None);
-            device.free_memory(self.depth_memory, None);
-            if self.multisampled() {
-                device.destroy_image_view(self.msaa_view, None);
-                device.destroy_image(self.msaa_image, None);
-                device.free_memory(self.msaa_memory, None);
+            for depth in &self.depth {
+                depth.destroy(device);
             }
-            for i in 0..FRAMES_IN_FLIGHT as usize {
-                device.destroy_image_view(self.offscreen_views[i], None);
-                device.destroy_image(self.offscreen_images[i], None);
-                device.free_memory(self.offscreen_memory[i], None);
+            if let Some(msaa) = &self.msaa {
+                msaa.destroy(device);
+            }
+            for target in &self.offscreen {
+                target.destroy(device);
+            }
+            if let Some(vrs) = &mut self.vrs {
+                vrs.destroy(device);
             }
         }
     }
 }
+
 
 fn pick_depth_format(instance: &ash::Instance, physical: vk::PhysicalDevice) -> vk::Format {
     for format in [
@@ -144,19 +155,20 @@ fn pick_depth_format(instance: &ash::Instance, physical: vk::PhysicalDevice) -> 
             return format;
         }
     }
-    panic!("No supported depth format");
+    // Unreachable: Vulkan guarantees D16_UNORM (last candidate) supports
+    // DEPTH_STENCIL_ATTACHMENT on every implementation.
+    unreachable!("no depth format despite spec-guaranteed D16_UNORM support");
 }
 
 fn create_image(
-    instance: &ash::Instance,
     device: &ash::Device,
-    physical: vk::PhysicalDevice,
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
     extent: vk::Extent2D,
     format: vk::Format,
     samples: vk::SampleCountFlags,
     usage: vk::ImageUsageFlags,
     aspect: vk::ImageAspectFlags,
-) -> (vk::Image, vk::DeviceMemory, vk::ImageView) {
+) -> ImageResources {
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
@@ -181,8 +193,7 @@ fn create_image(
 
     let requirements = unsafe { device.get_image_memory_requirements(image) };
     let memory_type = find_memory_type(
-        instance,
-        physical,
+        memory_props,
         requirements.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     );
@@ -218,24 +229,9 @@ fn create_image(
             .expect("Failed to create render target view")
     };
 
-    (image, memory, view)
-}
-
-pub fn find_memory_type(
-    instance: &ash::Instance,
-    physical: vk::PhysicalDevice,
-    type_filter: u32,
-    properties: vk::MemoryPropertyFlags,
-) -> u32 {
-    let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
-    for i in 0..memory_properties.memory_type_count {
-        let suitable = (type_filter & (1 << i)) != 0;
-        let has_props = memory_properties.memory_types[i as usize]
-            .property_flags
-            .contains(properties);
-        if suitable && has_props {
-            return i;
-        }
+    ImageResources {
+        image,
+        memory,
+        view,
     }
-    panic!("No suitable memory type");
 }

@@ -32,9 +32,7 @@ impl Swapchain {
                 .expect("Failed to get surface formats")
         };
 
-        // UNORM preferred: the game was authored against raylib/GL with no
-        // sRGB conversion on write, so UNORM passthrough reproduces its exact
-        // colors. SRGB would double-encode.
+        // Prefer UNORM: matches raylib/GL behavior without sRGB double-encoding.
         let surface_format = surface_formats
             .iter()
             .copied()
@@ -48,16 +46,22 @@ impl Swapchain {
                         && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
                 })
             })
-            .unwrap_or(surface_formats[0]);
+            .unwrap_or_else(|| {
+                let fallback = *surface_formats.first().expect("surface exposes no formats");
+                log::warn!(
+                    "No preferred UNORM surface format found; falling back to {:?} / {:?}",
+                    fallback.format,
+                    fallback.color_space
+                );
+                fallback
+            });
 
         let present_modes = unsafe {
             surface_loader
                 .get_physical_device_surface_present_modes(device.physical, surface)
                 .expect("Failed to get present modes")
         };
-        // vsync-off prefers IMMEDIATE: on MoltenVK (and some Wayland stacks)
-        // MAILBOX still syncs presentation to the display refresh, capping an
-        // uncapped game at ~60-120 fps. IMMEDIATE is the only true uncap.
+        // Without vsync, use IMMEDIATE (MAILBOX still syncs to refresh on some platforms).
         let present_mode = if vsync {
             vk::PresentModeKHR::FIFO
         } else {
@@ -78,8 +82,7 @@ impl Swapchain {
             image_count = capabilities.max_image_count;
         }
 
-        // current_extent == u32::MAX means the surface size is driven by the
-        // swapchain (e.g. Wayland); clamp our window size to the allowed range.
+        // If current_extent == u32::MAX (Wayland), clamp window size to supported range.
         let extent = if capabilities.current_extent.width != u32::MAX {
             capabilities.current_extent
         } else {
@@ -105,10 +108,11 @@ impl Swapchain {
             .image_color_space(surface_format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            // TRANSFER_DST: presentation copies the offscreen render target
-            // into the swapchain image (COLOR_ATTACHMENT — the only usage
-            // guaranteed by the spec — is kept as a harmless fallback).
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
+            // COLOR_ATTACHMENT: the tonemap pass renders into the swapchain image.
+            // TRANSFER_SRC: screenshots copy the finished image back to a host buffer.
+            .image_usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+            )
             .pre_transform(capabilities.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(present_mode)

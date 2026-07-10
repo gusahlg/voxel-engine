@@ -21,6 +21,42 @@ const SHADERS: &[Shader] = &[
         dst: "mesh3d.frag.spv",
     },
     Shader {
+        src: "shaders/debug.vert.slang",
+        stage: "vertex",
+        entry: "vertexMain",
+        dst: "debug.vert.spv",
+    },
+    Shader {
+        src: "shaders/debug.frag.slang",
+        stage: "fragment",
+        entry: "fragmentMain",
+        dst: "debug.frag.spv",
+    },
+    Shader {
+        src: "shaders/sky.vert.slang",
+        stage: "vertex",
+        entry: "vertexMain",
+        dst: "sky.vert.spv",
+    },
+    Shader {
+        src: "shaders/sky.frag.slang",
+        stage: "fragment",
+        entry: "fragmentMain",
+        dst: "sky.frag.spv",
+    },
+    Shader {
+        src: "shaders/tonemap.vert.slang",
+        stage: "vertex",
+        entry: "vertexMain",
+        dst: "tonemap.vert.spv",
+    },
+    Shader {
+        src: "shaders/tonemap.frag.slang",
+        stage: "fragment",
+        entry: "fragmentMain",
+        dst: "tonemap.frag.spv",
+    },
+    Shader {
         src: "shaders/tris2d.vert.slang",
         stage: "vertex",
         entry: "vertexMain",
@@ -31,6 +67,12 @@ const SHADERS: &[Shader] = &[
         stage: "fragment",
         entry: "fragmentMain",
         dst: "tris2d.frag.spv",
+    },
+    Shader {
+        src: "shaders/vrs.comp.slang",
+        stage: "compute",
+        entry: "computeMain",
+        dst: "vrs.comp.spv",
     },
 ];
 

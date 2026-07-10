@@ -78,6 +78,11 @@ pub enum Key {
     Down,
     Left,
     Right,
+    Home,
+    End,
+    Delete,
+    F1,
+    F2,
 }
 
 /// Mouse buttons the engine exposes. Other buttons are ignored.
@@ -298,6 +303,11 @@ fn map_key(code: KeyCode) -> Option<Key> {
         KeyCode::ArrowDown => Key::Down,
         KeyCode::ArrowLeft => Key::Left,
         KeyCode::ArrowRight => Key::Right,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::F1 => Key::F1,
+        KeyCode::F2 => Key::F2,
         _ => return None,
     })
 }

@@ -1,11 +1,11 @@
-//! Camera, projection, and view-frustum math.
+//! Camera, projection, and view-frustum utilities.
 //!
 //! The engine renders with Vulkan reversed-Z (depth cleared to 0.0, compare
 //! GREATER_OR_EQUAL) using `Mat4::perspective_infinite_reverse_rh`, and flips
-//! Y via a negative viewport height so NDC is GL-style y-up. Everything in
-//! this module is pure math: `Camera3D` mirrors raylib's camera (fovy in
-//! degrees), `world_to_screen` projects with the exact matrices used for
-//! rendering, and `Frustum` extracts Gribb-Hartmann planes for AABB culling.
+//! Y via a negative viewport height so NDC is GL-style y-up. `Camera3D`
+//! mirrors raylib's camera (fovy in degrees), `world_to_screen` projects with
+//! the matrices used for rendering, and `Frustum` extracts frustum planes for
+//! AABB culling.
 
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
@@ -44,35 +44,25 @@ impl Camera3D {
 /// Uses the same matrices as rendering. Points behind the camera produce
 /// unusable results (raylib parity — callers pre-filter).
 pub fn world_to_screen(p: Vec3, cam: &Camera3D, screen_w: f32, screen_h: f32) -> Vec2 {
-    let clip = cam.view_proj(screen_w / screen_h) * p.extend(1.0);
+    // Clamp aspect denominator to avoid zero height.
+    let clip = cam.view_proj(screen_w / screen_h.max(1.0)) * p.extend(1.0);
     let ndc = clip.truncate() / clip.w;
-    // Negative-viewport rendering keeps NDC y-up, so pixel y grows downward
-    // as NDC y decreases.
+    // Negative viewport flips y: NDC y-up maps to pixel y downward.
     Vec2::new(
         (ndc.x * 0.5 + 0.5) * screen_w,
         (0.5 - ndc.y * 0.5) * screen_h,
     )
 }
 
-/// View frustum for AABB culling, extracted Gribb-Hartmann style from a
-/// view_proj matrix. With an infinite reversed-Z projection there are 5
-/// meaningful planes (left, right, bottom, top, near); the far plane is at
-/// infinity and omitted.
-///
-/// Each plane is stored as `Vec4(n.x, n.y, n.z, d)` with the normal pointing
-/// inward: a point is inside when `dot(n, p) + d >= 0`.
+/// View frustum for AABB culling: 5 planes (left, right, bottom, top, near)
+/// extracted from a view_proj matrix; far plane omitted (infinite reversed-Z).
+/// Planes are stored as `Vec4(n.x, n.y, n.z, d)` with inward normals.
 pub struct Frustum {
     planes: [Vec4; 5],
 }
 
 impl Frustum {
-    /// Extracts the 5 planes from a view_proj matrix.
-    ///
-    /// glam matrices are column-major, so the matrix ROWS needed by
-    /// Gribb-Hartmann come from the transpose's axes. Vulkan clip space has
-    /// z in [0, w]; with reversed-Z the `0 <= z` side (row2 alone) is the
-    /// infinite far plane and is skipped, while `z <= w` (row3 - row2) is
-    /// the near plane.
+    /// Extracts the 5 frustum planes from a view_proj matrix.
     pub fn from_view_proj(m: &Mat4) -> Self {
         let t = m.transpose();
         let (r0, r1, r2, r3) = (t.x_axis, t.y_axis, t.z_axis, t.w_axis);
@@ -84,18 +74,14 @@ impl Frustum {
             r3 - r2, // near:    z <= w (reversed-Z)
         ];
         for p in &mut planes {
-            // Normalize by the length of the normal so plane distances are
-            // in world units (not required for the sign test, but cheap and
-            // keeps the planes usable for distance queries).
+            // Normalize planes to world units for distance queries.
             *p /= p.truncate().length();
         }
         Self { planes }
     }
 
-    /// Conservative positive-vertex test: for each plane, the AABB corner
-    /// most along the plane normal must be inside; if it is outside any
-    /// plane the whole box is outside. Never culls a visible box; may keep
-    /// a box that only intersects plane extensions (fine for culling).
+    /// Conservative test: checks the corner farthest along each plane normal.
+    /// If any corner is outside a plane, the whole box is culled.
     pub fn intersects_aabb(&self, min: Vec3, max: Vec3) -> bool {
         for plane in &self.planes {
             let n = plane.truncate();
@@ -183,8 +169,7 @@ mod tests {
     fn frustum_keeps_box_straddling_side_plane() {
         let cam = origin_cam();
         let fr = Frustum::from_view_proj(&cam.view_proj(ASPECT));
-        // At z=-10 the right frustum edge is at x = 10 * aspect * tan(30 deg)
-        // ~= 10.26; this box spans x in [9, 12] across that edge.
+        // This box straddles a frustum edge; should not be culled.
         let mn = Vec3::new(9.0, -0.5, -10.5);
         let mx = Vec3::new(12.0, 0.5, -9.5);
         assert!(fr.intersects_aabb(mn, mx));

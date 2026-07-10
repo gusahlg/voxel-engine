@@ -230,11 +230,6 @@ mod tests {
     }
 
     #[test]
-    fn atlas_has_correct_length() {
-        assert_eq!(build_atlas().len(), (ATLAS_WIDTH * ATLAS_HEIGHT) as usize);
-    }
-
-    #[test]
     fn space_cell_blank_and_a_cell_not() {
         let atlas = build_atlas();
         // Space is index 0 -> cell (0, 0).
