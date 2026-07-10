@@ -11,6 +11,7 @@ pub(crate) mod buffers;
 pub(crate) mod device;
 pub(crate) mod image_upload;
 pub(crate) mod instance;
+pub(crate) mod minimap;
 pub(crate) mod pipeline;
 pub(crate) mod swapchain;
 pub(crate) mod targets;
@@ -30,6 +31,7 @@ use block_textures::BlockTextures;
 use buffers::{DrawIndexedIndirect, DrawOffset, FRAMES_IN_FLIGHT, HostBuffer, MeshRegistry};
 use device::Device;
 use instance::InstanceBundle;
+use minimap::MinimapTexture;
 use pipeline::Pipelines;
 use swapchain::Swapchain;
 use targets::RenderTargets;
@@ -85,6 +87,7 @@ struct ImmOffsets {
     line: u64,
     shadow: u64,
     d2: u64,
+    d2_tex: u64,
 }
 
 /// One resolved mesh draw (one direction-run of one mesh), pre-sort scratch for
@@ -161,6 +164,9 @@ fn contiguous_runs(vis: [bool; 6]) -> ([(u8, u8); 3], usize) {
     (runs, n)
 }
 
+/// Minimap texture edge length in texels.
+pub(crate) const MINIMAP_SIZE: u32 = 256;
+
 pub(crate) struct Renderer {
     pub window: winit::window::Window,
 
@@ -180,6 +186,8 @@ pub(crate) struct Renderer {
     pipeline_cache: vk::PipelineCache,
     atlas: FontAtlas,
     block_textures: BlockTextures,
+    /// The minimap texture (per-slot double buffer), sampled by `tris2d_tex`.
+    minimap: MinimapTexture,
 
     frames: Vec<FrameSlot>,
     /// One per swapchain image: signaled by the copy submit, waited by present.
@@ -363,6 +371,16 @@ impl Renderer {
         );
         let mesh3d_set_layout = buffers::create_mesh3d_set_layout(&device.device);
 
+        let minimap = MinimapTexture::new(
+            &instance.instance,
+            &device.device,
+            device.physical,
+            device.graphics_queue,
+            device.command_pool,
+            MINIMAP_SIZE,
+            crate::color::Color::BLACK,
+        );
+
         let pipeline_cache = create_pipeline_cache(&device.device);
         let pipelines = Pipelines::new(
             &device.device,
@@ -427,6 +445,7 @@ impl Renderer {
             pipeline_cache,
             atlas,
             block_textures: block_tex,
+            minimap,
             frames,
             present_semaphores,
             imm,
@@ -571,6 +590,11 @@ impl Renderer {
             self.block_textures.size,
             self.block_textures.size,
         );
+    }
+
+    /// Uploads minimap pixels to staging buffer (synced per-slot).
+    pub fn update_minimap(&mut self, rgba: &[u8]) {
+        self.minimap.update(rgba);
     }
 
     /// Records and submits one frame from the recorded draw lists, and
@@ -723,10 +747,12 @@ impl Renderer {
         let line_bytes: &[u8] = bytemuck::cast_slice(&lists.line_verts);
         let shadow_bytes: &[u8] = bytemuck::cast_slice(&lists.shadow_verts);
         let d2_bytes: &[u8] = bytemuck::cast_slice(&lists.verts_2d);
+        let d2_tex_bytes: &[u8] = bytemuck::cast_slice(&lists.tex_verts_2d);
         let line = (cube_bytes.len() as u64).next_multiple_of(16);
         let shadow = (line + line_bytes.len() as u64).next_multiple_of(16);
         let d2 = (shadow + shadow_bytes.len() as u64).next_multiple_of(16);
-        let total = d2 + d2_bytes.len() as u64;
+        let d2_tex = (d2 + d2_bytes.len() as u64).next_multiple_of(16);
+        let total = d2_tex + d2_tex_bytes.len() as u64;
         let imm = &mut self.imm[slot];
         unsafe {
             imm.maintain(
@@ -740,9 +766,15 @@ impl Renderer {
                 imm.write(line, line_bytes);
                 imm.write(shadow, shadow_bytes);
                 imm.write(d2, d2_bytes);
+                imm.write(d2_tex, d2_tex_bytes);
             }
         }
-        ImmOffsets { line, shadow, d2 }
+        ImmOffsets {
+            line,
+            shadow,
+            d2,
+            d2_tex,
+        }
     }
 
     /// Resolves frame mesh draws into indirect commands, offsets, and runs.
@@ -910,6 +942,9 @@ impl Renderer {
                 .expect("begin command buffer failed");
 
             self.meshes.flush_copies(device, cmd, done_at);
+            // Upload this slot's minimap texture (if its version is stale) on the
+            // live frame command buffer, before the render pass begins.
+            self.minimap.sync(device, cmd, slot);
             if profiling {
                 self.gpu_timer.begin(device, cmd, slot);
             }
@@ -1994,6 +2029,39 @@ impl<'a> RenderPass<'a> {
                 );
                 device.cmd_draw(cmd, self.lists.verts_2d.len() as u32, 1, 0, 0);
             }
+
+            // Minimap pass: own descriptor set for the texture.
+            if self.r.minimap.ready() && !self.lists.tex_verts_2d.is_empty() {
+                device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.r.pipelines.tris2d_tex,
+                );
+                self.r.minimap.push_descriptor(
+                    &self.r.device.push_descriptor,
+                    cmd,
+                    self.r.pipelines.layout_2d,
+                    self.slot,
+                );
+                let pixels_to_ndc = [
+                    2.0 / self.window_extent.width as f32,
+                    2.0 / self.window_extent.height as f32,
+                ];
+                device.cmd_push_constants(
+                    cmd,
+                    self.r.pipelines.layout_2d,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    bytemuck::cast_slice(&pixels_to_ndc),
+                );
+                device.cmd_bind_vertex_buffers(
+                    cmd,
+                    0,
+                    &[self.r.imm[self.slot].buffer],
+                    &[self.offsets.d2_tex],
+                );
+                device.cmd_draw(cmd, self.lists.tex_verts_2d.len() as u32, 1, 0, 0);
+            }
         }
     }
 
@@ -2041,6 +2109,7 @@ impl Drop for Renderer {
             save_pipeline_cache(device, self.pipeline_cache);
             device.destroy_pipeline_cache(self.pipeline_cache, None);
             self.atlas.destroy(device);
+            self.minimap.destroy(device);
             device.destroy_descriptor_set_layout(self.mesh3d_set_layout, None);
             self.block_textures.destroy(device);
             self.gpu_timer.destroy(device);

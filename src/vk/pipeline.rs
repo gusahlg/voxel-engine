@@ -100,6 +100,7 @@ const DEBUG_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.vert.s
 const DEBUG_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.frag.spv"));
 const TRIS2D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tris2d.vert.spv"));
 const TRIS2D_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tris2d.frag.spv"));
+const TRIS2D_TEX_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tris2d_tex.frag.spv"));
 const SKY_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.vert.spv"));
 const SKY_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv"));
 const TONEMAP_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.vert.spv"));
@@ -135,6 +136,8 @@ pub struct Pipelines {
     pub debug_tris_blend: vk::Pipeline,
     pub debug_lines: vk::Pipeline,
     pub tris2d: vk::Pipeline,
+    /// Variant of `tris2d` that samples RGBA texture instead of R8 atlas.
+    pub tris2d_tex: vk::Pipeline,
     /// Vertex-less fullscreen background pass; push-constant only, no descriptor
     /// set. Depth-tests (read-only) at the reversed-Z far plane so it shades
     /// only pixels the terrain left uncovered.
@@ -282,6 +285,7 @@ impl Pipelines {
         let debug_frag = create_shader_module(device, DEBUG_FRAG);
         let tri2d_vert = create_shader_module(device, TRIS2D_VERT);
         let tri2d_frag = create_shader_module(device, TRIS2D_FRAG);
+        let tri2d_tex_frag = create_shader_module(device, TRIS2D_TEX_FRAG);
         let sky_vert = create_shader_module(device, SKY_VERT);
         let sky_frag = create_shader_module(device, SKY_FRAG);
 
@@ -405,6 +409,23 @@ impl Pipelines {
             },
         );
 
+        // Minimap pipeline: same vertex/layout as tris2d, only fragment sampler changed.
+        let tris2d_tex = builder.build(
+            tri2d_vert,
+            tri2d_tex_frag,
+            &bindings_2d,
+            attributes_2d,
+            layout_2d,
+            PipelineConfig {
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                depth: DepthMode::Disabled,
+                cull: vk::CullModeFlags::NONE,
+                blend: true,
+                vrs: false,
+                depth_bias: None,
+            },
+        );
+
         // Sky: no vertex input (verts synthesised from SV_VertexID), depth
         // read-only at the far plane, opaque, no cull. Same GREATER_OR_EQUAL
         // compare as the scene, so it passes only where depth is still cleared.
@@ -460,6 +481,7 @@ impl Pipelines {
             device.destroy_shader_module(debug_frag, None);
             device.destroy_shader_module(tri2d_vert, None);
             device.destroy_shader_module(tri2d_frag, None);
+            device.destroy_shader_module(tri2d_tex_frag, None);
             device.destroy_shader_module(sky_vert, None);
             device.destroy_shader_module(sky_frag, None);
         }
@@ -478,6 +500,7 @@ impl Pipelines {
             debug_tris_blend,
             debug_lines,
             tris2d,
+            tris2d_tex,
             sky,
             layout_sky,
             tonemap,
@@ -511,6 +534,7 @@ impl Pipelines {
             device.destroy_pipeline(self.debug_tris_blend, None);
             device.destroy_pipeline(self.debug_lines, None);
             device.destroy_pipeline(self.tris2d, None);
+            device.destroy_pipeline(self.tris2d_tex, None);
             device.destroy_pipeline(self.sky, None);
             device.destroy_pipeline(self.tonemap, None);
             device.destroy_pipeline_layout(self.layout_3d, None);

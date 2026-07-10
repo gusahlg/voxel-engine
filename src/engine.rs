@@ -269,6 +269,11 @@ impl Engine {
         self.renderer.set_block_textures(size, layers);
     }
 
+    /// Uploads minimap pixels (synced per-slot, version-gated).
+    pub fn update_minimap(&mut self, rgba: &[u8]) {
+        self.renderer.update_minimap(rgba);
+    }
+
     // ---- text / math ----
 
     pub fn measure_text(&self, text: &str, font_size: i32) -> i32 {

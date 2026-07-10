@@ -69,6 +69,12 @@ const SHADERS: &[Shader] = &[
         dst: "tris2d.frag.spv",
     },
     Shader {
+        src: "shaders/tris2d_tex.frag.slang",
+        stage: "fragment",
+        entry: "fragmentMain",
+        dst: "tris2d_tex.frag.spv",
+    },
+    Shader {
         src: "shaders/vrs.comp.slang",
         stage: "compute",
         entry: "computeMain",

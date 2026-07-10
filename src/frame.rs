@@ -61,6 +61,8 @@ pub(crate) struct DrawLists {
     /// depth-read-only debug pipeline after the opaque cubes.
     pub shadow_verts: Vec<DebugVertex>,
     pub verts_2d: Vec<Vertex2D>,
+    /// Minimap verts (drawn by `tris2d_tex` pipeline).
+    pub tex_verts_2d: Vec<Vertex2D>,
 }
 
 impl DrawLists {
@@ -78,6 +80,7 @@ impl DrawLists {
             line_verts: Vec::new(),
             shadow_verts: Vec::new(),
             verts_2d: Vec::new(),
+            tex_verts_2d: Vec::new(),
         }
     }
 
@@ -90,6 +93,7 @@ impl DrawLists {
         self.line_verts.clear();
         self.shadow_verts.clear();
         self.verts_2d.clear();
+        self.tex_verts_2d.clear();
     }
 }
 
@@ -188,6 +192,31 @@ impl<'e> Frame<'e> {
             }
             pen_x += size;
         }
+    }
+
+    /// Rotated textured quad; `tint` white means unmodified.
+    pub fn draw_minimap(&mut self, center: [f32; 2], radius_px: f32, rotation: f32, tint: Color) {
+        let c = [tint.r, tint.g, tint.b, tint.a];
+        let center = Vec2::from(center);
+        let (sin, cos) = rotation.sin_cos();
+        let r = radius_px;
+        // Vertex order matches push_quad_2d's TL, BL, BR, TR.
+        let corners = [
+            (Vec2::new(-r, -r), [0.0, 0.0]),
+            (Vec2::new(-r, r), [0.0, 1.0]),
+            (Vec2::new(r, r), [1.0, 1.0]),
+            (Vec2::new(r, -r), [1.0, 0.0]),
+        ];
+        let verts: [Vertex2D; 4] = corners.map(|(o, uv)| {
+            let pos = center + Vec2::new(o.x * cos - o.y * sin, o.x * sin + o.y * cos);
+            Vertex2D {
+                pos: pos.into(),
+                uv,
+                color: c,
+            }
+        });
+        let [tl, bl, br, tr] = verts;
+        self.eng.lists.tex_verts_2d.extend_from_slice(&[tl, bl, br, tl, br, tr]);
     }
 
     pub fn draw_fps(&mut self, x: i32, y: i32) {
