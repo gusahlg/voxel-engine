@@ -180,9 +180,18 @@ impl MinimapTexture {
         unsafe {
             self.staging[slot].write(0, &self.pixels);
 
+            let (src_stage, src_access) = if img.layout == vk::ImageLayout::UNDEFINED {
+                (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
+            } else {
+                (
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                )
+            };
+
             let to_transfer = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .src_stage_mask(src_stage)
+                .src_access_mask(src_access)
                 .dst_stage_mask(vk::PipelineStageFlags2::COPY)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .old_layout(img.layout)

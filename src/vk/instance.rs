@@ -1,6 +1,8 @@
+#[cfg(target_os = "macos")]
+use ash::khr;
 /// Vulkan instance creation: entry loading, optional validation layer with a
 /// debug-utils messenger, and MoltenVK portability enumeration on macOS.
-use ash::{ext, khr, vk};
+use ash::{ext, vk};
 use raw_window_handle::RawDisplayHandle;
 use std::ffi::{CStr, c_char, c_void};
 
@@ -46,19 +48,23 @@ impl InstanceBundle {
     pub fn new(display_handle: RawDisplayHandle) -> Self {
         let entry = load_entry();
 
-        let mut extensions = ash_window::enumerate_required_extensions(display_handle)
+        let extensions = ash_window::enumerate_required_extensions(display_handle)
             .expect("Failed to enumerate required surface extensions")
             .to_vec();
-
-        let mut create_flags = vk::InstanceCreateFlags::empty();
         // MoltenVK is a non-conformant "portability" driver; the loader hides
         // it unless the instance opts in.
         #[cfg(target_os = "macos")]
-        {
+        let (extensions, create_flags) = {
+            let mut extensions = extensions;
             extensions.push(khr::portability_enumeration::NAME.as_ptr());
             extensions.push(khr::get_physical_device_properties2::NAME.as_ptr());
-            create_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
-        }
+            (
+                extensions,
+                vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR,
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let create_flags = vk::InstanceCreateFlags::empty();
 
         let mut validation = validation_requested() && has_validation_layer(&entry);
 

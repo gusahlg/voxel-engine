@@ -16,10 +16,10 @@
         runtimeLibs = with pkgs; [ vulkan-loader libxkbcommon ]
           ++ pkgs.lib.optionals isLinux [
             wayland
-            xorg.libX11
-            xorg.libXcursor
-            xorg.libXrandr
-            xorg.libXi
+            libx11
+            libxcursor
+            libxrandr
+            libxi
           ];
       in
       {

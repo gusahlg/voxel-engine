@@ -33,8 +33,8 @@ const MESH_ALIGN: u64 = {
     stride / gcd(stride, GPU_OFFSET_ALIGN) * GPU_OFFSET_ALIGN
 };
 const _: () = {
-    assert!(MESH_ALIGN % std::mem::size_of::<crate::mesh::MeshVertex>() as u64 == 0);
-    assert!(MESH_ALIGN % GPU_OFFSET_ALIGN == 0);
+    assert!(MESH_ALIGN.is_multiple_of(std::mem::size_of::<crate::mesh::MeshVertex>() as u64));
+    assert!(MESH_ALIGN.is_multiple_of(GPU_OFFSET_ALIGN));
 };
 pub const FRAMES_IN_FLIGHT: u64 = 2;
 

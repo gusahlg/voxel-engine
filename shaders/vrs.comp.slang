@@ -8,6 +8,7 @@
 // (log2(w) << 2) | log2(h), i.e. 0 = 1x1, 0b0101 = 2x2.
 
 [[vk::binding(0, 0)]] Sampler2D depthTex;
+[[vk::image_format("r8ui")]]
 [[vk::binding(1, 0)]] RWTexture2D<uint> rateOut;
 
 struct Push {

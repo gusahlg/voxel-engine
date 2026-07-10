@@ -164,6 +164,51 @@ fn contiguous_runs(vis: [bool; 6]) -> ([(u8, u8); 3], usize) {
     (runs, n)
 }
 
+/// Fingerprint the exact inputs that produced a slot's depth image. Attachment
+/// VRS reuses that depth two frames later, but only while the view and draw set
+/// are unchanged; otherwise stale sky pixels can coarsen newly visible edges.
+fn scene_fingerprint(lists: &DrawLists, draws: &[DrawEntry]) -> u64 {
+    use ash::vk::Handle;
+
+    #[inline]
+    fn mix(hash: &mut u64, value: u64) {
+        *hash = (*hash ^ value).wrapping_mul(0x100_0000_01b3);
+    }
+
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    mix(&mut hash, lists.has_3d as u64);
+    for value in lists.view_proj.to_cols_array() {
+        mix(&mut hash, value.to_bits() as u64);
+    }
+    for draw in draws {
+        mix(&mut hash, draw.buffer.as_raw());
+        mix(
+            &mut hash,
+            match draw.pass {
+                Pass::Opaque => 0,
+                Pass::Transparent => 1,
+            },
+        );
+        mix(&mut hash, draw.biased as u64);
+        mix(&mut hash, draw.first as u64);
+        mix(&mut hash, draw.count as u64);
+        mix(&mut hash, draw.vertex_offset as u32 as u64);
+        for value in draw.offset.to_array() {
+            mix(&mut hash, value.to_bits() as u64);
+        }
+        mix(&mut hash, draw.scale.to_bits() as u64);
+    }
+    // Immediate cubes (avatars/highlights) also write depth before the VRS
+    // source image is stored. Their color cannot affect classification, but
+    // every position can.
+    for vertex in &lists.cube_verts {
+        for value in vertex.pos {
+            mix(&mut hash, value.to_bits() as u64);
+        }
+    }
+    hash
+}
+
 /// Minimap texture edge length in texels.
 pub(crate) const MINIMAP_SIZE: u32 = 256;
 
@@ -249,6 +294,10 @@ pub(crate) struct Renderer {
     /// (re)creation? The VRS compute pass reads it, so it must skip a slot until
     /// its depth is validly written and in `DEPTH_ATTACHMENT_OPTIMAL`.
     vrs_depth_ready: [bool; FRAMES_IN_FLIGHT as usize],
+    /// Fingerprint of the scene that wrote each slot's reusable depth image.
+    vrs_scene_fingerprint: [Option<u64>; FRAMES_IN_FLIGHT as usize],
+    /// Fingerprint prepared for the frame currently being recorded.
+    scene_fingerprint: u64,
 
     vsync: Pending<bool>,
     msaa: Pending<SampleCount>,
@@ -464,6 +513,8 @@ impl Renderer {
             pending_screenshot: None,
             slot: 0,
             vrs_depth_ready: [false; FRAMES_IN_FLIGHT as usize],
+            vrs_scene_fingerprint: [None; FRAMES_IN_FLIGHT as usize],
+            scene_fingerprint: 0,
             vsync: Pending::new(vsync),
             msaa: Pending::new(msaa),
             needs_recreate: false,
@@ -891,6 +942,7 @@ impl Renderer {
                 }
             }
         }
+        self.scene_fingerprint = scene_fingerprint(lists, &self.draw_scratch);
 
         let offsets_bytes: &[u8] = bytemuck::cast_slice(&self.draw_offsets_data);
         let indirect_bytes: &[u8] = bytemuck::cast_slice(&self.draw_commands);
@@ -967,7 +1019,8 @@ impl Renderer {
         let do_vrs = lists.has_3d
             && self.targets.vrs.is_some()
             && self.targets.msaa.is_none()
-            && self.vrs_depth_ready[slot];
+            && self.vrs_depth_ready[slot]
+            && self.vrs_scene_fingerprint[slot] == Some(self.scene_fingerprint);
 
         let device = &self.device.device;
         let stamp = |p| {
@@ -1008,10 +1061,13 @@ impl Renderer {
             stamp(GpuPass::Overlay);
             pass.end();
         }
-        self.gpu_timer.finish(slot);
+        if profiling {
+            self.gpu_timer.finish(slot);
+        }
         // The main pass just wrote (and stored) this slot's depth, so a later
         // cycle reusing this slot may read it for VRS classification.
         self.vrs_depth_ready[slot] = true;
+        self.vrs_scene_fingerprint[slot] = Some(self.scene_fingerprint);
 
         unsafe {
             self.device
@@ -1580,6 +1636,7 @@ impl Renderer {
             self.clear_copy();
             // Depth images recreated (layout UNDEFINED): VRS must re-prime.
             self.vrs_depth_ready = [false; FRAMES_IN_FLIGHT as usize];
+            self.vrs_scene_fingerprint = [None; FRAMES_IN_FLIGHT as usize];
 
             if msaa_changed || format_changed {
                 self.pipelines.destroy(&self.device.device);
@@ -2629,6 +2686,25 @@ mod tests {
     }
 
     #[test]
+    fn vrs_scene_fingerprint_changes_with_view_and_depth_geometry() {
+        let mut lists = DrawLists::new();
+        let empty = scene_fingerprint(&lists, &[]);
+        lists.has_3d = true;
+        let with_3d = scene_fingerprint(&lists, &[]);
+        assert_ne!(empty, with_3d);
+
+        lists.view_proj = glam::Mat4::from_rotation_y(0.25);
+        let turned = scene_fingerprint(&lists, &[]);
+        assert_ne!(with_3d, turned);
+
+        lists.cube_verts.push(crate::mesh::DebugVertex {
+            pos: [1.0, 2.0, 3.0],
+            color: [255; 4],
+        });
+        assert_ne!(turned, scene_fingerprint(&lists, &[]));
+    }
+
+    #[test]
     fn scale_clamps_into_range() {
         assert_eq!(Scale::new(1.0).get(), 1.0);
         assert_eq!(Scale::new(0.5).as_f32(), 0.5);
@@ -2691,4 +2767,3 @@ mod tests {
         assert!(!changed);
     }
 }
-
