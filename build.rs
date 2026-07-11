@@ -21,6 +21,18 @@ const SHADERS: &[Shader] = &[
         dst: "mesh3d.frag.spv",
     },
     Shader {
+        src: "shaders/surface3d.vert.slang",
+        stage: "vertex",
+        entry: "vertexMain",
+        dst: "surface3d.vert.spv",
+    },
+    Shader {
+        src: "shaders/surface3d.frag.slang",
+        stage: "fragment",
+        entry: "fragmentMain",
+        dst: "surface3d.frag.spv",
+    },
+    Shader {
         src: "shaders/debug.vert.slang",
         stage: "vertex",
         entry: "vertexMain",
