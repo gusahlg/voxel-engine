@@ -59,15 +59,50 @@ fn civil_from_epoch(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
 
 /// Writes tightly-packed RGBA8 pixels (`width * height * 4` bytes, top-down)
 /// as an 8-bit PNG.
+///
+/// Atomic: the encode goes to a sibling `<name>.tmp` which is then renamed onto
+/// `path`. A reader polling for `path` (the blocking [`crate::screenshot_to`]
+/// capture) therefore never observes a half-written file.
 pub(crate) fn write_png(
     path: &Path,
     width: u32,
     height: u32,
     rgba: &[u8],
 ) -> Result<(), png::EncodingError> {
-    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut encoder = png::Encoder::new(file, width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder.write_header()?.write_image_data(rgba)
+    let tmp = path.with_extension("png.tmp");
+    {
+        let file = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        let mut encoder = png::Encoder::new(file, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header()?.write_image_data(rgba)?;
+    }
+    std::fs::rename(&tmp, path).map_err(png::EncodingError::from)
+}
+
+/// Decodes an RGBA8 PNG written by [`write_png`] into flat, tightly-packed
+/// `(width, height, rgba)`. Used by [`crate::load_png`]; kept here beside the
+/// encoder so the `png` codec has one home.
+pub(crate) fn read_png(path: &Path) -> std::io::Result<(u32, u32, Vec<u8>)> {
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path)?));
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    buf.truncate(info.buffer_size());
+    // `screenshot_to` always writes RGBA8; reject anything else loudly rather
+    // than hand back mis-shaped pixels.
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "expected 8-bit RGBA PNG, got {:?}/{:?}",
+                info.color_type, info.bit_depth
+            ),
+        ));
+    }
+    Ok((info.width, info.height, buf))
 }

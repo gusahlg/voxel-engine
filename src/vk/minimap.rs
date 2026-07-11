@@ -219,7 +219,9 @@ impl MinimapTexture {
                 })];
             device.cmd_copy_buffer_to_image(
                 cmd,
-                self.staging[slot].buffer,
+                self.staging[slot]
+                    .bound()
+                    .expect("minimap staging is written before this upload copy"),
                 img.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &region,

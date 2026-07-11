@@ -58,3 +58,13 @@ impl Color {
     pub const RAYWHITE: Self = Self::rgb(245, 245, 245);
     pub const SALMON: Self = Self::rgb(250, 128, 114);
 }
+
+/// A colour in **linear** light, unclamped, with NO OETF on this path — the
+/// engine-boundary form for HDR tints that composite in linear space (the sky
+/// disc; water glint later). Distinct from [`Color`] (8-bit sRGB display codes):
+/// a value only reaches here through a non-quantising exit such as the game's
+/// `Rgb::to_linear`, so the linear invariant rides the type and is never
+/// re-decoded shader-side.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Debug, Pod, Zeroable)]
+pub struct LinearRgb(pub [f32; 3]);

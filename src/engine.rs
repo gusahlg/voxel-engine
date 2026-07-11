@@ -59,14 +59,66 @@ impl Default for Config {
     }
 }
 
+/// Env-gated render feature flags, read ONCE per process. `WATT_X=0` disables,
+/// `WATT_X=1` enables, unset takes the default. All gates are CPU-side: they
+/// neutralize a `FrameUniforms` lane (`frame::gate_uniforms`, applied to
+/// `Lighting::Composed`) or skip a pass's work (vk/mod.rs, vk/shadow.rs) — no
+/// shader variants.
+pub(crate) struct RenderFlags {
+    /// WATT_TAA (default OFF): camera jitter + TAA resolve, always coupled.
+    pub taa: bool,
+    /// WATT_FOG (default OFF): distance fog (`horizon.w` density).
+    pub fog: bool,
+    /// WATT_BLOCKLIGHT: torch/candle light (`candle.rgb`).
+    pub blocklight: bool,
+    /// WATT_AMBIENT (default OFF): omni ambient floor (`candle.w`) — off means black caves.
+    pub ambient: bool,
+    /// WATT_SUNLIGHT: sun/skylight (`light.rgb`), also kills the sky halo glow.
+    pub sunlight: bool,
+    /// WATT_EXPOSURE (default OFF): auto-exposure metering; off pins exposure at 1.0.
+    pub exposure: bool,
+    /// WATT_SHADOWS (default OFF): cascade occluder draws + far-field fallback; off is fully lit.
+    pub shadows: bool,
+    /// WATT_SKY: procedural sky background pass; off shows the clear colour.
+    pub sky: bool,
+}
+
+pub(crate) fn render_flags() -> &'static RenderFlags {
+    fn flag(name: &str, default: bool) -> bool {
+        match std::env::var(name).as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => default,
+        }
+    }
+    static FLAGS: std::sync::OnceLock<RenderFlags> = std::sync::OnceLock::new();
+    FLAGS.get_or_init(|| RenderFlags {
+        taa: flag("WATT_TAA", false),
+        fog: flag("WATT_FOG", false),
+        blocklight: flag("WATT_BLOCKLIGHT", false),
+        ambient: flag("WATT_AMBIENT", false),
+        sunlight: flag("WATT_SUNLIGHT", true),
+        exposure: flag("WATT_EXPOSURE", false),
+        shadows: flag("WATT_SHADOWS", false),
+        sky: flag("WATT_SKY", true),
+    })
+}
+
 pub struct Engine {
     pub(crate) client: RenderClient,
+    /// The render thread's published exposure, read by
+    /// [`Engine::exposure_for_compose`] each frame.
+    pub(crate) exposure_shared: crate::vk::exposure::ExposureShared,
     /// The window lives on the main thread; only the `Renderer` moved to the
     /// render thread. Window-touching methods read this directly.
     pub(crate) window: winit::window::Window,
     pub(crate) input: InputState,
     /// The frame being recorded; swapped with a pooled buffer each frame.
     pub(crate) lists: Box<DrawLists>,
+    /// The most recently submitted frame's draw lists, retained so a blocking
+    /// deterministic capture ([`crate::screenshot_to`]) can re-present the same
+    /// scene until the readback PNG lands instead of a blank frame.
+    pub(crate) last_lists: Box<DrawLists>,
 
     target_fps: u32,
     frame_start: Instant,
@@ -81,11 +133,14 @@ pub struct Engine {
 impl Engine {
     fn new(window: winit::window::Window, mut client: RenderClient, config: &Config) -> Self {
         let lists = client.take_frame();
+        let exposure_shared = client.exposure();
         Self {
             client,
+            exposure_shared,
             window,
             input: InputState::new(),
             lists,
+            last_lists: Box::new(DrawLists::new()),
             target_fps: config.target_fps,
             frame_start: Instant::now(),
             dt: 0.0,
@@ -112,6 +167,16 @@ impl Engine {
     }
 
     /// Measured frames per second, averaged over a short window.
+    /// Whether temporal AA is enabled (off by default; `WATT_TAA=1` enables). ONE flag read
+    /// once: it gates BOTH the sub-pixel camera jitter injection (frame.rs
+    /// `begin_3d`) and the TAA resolve pass (vk/mod.rs) — the two must never
+    /// disagree (jitter without the resolve is permanent whole-frame shimmer;
+    /// the resolve without jitter is a harmless no-op blur). Diagnostic gate;
+    /// a real `gfx taa` toggle can replace it later.
+    pub(crate) fn taa_enabled() -> bool {
+        render_flags().taa
+    }
+
     pub fn fps(&self) -> i32 {
         self.fps_cached
     }
@@ -207,6 +272,12 @@ impl Engine {
 
     pub fn mouse_delta(&self) -> Vec2 {
         self.input.mouse_delta()
+    }
+
+    /// Vertical scroll accumulated this frame, positive scrolling up/away, in
+    /// line units (a mouse notch is ~1.0).
+    pub fn mouse_wheel(&self) -> f32 {
+        self.input.mouse_wheel()
     }
 
     pub fn is_mouse_button_pressed(&self, button: MouseButton) -> bool {
@@ -333,7 +404,32 @@ impl Engine {
         let next = self.client.take_frame();
         let filled = std::mem::replace(&mut self.lists, next);
         self.lists.reset();
+        // Retain a copy for deterministic capture before the scene crosses to
+        // the render thread (cheap: once-per-frame clone reusing the retained
+        // Vec capacities).
+        // Deref so `DrawLists::clone_from` reuses the retained Vec capacities
+        // rather than `Box::clone_from` reallocating each frame.
+        (*self.last_lists).clone_from(&filled);
         self.client.submit_frame(filled);
+    }
+
+    /// Re-submits the last presented scene ([`Self::last_lists`]) so a pending
+    /// screenshot request latches a real frame. Mirrors [`Self::finish_frame`]'s
+    /// present-pacing (`take_frame` blocks until the render thread returns a
+    /// buffer) but does not touch the in-progress `lists`. Used only by the
+    /// blocking capture path.
+    pub(crate) fn present_last(&mut self) {
+        self.client.drain_returns();
+        let mut next = self.client.take_frame();
+        (*next).clone_from(&self.last_lists);
+        self.client.submit_frame(next);
+    }
+
+    /// Requests that the next presented frame be captured to `path` (async
+    /// write on the render thread); see [`crate::screenshot_to`] for the
+    /// blocking wrapper.
+    pub(crate) fn request_screenshot_to(&mut self, path: std::path::PathBuf) {
+        self.client.request_screenshot(path);
     }
 
     fn tick_timing(&mut self) {

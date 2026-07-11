@@ -15,6 +15,159 @@ use super::buffers::FRAMES_IN_FLIGHT;
 /// so this needs no capability query and no fallback.
 pub const HDR_COLOR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
+/// Cascaded-shadow-map depth format and per-cascade resolution. `D32_SFLOAT` is
+/// a mandatory-supported depth-attachment + sampled format, so no capability
+/// query is needed; it also gives the CSM the precision reversed-Z ortho wants.
+/// 2048² per cascade, two cascades → two array layers of ONE image.
+pub const SHADOW_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+pub const SHADOW_RESOLUTION: u32 = 2048;
+/// Exactly two cascades (mirrors `skeleton::Cascade`), so exactly two layers.
+pub const SHADOW_CASCADES: u32 = 2;
+
+/// The cascaded shadow map: one D32 image with two array layers (one per
+/// [`crate::skeleton::Cascade`]), each `SHADOW_RESOLUTION²`. `layer_views` are
+/// per-cascade single-layer depth attachments the producer renders into;
+/// `sample_view` is the whole 2D array the receiver samples through `sampler`
+/// (a comparison sampler for hardware PCF). Persistent: its size is independent
+/// of the swapchain, but it is recreated with the rest of `RenderTargets` on
+/// resize so its lifetime is a single owner.
+pub(crate) struct ShadowMap {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    /// 2D-array view over all cascades, bound at set 0 binding 4 for sampling.
+    pub sample_view: vk::ImageView,
+    /// One single-layer 2D view per cascade, used as the depth render target.
+    pub layer_views: [vk::ImageView; SHADOW_CASCADES as usize],
+    /// Depth-comparison sampler (reversed-Z: `GREATER_OR_EQUAL`) for PCF.
+    pub sampler: vk::Sampler,
+}
+
+impl ShadowMap {
+    fn new(
+        device: &ash::Device,
+        memory_props: &vk::PhysicalDeviceMemoryProperties,
+    ) -> Self {
+        let extent = vk::Extent3D {
+            width: SHADOW_RESOLUTION,
+            height: SHADOW_RESOLUTION,
+            depth: 1,
+        };
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(SHADOW_FORMAT)
+            .extent(extent)
+            .mip_levels(1)
+            .array_layers(SHADOW_CASCADES)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            // Rendered into (occluder depth) and sampled by the receiver.
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe {
+            device
+                .create_image(&image_info, None)
+                .expect("Failed to create shadow map image")
+        };
+
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let memory_type = find_memory_type(
+            memory_props,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        let memory = unsafe {
+            device
+                .allocate_memory(&alloc_info, None)
+                .expect("Failed to allocate shadow map memory")
+        };
+        unsafe {
+            device
+                .bind_image_memory(image, memory, 0)
+                .expect("Failed to bind shadow map memory");
+        }
+
+        let sample_view = unsafe {
+            device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
+                        .format(SHADOW_FORMAT)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::DEPTH,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: SHADOW_CASCADES,
+                        }),
+                    None,
+                )
+                .expect("Failed to create shadow sample view")
+        };
+
+        let layer_views = std::array::from_fn(|i| unsafe {
+            device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(SHADOW_FORMAT)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::DEPTH,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: i as u32,
+                            layer_count: 1,
+                        }),
+                    None,
+                )
+                .expect("Failed to create shadow layer view")
+        });
+
+        let sampler = unsafe {
+            device
+                .create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::LINEAR)
+                        .min_filter(vk::Filter::LINEAR)
+                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        // Reversed-Z ortho: a receiver is lit when its depth is
+                        // nearer-or-equal to the stored occluder depth.
+                        .compare_enable(true)
+                        .compare_op(vk::CompareOp::GREATER_OR_EQUAL),
+                    None,
+                )
+                .expect("Failed to create shadow comparison sampler")
+        };
+
+        Self {
+            image,
+            memory,
+            sample_view,
+            layer_views,
+            sampler,
+        }
+    }
+
+    unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.destroy_sampler(self.sampler, None);
+            for view in &self.layer_views {
+                device.destroy_image_view(*view, None);
+            }
+            device.destroy_image_view(self.sample_view, None);
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
 /// One image + its backing memory + view, freed together.
 pub(crate) struct ImageResources {
     pub image: vk::Image,
@@ -23,7 +176,7 @@ pub(crate) struct ImageResources {
 }
 
 impl ImageResources {
-    unsafe fn destroy(&self, device: &ash::Device) {
+    pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
         unsafe {
             device.destroy_image_view(self.view, None);
             device.destroy_image(self.image, None);
@@ -52,6 +205,10 @@ pub struct RenderTargets {
     /// their texel size as one consistent value — there is no way to have the
     /// images without the size or vice versa.
     pub(crate) vrs: Option<super::vrs::Vrs>,
+    /// The cascaded shadow map. One D32 array image, persistent but
+    /// re-created with the rest of the targets on resize (its resolution is
+    /// swapchain-independent, 2048² per cascade, so this only re-homes ownership).
+    pub(crate) shadow: ShadowMap,
 }
 
 impl RenderTargets {
@@ -101,9 +258,12 @@ impl RenderTargets {
                 extent,
                 color_format,
                 vk::SampleCountFlags::TYPE_1,
-                // SAMPLED (not TRANSFER_SRC): the tonemap pass reads this as a
-                // texture; present is no longer a transfer copy.
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                // SAMPLED: the tonemap + exposure passes read this as a texture.
+                // TRANSFER_DST: the TAA resolve copies the stabilized HDR
+                // back into the offscreen so exposure meters and tonemap reads it.
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_DST,
                 vk::ImageAspectFlags::COLOR,
             )
         });
@@ -116,6 +276,8 @@ impl RenderTargets {
             .filter(|_| matches!(std::env::var("VOXEL_VRS").as_deref(), Ok("1")))
             .map(|f| super::vrs::Vrs::new(device, &memory_props, f, extent));
 
+        let shadow = ShadowMap::new(device, &memory_props);
+
         Self {
             depth,
             depth_format,
@@ -124,6 +286,7 @@ impl RenderTargets {
             samples,
             color_format,
             vrs,
+            shadow,
         }
     }
 
@@ -141,6 +304,7 @@ impl RenderTargets {
             if let Some(vrs) = &mut self.vrs {
                 vrs.destroy(device);
             }
+            self.shadow.destroy(device);
         }
     }
 }

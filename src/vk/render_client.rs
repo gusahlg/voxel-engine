@@ -36,16 +36,13 @@ use crate::frame::DrawLists;
 use crate::mesh::{MeshData, MeshHandle};
 use crate::surface::{SurfaceData, SurfaceHandle};
 
-/// Device capabilities the main thread caches so settings clamp locally (no
-/// round-trip to the render thread).
+/// Device capabilities cached on main for local clamp.
 #[derive(Clone, Copy)]
 pub(crate) struct DeviceCaps {
     pub max_msaa: u32,
 }
 
-/// The ordered command stream, main → render. Every payload is `Send`
-/// ([`GpuResident`] because [`Allocation`] is, [`DrawLists`] because it is fully
-/// resolved POD).
+/// Ordered command stream from main to render thread.
 pub(crate) enum RenderCmd {
     UploadMesh {
         slot: u32,
@@ -83,25 +80,24 @@ pub(crate) enum RenderCmd {
     Shutdown,
 }
 
-/// Render → main: recycled frame buffers AND freed allocations for main's
-/// allocator freelist. One channel keeps ordering simple.
+/// Render thread → main: recycled frame buffers and freed allocations.
 pub(crate) enum RenderReturn {
     Frame(Box<DrawLists>),
     FreeAlloc(Allocation),
 }
 
-/// One-shot handshake so `RenderClient` can build its main-side [`GpuAllocator`]
-/// from the exact `GpuAllocator::new(instance, physical, memory_budget)` args.
+/// One-shot handshake from render thread.
 pub(crate) struct InitReply {
     pub instance: ash::Instance,
     pub physical: vk::PhysicalDevice,
     pub memory_budget: Option<MemoryBudget>,
     pub device: ash::Device,
     pub caps: DeviceCaps,
+    /// Render thread's published exposure cell for Engine's compose().
+    pub exposure: super::exposure::ExposureShared,
 }
 
-/// The render-thread build parameters (window-free slice of [`Config`] + the
-/// initial size and refresh interval queried on main).
+/// Render-thread build parameters.
 pub(crate) struct RenderConfig {
     pub vsync: bool,
     pub msaa: u32,
@@ -138,6 +134,8 @@ pub(crate) struct RenderClient {
     vsync: bool,
     msaa: u32,
     cull_faces: bool,
+    /// The render thread's published exposure cell, cloned into `Engine`.
+    exposure: super::exposure::ExposureShared,
     /// `None` once joined (shutdown is idempotent).
     join: Option<JoinHandle<DeviceLeftovers>>,
 }
@@ -225,9 +223,15 @@ impl RenderClient {
             vsync: config.vsync,
             msaa,
             cull_faces: false,
+            exposure: reply.exposure,
             join: Some(join),
         };
         (window, client)
+    }
+
+    /// The render thread's published exposure cell, for `Engine`'s compose path.
+    pub(crate) fn exposure(&self) -> super::exposure::ExposureShared {
+        self.exposure.clone()
     }
 
     // ---- meshes ----
@@ -379,7 +383,10 @@ impl RenderClient {
                 RenderReturn::FreeAlloc(a) => unsafe { self.mesh_alloc.free(a) },
             }
         }
-        unsafe { self.mesh_alloc.shrink_staging(&self.device) };
+        unsafe {
+            self.mesh_alloc.shrink_staging(&self.device);
+            self.mesh_alloc.shrink_device(&self.device);
+        }
     }
 
     /// Pops an idle snapshot to record into; blocks on the return channel when

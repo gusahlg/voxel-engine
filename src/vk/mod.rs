@@ -9,14 +9,18 @@ pub(crate) mod alloc;
 pub(crate) mod block_textures;
 pub(crate) mod buffers;
 pub(crate) mod device;
+pub(crate) mod exposure;
 pub(crate) mod image_upload;
 pub(crate) mod instance;
 pub(crate) mod minimap;
 pub(crate) mod pipeline;
 pub(crate) mod render_client;
+pub(crate) mod shadow;
 pub(crate) mod swapchain;
+pub(crate) mod taa;
 pub(crate) mod targets;
 pub(crate) mod texture;
+pub(crate) mod uniforms;
 pub(crate) mod timeline;
 pub(crate) mod vertex_input;
 pub(crate) mod vrs;
@@ -85,14 +89,40 @@ struct FrameSlot {
 /// (its copy hazard is resolved).
 struct SlotGuard(usize);
 
-/// Byte offsets of the line and 2D sections inside a frame's packed
-/// immediate buffer (cube verts start at offset 0).
+/// Byte offsets within a frame's packed immediate buffer.
 #[derive(Clone, Copy)]
 struct ImmOffsets {
     line: u64,
     shadow: u64,
     d2: u64,
     d2_tex: u64,
+}
+
+/// Proof that a slot's offscreen HDR image has been left in
+/// `SHADER_READ_ONLY_OPTIMAL` — the layout the tonemap present-copy samples it
+/// in. [`Renderer::present`] REQUIRES one, and the only places that mint it are
+/// the three finalizers that actually perform the transition
+/// ([`RenderPass::end_sampled`], [`Renderer::record_exposure_pass`], and
+/// [`Renderer::transition_offscreen_to_sampled`]). So "no pass finalized the
+/// offscreen layout" — the exact silent bug that shipped when auto-exposure
+/// stopped owning the transition — becomes a missing value the present call
+/// cannot be written without, rather than a validation-layer surprise.
+///
+/// Caveat honestly stated: the token is a *disciplined witness*, not a
+/// machine-checked proof — Rust lacks the linear types to verify the barrier
+/// itself. It guarantees SOME finalizer ran before present, not that its access
+/// masks are correct.
+#[must_use = "the offscreen HDR must be finalized to SHADER_READ before present"]
+pub(crate) struct HdrReadable {
+    slot: usize,
+}
+
+impl HdrReadable {
+    /// Mint the witness. `pub(in crate::vk)` so only the finalizers in this
+    /// module tree can create it — no other code can conjure the proof.
+    pub(in crate::vk) fn new(slot: usize) -> Self {
+        HdrReadable { slot }
+    }
 }
 
 /// The 2D overlay draw parameters carried to the post-tonemap present pass when
@@ -105,24 +135,19 @@ struct OverlayPresent {
     d2_tex_count: u32,
 }
 
-/// One resolved mesh draw (one direction-run of one mesh), pre-sort scratch for
-/// [`Renderer::prepare_mesh_draws`]. `first`/`count` are the index sub-range for
-/// this run (the whole mesh when face-culling is off).
+/// Resolved mesh draw (one direction-run or whole mesh), pre-sort scratch.
 #[derive(Clone, Copy)]
 struct DrawEntry {
     buffer: vk::Buffer,
     pass: Pass,
-    /// Draw through the depth-biased opaque pipeline (`mesh3d_biased`). Only
-    /// meaningful for [`Pass::Opaque`]; an orthogonal per-draw axis, not a
-    /// mesh-intrinsic pass.
+    /// Depth-biased variant (mesh3d_biased). Meaningful only for Opaque pass.
     biased: bool,
     first: u32,
     count: u32,
     vertex_offset: i32,
     offset: glam::Vec3,
     scale: f32,
-    /// Squared distance from the camera to the mesh's world-space AABB center.
-    /// Sort key for depth ordering; squared avoids a sqrt (monotonic).
+    /// Squared distance to AABB center (monotonic; sort key).
     dist2: f32,
 }
 
@@ -139,24 +164,18 @@ struct SurfaceEntry {
     scale: f32,
 }
 
-/// A contiguous range of indirect commands sharing one arena buffer AND one
-/// pass: one pipeline bind (on pass change) + one vertex/index bind + one
-/// indirect call each.
+/// Contiguous indirect commands sharing one buffer and pass.
 #[derive(Clone, Copy)]
 struct DrawRun {
     buffer: vk::Buffer,
     pass: Pass,
-    /// All entries in a run share one pipeline; `biased` distinguishes
-    /// `mesh3d` from `mesh3d_biased` within [`Pass::Opaque`].
+    /// Distinguishes mesh3d from mesh3d_biased within Opaque pass.
     biased: bool,
     first: u32,
     count: u32,
 }
 
-/// Which of the six face directions (indexed by `Normal`: `0=+X 1=-X 2=+Y
-/// 3=-Y 4=+Z 5=-Z`) can face the camera, given the camera position in the
-/// mesh's own frame and the mesh's world-space (already scaled) AABB. Inside an
-/// axis's extent both of that axis's faces show; outside, only the near one.
+/// Which of the six face directions can face the camera (indexed by Normal enum).
 fn visible_dirs(cam_local: glam::Vec3, aabb_min: glam::Vec3, aabb_max: glam::Vec3) -> [bool; 6] {
     [
         cam_local.x > aabb_min.x, // +X
@@ -168,11 +187,8 @@ fn visible_dirs(cam_local: glam::Vec3, aabb_min: glam::Vec3, aabb_max: glam::Vec
     ]
 }
 
-/// Maximal contiguous runs of visible directions as `[start, end)` index pairs
-/// over `0..6`, returned in a fixed array with a count. At most three runs (six
-/// slots can alternate visible/hidden at most three times). Adjacent visible
-/// directions coalesce into one run so their contiguous index buckets draw as a
-/// single command.
+/// Maximal contiguous runs of visible directions as `[start, end)` index pairs.
+/// Coalesces contiguous visible directions so buckets draw as one command.
 fn contiguous_runs(vis: [bool; 6]) -> ([(u8, u8); 3], usize) {
     let mut runs = [(0u8, 0u8); 3];
     let mut n = 0;
@@ -192,12 +208,22 @@ fn contiguous_runs(vis: [bool; 6]) -> ([(u8, u8); 3], usize) {
     (runs, n)
 }
 
-/// Fingerprint every input that shapes a slot's stored depth image. Attachment
-/// VRS reuses that depth two frames later to classify shading rate, but the
-/// reuse is only valid while the view and the depth-writing draw set are
-/// unchanged; a moved camera or altered draw list would otherwise let stale sky
-/// pixels coarsen newly visible edges. Color, sort distance, and other
-/// shading-only inputs are excluded — they cannot alter the depth buffer.
+/// Applies sub-pixel jitter to the view-proj matrix. Jitter only exists at
+/// record time; the returned matrix is consumed immediately and never stored.
+fn jittered_clip(clean: glam::Mat4, jitter_px: glam::Vec2, extent: vk::Extent2D) -> glam::Mat4 {
+    let ox = 2.0 * jitter_px.x / extent.width.max(1) as f32;
+    let oy = -2.0 * jitter_px.y / extent.height.max(1) as f32;
+    let t = glam::Mat4::from_cols(
+        glam::Vec4::X,
+        glam::Vec4::Y,
+        glam::Vec4::Z,
+        glam::Vec4::new(ox, oy, 0.0, 1.0),
+    );
+    t * clean
+}
+
+/// Hash of depth-affecting inputs (view, draw list, surface list, debug cubes);
+/// excludes shading-only fields. VRS reuses depth only while this stays constant.
 fn scene_fingerprint(lists: &DrawLists, draws: &[DrawEntry], surfaces: &[SurfaceEntry]) -> u64 {
     use ash::vk::Handle;
     use std::hash::{Hash, Hasher};
@@ -243,32 +269,25 @@ pub(crate) struct Renderer {
     surface: vk::SurfaceKHR,
     device: Device,
 
-    /// Render-side residency mirrors (device buffers, staged copies, retire).
-    /// Fed by the ordered command stream; freed allocations return to main.
+    /// Render-side residency mirrors, fed by the ordered command stream.
     mesh_res: MeshResidency,
-    /// Retained colored surfaces (Zone-3 far grey skin), drawn through the
-    /// `surface3d` lane. Shares the offsets SSBO + indirect buffers with meshes.
+    /// Retained colored surfaces (surface3d lane).
     surface_res: SurfaceResidency,
-    /// Returns freed allocations (freelist recycling) to the main-owned
-    /// allocator. The render loop uses its own clone for frame-buffer recycling.
+    /// Returns freed allocations to the main-owned allocator.
     ret: Sender<RenderReturn>,
-    /// Window/present size, updated by `RenderCmd::Resize` — replaces the old
-    /// `window.inner_size()` reads now the window lives on main.
+    /// Swapchain extent, updated by Resize.
     size: vk::Extent2D,
 
     swapchain: Swapchain,
     targets: RenderTargets,
     pipelines: Pipelines,
-    /// Disk-backed pipeline cache (see [`pipeline_cache_path`]): loaded at
-    /// init, passed to every pipeline build, written back on Drop.
+    /// Disk-backed pipeline cache.
     pipeline_cache: vk::PipelineCache,
     atlas: FontAtlas,
     block_textures: BlockTextures,
-    /// Old block-texture arrays retired on palette growth, destroyed once the
-    /// timeline proves every in-flight frame that could sample them is done —
-    /// avoids a load-time `device_wait_idle` stall (mirrors the mesh retire path).
+    /// Retired block-texture arrays, destroyed after timeline proves non-sampling.
     retired_textures: buffers::RetireQueue<BlockTextures>,
-    /// The minimap texture (per-slot double buffer), sampled by `tris2d_tex`.
+    /// Per-slot minimap texture, sampled by tris2d_tex.
     minimap: MinimapTexture,
 
     frames: Vec<FrameSlot>,
@@ -276,71 +295,74 @@ pub(crate) struct Renderer {
     /// Binary because the WSI rejects timeline semaphores.
     present_semaphores: Vec<BinarySemaphore>,
     imm: [HostBuffer; FRAMES_IN_FLIGHT as usize],
-    /// Per-slot per-draw offsets SSBO (one [`DrawOffset`] per command, in
-    /// lockstep with the indirect commands so `first_instance == command_index`).
-    /// Immediate debug geometry uses the descriptor-set-free debug pipelines, so
-    /// there is no reserved slot.
+    /// Per-slot offsets SSBO (one per command, lockstep with indirect).
     offsets: [HostBuffer; FRAMES_IN_FLIGHT as usize],
-    /// Per-slot indirect command buffer (20-byte VkDrawIndexedIndirectCommand
-    /// per mesh draw, instance_count 1, first_instance = SSBO slot).
+    /// Per-slot indirect command buffer.
     indirect: [HostBuffer; FRAMES_IN_FLIGHT as usize],
-    /// Single push-descriptor layout for the 3D pipeline: set 0 binding 0 =
-    /// per-draw offsets SSBO (vertex), binding 1 = block texture array
-    /// (fragment). Vulkan permits one push set per layout, so both share it.
+    /// Push-descriptor layout for 3D pipeline.
     mesh3d_set_layout: vk::DescriptorSetLayout,
+    /// Per-frame uniforms ring.
+    ubo_ring: uniforms::UboRing,
+    /// Cascaded shadow producer.
+    shadow: shadow::ShadowPass,
+    /// Exposure metering state.
+    exposure: exposure::ExposureState,
+    /// TAA resolve state.
+    taa: taa::TaaState,
+    /// Monotonic frame counter for the temporal dither phase (tonemap).
+    frame_index: u64,
 
-    /// Frame scratch (persistent capacity): resolved draws, sorted by (pass, arena).
+    /// Frame scratch: resolved draws.
     draw_scratch: Vec<DrawEntry>,
-    /// Frame scratch: the offsets SSBO contents (one per command).
+    /// Frame scratch: offsets SSBO contents.
     draw_offsets_data: Vec<DrawOffset>,
-    /// Frame scratch: indirect commands, (pass, arena)-contiguous.
+    /// Frame scratch: indirect commands.
     draw_commands: Vec<DrawIndexedIndirect>,
-    /// Frame scratch: one entry per (pass, arena) group with visible draws.
+    /// Frame scratch: draw runs.
     draw_runs: Vec<DrawRun>,
-    /// Frame scratch: resolved surface draws (handle → GpuSurface), in the order
-    /// the app recorded them. Cleared each frame.
+    /// Frame scratch: resolved surface draws.
     surface_scratch: Vec<SurfaceEntry>,
-    /// Frame scratch: contiguous runs of surface commands keyed by surface buffer.
+    /// Frame scratch: surface runs.
     surface_runs: Vec<DrawRun>,
 
-    /// Opt-in six-way face culling. Off (default) → one draw per mesh, byte
-    /// identical to a single coalesced run. On → per-mesh, the ≤3 maximal
-    /// contiguous runs of camera-facing direction buckets.
+    /// Opt-in six-way face culling.
     cull_faces: bool,
 
-    /// Command buffer for the offscreen->swapchain present copy. A single
-    /// one suffices: at most one copy is ever in flight, gated by the previous
-    /// copy's timeline value being reached before the next is submitted.
+    /// Command buffer for present copy.
     copy_cmd: vk::CommandBuffer,
-    /// The one monotonic timeline: render submits and present copies both
-    /// signal it, replacing the old per-slot render fence + render_done
-    /// semaphore + global copy fence.
+    /// Monotonic timeline for render and present.
     timeline: Timeline,
-    /// Timeline value of the last present copy submitted; the mailbox present
-    /// decision probes this non-blockingly, and vsync pacing waits on it.
+    /// Timeline value of the last present copy.
     last_copy_value: TimelineValue,
-    /// Timeline value of the last render submitted; freed meshes are stamped
-    /// with it.
+    /// Timeline value of the last render.
     last_render_value: TimelineValue,
-    /// Which offscreen slot the in-flight copy reads, if any. Rendering to
-    /// that slot again must wait its `copy_value` first (rare, sub-millisecond).
+    /// Which offscreen slot the in-flight copy reads.
     copy_slot: Option<usize>,
 
-    /// Set by [`Self::request_screenshot`]; consumed by the next present copy,
-    /// which reads the swapchain image back to a host buffer and writes a PNG.
+    /// Pending screenshot path.
     pending_screenshot: Option<std::path::PathBuf>,
 
     slot: usize,
 
-    /// Per-slot: has this slot's depth image been rendered at least once since
-    /// (re)creation? The VRS compute pass reads it, so it must skip a slot until
-    /// its depth is validly written and in `DEPTH_ATTACHMENT_OPTIMAL`.
-    vrs_depth_ready: [bool; FRAMES_IN_FLIGHT as usize],
-    /// Scene fingerprint that produced each slot's reusable depth image; VRS may
-    /// reuse a slot only while it still matches [`Self::scene_fingerprint`].
-    vrs_scene_fingerprint: [Option<u64>; FRAMES_IN_FLIGHT as usize],
+    /// Per-slot VRS depth state, as ONE value so "ready" and "which scene
+    /// produced it" cannot disagree: `Some(fp)` means this slot's depth image has
+    /// been validly rendered (in `DEPTH_ATTACHMENT_OPTIMAL`) by the scene with
+    /// fingerprint `fp`; `None` means not yet rendered since (re)creation. The
+    /// VRS classifier reuses a slot only while `Some(fp) == Some(scene_fingerprint)`
+    /// — both the depth-ready gate and the still-current gate collapse into that
+    /// single comparison (previously a `bool` + an `Option<u64>` hand-synced
+    /// across every set/reset site).
+    vrs_ready: [Option<u64>; FRAMES_IN_FLIGHT as usize],
     /// Fingerprint of the scene being recorded in the current frame.
     scene_fingerprint: u64,
+
+    /// Per-slot: has this slot cleared the shadow map to its fully-lit value
+    /// since (re)creation? When `WATT_SHADOWS=0` the map holds a constant
+    /// all-lit clear and never changes, so once every in-flight slot has
+    /// cleared it once (each with its own barriers, no cross-frame write/read
+    /// hazard) the per-frame shadow pass is skipped entirely. Any frame with
+    /// shadows enabled re-runs the pass and re-arms every slot.
+    shadow_lit_ready: [bool; FRAMES_IN_FLIGHT as usize],
 
     vsync: Pending<bool>,
     msaa: Pending<SampleCount>,
@@ -388,9 +410,6 @@ impl Renderer {
         let render_scale = Scale::new(render_scale).as_f32();
 
         let device = Device::new(&instance.instance, &surface_loader, surface);
-        // The block-suballocating allocator lives on MAIN; the render side only
-        // installs pre-built residents. Mesh uploads bypass staging on unified
-        // memory (logged main-side is fine, but keep the hint here too).
         let mesh_res = MeshResidency::new();
         let surface_res = SurfaceResidency::new();
 
@@ -491,6 +510,28 @@ impl Renderer {
             std::array::from_fn(|_| HostBuffer::new(vk::BufferUsageFlags::STORAGE_BUFFER));
         let indirect =
             std::array::from_fn(|_| HostBuffer::new(vk::BufferUsageFlags::INDIRECT_BUFFER));
+        let ubo_ring =
+            uniforms::UboRing::new(&instance.instance, &device.device, device.physical);
+
+        let shadow = shadow::ShadowPass::new(
+            &instance.instance,
+            &device.device,
+            device.physical,
+            pipeline_cache,
+            pipelines.layout_3d,
+        );
+        let memory_props = unsafe {
+            instance
+                .instance
+                .get_physical_device_memory_properties(device.physical)
+        };
+        let exposure = exposure::ExposureState::new(
+            &device.device,
+            &memory_props,
+            render_extent,
+            pipeline_cache,
+        );
+        let taa = taa::TaaState::new(&device.device, &memory_props, render_extent, pipeline_cache);
 
         let gpu_timer = GpuTimer::new(
             &device.device,
@@ -507,6 +548,7 @@ impl Renderer {
             memory_budget: device.memory_budget,
             device: device.device.clone(),
             caps,
+            exposure: exposure.shared(),
         };
 
         let renderer = Self {
@@ -532,6 +574,11 @@ impl Renderer {
             offsets,
             indirect,
             mesh3d_set_layout,
+            ubo_ring,
+            shadow,
+            exposure,
+            taa,
+            frame_index: 0,
             draw_scratch: Vec::new(),
             draw_offsets_data: Vec::new(),
             cull_faces: false,
@@ -546,9 +593,9 @@ impl Renderer {
             copy_slot: None,
             pending_screenshot: None,
             slot: 0,
-            vrs_depth_ready: [false; FRAMES_IN_FLIGHT as usize],
-            vrs_scene_fingerprint: [None; FRAMES_IN_FLIGHT as usize],
+            vrs_ready: [None; FRAMES_IN_FLIGHT as usize],
             scene_fingerprint: 0,
+            shadow_lit_ready: [false; FRAMES_IN_FLIGHT as usize],
             vsync: Pending::new(vsync),
             msaa: Pending::new(msaa),
             needs_recreate: false,
@@ -729,7 +776,33 @@ impl Renderer {
             self.prepare_mesh_draws(slot, lists);
             offsets
         };
-        let rs = {
+
+        // Per-frame UBO (set 0, binding 2). A 3D frame always carries lighting
+        // (`Frame::begin_3d` takes it as a required `Lighting` argument, so
+        // `has_3d` implies `frame_uniforms.is_some()`). This `None` branch is
+        // therefore reached ONLY by pure-2D frames, where the mesh shaders never
+        // sample the block; the full-bright filler just keeps the binding live
+        // and validated.
+        {
+            let mut u = lists
+                .frame_uniforms
+                .unwrap_or_else(crate::skeleton::FrameUniformsGpu::full_bright);
+            // Debug-flat: claim the `reserved` lane as [r, g, b, enabled] —
+            // sRGB-encoded key channels + an enable flag. mesh3d.frag linearises rgb
+            // (as it does every CPU colour) and outputs it flat while depth writes.
+            // Layout-only use of the zeroed lane; no FrameUniformsGpu changes.
+            if let Some(c) = lists.debug_flat {
+                u.reserved = [
+                    c.r as f32 / 255.0,
+                    c.g as f32 / 255.0,
+                    c.b as f32 / 255.0,
+                    1.0,
+                ];
+            }
+            self.ubo_ring
+                .write(crate::skeleton::FrameSlot::new(slot), &u);
+        }
+        let (rs, hdr_readable) = {
             let _p = scope(Meter::Record);
             self.record_render(&guard, lists, offsets)
         };
@@ -749,10 +822,21 @@ impl Renderer {
                 d2_tex_offset: offsets.d2_tex,
                 d2_tex_count: lists.tex_verts_2d.len() as u32,
             };
-            self.present(slot, present_target, lists.warp_map, overlay);
+            self.present(slot, present_target, lists.warp_map, overlay, hdr_readable);
         }
 
         self.slot = (self.slot + 1) % self.frames.len();
+        self.frame_index = self.frame_index.wrapping_add(1);
+    }
+
+    /// The frame-in-flight slot currently being recorded, as the parity newtype.
+    /// This is the authoritative mint: `FrameSlot` is constructed only here, at the pacer.
+    /// Per-slot GPU resources (the UBO ring, and later the exposure ring) index off this.
+    /// The `Engine`-facing `skeleton::current_slot` accessor still needs channel plumbing
+    /// to reach this value from the main thread.
+    #[allow(dead_code)] // consumer (Engine accessor / exposure ring) lands later
+    pub(crate) fn current_slot(&self) -> crate::skeleton::FrameSlot {
+        crate::skeleton::FrameSlot::new(self.slot)
     }
 
     /// Tracks which offscreen slot the current copy is reading from.
@@ -1042,8 +1126,14 @@ impl Renderer {
                 }
             }
         }
-        self.scene_fingerprint =
-            scene_fingerprint(lists, &self.draw_scratch, &self.surface_scratch);
+        // The fingerprint exists only so VRS can tell whether a slot's stored
+        // depth still matches the scene it will classify; with VRS off nothing
+        // reads it, so skip the per-frame hash of every draw and surface.
+        self.scene_fingerprint = if self.targets.vrs.is_some() {
+            scene_fingerprint(lists, &self.draw_scratch, &self.surface_scratch)
+        } else {
+            0
+        };
 
         let offsets_bytes: &[u8] = bytemuck::cast_slice(&self.draw_offsets_data);
         let indirect_bytes: &[u8] = bytemuck::cast_slice(&self.draw_commands);
@@ -1078,7 +1168,7 @@ impl Renderer {
         guard: &SlotGuard,
         lists: &DrawLists,
         offsets: ImmOffsets,
-    ) -> RenderSubmit {
+    ) -> (RenderSubmit, HdrReadable) {
         let slot = guard.0;
         let cmd = self.frames[slot].cmd;
         // Read the prior render-pass GPU time for this slot before its queries
@@ -1115,14 +1205,46 @@ impl Renderer {
             }
         }
 
+        // Cascaded shadows: fit both cascades around this frame's frustum,
+        // publish the binding-3 uniforms the receiver samples, and render the
+        // occluders into the shadow map BEFORE the color pass (it leaves the map
+        // in SHADER_READ_ONLY_OPTIMAL for mesh3d.frag's PCF). The mesh pass always
+        // samples binding 4, so this must run whenever `has_3d`.
+        if let Some(cam) = lists.camera {
+            // With shadows disabled the map holds a constant fully-lit clear and
+            // its cascade UBO a constant (SHADOW_LIMIT=∞) block, so once this
+            // slot has primed both there is nothing left to re-record: skip the
+            // per-frame clears + barriers (the bulk of the off-path cost). Any
+            // shadowed frame re-runs the pass and re-arms every slot.
+            let shadows_on = crate::engine::render_flags().shadows;
+            if shadows_on || !self.shadow_lit_ready[slot] {
+                let _g = crate::profile::scope(crate::profile::Meter::RecShadow);
+                let cfg = crate::skeleton::ShadowCfg::provisional();
+                let sun = lists
+                    .frame_uniforms
+                    .map(|u| {
+                        glam::DVec3::new(
+                            u.sun_dir_elev[0] as f64,
+                            u.sun_dir_elev[1] as f64,
+                            u.sun_dir_elev[2] as f64,
+                        )
+                    })
+                    .filter(|d| d.length_squared() > 1e-6)
+                    .unwrap_or(glam::DVec3::Y);
+                let cu = self.shadow_uniforms(&cam, sun, &cfg);
+                self.shadow.write_uniforms(slot, &cu);
+                self.record_shadow_pass(cmd, slot, &cam, sun, &cfg);
+                self.shadow_lit_ready[slot] = !shadows_on;
+            }
+        }
+
         // VRS generation needs a validly-written, single-sampled depth image to
         // classify. MSAA depth would need multisample sampling (skipped), and a
         // slot's depth is only readable once it has been rendered at least once.
         let do_vrs = lists.has_3d
             && self.targets.vrs.is_some()
             && self.targets.msaa.is_none()
-            && self.vrs_depth_ready[slot]
-            && self.vrs_scene_fingerprint[slot] == Some(self.scene_fingerprint);
+            && self.vrs_ready[slot] == Some(self.scene_fingerprint);
 
         let device = &self.device.device;
         let stamp = |p| {
@@ -1130,55 +1252,124 @@ impl Renderer {
                 unsafe { self.gpu_timer.mark(device, cmd, slot, p) };
             }
         };
-        let pass = unsafe { RenderPass::begin(self, cmd, slot, lists, offsets, do_vrs) };
+        let pass = {
+            let _g = crate::profile::scope(crate::profile::Meter::RecTransitions);
+            unsafe { RenderPass::begin(self, cmd, slot, lists, offsets, do_vrs) }
+        };
         if lists.has_3d {
+            use crate::profile::{Meter, scope};
             // Transparency forces an interleave: all opaque geometry (mesh runs
             // AND opaque debug cubes/lines) writes depth before any transparent
             // mesh run tests against it.
             unsafe {
-                pass.record_mesh_indirect(Pass::Opaque);
-                // Cutout writes depth like opaque, so it belongs in the opaque
-                // prefix (before sky). Dormant until a block emits it.
-                pass.record_mesh_indirect(Pass::Cutout);
+                {
+                    let _g = scope(Meter::RecMesh);
+                    pass.record_mesh_indirect(Pass::Opaque);
+                    // Cutout writes depth like opaque, so it belongs in the opaque
+                    // prefix (before sky). Dormant until a block emits it.
+                    pass.record_mesh_indirect(Pass::Cutout);
+                }
                 stamp(GpuPass::Opaque);
                 // Zone-3 far skin: after chunks/tiles laid opaque depth (they
                 // early-Z the hidden parts), before sky fills behind the edge.
-                pass.record_surface_indirect();
+                {
+                    let _g = scope(Meter::RecSurface);
+                    pass.record_surface_indirect();
+                }
                 // Sky fills the background (uncovered pixels) right after opaque
                 // depth is laid down. It must precede the immediate debug
                 // cubes/lines: the highlight lines are depth read-only (no depth
                 // write), so a line silhouetted against the background leaves the
                 // depth cleared there — drawing sky afterward would overpaint it.
                 // Debug geometry and transparent water both composite over the sky.
-                pass.record_sky();
+                {
+                    let _g = scope(Meter::RecSky);
+                    if crate::engine::render_flags().sky {
+                        pass.record_sky();
+                    }
+                }
                 stamp(GpuPass::Sky);
-                pass.record_immediate_cubes();
-                stamp(GpuPass::Cubes);
-                pass.record_lines();
-                stamp(GpuPass::Lines);
-                // Contact shadows: translucent, blended over the opaque terrain
-                // depth just laid down, before transparent water.
-                pass.record_shadows();
+                {
+                    let _g = scope(Meter::RecImmediate);
+                    pass.record_immediate_cubes();
+                    stamp(GpuPass::Cubes);
+                    pass.record_lines();
+                    stamp(GpuPass::Lines);
+                    // Contact shadows: translucent, blended over the opaque terrain
+                    // depth just laid down, before transparent water.
+                    pass.record_shadows();
+                }
                 stamp(GpuPass::Shadows);
-                pass.record_mesh_indirect(Pass::Blend);
+                {
+                    let _g = scope(Meter::RecMesh);
+                    pass.record_mesh_indirect(Pass::Blend);
+                }
                 stamp(GpuPass::Transparent);
             }
         }
+        // The offscreen HDR must reach SHADER_READ_ONLY before the tonemap
+        // present copy samples it. `end` performs that COLOR_ATTACHMENT→
+        // SHADER_READ barrier UNLESS a later offscreen writer runs after it: the
+        // TAA resolve and exposure metering both write the offscreen *after*
+        // `end`, so when either is active `end` must NOT transition (the barrier
+        // would race their writes) — the deferred finalization below owns it
+        // instead. With both disabled (the common path) `end` transitions.
+        let taa = lists.has_3d && crate::engine::Engine::taa_enabled();
+        let exposure = lists.has_3d && crate::engine::render_flags().exposure;
+        let deferred = taa || exposure;
         unsafe {
             // In wide-FOV the overlay is drawn AFTER the tonemap resample (swapchain
             // space) so the warp never bends it; here it would be compressed. In
             // rectilinear it stays in the offscreen pass exactly as before.
             if lists.warp_map.is_identity() {
+                let _g = crate::profile::scope(crate::profile::Meter::RecOverlay);
                 pass.record_2d();
             }
             stamp(GpuPass::Overlay);
-            pass.end();
         }
+        // Finalize the offscreen to SHADER_READ_ONLY exactly once and obtain the
+        // [`HdrReadable`] proof the tonemap present-copy requires. The branches
+        // are exhaustive and each ends with the offscreen sampled: (a) not
+        // deferred → the render pass transitions; (b) deferred + exposure →
+        // metering owns the transition; (c) deferred + !exposure (TAA-on,
+        // exposure-off) → TAA left COLOR_ATTACHMENT, so transition explicitly.
+        // Producing the proof only inside these paths is what makes "nobody
+        // finalized the layout" fail to compile at `present` rather than trip the
+        // validation layer (the exact bug from the exposure-default-off change).
+        let readable: HdrReadable = {
+            let _g = crate::profile::scope(crate::profile::Meter::RecTransitions);
+            if deferred {
+                unsafe { pass.end_deferred() };
+                // TAA resolve runs AFTER the HDR resolve and BEFORE exposure, so
+                // exposure meters the stabilized image. It reads the current HDR +
+                // reprojected history, writes the resolved HDR back, and leaves it
+                // COLOR_ATTACHMENT for the exposure pass. Reprojection uses the
+                // un-jittered view-proj; WATT_TAA=0 never reaches here.
+                if taa {
+                    self.record_taa_pass(
+                        cmd,
+                        crate::skeleton::FrameSlot::new(slot),
+                        lists.view_proj,
+                        lists.eye,
+                    );
+                }
+                if exposure {
+                    // Reduce the offscreen to per-tile mean log2-luma, publish the
+                    // smoothed exposure, and finalize the offscreen in SHADER_READ.
+                    self.record_exposure_pass(cmd, crate::skeleton::FrameSlot::new(slot))
+                } else {
+                    unsafe { self.transition_offscreen_to_sampled(cmd, slot) }
+                }
+            } else {
+                // Common path (TAA + exposure both off): the render pass finalizes.
+                unsafe { pass.end_sampled() }
+            }
+        };
         self.gpu_timer.finish(slot);
         // The main pass just wrote (and stored) this slot's depth, so a later
-        // cycle reusing this slot may read it for VRS classification.
-        self.vrs_depth_ready[slot] = true;
-        self.vrs_scene_fingerprint[slot] = Some(self.scene_fingerprint);
+        // cycle reusing this slot may read it for VRS classification. Stamp
+        // ready-and-fingerprint in one write (they can never disagree).
+        self.vrs_ready[slot] = Some(self.scene_fingerprint);
 
         unsafe {
             self.device
@@ -1186,7 +1377,35 @@ impl Renderer {
                 .end_command_buffer(cmd)
                 .expect("end command buffer failed");
         }
-        rs
+        (rs, readable)
+    }
+
+    /// Transitions slot `slot`'s offscreen HDR from `COLOR_ATTACHMENT_OPTIMAL` to
+    /// `SHADER_READ_ONLY_OPTIMAL` for the tonemap present-copy, minting the
+    /// [`HdrReadable`] proof. Used on the TAA-on/exposure-off path, where the TAA
+    /// resolve left the offscreen in `COLOR_ATTACHMENT` and no metering pass owns
+    /// the transition.
+    unsafe fn transition_offscreen_to_sampled(
+        &self,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+    ) -> HdrReadable {
+        let to_sampled = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(self.targets.offscreen[slot].image)
+            .subresource_range(color_range())];
+        unsafe {
+            self.device.device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
+            );
+        }
+        HdrReadable::new(slot)
     }
 
     /// Records the VRS classifier: samples this slot's depth (from two cycles
@@ -1328,14 +1547,21 @@ impl Renderer {
     }
 
     /// Copies the finished frame into the acquired swapchain image (when one
-    /// was acquired in [`Self::decide_present`]) and queues the present.
+    /// was acquired in [`Self::decide_present`]) and queues the present. The
+    /// [`HdrReadable`] proof is REQUIRED (not merely passed): the present copy's
+    /// tonemap samples the offscreen, so this signature makes it impossible to
+    /// present a frame whose offscreen was never finalized to
+    /// `SHADER_READ_ONLY_OPTIMAL`.
     fn present(
         &mut self,
         slot: usize,
         present_target: Option<u32>,
         warp_map: crate::camera::WarpMap,
         overlay: OverlayPresent,
+        hdr_readable: HdrReadable,
     ) {
+        // The proof must be for the slot we are about to sample.
+        debug_assert_eq!(hdr_readable.slot, slot, "HdrReadable slot mismatch");
         if let Some(image_index) = present_target {
             unsafe { self.submit_present_copy(slot, image_index, warp_map, overlay) };
             self.last_present = std::time::Instant::now();
@@ -1382,7 +1608,10 @@ impl Renderer {
                     0,
                     bytemuck::cast_slice(&pixels_to_ndc),
                 );
-                device.cmd_bind_vertex_buffers(cmd, 0, &[self.imm[slot].buffer], &[overlay.d2_offset]);
+                let imm = self.imm[slot]
+                    .bound()
+                    .expect("d2_count > 0 implies the immediate buffer is allocated");
+                device.cmd_bind_vertex_buffers(cmd, 0, &[imm], &[overlay.d2_offset]);
                 device.cmd_draw(cmd, overlay.d2_count, 1, 0, 0);
             }
 
@@ -1405,12 +1634,10 @@ impl Renderer {
                     0,
                     bytemuck::cast_slice(&pixels_to_ndc),
                 );
-                device.cmd_bind_vertex_buffers(
-                    cmd,
-                    0,
-                    &[self.imm[slot].buffer],
-                    &[overlay.d2_tex_offset],
-                );
+                let imm = self.imm[slot]
+                    .bound()
+                    .expect("d2_tex_count > 0 implies the immediate buffer is allocated");
+                device.cmd_bind_vertex_buffers(cmd, 0, &[imm], &[overlay.d2_tex_offset]);
                 device.cmd_draw(cmd, overlay.d2_tex_count, 1, 0, 0);
             }
         }
@@ -1445,8 +1672,13 @@ impl Renderer {
         // there is no separate copy/blit path anymore. The same pass also applies
         // the wide-FOV periphery remap: `warp_map` carries the coefficients, and an
         // identity (rectilinear) map pushes `s = 0` so the frag stays a no-op.
-        const EXPOSURE: f32 = 1.0;
-        let tonemap_push = warp_map.push(EXPOSURE);
+        // Metered scene exposure times the temporal dither phase for the
+        // post-tonemap ordered dither (`DITHER_PHASE_16[frame % 16]`, matching
+        // FrameUniforms.exposure_dither.y).
+        let exposure = self.exposure.current().0;
+        let dither_phase = crate::genconst::DITHER_PHASE_16
+            [(self.frame_index % crate::skeleton::TEMPORAL_SEQ_LEN) as usize];
+        let tonemap_push = warp_map.push(exposure, dither_phase);
         unsafe {
             device
                 .reset_command_buffer(self.copy_cmd, vk::CommandBufferResetFlags::empty())
@@ -1850,11 +2082,25 @@ impl Renderer {
                 self.msaa.effective(),
                 self.device.fragment_shading_rate.as_ref(),
             );
+            // Exposure's tile grid tracks the render extent: rebuild its GPU
+            // resources in place (the published `ExposureShared` cell the main
+            // thread holds is preserved, so `compose()` keeps reading it).
+            let memory_props = self
+                .instance
+                .instance
+                .get_physical_device_memory_properties(self.device.physical);
+            self.exposure
+                .recreate(&self.device.device, &memory_props, self.render_extent);
+            // History is extent-sized; recreate discards it (reconverges).
+            self.taa
+                .recreate(&self.device.device, &memory_props, self.render_extent);
+
             // Offscreen images recreated; clear copy tracking.
             self.clear_copy();
             // Depth images recreated (layout UNDEFINED): VRS must re-prime.
-            self.vrs_depth_ready = [false; FRAMES_IN_FLIGHT as usize];
-            self.vrs_scene_fingerprint = [None; FRAMES_IN_FLIGHT as usize];
+            self.vrs_ready = [None; FRAMES_IN_FLIGHT as usize];
+            // Shadow map recreated (layout UNDEFINED): re-prime the lit clear.
+            self.shadow_lit_ready = [false; FRAMES_IN_FLIGHT as usize];
 
             if msaa_changed || format_changed {
                 self.pipelines.destroy(&self.device.device);
@@ -1894,6 +2140,14 @@ struct RenderPass<'a> {
     window_extent: vk::Extent2D,
     offscreen_image: vk::Image,
     ended: bool,
+    /// Are the `layout_3d` push descriptors (block texture, offsets SSBO, frame
+    /// UBO, cascade UBO, shadow map) currently live on `cmd`? Push descriptors
+    /// survive binding another pipeline that shares `layout_3d` (the mesh /
+    /// surface pipelines) but are disturbed by any pass that binds an
+    /// incompatible layout (sky, debug cubes/lines/shadows, 2D). Tracking this
+    /// lets adjacent `layout_3d` passes (e.g. opaque → surface) skip re-pushing
+    /// the five descriptors; each foreign pass clears the flag.
+    mesh_desc_bound: std::cell::Cell<bool>,
 }
 
 impl<'a> RenderPass<'a> {
@@ -2073,6 +2327,7 @@ impl<'a> RenderPass<'a> {
             window_extent,
             offscreen_image,
             ended: false,
+            mesh_desc_bound: std::cell::Cell::new(false),
         }
     }
 
@@ -2083,29 +2338,72 @@ impl<'a> RenderPass<'a> {
     /// incompatible layouts that disturb this state. Only sound when at least
     /// one mesh run exists (else the offsets SSBO can be a null buffer).
     unsafe fn bind_mesh3d_state(&self) {
+        unsafe {
+            self.push_mesh3d_descriptors();
+            // Mesh passes never clip; only the surface pass sets a nonzero clip.
+            self.push_mesh3d_constants(0.0);
+        }
+    }
+
+    /// Pushes the five `layout_3d` descriptors (block texture, offsets SSBO,
+    /// frame UBO, cascade UBO, shadow map) — but only if a foreign-layout pass
+    /// has disturbed them since the last push (tracked by `mesh_desc_bound`).
+    /// Adjacent `layout_3d` passes (opaque → surface, etc.) thus push the set
+    /// once and reuse it. Each foreign pass clears the flag via
+    /// [`Self::invalidate_mesh_desc`].
+    unsafe fn push_mesh3d_descriptors(&self) {
+        if self.mesh_desc_bound.get() {
+            return;
+        }
         let r = self.r;
-        let cmd = self.cmd;
+        // Reached only from the mesh/surface passes after they confirmed at least
+        // one run exists, so the offsets SSBO is allocated.
+        let offsets = r.offsets[self.slot]
+            .bound()
+            .expect("a mesh/surface run implies the offsets SSBO is allocated");
+        buffers::push_mesh3d_descriptors(
+            &r.device.push_descriptor,
+            self.cmd,
+            r.pipelines.layout_3d,
+            offsets,
+            r.block_textures.sampler,
+            r.block_textures.view,
+            r.ubo_ring.buffer(crate::skeleton::FrameSlot::new(self.slot)),
+            r.shadow.ubo(self.slot),
+            r.targets.shadow.sampler,
+            r.targets.shadow.sample_view,
+        );
+        self.mesh_desc_bound.set(true);
+    }
+
+    /// Pushes the `layout_3d` push constants (jittered view-proj + skin near-clip
+    /// radius). Cheap (one 68 B push) and pass-specific (`clip` differs between
+    /// the mesh passes and the surface pass), so — unlike the descriptors — it is
+    /// pushed unconditionally at each pass head. The jitter rides here at packing
+    /// as a local that never escapes; `self.lists.view_proj` stays clean.
+    unsafe fn push_mesh3d_constants(&self, clip: f32) {
+        let r = self.r;
         let push = pipeline::Mesh3dPush {
-            view_proj: self.lists.view_proj,
-            sky: self.lists.sky_light,
+            view_proj: jittered_clip(self.lists.view_proj, self.lists.jitter.0, r.render_extent),
+            clip,
+            _pad: [0.0; 3],
         };
         unsafe {
             r.device.device.cmd_push_constants(
-                cmd,
+                self.cmd,
                 r.pipelines.layout_3d,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
                 bytemuck::bytes_of(&push),
             );
-            buffers::push_mesh3d_descriptors(
-                &r.device.push_descriptor,
-                cmd,
-                r.pipelines.layout_3d,
-                r.offsets[self.slot].buffer,
-                r.block_textures.sampler,
-                r.block_textures.view,
-            );
         }
+    }
+
+    /// Marks the `layout_3d` push descriptors stale: call after binding any
+    /// pipeline whose layout is not push-compatible with `layout_3d` (sky, debug
+    /// cubes/lines/shadows, 2D), so the next `layout_3d` pass re-pushes them.
+    fn invalidate_mesh_desc(&self) {
+        self.mesh_desc_bound.set(false);
     }
 
     /// Issues indirect mesh draws for one pass, using the best available
@@ -2126,7 +2424,9 @@ impl<'a> RenderPass<'a> {
         let device = &self.r.device.device;
         let cmd = self.cmd;
         unsafe {
-            let indirect_buffer = self.r.indirect[self.slot].buffer;
+            let indirect_buffer = self.r.indirect[self.slot]
+                .bound()
+                .expect("a draw run implies the indirect buffer is allocated");
             const STRIDE: u64 = std::mem::size_of::<DrawIndexedIndirect>() as u64;
             // Opaque runs may carry a `biased` flag selecting `mesh3d_biased`
             // (far-LOD tiles); rebind only when the selected pipeline changes.
@@ -2191,35 +2491,29 @@ impl<'a> RenderPass<'a> {
         if self.r.surface_runs.is_empty() {
             return;
         }
-        // Re-establish layout_3d push constants + descriptors (the opaque mesh
-        // pass bound the same layout, but keep this self-contained/robust to
-        // recording order).
-        unsafe { self.bind_mesh3d_state() };
+        // Re-establish layout_3d descriptors only if a foreign pass disturbed
+        // them (the adjacent opaque pass usually leaves them live), then push the
+        // surface-specific constant: the skin near-clip radius. The fragment
+        // discards skin within this horizontal radius so the far grey skin
+        // renders only BEYOND the near zones, never poking through them. Same
+        // jitter as the mesh passes so the far skin aligns sub-pixel with the
+        // terrain the TAA resolve integrates. `surface3d` shares `layout_3d`, so
+        // binding it does not disturb the descriptors.
+        unsafe {
+            self.push_mesh3d_descriptors();
+            self.push_mesh3d_constants(self.lists.skin_clip);
+        }
         let device = &self.r.device.device;
         let cmd = self.cmd;
         unsafe {
-            let indirect_buffer = self.r.indirect[self.slot].buffer;
+            let indirect_buffer = self.r.indirect[self.slot]
+                .bound()
+                .expect("a draw run implies the indirect buffer is allocated");
             const STRIDE: u64 = std::mem::size_of::<DrawIndexedIndirect>() as u64;
             device.cmd_bind_pipeline(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.r.pipelines.surface3d,
-            );
-            // Surface-specific push: carry the skin clip radius in the otherwise
-            // unused `sun_light.w` lane (mesh passes ignore it). The fragment
-            // discards skin within this horizontal radius so the far grey skin
-            // renders only BEYOND the near zones, never poking through them.
-            let mut push = pipeline::Mesh3dPush {
-                view_proj: self.lists.view_proj,
-                sky: self.lists.sky_light,
-            };
-            push.sky.sun_light[3] = self.lists.skin_clip;
-            device.cmd_push_constants(
-                cmd,
-                self.r.pipelines.layout_3d,
-                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                0,
-                bytemuck::bytes_of(&push),
             );
             for run in &self.r.surface_runs {
                 // Index and vertex data share one VkBuffer: indices bound at
@@ -2292,8 +2586,11 @@ impl<'a> RenderPass<'a> {
                     vk::PipelineBindPoint::GRAPHICS,
                     self.r.pipelines.debug_tris,
                 );
+                self.invalidate_mesh_desc();
                 self.push_debug_view_proj();
-                device.cmd_bind_vertex_buffers(cmd, 0, &[self.r.imm[self.slot].buffer], &[0]);
+                device.cmd_bind_vertex_buffers(cmd, 0, &[self.r.imm[self.slot]
+                    .bound()
+                    .expect("a non-empty immediate list implies an allocated buffer")], &[0]);
                 device.cmd_draw(cmd, self.lists.cube_verts.len() as u32, 1, 0, 0);
             }
         }
@@ -2312,11 +2609,14 @@ impl<'a> RenderPass<'a> {
                     vk::PipelineBindPoint::GRAPHICS,
                     self.r.pipelines.debug_tris_blend,
                 );
+                self.invalidate_mesh_desc();
                 self.push_debug_view_proj();
                 device.cmd_bind_vertex_buffers(
                     cmd,
                     0,
-                    &[self.r.imm[self.slot].buffer],
+                    &[self.r.imm[self.slot]
+                    .bound()
+                    .expect("a non-empty immediate list implies an allocated buffer")],
                     &[self.offsets.shadow],
                 );
                 device.cmd_draw(cmd, self.lists.shadow_verts.len() as u32, 1, 0, 0);
@@ -2336,11 +2636,14 @@ impl<'a> RenderPass<'a> {
                     vk::PipelineBindPoint::GRAPHICS,
                     self.r.pipelines.debug_lines,
                 );
+                self.invalidate_mesh_desc();
                 self.push_debug_view_proj();
                 device.cmd_bind_vertex_buffers(
                     cmd,
                     0,
-                    &[self.r.imm[self.slot].buffer],
+                    &[self.r.imm[self.slot]
+                    .bound()
+                    .expect("a non-empty immediate list implies an allocated buffer")],
                     &[self.offsets.line],
                 );
                 device.cmd_draw(cmd, self.lists.line_verts.len() as u32, 1, 0, 0);
@@ -2348,11 +2651,12 @@ impl<'a> RenderPass<'a> {
         }
     }
 
-    /// The procedural sky background pass (sky pipeline, push-constant only, no
-    /// vertex buffer or descriptor set). A single fullscreen triangle at the
-    /// reversed-Z far plane; the read-only depth test rejects it wherever
-    /// terrain wrote closer depth, so it shades only background pixels. Skipped
-    /// unless the frame set a sky palette.
+    /// The procedural sky background pass (sky pipeline: geometry push constant
+    /// + the shared per-frame `FrameUniforms` at set 0 binding 2, no vertex
+    /// buffer). A single fullscreen triangle at the reversed-Z far plane; the
+    /// read-only depth test rejects it wherever terrain wrote closer depth, so
+    /// it shades only background pixels. Skipped unless the frame set a sky
+    /// palette.
     unsafe fn record_sky(&self) {
         let Some(desc) = self.lists.sky else {
             return;
@@ -2362,12 +2666,34 @@ impl<'a> RenderPass<'a> {
         let params = pipeline::SkyParams::compose(self.lists.view_proj.inverse(), &desc);
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.r.pipelines.sky);
+            self.invalidate_mesh_desc();
             device.cmd_push_constants(
                 cmd,
                 self.r.pipelines.layout_sky,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
                 bytemuck::bytes_of(&params),
+            );
+            // Push ONLY binding 2 (the per-frame UBO): the sky fragment reads its
+            // colours from the same linear `FrameUniforms` the terrain fog does
+            // Reuses the mesh layout. The layout's other bindings (offsets SSBO, textures,
+            // shadow map) are unused by this pass, so they stay unwritten — valid
+            // for a push-descriptor set when the shader never accesses them.
+            let ubo = self.r.ubo_ring.buffer(crate::skeleton::FrameSlot::new(self.slot));
+            let ubo_infos = [vk::DescriptorBufferInfo::default()
+                .buffer(ubo)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+            let writes = [vk::WriteDescriptorSet::default()
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&ubo_infos)];
+            self.r.device.push_descriptor.cmd_push_descriptor_set(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.r.pipelines.layout_sky,
+                0,
+                &writes,
             );
             device.cmd_draw(cmd, 3, 1, 0, 0);
         }
@@ -2385,6 +2711,7 @@ impl<'a> RenderPass<'a> {
                     vk::PipelineBindPoint::GRAPHICS,
                     self.r.pipelines.tris2d,
                 );
+                self.invalidate_mesh_desc();
                 self.r.atlas.push_descriptor(
                     &self.r.device.push_descriptor,
                     cmd,
@@ -2405,7 +2732,9 @@ impl<'a> RenderPass<'a> {
                 device.cmd_bind_vertex_buffers(
                     cmd,
                     0,
-                    &[self.r.imm[self.slot].buffer],
+                    &[self.r.imm[self.slot]
+                    .bound()
+                    .expect("a non-empty immediate list implies an allocated buffer")],
                     &[self.offsets.d2],
                 );
                 device.cmd_draw(cmd, self.lists.verts_2d.len() as u32, 1, 0, 0);
@@ -2418,6 +2747,7 @@ impl<'a> RenderPass<'a> {
                     vk::PipelineBindPoint::GRAPHICS,
                     self.r.pipelines.tris2d_tex,
                 );
+                self.invalidate_mesh_desc();
                 self.r.minimap.push_descriptor(
                     &self.r.device.push_descriptor,
                     cmd,
@@ -2438,7 +2768,9 @@ impl<'a> RenderPass<'a> {
                 device.cmd_bind_vertex_buffers(
                     cmd,
                     0,
-                    &[self.r.imm[self.slot].buffer],
+                    &[self.r.imm[self.slot]
+                    .bound()
+                    .expect("a non-empty immediate list implies an allocated buffer")],
                     &[self.offsets.d2_tex],
                 );
                 device.cmd_draw(cmd, self.lists.tex_verts_2d.len() as u32, 1, 0, 0);
@@ -2449,11 +2781,38 @@ impl<'a> RenderPass<'a> {
     /// Ends dynamic rendering and transitions the offscreen image to be sampled
     /// by the tonemap pass. Ordering across the render/tonemap submits is
     /// enforced by the timeline; this barrier only owns the layout + visibility.
-    unsafe fn end(mut self) {
+    /// Ends dynamic rendering. When `transition_offscreen` the offscreen is left
+    /// in `SHADER_READ_ONLY_OPTIMAL` for the present-copy tonemap; the exposure
+    /// metering pass (which itself transitions COLOR_ATTACHMENT→SHADER_READ)
+    /// passes `false` so it owns that barrier instead.
+    /// Ends dynamic rendering AND transitions the offscreen to
+    /// `SHADER_READ_ONLY_OPTIMAL`, returning the [`HdrReadable`] proof. Use when
+    /// no later pass writes the offscreen (the common path: TAA and exposure both
+    /// off), so this pass owns the finalization.
+    unsafe fn end_sampled(self) -> HdrReadable {
+        let slot = self.slot;
+        unsafe { self.end(true) };
+        HdrReadable::new(slot)
+    }
+
+    /// Ends dynamic rendering WITHOUT the sampled transition: a later offscreen
+    /// writer (TAA resolve / exposure metering) runs after this, and one of them
+    /// owns the finalization instead (its barrier would otherwise race their
+    /// writes). Yields no proof — the deferred finalizer produces it.
+    unsafe fn end_deferred(self) {
+        unsafe { self.end(false) };
+    }
+
+    unsafe fn end(mut self, transition_offscreen: bool) {
         let device = &self.r.device.device;
         let cmd = self.cmd;
         unsafe {
             device.cmd_end_rendering(cmd);
+
+            self.ended = true;
+            if !transition_offscreen {
+                return;
+            }
 
             let to_sampled = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -2469,7 +2828,6 @@ impl<'a> RenderPass<'a> {
                 &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
             );
         }
-        self.ended = true;
     }
 }
 
@@ -2495,6 +2853,10 @@ impl Renderer {
             self.atlas.destroy(device);
             self.minimap.destroy(device);
             device.destroy_descriptor_set_layout(self.mesh3d_set_layout, None);
+            self.ubo_ring.destroy(device);
+            self.shadow.destroy(device);
+            self.exposure.destroy(device);
+            self.taa.destroy(device);
             self.block_textures.destroy(device);
             self.retired_textures
                 .collect_all(|mut tex| tex.destroy(device));

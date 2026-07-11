@@ -46,6 +46,16 @@ pub enum Meter {
     Acquire,
     Pack,
     Record,
+    // Record sub-stages: the CPU cost of recording each pass inside `Record`.
+    // Substages (like the tile ones) — excluded from the submit tier total and
+    // printed on their own breakdown line, so they never double-count `Record`.
+    RecShadow,
+    RecMesh,
+    RecSurface,
+    RecSky,
+    RecImmediate,
+    RecOverlay,
+    RecTransitions,
     Submit,
     Present,
     // Tier::Gpu — GPU render passes (timestamp readback)
@@ -66,7 +76,7 @@ pub enum Meter {
 }
 
 impl Meter {
-    const ALL: [Meter; 29] = [
+    const ALL: [Meter; 36] = [
         Meter::NetEvents,
         Meter::Physics,
         Meter::StreamDrain,
@@ -81,6 +91,13 @@ impl Meter {
         Meter::Acquire,
         Meter::Pack,
         Meter::Record,
+        Meter::RecShadow,
+        Meter::RecMesh,
+        Meter::RecSurface,
+        Meter::RecSky,
+        Meter::RecImmediate,
+        Meter::RecOverlay,
+        Meter::RecTransitions,
         Meter::Submit,
         Meter::Present,
         Meter::GpuOpaque,
@@ -115,6 +132,13 @@ impl Meter {
             Meter::Acquire => "acquire",
             Meter::Pack => "pack",
             Meter::Record => "record",
+            Meter::RecShadow => "rec.shadow",
+            Meter::RecMesh => "rec.mesh",
+            Meter::RecSurface => "rec.surface",
+            Meter::RecSky => "rec.sky",
+            Meter::RecImmediate => "rec.imm",
+            Meter::RecOverlay => "rec.2d",
+            Meter::RecTransitions => "rec.trans",
             Meter::Submit => "submit",
             Meter::Present => "present",
             Meter::GpuOpaque => "opaque",
@@ -147,6 +171,13 @@ impl Meter {
             | Meter::Acquire
             | Meter::Pack
             | Meter::Record
+            | Meter::RecShadow
+            | Meter::RecMesh
+            | Meter::RecSurface
+            | Meter::RecSky
+            | Meter::RecImmediate
+            | Meter::RecOverlay
+            | Meter::RecTransitions
             | Meter::Submit
             | Meter::Present => Tier::CpuSubmit,
             Meter::GpuOpaque
@@ -367,10 +398,42 @@ fn report(frames: u64) {
         }
         eprintln!("{line}");
     }
+
+    // Record breakdown: the CPU sub-costs inside `Record`, hottest-first. These
+    // are substages (not in the submit tier total); this line explains where the
+    // `record` number goes without double-counting it.
+    let mut rec: Vec<Meter> = [
+        Meter::RecShadow,
+        Meter::RecMesh,
+        Meter::RecSurface,
+        Meter::RecSky,
+        Meter::RecImmediate,
+        Meter::RecOverlay,
+        Meter::RecTransitions,
+    ]
+    .into_iter()
+    .collect();
+    rec.sort_unstable_by(|a, b| ms_per_frame[*b as usize].total_cmp(&ms_per_frame[*a as usize]));
+    let mut rline = String::from("  record :");
+    for m in rec {
+        rline.push_str(&format!(" {} {:.2}", m.label(), ms_per_frame[m as usize]));
+    }
+    eprintln!("{rline}");
 }
 
 /// Tile sub-stage meters are reported inline in the workers line, not as their
 /// own tier entries (they double-count `tile`'s wall-time).
 fn is_substage(m: Meter) -> bool {
-    matches!(m, Meter::TileSample | Meter::TileMesh)
+    matches!(
+        m,
+        Meter::TileSample
+            | Meter::TileMesh
+            | Meter::RecShadow
+            | Meter::RecMesh
+            | Meter::RecSurface
+            | Meter::RecSky
+            | Meter::RecImmediate
+            | Meter::RecOverlay
+            | Meter::RecTransitions
+    )
 }

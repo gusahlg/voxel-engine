@@ -19,8 +19,7 @@ pub const Z_NEAR: f32 = 0.05;
 pub struct WarpStrength(f32);
 
 impl WarpStrength {
-    /// Upper clamp: beyond this the periphery compression is unusable (the
-    /// derivation harness shows edge/center source-density > 4.5x by here).
+    /// Upper clamp: beyond this the periphery compression is unusable.
     pub const MAX: f32 = 2.0;
 
     /// Returns `None` for non-finite or `<= 0.0` (that is `Rectilinear`, not a
@@ -97,8 +96,7 @@ impl WarpMap {
         matches!(self, WarpMap::Identity)
     }
 
-    /// Horizontal source-fov widening `tan(src_hfov/2)/tan(hfov/2) = s/atan(s)`,
-    /// a pure function of strength (validated in `warp_derive`). `1.0` for identity.
+    /// Horizontal source-fov widening: a pure function of strength. `1.0` for identity.
     #[inline]
     pub fn fov_scale(&self) -> f32 {
         match self {
@@ -130,10 +128,10 @@ impl WarpMap {
     /// GPU push bytes for the tonemap remap. Identity yields `s = 0` so the frag's
     /// `s <= 0` branch is a no-op (rectilinear stays byte-identical).
     #[inline]
-    pub fn push(&self, exposure: f32) -> WarpPush {
+    pub fn push(&self, exposure: f32, dither_phase: f32) -> WarpPush {
         match self {
-            WarpMap::Identity => WarpPush { exposure, s: 0.0, atan_s: 0.0 },
-            WarpMap::Active { s, atan_s } => WarpPush { exposure, s: *s, atan_s: *atan_s },
+            WarpMap::Identity => WarpPush { exposure, s: 0.0, atan_s: 0.0, dither_phase },
+            WarpMap::Active { s, atan_s } => WarpPush { exposure, s: *s, atan_s: *atan_s, dither_phase },
         }
     }
 }
@@ -147,6 +145,9 @@ pub struct WarpPush {
     pub exposure: f32,
     pub s: f32,
     pub atan_s: f32,
+    /// Ordered-dither temporal phase (`DITHER_PHASE_16[frame % 16]`), fed to the
+    /// tonemap frag's post-tonemap dither. Trailing lane (ABI-appended).
+    pub dither_phase: f32,
 }
 
 /// Perspective camera, raylib-parity: `fovy` is the vertical field of view in
@@ -472,30 +473,8 @@ mod tests {
     }
 }
 
-// Step 0 derivation harness for the post-process wide-FOV remap. This is a
-// scratch/spec module: it pins the 1-D horizontal remap math the later WarpMap
-// (and the tonemap frag) will encode, and asserts the properties the whole
-// approach rests on, BEFORE any renderer type moves. Horizontal-only, matching
-// the De Carpentier cylinder (vertical stays rectilinear, so the widening is
-// purely horizontal and the vertical fov is untouched in both spaces).
-//
-// Model: the SOURCE is a plain rectilinear render at a *wider* horizontal fov.
-// Source-NDC x = qx ∈ [-1,1] spans that wide frustum. Display maps presented-NDC
-// x = px to source qx and samples. The two maps are the existing atan/tan pair:
-//
-//   forward  (picking):  px = atan(qx * s) / atan(s)     -- source -> presented
-//   inverse  (sampling): qx = tan(px * atan(s)) / s      -- presented -> source
-//
-// The key derived quantity is how much wider the source must be rendered so the
-// presented *center* keeps a chosen scale. Near center d(px)/d(qx) = s/atan(s),
-// i.e. the center is magnified by `fov_scale = s / atan(s)`. So to make the
-// presented center match a plain rectilinear render at the user's fov, the source
-// horizontal fov is widened by `fov_scale` in tan-space:
-//
-//   tan(source_hfov/2) = fov_scale * tan(presented_hfov/2)
-//
-// which for a (vfov, aspect) projection means source_aspect = aspect * fov_scale
-// (vfov unchanged). fov_scale is a pure function of s — a single client knob.
+// Derivation harness for the wide-FOV remap: validates the atan/tan formulas
+// and their properties before embedding in WarpMap and the tonemap frag.
 #[cfg(test)]
 mod warp_derive {
     #[inline]
@@ -552,7 +531,7 @@ mod warp_derive {
 
     #[test]
     fn center_magnification_equals_fov_scale() {
-        // d(warp)/dqx at 0, by finite difference, must equal fov_scale = s/atan(s).
+        // Center magnification (finite difference) must equal fov_scale.
         for &s in &STRENGTHS {
             let h = 1e-4;
             let deriv = (warp_x(h, s) - warp_x(-h, s)) / (2.0 * h);

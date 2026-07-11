@@ -1,0 +1,549 @@
+//! Scene exposure metering — compute-based reduction with temporal smoothing.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use ash::vk;
+
+use super::alloc::find_memory_type;
+use super::buffers::FRAMES_IN_FLIGHT;
+use crate::engine::Engine;
+use crate::skeleton::{Exposure, ExposureRead, ExposureWrite, FrameSlot};
+
+const EXPOSURE_REDUCE_COMP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/exposure_reduce.comp.spv"));
+
+/// One tile = this many HDR texels per side (mirrors `TILE` in the shader).
+const TILE: u32 = 16;
+
+/// Shader curve — geometric-mean luma → exposure multiplier. Tentative; to be
+/// re-derived for our HDR range. Kept as one function so the CPU has a single owner.
+fn makeup_curve(luma: f32) -> f32 {
+    let _tuned = (-luma).exp() * 3.03 + 0.6;
+    Exposure::DEFAULT.0
+}
+
+/// Local SPIR-V module builder (pipeline.rs's is private to its module).
+fn create_shader_module(device: &ash::Device, bytes: &[u8]) -> vk::ShaderModule {
+    let code =
+        ash::util::read_spv(&mut std::io::Cursor::new(bytes)).expect("invalid embedded SPIR-V");
+    unsafe {
+        device
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
+            .expect("create exposure shader module")
+    }
+}
+
+/// Push constants for `exposure_reduce.comp`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ExposurePush {
+    hdr_dim: [u32; 2],
+    tiles: [u32; 2],
+}
+
+// Double-buffered tile-mean buffers for per-slot GPU readback.
+
+/// One slot's host-visible, persistently-mapped tile-mean buffer (mean log2
+/// luma per tile). Host-coherent so no flush/invalidate is needed on readback.
+struct TileMeans {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: *mut f32,
+}
+
+impl TileMeans {
+    fn new(
+        device: &ash::Device,
+        memory_props: &vk::PhysicalDeviceMemoryProperties,
+        tile_count: usize,
+    ) -> TileMeans {
+        let size = (tile_count.max(1) * size_of::<f32>()) as u64;
+        let buffer = unsafe {
+            device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(size)
+                        // Written by the compute reduction, read back by the CPU.
+                        .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )
+                .expect("create exposure tile-mean buffer")
+        };
+        let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let memory = unsafe {
+            device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(reqs.size)
+                        .memory_type_index(find_memory_type(
+                            memory_props,
+                            reqs.memory_type_bits,
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )),
+                    None,
+                )
+                .expect("allocate exposure tile-mean memory")
+        };
+        unsafe {
+            device
+                .bind_buffer_memory(buffer, memory, 0)
+                .expect("bind exposure tile-mean memory");
+        }
+        let mapped = unsafe {
+            device
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .expect("map exposure tile-mean memory") as *mut f32
+        };
+        // Start neutral (log2(1.0) == 0) so the very first frame reads a sane value.
+        unsafe { std::ptr::write_bytes(mapped, 0, tile_count.max(1)) };
+        TileMeans {
+            buffer,
+            memory,
+            mapped,
+        }
+    }
+
+    unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.unmap_memory(self.memory);
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Double-buffered exposure readback. The compute reduction writes one
+/// slot; the CPU reads the *other* — the one whose fence has already cleared —
+/// so the readback never races an in-flight GPU write. The parity rule lives in
+/// exactly one function ([`ExposureRing::views`]); callers cannot mix the views.
+pub struct ExposureRing {
+    slots: [TileMeans; FRAMES_IN_FLIGHT as usize],
+    tile_count: usize,
+}
+
+impl ExposureRing {
+    fn new(
+        device: &ash::Device,
+        memory_props: &vk::PhysicalDeviceMemoryProperties,
+        tile_count: usize,
+    ) -> ExposureRing {
+        ExposureRing {
+            slots: std::array::from_fn(|_| TileMeans::new(device, memory_props, tile_count)),
+            tile_count,
+        }
+    }
+
+    /// The parity resolver: the compute pass writes `s`, the CPU reads `s.other()`.
+    /// Baked HERE so no call site can hold both views mixed up.
+    pub fn views(&self, s: FrameSlot) -> (ExposureWrite<'_>, ExposureRead<'_>) {
+        (
+            ExposureWrite {
+                buf: &self.slots[s.index()].buffer,
+            },
+            ExposureRead {
+                buf: &self.slots[s.other().index()].buffer,
+            },
+        )
+    }
+
+    /// CPU readback of the buffer a `views(_).1` read-view points at, plus the
+    /// MakeUp curve and temporal smoothing. Returns the exposure the next
+    /// `compose()` should carry. Host-coherent memory → the mapped floats are up
+    /// to date once the slot's fence has cleared (the caller's responsibility).
+    pub fn metered(&self, read: ExposureRead<'_>, dt: f32, prev: Exposure) -> Exposure {
+        let slot = self
+            .slots
+            .iter()
+            .find(|t| t.buffer == *read.buf)
+            .expect("ExposureRead must originate from this ring");
+
+        // Average tile means = mean log2 luma; exp2 → geometric-mean scene luma.
+        let mut sum = 0.0f32;
+        for i in 0..self.tile_count {
+            sum += unsafe { *slot.mapped.add(i) };
+        }
+        let mean_log2 = if self.tile_count > 0 {
+            sum / self.tile_count as f32
+        } else {
+            0.0
+        };
+        // Robustness: the read slot is the one NOT written this frame (the parity
+        // resolver), but under an unlucky fence race a partial write could yield a
+        // non-finite sum. Exposure is a slowly-varying scalar under heavy
+        // smoothing, so the correct recovery is simply to hold `prev` for a frame
+        // rather than let a NaN poison the filter forever.
+        if !mean_log2.is_finite() {
+            return prev;
+        }
+        let luma = mean_log2.exp2();
+
+        let target = makeup_curve(luma).max(1e-3); // exposure is a positive multiplier
+        // mix(new, prev, exp(-dt·1.25)): large dt → mostly new (fast adapt on a
+        // long frame), small dt → mostly prev (smooth). Frame-rate independent.
+        let k = (-dt * 1.25).exp();
+        Exposure(target * (1.0 - k) + prev.0 * k)
+    }
+
+    unsafe fn destroy(&self, device: &ash::Device) {
+        for slot in &self.slots {
+            unsafe { slot.destroy(device) };
+        }
+    }
+}
+
+// SAFETY: the mapped pointers are only dereferenced on the render thread (the
+// ring lives inside the render-thread-owned `Renderer`); `Send` is needed only
+// because `Renderer` is constructed on and moved to that thread.
+unsafe impl Send for ExposureRing {}
+
+// ============================================================================
+// Compute pipeline
+// ============================================================================
+
+/// The metering compute pipeline plus the sampler it reads the HDR target
+/// through. Set 0 is push-descriptor: binding 0 = HDR (combined image sampler),
+/// binding 1 = tile-mean storage buffer.
+struct ExposureCompute {
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    set_layout: vk::DescriptorSetLayout,
+    sampler: vk::Sampler,
+}
+
+impl ExposureCompute {
+    fn new(device: &ash::Device, cache: vk::PipelineCache) -> ExposureCompute {
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let set_layout = unsafe {
+            device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+                        .bindings(&bindings),
+                    None,
+                )
+                .expect("create exposure set layout")
+        };
+        let push = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(size_of::<ExposurePush>() as u32)];
+        let set_layouts = [set_layout];
+        let layout = unsafe {
+            device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&set_layouts)
+                        .push_constant_ranges(&push),
+                    None,
+                )
+                .expect("create exposure pipeline layout")
+        };
+
+        let module = create_shader_module(device, EXPOSURE_REDUCE_COMP);
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .module(module)
+            .name(c"main")
+            .stage(vk::ShaderStageFlags::COMPUTE);
+        let info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(layout);
+        let pipeline = unsafe {
+            device
+                .create_compute_pipelines(cache, &[info], None)
+                .map_err(|(_, err)| err)
+                .expect("create exposure compute pipeline")[0]
+        };
+        unsafe { device.destroy_shader_module(module, None) };
+
+        // Linear clamp: tile means smooth a little over the box; edge clamp keeps
+        // the border tiles from wrapping.
+        let sampler = unsafe {
+            device
+                .create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::LINEAR)
+                        .min_filter(vk::Filter::LINEAR)
+                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                    None,
+                )
+                .expect("create exposure HDR sampler")
+        };
+
+        ExposureCompute {
+            pipeline,
+            layout,
+            set_layout,
+            sampler,
+        }
+    }
+
+    unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+            device.destroy_sampler(self.sampler, None);
+        }
+    }
+}
+
+// ============================================================================
+// Cross-thread published exposure
+// ============================================================================
+
+/// The latest metered exposure, published by the render thread and read by the
+/// main thread's `compose()`. A single `f32` in an atomic — exposure changes
+/// slowly and a torn-free scalar is all `compose` needs.
+#[derive(Clone)]
+pub struct ExposureShared(Arc<AtomicU32>);
+
+impl ExposureShared {
+    fn new() -> ExposureShared {
+        ExposureShared(Arc::new(AtomicU32::new(Exposure::DEFAULT.0.to_bits())))
+    }
+    fn store(&self, e: Exposure) {
+        self.0.store(e.0.to_bits(), Ordering::Relaxed);
+    }
+    pub fn load(&self) -> Exposure {
+        Exposure(f32::from_bits(self.0.load(Ordering::Relaxed)))
+    }
+}
+
+// ============================================================================
+// ExposureState — render-thread owner of the whole pass
+// ============================================================================
+
+pub(crate) struct ExposureState {
+    compute: ExposureCompute,
+    ring: ExposureRing,
+    /// Tile-grid dimensions = ceil(hdr_dim / TILE).
+    tiles: vk::Extent2D,
+    hdr_dim: vk::Extent2D,
+    /// Last smoothed exposure (render-thread state, fed back into `metered`).
+    exposure: Exposure,
+    /// Wall-clock of the previous metering, for the temporal-smoothing `dt`
+    /// (the render thread owns its own cadence; there is no game `dt` here).
+    last: std::time::Instant,
+    shared: ExposureShared,
+}
+
+impl ExposureState {
+    pub(crate) fn new(
+        device: &ash::Device,
+        memory_props: &vk::PhysicalDeviceMemoryProperties,
+        render_extent: vk::Extent2D,
+        cache: vk::PipelineCache,
+    ) -> ExposureState {
+        let tiles = vk::Extent2D {
+            width: render_extent.width.div_ceil(TILE).max(1),
+            height: render_extent.height.div_ceil(TILE).max(1),
+        };
+        let tile_count = (tiles.width * tiles.height) as usize;
+        ExposureState {
+            compute: ExposureCompute::new(device, cache),
+            ring: ExposureRing::new(device, memory_props, tile_count),
+            tiles,
+            hdr_dim: render_extent,
+            exposure: Exposure::DEFAULT,
+            last: std::time::Instant::now(),
+            shared: ExposureShared::new(),
+        }
+    }
+
+    /// Clone of the published cell for the main thread (`Engine`).
+    pub(crate) fn shared(&self) -> ExposureShared {
+        self.shared.clone()
+    }
+
+    /// The render thread's latest metered+smoothed exposure — the multiplier the
+    /// tonemap pass applies before its curve. Same value published to
+    /// [`ExposureShared`], read directly here since tonemap runs render-side.
+    pub(crate) fn current(&self) -> Exposure {
+        self.exposure
+    }
+
+    /// Rebuild the extent-dependent GPU resources (the tile-mean ring) after a
+    /// resize. The compute pipeline is extent-independent (dims arrive by push),
+    /// and the published `ExposureShared` cell + smoothed `exposure` are kept so
+    /// the main thread's `compose()` reads an unbroken value. The caller has
+    /// already `device_wait_idle`'d.
+    pub(crate) fn recreate(
+        &mut self,
+        device: &ash::Device,
+        memory_props: &vk::PhysicalDeviceMemoryProperties,
+        render_extent: vk::Extent2D,
+    ) {
+        let tiles = vk::Extent2D {
+            width: render_extent.width.div_ceil(TILE).max(1),
+            height: render_extent.height.div_ceil(TILE).max(1),
+        };
+        let tile_count = (tiles.width * tiles.height) as usize;
+        unsafe { self.ring.destroy(device) };
+        self.ring = ExposureRing::new(device, memory_props, tile_count);
+        self.tiles = tiles;
+        self.hdr_dim = render_extent;
+    }
+
+    pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            self.compute.destroy(device);
+            self.ring.destroy(device);
+        }
+    }
+}
+
+// ============================================================================
+// Seams (impls on foreign-owned types — see module MERGE NOTES)
+// ============================================================================
+
+impl super::Renderer {
+    /// Record the metering reduction and fold the previous result into the
+    /// published exposure. Inserted by the orchestrator AFTER the HDR pass and
+    /// BEFORE tonemap. `slot` is this frame's slot; `views(slot)` writes it and
+    /// reads `slot.other()` (the buffer not written this frame), with `metered`
+    /// guarding the rare fence-race torn read.
+    ///
+    /// This pass owns the offscreen's `COLOR_ATTACHMENT → SHADER_READ_ONLY`
+    /// transition (it samples the HDR for the reduction and leaves it sampled),
+    /// so it returns the [`super::HdrReadable`] proof the tonemap present-copy
+    /// requires.
+    pub(crate) fn record_exposure_pass(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        slot: FrameSlot,
+    ) -> super::HdrReadable {
+        let device = &self.device.device;
+        let exp = &mut self.exposure;
+
+        // Parity resolver: compute writes `slot`, CPU reads `slot.other()`
+        // — the buffer NOT being written this frame. `metered` guards a torn read.
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(exp.last).as_secs_f32();
+        exp.last = now;
+        let metered = {
+            let (_write, read) = exp.ring.views(slot);
+            exp.ring.metered(read, dt, exp.exposure)
+        };
+        exp.exposure = metered;
+        exp.shared.store(metered);
+        // The buffer the compute dispatch fills this frame (read next frame).
+        let write_buf = *exp.ring.views(slot).0.buf;
+
+        let hdr = &self.targets.offscreen[slot.index()];
+        let tiles = exp.tiles;
+        unsafe {
+            // HDR color-attachment write → compute sampled read. The buffer is
+            // host-coherent + freshly fence-cleared, so no pre-barrier is needed
+            // for the write target beyond the frame fence already waited.
+            let pre = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(hdr.image)
+                .subresource_range(super::color_range())];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&pre),
+            );
+
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, exp.compute.pipeline);
+            let hdr_info = [vk::DescriptorImageInfo::default()
+                .sampler(exp.compute.sampler)
+                .image_view(hdr.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let buf_info = [vk::DescriptorBufferInfo::default()
+                .buffer(write_buf)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&hdr_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&buf_info),
+            ];
+            self.device.push_descriptor.cmd_push_descriptor_set(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                exp.compute.layout,
+                0,
+                &writes,
+            );
+
+            let push = ExposurePush {
+                hdr_dim: [exp.hdr_dim.width, exp.hdr_dim.height],
+                tiles: [tiles.width, tiles.height],
+            };
+            device.cmd_push_constants(
+                cmd,
+                exp.compute.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&push),
+            );
+            device.cmd_dispatch(cmd, tiles.width.div_ceil(8), tiles.height.div_ceil(8), 1);
+
+            // Compute storage write → host read (next cycle) and HDR back to
+            // color-attachment layout for the tonemap sample.
+            let post = [
+                vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                    .dst_access_mask(vk::AccessFlags2::HOST_READ),
+            ];
+            let img_post = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(hdr.image)
+                .subresource_range(super::color_range())];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default()
+                    .memory_barriers(&post)
+                    .image_memory_barriers(&img_post),
+            );
+        }
+        // The offscreen is now in SHADER_READ_ONLY for the tonemap present-copy.
+        super::HdrReadable::new(slot.index())
+    }
+}
+
+impl Engine {
+    /// The exposure `compose()` folds into this frame's `FrameSnapshot`:
+    /// the render thread's latest metered+smoothed value. The temporal smoothing
+    /// (which needs the readback cadence) already happened render-side, so `dt`
+    /// is unused here — the seam keeps it for symmetry with `metered`.
+    ///
+    /// MERGE NOTE: reads `self.exposure_shared` (a clone of
+    /// `ExposureState::shared()` handed to `Engine` at construction).
+    pub fn exposure_for_compose(&mut self, _dt: f32) -> Exposure {
+        self.exposure_shared.load()
+    }
+}

@@ -30,8 +30,7 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
-/// Suballocation alignment: LCM of GPU offset alignment (256) and vertex stride.
-/// Aligns all vertex data to stride boundaries and allows binding at offset 0.
+/// Suballocation alignment: must divide both GPU offset alignment (256) and vertex stride.
 const MESH_ALIGN: u64 = {
     let stride = std::mem::size_of::<crate::mesh::MeshVertex>() as u64;
     stride / gcd(stride, GPU_OFFSET_ALIGN) * GPU_OFFSET_ALIGN
@@ -272,7 +271,6 @@ pub(crate) unsafe fn build_mesh_resident(
     }
 
     let vertex_bytes: &[u8] = bytemuck::cast_slice(&data.vertices);
-    // Index data starts 4-byte aligned right after the vertices.
     let index_start = (vertex_bytes.len() as u64).next_multiple_of(4);
     let index_bytes_len = total_indices * std::mem::size_of::<u32>();
     let total = index_start + index_bytes_len as u64;
@@ -281,8 +279,6 @@ pub(crate) unsafe fn build_mesh_resident(
         .map_err(|err| log::error!("mesh allocation failed: {err:?}"))
         .ok()?;
 
-    // Writes vertices at 0, then the six index buckets concatenated in
-    // `Normal` order starting at `index_start` (one memcpy per bucket).
     let write_into = |dst: *mut u8| unsafe {
         std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), dst, vertex_bytes.len());
         let mut cursor = index_start as usize;
@@ -326,7 +322,6 @@ pub(crate) unsafe fn build_mesh_resident(
         aabb_max = aabb_max.max(p);
     }
 
-    // All meshes share the same index and vertex buffer bindings.
     const _: () =
         assert!(MESH_ALIGN.is_multiple_of(VERTEX_STRIDE) && MESH_ALIGN.is_multiple_of(256));
     debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
@@ -334,8 +329,6 @@ pub(crate) unsafe fn build_mesh_resident(
     let vertex_offset = (alloc.offset / VERTEX_STRIDE) as i32;
     let first_index = ((alloc.offset + index_start) / 4) as u32;
 
-    // Absolute first-index boundaries: bounds[0] = first_index, then a
-    // running sum of bucket lengths, so they always increase.
     let mut bounds = [first_index; 7];
     for dir in 0..6 {
         bounds[dir + 1] = bounds[dir] + data.buckets[dir].len() as u32;
@@ -532,8 +525,7 @@ pub(crate) unsafe fn build_surface_resident(
 
     let vertex_bytes: &[u8] = bytemuck::cast_slice(&data.verts);
     let index_bytes: &[u8] = bytemuck::cast_slice(&data.indices);
-    // Index data starts 4-byte aligned right after the vertices (the 16-byte
-    // vertex stride already keeps this at a 4-boundary).
+    // 16-byte stride naturally keeps index data 4-byte aligned.
     let index_start = (vertex_bytes.len() as u64).next_multiple_of(4);
     let total = index_start + index_bytes.len() as u64;
 
@@ -735,7 +727,12 @@ const IMM_SHRINK_WINDOW: u32 = 600;
 /// A growable host-visible buffer written each frame, one per frame-in-flight.
 /// Used for immediate geometry, offsets, and indirect commands.
 pub struct HostBuffer {
-    pub buffer: vk::Buffer,
+    /// Private: `VK_NULL_HANDLE` until the first non-empty write, so it must
+    /// never be handed out raw. Consumers obtain it through [`Self::bound`],
+    /// which yields `None` while unallocated — turning "bound/pushed a null
+    /// buffer" (a validation error + potential GPU hang) into a `None` the call
+    /// site is forced to handle.
+    buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: *mut u8,
     capacity: u64,
@@ -747,6 +744,16 @@ pub struct HostBuffer {
 }
 
 impl HostBuffer {
+    /// The device buffer handle, or `None` if nothing has been written yet (the
+    /// handle is still `VK_NULL_HANDLE`). This is the ONLY way to read the
+    /// handle: binding it as a vertex/index buffer or pushing it as a descriptor
+    /// requires a valid handle, so routing every such use through this `Option`
+    /// makes an empty-frame null bind a compile-visible case rather than a
+    /// runtime validation error in a pass far from this buffer.
+    pub fn bound(&self) -> Option<vk::Buffer> {
+        (self.buffer != vk::Buffer::null()).then_some(self.buffer)
+    }
+
     pub fn new(usage: vk::BufferUsageFlags) -> Self {
         Self {
             buffer: vk::Buffer::null(),
@@ -871,10 +878,7 @@ impl HostBuffer {
     }
 }
 
-/// One per-draw offsets-SSBO element: a camera-relative translation plus a
-/// uniform scale, read per-vertex in the mesh vertex shader as
-/// `world = local * scale + offset`. Naming `scale` (vs a bare `[f32; 4]` w)
-/// keeps it from silently defaulting to zero. 16 bytes, `std430`-compatible.
+/// Per-draw translation and scale. Naming `scale` (not `w`) avoids silent zeroing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrawOffset {
@@ -893,16 +897,11 @@ pub struct DrawIndexedIndirect {
     pub instance_count: u32,
     pub first_index: u32,
     pub vertex_offset: i32,
-    /// Doubles as the draw's slot in the offsets SSBO: the vertex shader
-    /// reads `draw_offsets[InstanceIndex]` and InstanceIndex starts at
-    /// `first_instance` (instance_count is always 1).
+    /// Slot index in the offsets SSBO (instance_count is always 1).
     pub first_instance: u32,
 }
 
-// Layout must match `VkDrawIndexedIndirectCommand` field-for-field so the
-// struct can be memcpy'd straight into the indirect buffer. Checked against
-// ash's own type at compile time (stronger than a size-only runtime test:
-// this also catches a transposed field).
+// Layout must match `VkDrawIndexedIndirectCommand` field-for-field.
 const _: () = {
     use ash::vk::DrawIndexedIndirectCommand as Ash;
     assert!(std::mem::size_of::<DrawIndexedIndirect>() == std::mem::size_of::<Ash>());
@@ -928,11 +927,8 @@ const _: () = {
     );
 };
 
-/// Single push-descriptor set layout for the 3D mesh pipeline: binding 0 =
-/// per-draw offsets SSBO (vertex stage), binding 1 = block texture array
-/// (fragment stage). Both live in one set because Vulkan permits at most one
-/// push-descriptor set per pipeline layout. No pool or set: the current
-/// frame's buffer and texture are pushed at record time.
+/// 3D pipeline push-descriptor set: binding 0 = offsets SSBO (vertex),
+/// binding 1 = texture array (fragment), binding 2 = per-frame UBO (both).
 pub fn create_mesh3d_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout {
     let bindings = [
         vk::DescriptorSetLayoutBinding::default()
@@ -942,6 +938,21 @@ pub fn create_mesh3d_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout
             .stage_flags(vk::ShaderStageFlags::VERTEX),
         vk::DescriptorSetLayoutBinding::default()
             .binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(3)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(4)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
@@ -956,8 +967,8 @@ pub fn create_mesh3d_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout
     }
 }
 
-/// Pushes the per-draw offsets SSBO (binding 0) and block texture array
-/// (binding 1) into set 0 of the bound 3D layout, in one call.
+/// Push-descriptor call for mesh3d set 0 bindings 0-4.
+#[allow(clippy::too_many_arguments)]
 pub fn push_mesh3d_descriptors(
     push: &khr::push_descriptor::Device,
     cmd: vk::CommandBuffer,
@@ -965,6 +976,10 @@ pub fn push_mesh3d_descriptors(
     offsets: vk::Buffer,
     tex_sampler: vk::Sampler,
     tex_view: vk::ImageView,
+    ubo: vk::Buffer,
+    cascade_ubo: vk::Buffer,
+    shadow_sampler: vk::Sampler,
+    shadow_view: vk::ImageView,
 ) {
     let buffer_infos = [vk::DescriptorBufferInfo::default()
         .buffer(offsets)
@@ -973,6 +988,18 @@ pub fn push_mesh3d_descriptors(
     let image_infos = [vk::DescriptorImageInfo::default()
         .sampler(tex_sampler)
         .image_view(tex_view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let ubo_infos = [vk::DescriptorBufferInfo::default()
+        .buffer(ubo)
+        .offset(0)
+        .range(vk::WHOLE_SIZE)];
+    let cascade_infos = [vk::DescriptorBufferInfo::default()
+        .buffer(cascade_ubo)
+        .offset(0)
+        .range(vk::WHOLE_SIZE)];
+    let shadow_infos = [vk::DescriptorImageInfo::default()
+        .sampler(shadow_sampler)
+        .image_view(shadow_view)
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
     let writes = [
         vk::WriteDescriptorSet::default()
@@ -983,13 +1010,24 @@ pub fn push_mesh3d_descriptors(
             .dst_binding(1)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&image_infos),
+        vk::WriteDescriptorSet::default()
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&ubo_infos),
+        vk::WriteDescriptorSet::default()
+            .dst_binding(3)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&cascade_infos),
+        vk::WriteDescriptorSet::default()
+            .dst_binding(4)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&shadow_infos),
     ];
     unsafe {
         push.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &writes);
     }
 }
 
-/// Shrink a buffer if it's oversized relative to usage.
 fn shrink_capacity(capacity: u64, peak: u64) -> Option<u64> {
     if capacity <= IMM_MIN_CAPACITY {
         return None; // already at (or below) the floor

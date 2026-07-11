@@ -63,3 +63,11 @@ fn main() {
   vulkan-loader`); the engine finds Homebrew's loader automatically.
 - `cargo test` — CPU-side unit tests (font atlas, input semantics, frustum &
   projection math, allocator free-list).
+
+For performance consider installing mold and creating this file.
+```
+cat ~/.cargo/config.toml
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=mold"]
+```

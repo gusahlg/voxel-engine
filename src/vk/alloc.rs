@@ -23,6 +23,13 @@ use super::device::{BudgetSnapshot, MemoryBudget};
 /// Default block size; larger allocations get a dedicated, larger block.
 const BLOCK_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Consecutive `shrink_device` ticks a device block must stay completely
+/// free before it is returned to the driver. At a per-frame cadence this is
+/// several seconds of sustained emptiness, so a block that briefly drains and
+/// refills (a player leaving and re-entering a region) is never released and
+/// then immediately recreated — the settling window is the anti-thrash guard.
+const DEVICE_SHRINK_SETTLE_TICKS: u32 = 300;
+
 /// Whether the DEVICE pool is host-visible (unified memory).
 /// Decided at construction and never changes.
 #[derive(Clone, Copy)]
@@ -206,6 +213,10 @@ struct Block {
     /// Base pointer of the persistent mapping, when host-visible.
     mapped: Option<NonNull<u8>>,
     free_list: FreeList,
+    /// Consecutive `shrink_device` ticks this block has been completely free.
+    /// Reset to 0 whenever it holds any live suballocation. Only meaningful
+    /// for the device pool; staging shrink ignores it.
+    empty_ticks: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -414,6 +425,39 @@ impl GpuAllocator {
         }
     }
 
+    /// Returns settled-empty device blocks to the driver, bounding the pool's
+    /// high-water mark over a long session. Call once per frame.
+    ///
+    /// Meshing churn (the LOD pyramid multiplies it) makes the device pool
+    /// grow to a transient peak; without this it would retain every block ever
+    /// touched forever. A block is released only after it has been *completely*
+    /// free for [`DEVICE_SHRINK_SETTLE_TICKS`] consecutive calls, keeping one
+    /// empty block warm to absorb the next spike.
+    ///
+    /// Safety / deferred-free interaction: an empty `free_list` means the block
+    /// holds zero live suballocations. Every suballocation only reaches
+    /// `free()` — and thus the free_list — *after* the caller's deferred-free
+    /// window (frames-in-flight) has elapsed, so no in-flight command buffer
+    /// can still reference any byte of an empty block. Its slot is set to
+    /// `None`; because it was empty, no outstanding `Allocation` names it, so
+    /// reusing the slot later cannot alias a live handle.
+    pub unsafe fn shrink_device(&mut self, device: &ash::Device) {
+        for index in settled_empty_blocks(&mut self.device_blocks, DEVICE_SHRINK_SETTLE_TICKS) {
+            let block = self.device_blocks[index]
+                .take()
+                .expect("selected slot holds a block");
+            // Freeing the memory implicitly unmaps any persistent mapping.
+            unsafe {
+                device.destroy_buffer(block.buffer, None);
+                device.free_memory(block.memory, None);
+            }
+            log::debug!(
+                "released settled-empty device block ({} MiB)",
+                block.memory_size / (1024 * 1024)
+            );
+        }
+    }
+
     /// Destroy all blocks (GPU must be idle).
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         for block in self
@@ -460,6 +504,33 @@ fn empty_blocks_beyond_first(blocks: &[Option<Block>]) -> Vec<usize> {
             extra.push(index);
         } else {
             kept_one = true;
+        }
+    }
+    extra
+}
+
+/// Advances each block's empty-settling counter and returns the indices of
+/// blocks that have stayed completely free for at least `settle_ticks`
+/// consecutive calls, always keeping the first still-empty block warm.
+///
+/// A block holding any live suballocation resets its counter to 0. Because the
+/// counter advances only while a block is empty, a block that momentarily
+/// drains and refills is never selected — this is what stops release/recreate
+/// thrash. Returns an empty Vec in typical steady state.
+fn settled_empty_blocks(blocks: &mut [Option<Block>], settle_ticks: u32) -> Vec<usize> {
+    let mut extra = Vec::new();
+    let mut kept_warm = false;
+    for (index, slot) in blocks.iter_mut().enumerate() {
+        let Some(block) = slot else { continue };
+        if !block.free_list.is_empty() {
+            block.empty_ticks = 0;
+            continue;
+        }
+        block.empty_ticks = block.empty_ticks.saturating_add(1);
+        if !kept_warm {
+            kept_warm = true;
+        } else if block.empty_ticks >= settle_ticks {
+            extra.push(index);
         }
     }
     extra
@@ -611,6 +682,7 @@ unsafe fn create_block(
         // Suballocate only within the buffer's extent, not the (possibly
         // slightly larger) memory allocation.
         free_list: FreeList::new(buffer_size),
+        empty_ticks: 0,
     })
 }
 
@@ -691,7 +763,10 @@ fn pick_memory_type(
 #[cfg(test)]
 mod tests {
     use super::super::device::BudgetSnapshot;
-    use super::{Block, FreeList, FreeRange, empty_blocks_beyond_first, pick_memory_type};
+    use super::{
+        Block, FreeList, FreeRange, empty_blocks_beyond_first, pick_memory_type,
+        settled_empty_blocks,
+    };
     use ash::vk;
 
     /// Two memory types on two heaps: type 0 (preferred, heap 0) and a
@@ -766,6 +841,7 @@ mod tests {
             memory_size: capacity,
             mapped: None,
             free_list,
+            empty_ticks: 0,
         })
     }
 
@@ -806,6 +882,44 @@ mod tests {
             dummy_block(1024, 0),   // destroyed
         ];
         assert_eq!(empty_blocks_beyond_first(&blocks), vec![2, 4]);
+    }
+
+    #[test]
+    fn device_shrink_settles_before_release() {
+        // Two empty blocks beyond a warm one; a third in use.
+        let mut blocks = vec![
+            dummy_block(1024, 100), // in use — never selected
+            dummy_block(1024, 0),   // first empty — kept warm
+            dummy_block(1024, 0),   // eligible after settling
+        ];
+
+        // Below threshold: settling, nothing released yet.
+        for _ in 0..2 {
+            assert!(settled_empty_blocks(&mut blocks, 3).is_empty());
+        }
+        // Third consecutive empty tick crosses the window.
+        assert_eq!(settled_empty_blocks(&mut blocks, 3), vec![2]);
+    }
+
+    #[test]
+    fn device_shrink_refill_resets_counter() {
+        let mut blocks = vec![
+            dummy_block(1024, 0), // kept warm
+            dummy_block(1024, 0), // candidate
+        ];
+        // Accumulate settling ticks just shy of release.
+        for _ in 0..2 {
+            assert!(settled_empty_blocks(&mut blocks, 3).is_empty());
+        }
+        // The candidate briefly refills: its counter must reset.
+        blocks[1].as_mut().unwrap().free_list.alloc(64, 1).unwrap();
+        assert!(settled_empty_blocks(&mut blocks, 3).is_empty());
+        blocks[1].as_mut().unwrap().free_list.free(0, 64);
+        // Starts settling from zero again — no premature release.
+        for _ in 0..2 {
+            assert!(settled_empty_blocks(&mut blocks, 3).is_empty());
+        }
+        assert_eq!(settled_empty_blocks(&mut blocks, 3), vec![1]);
     }
 
     #[test]

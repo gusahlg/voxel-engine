@@ -83,6 +83,7 @@ pub enum Key {
     Delete,
     F1,
     F2,
+    F3,
 }
 
 /// Mouse buttons the engine exposes. Other buttons are ignored.
@@ -104,6 +105,9 @@ pub struct InputState {
     mouse_down: HashSet<MouseButton>,
     mouse_pressed: HashSet<MouseButton>,
     mouse_delta: (f64, f64),
+    /// Vertical scroll accumulated since `begin_frame`, in line units (a mouse
+    /// notch is ~1.0; pixel-delta devices are normalised to the same scale).
+    scroll_delta: f32,
     chars: RefCell<VecDeque<char>>,
 }
 
@@ -115,6 +119,7 @@ impl InputState {
             mouse_down: HashSet::new(),
             mouse_pressed: HashSet::new(),
             mouse_delta: (0.0, 0.0),
+            scroll_delta: 0.0,
             chars: RefCell::new(VecDeque::new()),
         }
     }
@@ -126,6 +131,7 @@ impl InputState {
         self.keys_pressed.clear();
         self.mouse_pressed.clear();
         self.mouse_delta = (0.0, 0.0);
+        self.scroll_delta = 0.0;
         self.chars.borrow_mut().clear();
     }
 
@@ -154,6 +160,16 @@ impl InputState {
                     _ => return,
                 };
                 self.mouse_button_event(b, state.is_pressed());
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Normalise both wheel encodings to line units: notched wheels
+                // report lines directly; trackpads/precision wheels report
+                // pixels, which we scale down to a comparable notch size.
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => *y,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
+                };
+                self.scroll_delta += lines;
             }
             WindowEvent::Focused(false) => self.focus_lost(),
             _ => {}
@@ -185,6 +201,12 @@ impl InputState {
     /// Raw relative mouse motion accumulated since `begin_frame`.
     pub fn mouse_delta(&self) -> glam::Vec2 {
         glam::Vec2::new(self.mouse_delta.0 as f32, self.mouse_delta.1 as f32)
+    }
+
+    /// Vertical scroll accumulated since `begin_frame`, positive when scrolling
+    /// up/away. In line units (a mouse notch is ~1.0).
+    pub fn mouse_wheel(&self) -> f32 {
+        self.scroll_delta
     }
 
     pub fn is_mouse_button_pressed(&self, b: MouseButton) -> bool {
@@ -308,6 +330,7 @@ fn map_key(code: KeyCode) -> Option<Key> {
         KeyCode::Delete => Key::Delete,
         KeyCode::F1 => Key::F1,
         KeyCode::F2 => Key::F2,
+        KeyCode::F3 => Key::F3,
         _ => return None,
     })
 }

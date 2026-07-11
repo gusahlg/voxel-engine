@@ -1,38 +1,75 @@
 /// Per-frame draw recording: `Frame` (2D overlay + frame lifecycle) and
 /// `Frame3D` (world rendering inside a `begin_3d` scope). Everything records
 /// into reused CPU lists; submission happens when the `Frame` drops.
-use glam::{Mat3, Mat4, Vec2, Vec3};
+use glam::{DVec3, Mat3, Mat4, Vec2, Vec3};
 
 use std::num::NonZeroU32;
 
 use crate::camera::{Aspect, Camera3D, Frustum, WarpMap};
-use crate::color::Color;
+use crate::color::{Color, LinearRgb};
+use crate::skeleton::{FrameUniformsGpu, JitterOffset};
 use crate::engine::Engine;
 use crate::font;
 use crate::mesh::{DebugVertex, MeshHandle, Pass};
 use crate::surface::SurfaceHandle;
-use crate::vk::pipeline::{SkyLight, Vertex2D};
+use crate::vk::pipeline::Vertex2D;
 
-/// Palette-only description of the procedural sky, set by the app inside a
-/// `begin_3d` scope. The engine composes the GPU push constant (adding the
-/// inverse view-projection and deriving the sun-disc cosines) at record time,
-/// so the app never touches a matrix. Colours are the two anchors the fragment
-/// shader interpolates by ray elevation — sampled from the app's single
-/// radiance source of truth, not re-derived on the GPU.
+/// Sky-pass-private state, set by the app inside a `begin_3d` scope: sun
+/// geometry plus the disc tint. The sky COLOURS (zenith/horizon gradient, fog
+/// glow) are NOT here — the sky fragment reads them from the per-frame
+/// `FrameUniforms` UBO, the SAME linear source the terrain fog reads, so the two
+/// can never diverge (one source of truth for sky data). The engine adds the inverse
+/// view-projection at record time, so the app never touches a matrix.
 #[derive(Clone, Copy)]
 pub struct SkyDesc {
     pub sun_dir: Vec3,
-    /// Sky colour looking straight up.
-    pub zenith: Color,
-    /// Sky colour at the horizon (matches terrain fog for a seamless edge).
-    pub horizon: Color,
-    /// Warm glow colour smeared along the horizon toward the sun's azimuth.
-    pub sun_tint: Color,
-    /// Linear exposure multiplier applied to the whole sky.
-    pub exposure: f32,
-    /// Angular radius of the sun disc, in radians; the engine derives the
-    /// inner/outer edge cosines for the analytic disc from it.
+    /// Linear disc/glow tint (no OETF on this path); the analytic sun disc adds
+    /// it around the sun direction.
+    pub sun_tint: LinearRgb,
+    /// Angular radius of the sun disc, in radians; the shader derives the disc's
+    /// core/rim edge cosines from it (generated `SUN_DISC_*` cone constants).
     pub sun_angular_radius: f32,
+}
+
+/// This 3D scope's lighting, a REQUIRED argument to [`Frame::begin_3d`]. The
+/// mesh, sky, and water shaders read all of their lighting from the per-frame
+/// UBO, so a 3D pass with no lighting renders pure black — making it a required
+/// parameter (rather than an optional setter) removes that failure mode at the
+/// type level: there is no way to open a 3D scope without deciding lighting.
+pub enum Lighting {
+    /// App-composed per-frame uniforms (`FrameSnapshot` → [`FrameUniformsGpu`]):
+    /// the single CPU truth for shader-side sky, fog, candle/ambient, and shadow
+    /// evaluation. Passed through the env feature gates (engine.rs `render_flags`)
+    /// before it reaches the GPU, so a disabled feature is neutralized once, at
+    /// this producer→GPU chokepoint, for every consumer.
+    Composed(FrameUniformsGpu),
+    /// A fixed lit neutral ([`FrameUniformsGpu::full_bright`]): unit ambient
+    /// floor, valid sun, no fog. For smoke tests and apps that don't compose
+    /// lighting yet — geometry renders lit instead of black. A deliberate,
+    /// named choice, never a silent fallback.
+    FullBright,
+}
+
+/// Applies the env feature gates to composed uniforms — the ONE producer→GPU
+/// chokepoint, so terrain, sky, fog, and water all see the same disabled state.
+fn gate_uniforms(mut u: FrameUniformsGpu) -> FrameUniformsGpu {
+    let f = crate::engine::render_flags();
+    if !f.fog {
+        u.horizon[3] = 0.0;
+    }
+    if !f.blocklight {
+        u.candle[..3].fill(0.0);
+    }
+    if !f.ambient {
+        u.candle[3] = 0.0;
+    }
+    if !f.sunlight {
+        u.light[..3].fill(0.0);
+    }
+    if !f.exposure {
+        u.exposure_dither[0] = 1.0;
+    }
+    u
 }
 
 /// A fully-resolved mesh draw: identity + culling metadata + placement, with NO
@@ -72,16 +109,38 @@ pub(crate) struct SurfaceDraw {
 }
 
 /// CPU-side draw lists for one frame. Vec capacities persist across frames.
+///
+/// `Clone` exists solely for deterministic capture ([`crate::screenshot_to`]):
+/// the last submitted lists are retained so the blocking capture can re-present
+/// the same scene until the readback PNG lands, rather than a blank frame.
+#[derive(Clone)]
 pub(crate) struct DrawLists {
     pub clear: Color,
     pub view_proj: Mat4,
-    /// Sky lighting/fog for the mesh pipeline. The default [`SkyLight::IDENTITY`]
-    /// (white sun, black ambient, fog density 0) renders exactly as an unlit
-    /// scene (`light = shade·ao·max(sky,block)`, no fog).
-    pub sky_light: SkyLight,
+    /// The current 3D scope's camera, retained so the render thread can fit the
+    /// shadow cascades around this frame's frustum. `None`
+    /// until `begin_3d`; `has_3d` gates its use.
+    pub camera: Option<Camera3D>,
+    /// This frame's lighting uniforms. Resolved from the required [`Lighting`]
+    /// argument to [`Frame::begin_3d`], so it is `Some` for every 3D frame
+    /// (`has_3d` implies this is set); `None` only on pure-2D frames, where the
+    /// renderer writes a full-bright filler the mesh shaders never sample.
+    /// Written into the per-frame UBO (set 0, binding 2) each frame; the single
+    /// source of truth for shader-side sky, fog, candle/ambient, and shadow
+    /// evaluation, and for avatar key lighting (see [`KeyLight`]).
+    pub frame_uniforms: Option<FrameUniformsGpu>,
     /// Camera world position for the current 3D scope; feeds six-way face
     /// culling (which needs the camera in each mesh's local frame).
     pub cam_pos: Vec3,
+    /// World-space position of the RENDER-SPACE ORIGIN (the rebase point), in
+    /// f64 — the input TAA's reprojection translation derives from
+    /// `camera_delta = prev_eye − eye`, f64 subtract, narrowed only inside
+    /// `Reprojection::pack`). A camera-at-origin app passes its true eye here
+    /// (its `cam_pos` is zero and carries NO translation — the "whole game
+    /// jitters while moving" bug); an app drawing in absolute
+    /// coordinates passes ZERO (its translation already lives in the view
+    /// matrix; a nonzero value here would double-count it).
+    pub eye: DVec3,
     /// `tan(fovy/2)` for the current 3D camera; the renderer derives the
     /// vertical focal length (`0.5·height/tan_half`) for VRS depth thresholding.
     pub fovy_tan_half: f32,
@@ -89,6 +148,13 @@ pub(crate) struct DrawLists {
     /// projection is already widened to the source frustum for `Active`; this
     /// carries the coefficients the tonemap resample uses to compress the periphery.
     pub warp_map: WarpMap,
+    /// Sub-pixel camera jitter (PIXELS, ±0.5) for this 3D scope, injected here —
+    /// the sole injection point. It rides to the renderer, which applies
+    /// it to the mesh view-proj *only* at push-constant packing (a local matrix
+    /// that never escapes, `vk::jittered_clip`); `view_proj` above stays CLEAN so
+    /// culling, VRS fingerprinting, and TAA reprojection never see the jitter.
+    /// `JitterOffset::ZERO` outside a 3D scope.
+    pub jitter: JitterOffset,
     pub has_3d: bool,
     /// Procedural sky palette for this frame's background pass, or `None` to
     /// leave the flat clear colour showing. Set via [`Frame3D::set_sky`].
@@ -113,6 +179,12 @@ pub(crate) struct DrawLists {
     pub verts_2d: Vec<Vertex2D>,
     /// Minimap verts (drawn by `tris2d_tex` pipeline).
     pub tex_verts_2d: Vec<Vertex2D>,
+    /// Debug-flat override (`DebugView::TerrainKey`): when set,
+    /// every 3D mesh fragment outputs this flat key colour while still writing
+    /// depth, so the sky-hole detector sees real terrain coverage (key) versus
+    /// the magenta clear. `None` renders normally. Rides the per-frame UBO's
+    /// `reserved` lane. Set via [`Frame3D::set_debug_flat`].
+    pub debug_flat: Option<Color>,
 }
 
 impl DrawLists {
@@ -120,10 +192,13 @@ impl DrawLists {
         Self {
             clear: Color::BLACK,
             view_proj: Mat4::IDENTITY,
-            sky_light: SkyLight::IDENTITY,
+            camera: None,
+            frame_uniforms: None,
             cam_pos: Vec3::ZERO,
+            eye: DVec3::ZERO,
             fovy_tan_half: 1.0,
             warp_map: WarpMap::Identity,
+            jitter: JitterOffset::ZERO,
             has_3d: false,
             sky: None,
             mesh_draws: Vec::new(),
@@ -134,14 +209,17 @@ impl DrawLists {
             shadow_verts: Vec::new(),
             verts_2d: Vec::new(),
             tex_verts_2d: Vec::new(),
+            debug_flat: None,
         }
     }
 
     pub fn reset(&mut self) {
         self.has_3d = false;
+        self.camera = None;
         self.sky = None;
         self.warp_map = WarpMap::Identity;
-        self.sky_light = SkyLight::IDENTITY;
+        self.jitter = JitterOffset::ZERO;
+        self.frame_uniforms = None;
         self.mesh_draws.clear();
         self.surface_draws.clear();
         self.skin_clip = 0.0;
@@ -150,8 +228,13 @@ impl DrawLists {
         self.shadow_verts.clear();
         self.verts_2d.clear();
         self.tex_verts_2d.clear();
+        self.debug_flat = None;
     }
 }
+
+/// Monotone jitter-sequence index, advanced once per [`Frame::begin_3d`]. Indexes
+/// the shared Halton table (`jitter_at`), so consecutive frames decorrelate.
+static JITTER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub struct Frame<'e> {
     pub(crate) eng: &'e mut Engine,
@@ -164,7 +247,22 @@ impl<'e> Frame<'e> {
     /// All 3D geometry in a frame shares one camera: calling `begin_3d` a
     /// second time replaces the camera for every 3D draw already recorded
     /// this frame (frustum culling, however, uses each scope's own camera).
-    pub fn begin_3d(&mut self, cam: &Camera3D) -> Frame3D<'_, 'e> {
+    ///
+    /// `eye` is the world-space position of the RENDER-SPACE ORIGIN in f64
+    /// (see [`DrawLists::eye`]): a camera-at-origin app passes its true eye
+    /// (the translation TAA reprojection needs lives ONLY here); an app whose
+    /// draws use absolute world coordinates passes `DVec3::ZERO`. Taking it as
+    /// a parameter — rather than an optional setter — makes forgetting it
+    /// unrepresentable.
+    ///
+    /// `light` is this scope's lighting ([`Lighting`]): the mesh, sky, and water
+    /// shaders read ALL their lighting from the per-frame UBO, so a 3D scope with
+    /// no lighting would render pure black. Taking it as a required parameter —
+    /// same rationale as `eye` — makes the black-scene bug unrepresentable:
+    /// there is no way to open a 3D pass without deciding lighting. Pass
+    /// [`Lighting::FullBright`] for a lit neutral, or [`Lighting::Composed`] with
+    /// the app's own [`FrameUniformsGpu`].
+    pub fn begin_3d(&mut self, cam: &Camera3D, eye: DVec3, light: Lighting) -> Frame3D<'_, 'e> {
         let w = self.eng.client.screen_width().max(1) as f32;
         let h = self.eng.client.screen_height().max(1) as f32;
         // Wide-FOV renders a *wider* rectilinear source (horizontal only, so the
@@ -176,10 +274,34 @@ impl<'e> Frame<'e> {
         let view_proj = cam.view_proj(source_aspect.get());
         let frustum = Frustum::from_view_proj(&view_proj);
         self.eng.lists.view_proj = view_proj;
+        self.eng.lists.camera = Some(*cam);
         self.eng.lists.cam_pos = cam.position;
+        self.eng.lists.eye = eye;
         self.eng.lists.fovy_tan_half = (cam.fovy.to_radians() * 0.5).tan();
         self.eng.lists.warp_map = warp_map;
+        // Advance the temporal jitter sequence once per 3D scope. The
+        // renderer's own `frame_index` drives reprojection/dither on the render
+        // thread; here on the record thread we keep an independent 1:1 sequence
+        // counter (each recorded frame submits exactly one `draw_frame`), so the
+        // mesh view-proj sees a fresh Halton offset every frame. The value only
+        // travels to `jittered_clip`; it never perturbs the clean `view_proj`.
+        let seq = JITTER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // WATT_TAA=0: no jitter AND no resolve, one coupled state (see
+        // `Engine::taa_enabled` — never toggle one without the other).
+        self.eng.lists.jitter = if crate::engine::Engine::taa_enabled() {
+            crate::skeleton::jitter_at(seq)
+        } else {
+            JitterOffset::ZERO
+        };
         self.eng.lists.has_3d = true;
+        // Resolve lighting to a concrete UBO here, at the single 3D entry point,
+        // so `has_3d` and `frame_uniforms.is_some()` are established together —
+        // a 3D frame always carries lighting. `Composed` runs through the env
+        // feature gates; `FullBright` is the fixed lit neutral.
+        self.eng.lists.frame_uniforms = Some(match light {
+            Lighting::Composed(u) => gate_uniforms(u),
+            Lighting::FullBright => FrameUniformsGpu::full_bright(),
+        });
         Frame3D {
             frame: self,
             frustum,
@@ -282,11 +404,6 @@ impl<'e> Frame<'e> {
         self.eng.lists.tex_verts_2d.extend_from_slice(&[tl, bl, br, tl, br, tr]);
     }
 
-    pub fn draw_fps(&mut self, x: i32, y: i32) {
-        let fps = self.eng.fps();
-        let text = format!("{fps:2} FPS");
-        self.draw_text(&text, x, y, 20, Color::LIME);
-    }
 }
 
 impl Drop for Frame<'_> {
@@ -387,25 +504,6 @@ impl Frame3D<'_, '_> {
         });
     }
 
-    /// Sets the sky lighting and fog applied to every mesh drawn this frame.
-    ///
-    /// `sun_light` tints the sky-lit portion of each face, `ambient` is the
-    /// unlit floor (block-lit torches are unaffected by either), and geometry
-    /// fades toward `fog` with `exp(-distance · fog_density)`. Call once inside
-    /// the `begin_3d` scope; the defaults (white sun, black ambient, zero
-    /// density) reproduce the unlit look when never called.
-    pub fn set_sky_light(&mut self, sun_light: Color, ambient: Color, fog: Color, fog_density: f32) {
-        let n = |c: Color| [c.r, c.g, c.b].map(|v| v as f32 / 255.0);
-        let [sr, sg, sb] = n(sun_light);
-        let [ar, ag, ab] = n(ambient);
-        let [fr, fg, fb] = n(fog);
-        self.frame.eng.lists.sky_light = SkyLight {
-            sun_light: [sr, sg, sb, 1.0],
-            ambient: [ar, ag, ab, 1.0],
-            fog: [fr, fg, fb, fog_density],
-        };
-    }
-
     /// Sets the procedural sky drawn behind this frame's geometry. The
     /// background pass shades only pixels the terrain did not cover (a
     /// reversed-Z depth trick), so it is near-free. Call once inside the
@@ -414,12 +512,21 @@ impl Frame3D<'_, '_> {
         self.frame.eng.lists.sky = Some(desc);
     }
 
+    /// Debug-flat override (`DebugView::TerrainKey`): `Some(key)`
+    /// makes every 3D mesh fragment output `key` while still writing depth, so
+    /// occlusion/silhouette stay exact and the sky-hole detector distinguishes
+    /// real terrain coverage from the magenta clear. `None` restores normal
+    /// shading. Rides the per-frame UBO's `reserved` lane (no push-constant or
+    /// pipeline change).
+    pub fn set_debug_flat(&mut self, color: Option<Color>) {
+        self.frame.eng.lists.debug_flat = color;
+    }
+
     pub fn draw_cube(&mut self, center: Vec3, size: Vec3, color: Color) {
         let min = center - size * 0.5;
         let max = center + size * 0.5;
         let c = [color.r, color.g, color.b, color.a];
         let verts = &mut self.frame.eng.lists.cube_verts;
-        // 6 faces, each two triangles, corners wound CCW seen from outside.
         for face in cube_faces(min, max) {
             for idx in [0usize, 1, 2, 0, 2, 3] {
                 verts.push(DebugVertex {
@@ -633,10 +740,10 @@ fn cube_faces(min: Vec3, max: Vec3) -> [[[f32; 3]; 4]; 6] {
 }
 
 /// The directional key light used to shade oriented boxes ([`Frame3D::draw_box`]).
-/// It is the single typed source of avatar shading: derived from the frame's sky
-/// state (the same `sky_light`/`sky` terrain reads), so a peer and the terrain
-/// around it can never be lit inconsistently. `sun`/`ambient` are per-channel RGB
-/// multipliers; `dir` points toward the light.
+/// It is the single typed source of avatar shading: derived from the per-frame
+/// UBO (`frame_uniforms`) — the SAME lighting truth the terrain reads — so
+/// a peer and the terrain around it can never be lit inconsistently. `sun`/
+/// `ambient` are per-channel RGB multipliers; `dir` points toward the light.
 struct KeyLight {
     dir: Vec3,
     sun: Vec3,
@@ -652,18 +759,26 @@ impl KeyLight {
         ambient: Vec3::splat(0.55),
     };
 
-    /// Derive the key from the frame's sky. When a procedural sky is set, take its
-    /// sun direction and the sky lighting colours the mesh pipeline uses; otherwise
-    /// fall back to [`KeyLight::DEFAULT`].
+    /// Derive the key from this frame's composed lighting UBO. Formula mirrors
+    /// `frame_snapshot::compose`/`legacy_env` exactly: `sun` is the linear `light`
+    /// lane; `ambient` is `zenith` re-scaled to the `ambient_floor` luma (the
+    /// `candle.w` lane). Clamped to [0,1] to reproduce the old
+    /// `Rgb::to_srgb8_legacy` exit, which truncated linear values to 8-bit with
+    /// NO sRGB curve (so the retarget is pixel-identical up to ±1/255). With no
+    /// uniforms set (e.g. `bin/demo.rs`) fall back to [`KeyLight::DEFAULT`].
     fn from_lists(lists: &DrawLists) -> Self {
-        match lists.sky {
-            Some(desc) => {
-                let [sr, sg, sb, _] = lists.sky_light.sun_light;
-                let [ar, ag, ab, _] = lists.sky_light.ambient;
+        match lists.frame_uniforms {
+            Some(u) => {
+                let sun = Vec3::new(u.light[0], u.light[1], u.light[2]).clamp(Vec3::ZERO, Vec3::ONE);
+                let zenith = Vec3::new(u.zenith[0], u.zenith[1], u.zenith[2]);
+                let ambient_floor = u.candle[3];
+                let luma = 0.2126 * zenith.x + 0.7152 * zenith.y + 0.0722 * zenith.z;
+                let ambient = if luma > 0.0 { zenith * (ambient_floor / luma) } else { zenith };
+                let dir = Vec3::new(u.sun_dir_elev[0], u.sun_dir_elev[1], u.sun_dir_elev[2]);
                 KeyLight {
-                    dir: desc.sun_dir.normalize_or(Self::DEFAULT.dir),
-                    sun: Vec3::new(sr, sg, sb),
-                    ambient: Vec3::new(ar, ag, ab),
+                    dir: dir.normalize_or(Self::DEFAULT.dir),
+                    sun,
+                    ambient: ambient.clamp(Vec3::ZERO, Vec3::ONE),
                 }
             }
             None => Self::DEFAULT,

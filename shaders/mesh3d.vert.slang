@@ -1,22 +1,13 @@
 // mesh3d.vert.slang — camera-relative packed world-mesh vertices. Input is a
-// single uint2 (see mesh.rs for the bit table): a chunk-local integer position,
-// a face-normal index, a texture-array layer, and reserved AO/light bits. A
-// per-draw float4 (indexed by the raw Vulkan InstanceIndex) carries an offset
-// in xyz and a uniform scale in w: the local position is scaled then offset
-// (`world = local * scale + offset`) before the view_proj multiply, so meshes
-// carry small local coordinates while the world spans huge distances and a
-// single 16³-local mesh can stand in for a coarse LOD tile (scale = 2^k). One
-// element per indirect command; immediate debug geometry uses a separate
-// (descriptor-set-free) pipeline and never indexes this buffer.
+// single uint2 (see mesh.rs for the bit table) with position, normal, layer, AO/light.
+// Per-draw float4 carries offset (xyz) and scale (w): world = local * scale + offset.
+// Meshes use small local coords; scale = 2^k for coarse LOD.
 //
-// SV_VulkanInstanceID, NOT SV_InstanceID: Slang lowers SV_InstanceID with D3D
-// semantics (InstanceIndex - BaseInstance), which would always read slot 0
-// under the first_instance-as-index scheme. SV_VulkanInstanceID lowers to the
-// plain InstanceIndex builtin.
+// SV_VulkanInstanceID (not SV_InstanceID) to read plain InstanceIndex.
 //
-// The shifts/masks below mirror the SHIFT_*/MASK_* consts in mesh.rs. UV is
-// derived from position + normal (the sampler is REPEAT, so greedy quads tile);
-// per-face directional shade is derived from the normal.
+// Shifts/masks mirror mesh.rs. UV and shade derive from position and normal.
+
+#include "common.slang"
 
 [[vk::binding(0, 0)]]
 StructuredBuffer<float4> draw_offsets;
@@ -39,31 +30,34 @@ struct VertexOutput
     [[vk::location(1)]]
     nointerpolation uint layer;
 
+    // Camera-relative world position (camera sits at the origin). The fragment
+    // derives fog distance (`length(world)`), the fog/reflection view ray
+    // (`normalize(world)`), and the shadow-map light-space projection from it.
     [[vk::location(2)]]
-    float3 light;
+    float3 world;
 
+    // Face normal (unit), used by the fragment stage for the shadow slope bias.
     [[vk::location(3)]]
-    float dist; // camera-relative distance, for fragment fog
+    nointerpolation float3 nrm;
+
+    // Fragment-side lighting inputs: x = per-face directional shade, y = AO
+    // factor, z = skylight amount [0,1] (also the sky-visibility term), w =
+    // blocklight amount [0,1]. The lighting term itself is evaluated in the
+    // fragment (candle curve, ambient floor, shadow) off the per-frame UBO.
+    [[vk::location(4)]]
+    float4 lightparams;
 };
 
 struct PushConstants
 {
     float4x4 view_proj;
-    float4 sun_light; // rgb tints the sky-lit term
-    float4 ambient;   // rgb unlit floor
-    float4 fog;       // rgb fog colour, a = density
+    // All sky/fog/candle lighting rides the per-frame UBO (set 0, binding 2);
+    // this stage needs only the camera. The push range's tail `clip` lane
+    // (surface pass only) is not declared here — a stage may declare a prefix.
 };
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc;
-
-// CPU light colours arrive sRGB-encoded; lighting composites in linear.
-float3 srgbToLinear(float3 c)
-{
-    float3 lo = c / 12.92;
-    float3 hi = pow(max((c + 0.055) / 1.055, 0.0), float3(2.4, 2.4, 2.4));
-    return select(c <= 0.04045, lo, hi);
-}
 
 [shader("vertex")]
 VertexOutput vertexMain(VertexInput input)
@@ -104,28 +98,26 @@ VertexOutput vertexMain(VertexInput input)
     float sky_amount = float(sky) / 15.0;
     float block_amount = float(block) / 15.0;
 
-    // Skylight is tinted by the sun over an ambient floor; blocklight (torches)
-    // stays white and is unaffected by the sky. Defaults (sun=white, ambient=0)
-    // collapse this to the old grayscale `max(sky, block)/15`.
-    float3 lit = max(
-        srgbToLinear(pc.ambient.rgb) + srgbToLinear(pc.sun_light.rgb) * sky_amount,
-        block_amount.xxx);
+    // Face normal for the receiver's slope bias (matches the `normal` index).
+    float3 N;
+    if (normal == 0)      N = float3(1.0, 0.0, 0.0);
+    else if (normal == 1) N = float3(-1.0, 0.0, 0.0);
+    else if (normal == 2) N = float3(0.0, 1.0, 0.0);
+    else if (normal == 3) N = float3(0.0, -1.0, 0.0);
+    else if (normal == 4) N = float3(0.0, 0.0, 1.0);
+    else                  N = float3(0.0, 0.0, -1.0);
 
     float4 placement = draw_offsets[input.instance]; // xyz = offset, w = scale
     float3 world = float3(x, y, z) * placement.w + placement.xyz;
 
     VertexOutput output;
-    // Plain rectilinear projection; wide-FOV compression is a post-process
-    // (tonemap resample), so the vertex path stays linear.
+    // Plain rectilinear projection; wide-FOV compression is a post-process.
     output.position = mul(pc.view_proj, float4(world, 1.0));
-    // Counter-scale UV by the per-draw scale so texel density stays locked to
-    // world metres: a full-res chunk (scale 1) tiles once per block, and a
-    // coarse LOD tile (scale 2^k) tiles 2^k times per cell — still once per
-    // metre — instead of stretching one block texel across the whole cell. Keeps
-    // far LOD terrain texturally faithful to the full-res band it abuts.
+    // Scale UV to maintain texel density across LOD levels.
     output.uv = uv * placement.w;
     output.layer = layer;
-    output.light = shade * ao_factor * lit;
-    output.dist = length(world); // camera sits at the origin, so depth = distance to world
+    output.world = world;
+    output.nrm = N;
+    output.lightparams = float4(shade, ao_factor, sky_amount, block_amount);
     return output;
 }

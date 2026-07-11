@@ -44,34 +44,27 @@ fn push_quad_lit(
 fn push_cube(data: &mut MeshData, x: u8, y: u8, z: u8, layer: u8, lit: Option<(Ao, Light)>) {
     let (x1, y1, z1) = (x + 1, y, z + 1);
     let y0 = y - 1;
-    // 8 corners.
     let faces: [([[u8; 3]; 4], Normal); 6] = [
-        // +Y top
         (
             [[x, y1, z], [x, y1, z1], [x1, y1, z1], [x1, y1, z]],
             Normal::PosY,
         ),
-        // -Y bottom
         (
             [[x, y0, z], [x1, y0, z], [x1, y0, z1], [x, y0, z1]],
             Normal::NegY,
         ),
-        // +X
         (
             [[x1, y0, z], [x1, y1, z], [x1, y1, z1], [x1, y0, z1]],
             Normal::PosX,
         ),
-        // -X
         (
             [[x, y0, z], [x, y0, z1], [x, y1, z1], [x, y1, z]],
             Normal::NegX,
         ),
-        // +Z
         (
             [[x, y0, z1], [x1, y0, z1], [x1, y1, z1], [x, y1, z1]],
             Normal::PosZ,
         ),
-        // -Z
         (
             [[x, y0, z], [x, y1, z], [x1, y1, z], [x1, y0, z]],
             Normal::NegZ,
@@ -122,7 +115,7 @@ fn build_water() -> MeshData {
     data
 }
 
-/// Layer 0: all white (engine contract). Layer 1: a 4×4-cell two-tone checker.
+/// Layer 0: all white. Layer 1: a 4×4-cell two-tone checker.
 /// Layer 2: a semi-transparent blue for the water plane (alpha < 255).
 fn block_texture_layers(size: u32) -> Vec<Vec<u8>> {
     let n = (size * size * 4) as usize;
@@ -173,6 +166,31 @@ fn build_surface() -> SurfaceData {
     data
 }
 
+/// Sun direction shared by the sky disc ([`SkyDesc`]) and the lighting UBO, so
+/// the disc and the terrain shading agree.
+const SUN_DIR: Vec3 = Vec3::new(0.6, 0.35, 0.2);
+
+/// A daytime lighting block for the demo, passed as `Lighting::Composed` to
+/// `begin_3d`. The mesh/sky/water shaders read ALL their lighting from this
+/// per-frame UBO; this drives the real lit path — sun-tinted skylight, a
+/// blue-gradient sky, a modest ambient floor, no fog. (`Lighting::FullBright`
+/// would instead give a flat lit neutral.)
+fn daytime_uniforms() -> voxel_engine::skeleton::FrameUniformsGpu {
+    let sun = SUN_DIR.normalize();
+    voxel_engine::skeleton::FrameUniformsGpu {
+        sun_dir_elev: [sun.x, sun.y, sun.z, sun.y.asin()],
+        // Bright warm sun (linear), day_night_mix = 1.0 (full day).
+        light: [1.25, 1.15, 1.0, 1.0],
+        // Sky anchors (linear): deep blue zenith, pale horizon; w = turbidity.
+        zenith: [0.09, 0.22, 0.45, 2.0],
+        horizon: [0.55, 0.65, 0.80, 0.0], // w = fog density (off)
+        // No blocklight; ambient floor keeps shadowed faces off pure black.
+        candle: [0.0, 0.0, 0.0, 0.30],
+        exposure_dither: [1.0, 0.0, 0.0, 0.0],
+        reserved: [0.0; 4],
+    }
+}
+
 fn main() {
     env_logger::init();
 
@@ -186,6 +204,9 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
+    // Vertical FOV in degrees, zoomed with the scroll wheel and clamped to a
+    // usable range (telephoto .. wide) so you can't invert or flatten the lens.
+    let mut fovy: f32 = 70.0;
     // VOXEL_AUTOSHOT=1: grab one screenshot after warm-up, then quit — used to
     // verify the warp offscreen. Off by default (interactive run).
     let autoshot = std::env::var("VOXEL_AUTOSHOT").is_ok();
@@ -260,13 +281,19 @@ fn main() {
                 surface = Some(handle);
             }
 
+            // Scroll to zoom: each notch nudges the vertical FOV, scrolling up
+            // (positive) narrows toward telephoto. Clamped so the lens stays sane.
+            const FOVY_MIN: f32 = 20.0;
+            const FOVY_MAX: f32 = 160.0;
+            fovy = (fovy - eng.mouse_wheel() * 4.0).clamp(FOVY_MIN, FOVY_MAX);
+
             angle += eng.frame_time() * 0.4;
             let center = Vec3::new(CHUNK as f32, 4.0, CHUNK as f32);
             let cam = Camera3D {
                 position: center + Vec3::new(angle.cos() * 44.0, 30.0, angle.sin() * 44.0),
                 target: center + Vec3::new(0.0, 8.0, 0.0),
                 up: Vec3::Y,
-                fovy: 70.0,
+                fovy,
                 lens: voxel_engine::WarpStrength::new(warp_ratio)
                     .map_or(voxel_engine::Lens::Rectilinear, |strength| {
                         voxel_engine::Lens::WideFov { strength }
@@ -277,18 +304,25 @@ fn main() {
             let msaa = eng.msaa();
             let fullscreen = eng.fullscreen();
             let cull = eng.cull_faces();
+            let fps = eng.fps();
 
             let mut frame = eng.begin_frame(Color::SKYBLUE);
             {
-                let mut f3 = frame.begin_3d(&cam);
-                // Procedural sky background: an afternoon palette with the sun
-                // low in the west so the horizon glow and disc are both visible.
+                // Demo draws in absolute coordinates (no camera rebase): the
+                // render-space origin is the world origin, so eye = ZERO — the
+                // camera's own translation already lives in the view matrix.
+                let mut f3 = frame.begin_3d(
+                    &cam,
+                    voxel_engine::DVec3::ZERO,
+                    voxel_engine::Lighting::Composed(daytime_uniforms()),
+                );
+                // Procedural sky background: sun low in the west so the disc is
+                // visible. The gradient/glow colours come from the
+                // per-frame UBO (unset here → neutral); this smoke test only
+                // exercises the sun geometry + disc tint (approx. warm linear).
                 f3.set_sky(SkyDesc {
-                    sun_dir: Vec3::new(0.6, 0.35, 0.2).normalize(),
-                    zenith: Color::rgb(71, 128, 224),
-                    horizon: Color::rgb(168, 204, 240),
-                    sun_tint: Color::rgb(240, 150, 70),
-                    exposure: 1.0,
+                    sun_dir: SUN_DIR.normalize(),
+                    sun_tint: voxel_engine::LinearRgb([0.87, 0.30, 0.06]),
                     sun_angular_radius: 0.03,
                 });
                 if let Some(handle) = chunk {
@@ -341,7 +375,7 @@ fn main() {
                 );
             }
             frame.draw_rect(8, 8, 360, 76, Color::new(0, 0, 0, 150));
-            frame.draw_fps(16, 14);
+            frame.draw_text(&format!("{fps} FPS"), 16, 14, 20, Color::LIME);
             frame.draw_text(
                 &format!("vsync {vsync} msaa {msaa}x fullscreen {fullscreen} cull {cull}"),
                 16,

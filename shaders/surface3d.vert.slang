@@ -1,13 +1,6 @@
-// surface3d.vert.slang — camera-relative unpacked colored-surface vertices for
-// the Zone-3 far grey skin. Input is a float3 world-local position plus an
-// RGBA8 colour (declared as an R8G8B8A8_UNORM attribute, so it arrives as a
-// float4 in 0..1). A per-draw float4 (indexed by the raw Vulkan InstanceIndex)
-// carries an offset in xyz and a uniform scale in w: `world = local * scale +
-// offset` before the view_proj multiply, exactly like mesh3d.vert — the skin is
-// drawn camera-relative so it never jitters at Zone-3 distances.
-//
-// SV_VulkanInstanceID (not SV_InstanceID): reads the plain SPIR-V InstanceIndex,
-// so `first_instance` doubles as the draw's SSBO slot (see mesh3d.vert).
+// surface3d.vert.slang — camera-relative colored-surface vertices for Zone-3 far skin.
+// Input: float3 position, RGBA8 color. Per-draw float4: offset (xyz) + scale (w).
+// SV_VulkanInstanceID reads plain InstanceIndex for SSBO indexing.
 
 
 [[vk::binding(0, 0)]]
@@ -41,14 +34,11 @@ struct VertexOutput
     float boxdist;
 };
 
-// Mirrors mesh3d's push constant layout exactly (Mesh3dPush = view_proj + the
-// SkyLight tail); the vertex stage uses view_proj, the fragment stage the fog.
+// Mirrors mesh3d's push layout (Mesh3dPush = view_proj + a tail `clip` scalar).
+// The vertex stage uses only view_proj; the fragment stage reads `clip`.
 struct PushConstants
 {
     float4x4 view_proj;
-    float4 sun_light;
-    float4 ambient;
-    float4 fog; // rgb colour, a = density
 };
 
 [[vk::push_constant]]

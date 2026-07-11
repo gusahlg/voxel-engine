@@ -17,82 +17,49 @@ use crate::mesh::{DebugVertex, MeshVertex, Pass};
 use crate::vk::device::FragmentShadingRate;
 use crate::vk::vertex_input::{VertexInput, vertex_struct};
 
-pub const PUSH_BYTES_3D: u32 = size_of::<Mesh3dPush>() as u32; // view_proj + SkyLight
+pub const PUSH_BYTES_3D: u32 = size_of::<Mesh3dPush>() as u32; // view_proj + skin near-clip radius
 pub const PUSH_BYTES_DEBUG: u32 = size_of::<DebugPush>() as u32; // view_proj
 pub const PUSH_BYTES_2D: u32 = size_of::<[f32; 2]>() as u32; // pixels_to_ndc
-pub const PUSH_BYTES_SKY: u32 = size_of::<SkyParams>() as u32; // full 128-byte sky block
+pub const PUSH_BYTES_SKY: u32 = size_of::<SkyParams>() as u32; // inv_view_proj + sun geom + tint
 // exposure + wide-FOV remap coefficients (s, atan_s); see camera::WarpPush.
 pub const PUSH_BYTES_TONEMAP: u32 = size_of::<crate::camera::WarpPush>() as u32;
 
-/// Sky lighting/fog for the mesh pipeline — the tail of [`Mesh3dPush`], read by
-/// `mesh3d`'s fragment stage. `sun_light`/`ambient` are rgb in `.xyz` (`.w`
-/// unused); `fog` is rgb with density in `.w`. [`SkyLight::IDENTITY`] (white
-/// sun, black ambient, zero density) reproduces the unlit look.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct SkyLight {
-    pub sun_light: [f32; 4],
-    pub ambient: [f32; 4],
-    pub fog: [f32; 4],
-}
-
-impl SkyLight {
-    pub const IDENTITY: Self = Self {
-        sun_light: [1.0, 1.0, 1.0, 1.0],
-        ambient: [0.0, 0.0, 0.0, 1.0],
-        fog: [0.0, 0.0, 0.0, 0.0],
-    };
-}
-
-/// The mesh pipeline's push constant: camera matrix plus this frame's sky
-/// lighting. Composed at record time from the frame's `view_proj` and
-/// [`SkyLight`]; a single push replaces the former split at offset 64.
+/// 3D push constant: view_proj + surface clip radius.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Mesh3dPush {
     pub view_proj: Mat4,
-    pub sky: SkyLight,
+    pub clip: f32,
+    /// Padding to match Mat4 alignment; shaders only read view_proj and clip.
+    pub _pad: [f32; 3],
 }
 
-/// The debug/immediate-geometry pipeline's push constant: just the camera matrix.
-/// Debug geometry renders plain-rectilinear into the (wide) source and is
-/// compressed with the terrain by the tonemap resample, so no warp lane is needed.
+/// Debug push constant: view_proj only.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DebugPush {
     pub view_proj: Mat4,
 }
 
-/// The sky background pass's push constant, exactly 128 bytes (the guaranteed
-/// `maxPushConstantsSize` minimum). Scalars ride in the `.w` lanes rather than
-/// adding fields. Composed by the engine at record time from a [`SkyDesc`];
-/// the app never builds it directly.
+/// Sky push constant: inverse view-proj, sun direction and radius, tint color.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SkyParams {
-    inv_view_proj: Mat4, // 64 — clip→world; ray reconstructed camera-independently
-    sun: [f32; 4],       // xyz sun dir, w = exposure
-    zenith: [f32; 4],    // rgb, w = daylight (reserved for future use)
-    horizon: [f32; 4],   // rgb, w = cos_inner (sun-disc inner edge)
-    sun_tint: [f32; 4],  // rgb, w = cos_outer (sun-disc outer edge)
+    inv_view_proj: Mat4,
+    sun: [f32; 4],
+    sun_tint: [f32; 4],
 }
 
 impl SkyParams {
     pub fn compose(inv_view_proj: Mat4, desc: &SkyDesc) -> Self {
-        let n = |c: crate::color::Color| [c.r, c.g, c.b].map(|v| v as f32 / 255.0);
         let s = desc.sun_dir.normalize_or_zero();
-        let [zr, zg, zb] = n(desc.zenith);
-        let [hr, hg, hb] = n(desc.horizon);
-        let [tr, tg, tb] = n(desc.sun_tint);
-        let r = desc.sun_angular_radius;
+        // sun_tint is ALREADY linear (LinearRgb, non-quantising boundary) — no
+        // /255 decode: the disc composites in linear light shader-side.
+        let [tr, tg, tb] = desc.sun_tint.0;
         Self {
             inv_view_proj,
-            sun: [s.x, s.y, s.z, desc.exposure],
-            // zenith.w reserved (was the high-FOV warp strength; the warp is now a
-            // post-process resample, so the sky reconstructs rays from plain NDC).
-            zenith: [zr, zg, zb, 0.0],
-            horizon: [hr, hg, hb, r.cos()],
-            sun_tint: [tr, tg, tb, (r * 2.0).cos()],
+            sun: [s.x, s.y, s.z, desc.sun_angular_radius],
+            sun_tint: [tr, tg, tb, 0.0],
         }
     }
 }
@@ -119,6 +86,9 @@ const SKY_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.vert.spv")
 const SKY_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv"));
 const TONEMAP_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.vert.spv"));
 const TONEMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
+/// Shader display-space sigmoid variant, selected by `WATT_TONEMAP=makeup`.
+const TONEMAP_FRAG_MAKEUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/tonemap_makeup.frag.spv"));
 const VRS_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vrs.comp.spv"));
 
 /// The VRS classifier compute pipeline plus the depth sampler it reads through.
@@ -145,7 +115,7 @@ pub struct Pipelines {
     /// blends and reads (never writes) depth. Selected for [`Pass::Blend`].
     pub mesh3d_transparent: vk::Pipeline,
     /// Retained colored-surface pipeline (Zone-3 far skin): `SurfaceVertex`
-    /// attributes, reuses `layout_3d` (per-draw offset SSBO + `Mesh3dPush` fog),
+    /// attributes, reuses `layout_3d` (per-draw offset SSBO + `Mesh3dPush` clip),
     /// double-sided, VRS, biased deeper than `mesh3d_biased`. STAGE 1: `null`
     /// until E1 builds it in Stage 2.
     pub surface3d: vk::Pipeline,
@@ -162,9 +132,10 @@ pub struct Pipelines {
     /// Unused in rectilinear mode (the overlay stays in the offscreen scene pass).
     pub tris2d_present: vk::Pipeline,
     pub tris2d_tex_present: vk::Pipeline,
-    /// Vertex-less fullscreen background pass; push-constant only, no descriptor
-    /// set. Depth-tests (read-only) at the reversed-Z far plane so it shades
-    /// only pixels the terrain left uncovered.
+    /// Vertex-less fullscreen background pass: geometry push constant + set 0
+    /// binding 2 (the shared per-frame `FrameUniforms`). Depth-tests
+    /// (read-only) at the reversed-Z far plane so it shades only pixels the
+    /// terrain left uncovered.
     pub sky: vk::Pipeline,
     pub layout_sky: vk::PipelineLayout,
     /// Fullscreen AgX tonemap: samples the HDR offscreen (set 0 push descriptor,
@@ -221,13 +192,19 @@ impl Pipelines {
                 .expect("Failed to create debug pipeline layout")
         };
 
-        // Sky layout: one 128-byte push constant across both stages, no set.
+        // Sky layout: geometry push constant across both stages, plus set 0 =
+        // the SAME `mesh3d_set_layout` the mesh passes use, so the sky
+        // fragment reads the per-frame `FrameUniforms` at binding 2 — one UBO,
+        // one descriptor-set-layout, no second definition. The sky shader only
+        // touches binding 2; the other bindings stay unwritten for this pass.
         let push_sky = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(PUSH_BYTES_SKY)];
-        let layout_sky_info =
-            vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_sky);
+        let set_layouts_sky = [mesh3d_set_layout];
+        let layout_sky_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts_sky)
+            .push_constant_ranges(&push_sky);
         let layout_sky = unsafe {
             device
                 .create_pipeline_layout(&layout_sky_info, None)
@@ -356,7 +333,7 @@ impl Pipelines {
             },
         );
         // Zone-3 far skin: unpacked colored surface, reuses `layout_3d` (per-draw
-        // offset SSBO + Mesh3dPush fog). Double-sided (cull NONE), biased deeper
+        // offset SSBO + Mesh3dPush clip). Double-sided (cull NONE), biased deeper
         // than mesh3d_biased so the skin always loses the depth test to chunks AND
         // tiles at coincident depth, leaving it visible only where nothing drew.
         let surface_bindings = [crate::surface::SurfaceVertex::binding()];
@@ -498,7 +475,9 @@ impl Pipelines {
         // Tonemap: its own builder — writes the present format at single-sample
         // with no depth attachment; never VRS.
         let tonemap_vert = create_shader_module(device, TONEMAP_VERT);
-        let tonemap_frag = create_shader_module(device, TONEMAP_FRAG);
+        let makeup = std::env::var_os("WATT_TONEMAP").is_some_and(|v| v == "makeup");
+        let tonemap_frag =
+            create_shader_module(device, if makeup { TONEMAP_FRAG_MAKEUP } else { TONEMAP_FRAG });
         let tonemap_builder = PipelineBuilder {
             device,
             cache,

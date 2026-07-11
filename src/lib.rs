@@ -10,23 +10,27 @@
 //! Entry point: [`run`] with a per-frame callback over [`Engine`].
 
 mod camera;
+mod capture;
 mod color;
 mod engine;
 mod font;
 mod frame;
+pub mod genconst;
 mod input;
 mod mesh;
 pub mod profile;
 mod screenshot;
+pub mod skeleton;
 mod surface;
 mod vk;
 
 pub use camera::{
     Aspect, Camera3D, Frustum, Lens, WarpMap, WarpPush, WarpStrength, Z_NEAR, world_to_screen,
 };
-pub use color::Color;
+pub use capture::{Screenshot, load_png, screenshot_to};
+pub use color::{Color, LinearRgb};
 pub use engine::{Config, Engine, run};
-pub use frame::{Frame, Frame3D, SkyDesc};
+pub use frame::{Frame, Frame3D, Lighting, SkyDesc};
 pub use glam::{DVec2, DVec3, IVec2, Mat3, Mat4, Vec2, Vec3};
 pub use input::{Key, MouseButton};
 pub use mesh::{Ao, DebugVertex, Light, MeshData, MeshHandle, MeshVertex, Normal, Pass};
