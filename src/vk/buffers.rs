@@ -150,6 +150,7 @@ impl<H: GpuHandle, M: Copy> HandleAllocator<H, M> {
         }
     }
 
+    #[cfg(test)]
     pub fn live_count(&self) -> usize {
         self.live
     }
@@ -373,10 +374,6 @@ impl MeshResidency {
             retire: RetireQueue::new(),
             live: 0,
         }
-    }
-
-    pub fn live_count(&self) -> usize {
-        self.live
     }
 
     fn ensure_slot(&mut self, i: usize) {

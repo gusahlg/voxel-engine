@@ -12,100 +12,153 @@ use glam::{Mat4, Vec2, Vec3, Vec4};
 /// Near plane distance shared by rendering and culling.
 pub const Z_NEAR: f32 = 0.05;
 
-/// Nonlinear projection warp (De Carpentier-family adaptive-cylindrical).
-/// Applied per-vertex to NDC xy *after* the linear `view_proj` projection: it
-/// pins the horizontal screen edges (nx = ±1) and compresses interior columns
-/// toward center, so peripheral geometry occupies fewer pixels — cancelling the
-/// wide-FOV corner/edge stretch of a plain perspective projection.
-///
-/// Forward map (horizontal only): `nx' = atan(nx * s) / atan(s)`, `s =
-/// cylindrical_ratio`.
-/// - At `s = 0` the warp is the identity, reproducing the pure-perspective image
-///   bit-for-bit ([`WarpParams::IDENTITY`], the regression anchor).
-/// - At `nx = 0` the output is `nx' = 0` — the view center is a fixed point.
-/// - At `nx = ±1` the output is `nx' = ±1` — screen edges are pinned. The
-///   silhouette is therefore unchanged and the warp only ever pulls points
-///   *inward*, so the existing linear `view_proj` frustum already conservatively
-///   bounds the warped image: culling needs no separate matrix (see [`Frustum`]).
-///
-/// Inverse map (used by the sky pass, which reconstructs world rays from NDC):
-/// `nx = tan(nx' * atan(s)) / s`.
-///
-/// Vertical (`ny`) is left rectilinear — a cylinder about the vertical axis.
-/// This is the De Carpentier compromise (horizontal lines still bow slightly
-/// off-center) chosen deliberately for flat-monitor comfort over architectural
-/// vertical-line straightness.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct WarpParams {
-    /// Cylindrical blend strength `s`. 0.0 = pure perspective (identity).
-    /// Comfortable wide-FOV range is roughly 0.3..1.5; higher compresses the
-    /// periphery more.
-    pub cylindrical_ratio: f32,
-    /// Precomputed `atan(cylindrical_ratio)` so the shader (and `warp_ndc`)
-    /// avoid a per-vertex `atan` on this frame-constant. 0.0 in the identity
-    /// case, where both maps short-circuit to the identity.
-    pub atan_ratio: f32,
+/// Validated cylindrical warp strength for the wide-FOV lens: finite and
+/// `0 < s <= MAX`. The *absence* of warp is [`Lens::Rectilinear`], not a zero
+/// strength — so a `WarpStrength` always denotes an active warp.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WarpStrength(f32);
+
+impl WarpStrength {
+    /// Upper clamp: beyond this the periphery compression is unusable (the
+    /// derivation harness shows edge/center source-density > 4.5x by here).
+    pub const MAX: f32 = 2.0;
+
+    /// Returns `None` for non-finite or `<= 0.0` (that is `Rectilinear`, not a
+    /// weak warp); otherwise clamps to `MAX`.
+    #[inline]
+    pub fn new(s: f32) -> Option<Self> {
+        (s.is_finite() && s > 0.0).then(|| Self(s.min(Self::MAX)))
+    }
+
+    #[inline]
+    pub fn get(self) -> f32 {
+        self.0
+    }
 }
 
-impl WarpParams {
-    /// Pure perspective: the warp is the identity, reproducing today's image.
-    pub const IDENTITY: Self = Self {
-        cylindrical_ratio: 0.0,
-        atan_ratio: 0.0,
-    };
+/// How a [`Camera3D`] projects. `Rectilinear` is the zero-cost fast path and
+/// carries no warp machinery, so a rectilinear camera is unrepresentable-with-warp
+/// by construction. `WideFov` renders a wider rectilinear source (see [`Aspect`])
+/// and compresses the periphery in the tonemap resample.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum Lens {
+    #[default]
+    Rectilinear,
+    WideFov {
+        strength: WarpStrength,
+    },
+}
 
-    /// Builds params from a cylindrical strength (clamped non-negative),
-    /// precomputing `atan_ratio`. `0.0` yields [`WarpParams::IDENTITY`].
-    pub fn new(cylindrical_ratio: f32) -> Self {
-        let s = cylindrical_ratio.max(0.0);
-        if s == 0.0 {
-            return Self::IDENTITY;
-        }
-        Self {
-            cylindrical_ratio: s,
-            atan_ratio: s.atan(),
+/// Aspect ratio (framebuffer width / height). Newtype so the *source* (wide)
+/// aspect used for the offscreen render can never be confused with the presented
+/// window aspect.
+#[derive(Clone, Copy, Debug)]
+pub struct Aspect(pub f32);
+
+impl Aspect {
+    #[inline]
+    pub fn get(self) -> f32 {
+        self.0
+    }
+
+    /// Widens horizontally for the wide-FOV source render (vertical fov unchanged):
+    /// `source_aspect = aspect * fov_scale`. Identity leaves the aspect untouched.
+    #[inline]
+    pub fn source(self, warp: &WarpMap) -> Aspect {
+        Aspect(self.0 * warp.fov_scale())
+    }
+}
+
+/// The single source of truth for the warp maps and the GPU bytes, built once per
+/// frame from a [`Lens`]. Both the CPU picking transform ([`WarpMap::warp_ndc`],
+/// used by [`world_to_screen`]) and the tonemap push ([`WarpMap::push`]) read the
+/// same coefficients, so they cannot desync. Horizontal-only (De Carpentier
+/// cylinder): vertical NDC is rectilinear and untouched.
+#[derive(Clone, Copy, Debug)]
+pub enum WarpMap {
+    Identity,
+    Active { s: f32, atan_s: f32 },
+}
+
+impl WarpMap {
+    #[inline]
+    pub fn from_lens(lens: Lens) -> Self {
+        match lens {
+            Lens::Rectilinear => WarpMap::Identity,
+            Lens::WideFov { strength } => {
+                let s = strength.get();
+                WarpMap::Active { s, atan_s: s.atan() }
+            }
         }
     }
 
-    /// True when the warp is the identity (pure perspective).
     #[inline]
     pub fn is_identity(&self) -> bool {
-        self.cylindrical_ratio == 0.0
+        matches!(self, WarpMap::Identity)
     }
 
-    /// Forward warp of an NDC point. Mirrors the Slang `applyWarp`; any change
-    /// here must be echoed there or CPU picking desyncs from the GPU image.
+    /// Horizontal source-fov widening `tan(src_hfov/2)/tan(hfov/2) = s/atan(s)`,
+    /// a pure function of strength (validated in `warp_derive`). `1.0` for identity.
+    #[inline]
+    pub fn fov_scale(&self) -> f32 {
+        match self {
+            WarpMap::Identity => 1.0,
+            WarpMap::Active { s, atan_s } => s / atan_s,
+        }
+    }
+
+    /// Forward map: source-NDC -> presented-NDC. Mirrors the tonemap frag and is
+    /// the picking transform. Horizontal only; vertical passes through.
     #[inline]
     pub fn warp_ndc(&self, ndc: Vec2) -> Vec2 {
-        if self.is_identity() {
-            return ndc;
+        match self {
+            WarpMap::Identity => ndc,
+            WarpMap::Active { s, atan_s } => Vec2::new((ndc.x * s).atan() / atan_s, ndc.y),
         }
-        Vec2::new((ndc.x * self.cylindrical_ratio).atan() / self.atan_ratio, ndc.y)
     }
 
-    /// Inverse warp of an NDC point. Mirrors the Slang `inverseWarpNdc` and
-    /// round-trips [`WarpParams::warp_ndc`] to float precision; the sky pass
-    /// uses it to reconstruct the same ray the warped terrain shows per pixel.
+    /// Inverse map: presented-NDC -> source-NDC. The tonemap resample samples the
+    /// source here; round-trips [`WarpMap::warp_ndc`] to float precision.
     #[inline]
     pub fn unwarp_ndc(&self, ndc: Vec2) -> Vec2 {
-        if self.is_identity() {
-            return ndc;
+        match self {
+            WarpMap::Identity => ndc,
+            WarpMap::Active { s, atan_s } => Vec2::new((ndc.x * atan_s).tan() / s, ndc.y),
         }
-        Vec2::new((ndc.x * self.atan_ratio).tan() / self.cylindrical_ratio, ndc.y)
+    }
+
+    /// GPU push bytes for the tonemap remap. Identity yields `s = 0` so the frag's
+    /// `s <= 0` branch is a no-op (rectilinear stays byte-identical).
+    #[inline]
+    pub fn push(&self, exposure: f32) -> WarpPush {
+        match self {
+            WarpMap::Identity => WarpPush { exposure, s: 0.0, atan_s: 0.0 },
+            WarpMap::Active { s, atan_s } => WarpPush { exposure, s: *s, atan_s: *atan_s },
+        }
     }
 }
 
-/// Perspective camera, raylib-parity: `fovy` is the vertical field of view
-/// in DEGREES. `warp` adds an optional nonlinear high-FOV projection on top of
-/// the linear perspective; [`WarpParams::IDENTITY`] leaves the image unchanged.
+/// GPU push constant for the tonemap resample: exposure plus the warp coefficients
+/// (`s <= 0` = rectilinear no-op). `exposure` is first for ABI stability with the
+/// current single-`f32` tonemap push. Layout mirrored one-to-one in Slang.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WarpPush {
+    pub exposure: f32,
+    pub s: f32,
+    pub atan_s: f32,
+}
+
+/// Perspective camera, raylib-parity: `fovy` is the vertical field of view in
+/// DEGREES. `lens` selects the plain rectilinear fast path or the wide-FOV mode;
+/// [`Lens::Rectilinear`] leaves the image identical to a plain projection.
 #[derive(Clone, Copy, Debug)]
 pub struct Camera3D {
     pub position: Vec3,
     pub target: Vec3,
     pub up: Vec3,
     pub fovy: f32,
-    pub warp: WarpParams,
+    pub lens: Lens,
 }
 
 impl Camera3D {
@@ -130,12 +183,14 @@ impl Camera3D {
 /// Uses the same matrices as rendering. Points behind the camera produce
 /// unusable results (raylib parity — callers pre-filter).
 pub fn world_to_screen(p: Vec3, cam: &Camera3D, screen_w: f32, screen_h: f32) -> Vec2 {
-    // Clamp aspect denominator to avoid zero height.
-    let clip = cam.view_proj(screen_w / screen_h.max(1.0)) * p.extend(1.0);
+    // Project through the SAME widened source frustum the scene renders into
+    // (`begin_3d`), then apply the forward warp to land in presented-NDC — the
+    // exact inverse of the tonemap resample. Rectilinear leaves both untouched.
+    let warp = WarpMap::from_lens(cam.lens);
+    let source_aspect = Aspect(screen_w / screen_h.max(1.0)).source(&warp);
+    let clip = cam.view_proj(source_aspect.get()) * p.extend(1.0);
     let ndc = clip.truncate() / clip.w;
-    // Same nonlinear warp the vertex shaders apply, so overlays/picking track
-    // the warped geometry. Identity warp leaves `ndc.xy` untouched.
-    let ndc = cam.warp.warp_ndc(ndc.truncate());
+    let ndc = warp.warp_ndc(ndc.truncate());
     // Negative viewport flips y: NDC y-up maps to pixel y downward.
     Vec2::new(
         (ndc.x * 0.5 + 0.5) * screen_w,
@@ -202,7 +257,7 @@ mod tests {
             target: Vec3::new(0.0, 0.0, -1.0),
             up: Vec3::Y,
             fovy: 60.0,
-            warp: WarpParams::IDENTITY,
+            lens: Lens::Rectilinear,
         }
     }
 
@@ -218,7 +273,7 @@ mod tests {
             target: Vec3::new(4.0, 5.0, 6.0),
             up: Vec3::Y,
             fovy: 60.0,
-            warp: WarpParams::IDENTITY,
+            lens: Lens::Rectilinear,
         };
         let dir = (cam.target - cam.position).normalize();
         let p = cam.position + dir * 7.0;
@@ -289,7 +344,7 @@ mod tests {
         // The regression anchor: ratio 0 must reproduce the pure-perspective
         // pixel exactly, so enabling the feature at rest changes nothing.
         let mut cam = origin_cam();
-        cam.warp = WarpParams::IDENTITY;
+        cam.lens = Lens::Rectilinear;
         let linear = world_to_screen(Vec3::new(0.7, -0.3, -5.0), &cam, W, H);
 
         // Build the reference without any warp code path.
@@ -299,12 +354,18 @@ mod tests {
         assert!((linear - expect).length() < 1e-4, "{linear} vs {expect}");
     }
 
+    fn active_map(s: f32) -> WarpMap {
+        WarpMap::from_lens(Lens::WideFov {
+            strength: WarpStrength::new(s).unwrap(),
+        })
+    }
+
     #[test]
     fn warp_fixes_center_and_edges() {
-        let wp = WarpParams::new(0.8);
+        let wp = active_map(0.8);
         // View center is a fixed point.
         assert!(wp.warp_ndc(Vec2::ZERO).abs_diff_eq(Vec2::ZERO, 1e-6));
-        // Horizontal edges are pinned (silhouette unchanged → cull stays valid).
+        // Horizontal edges are pinned (presented ±1 maps to source ±1).
         assert!((wp.warp_ndc(Vec2::new(1.0, 0.4)).x - 1.0).abs() < 1e-5);
         assert!((wp.warp_ndc(Vec2::new(-1.0, 0.4)).x + 1.0).abs() < 1e-5);
         // Vertical is left untouched (cylinder about the vertical axis).
@@ -312,35 +373,21 @@ mod tests {
     }
 
     #[test]
-    fn warp_compresses_periphery_and_stays_in_silhouette() {
-        // The de-stretch is a *relative* effect: the map magnifies the center
-        // and shrinks equal-width columns as they approach the edge. So a fixed
-        // interval near the periphery must project to fewer NDC units than the
-        // same interval near center.
-        let wp = WarpParams::new(1.0);
+    fn warp_compresses_periphery() {
+        // The forward map magnifies the center and shrinks equal-width columns as
+        // they approach the edge, so a fixed interval near the periphery spans
+        // fewer presented-NDC units than the same interval near center.
+        let wp = active_map(1.0);
         let w = |a: f32, b: f32| wp.warp_ndc(Vec2::new(b, 0.0)).x - wp.warp_ndc(Vec2::new(a, 0.0)).x;
         let central = w(0.0, 0.1);
         let peripheral = w(0.85, 0.95);
         assert!(peripheral < central, "peripheral {peripheral} !< central {central}");
-
-        // No point escapes the linear silhouette [-1, 1]: the map is monotonic
-        // and pins ±1, so nothing off-screen is pulled on-screen. This is why
-        // `Frustum::from_view_proj` on the linear matrix stays conservative and
-        // needs no widening.
-        let mut prev = wp.warp_ndc(Vec2::new(-1.0, 0.0)).x;
-        for i in -99..=100 {
-            let nx = i as f32 / 100.0;
-            let out = wp.warp_ndc(Vec2::new(nx, 0.0)).x;
-            assert!(out.abs() <= 1.0 + 1e-6, "nx={nx} escaped: {out}");
-            assert!(out > prev - 1e-6, "not monotonic at nx={nx}");
-            prev = out;
-        }
     }
 
     #[test]
     fn warp_round_trips_through_inverse() {
-        // The sky pass relies on unwarp(warp(x)) = x to reconstruct rays.
-        let wp = WarpParams::new(1.2);
+        // Picking (forward) and the tonemap resample (inverse) must round-trip.
+        let wp = active_map(1.2);
         for &p in &[
             Vec2::new(0.0, 0.0),
             Vec2::new(0.9, -0.7),
@@ -353,6 +400,68 @@ mod tests {
     }
 
     #[test]
+    fn widefov_picking_mirrors_the_tonemap_remap() {
+        // world_to_screen must land on the pixel the GPU shows: projecting through
+        // the widened source frustum then forward-warping is the exact inverse of
+        // the tonemap resample (which unwarps presented-NDC to sample source-NDC).
+        // So unwarp(presented_ndc) must equal the raw wide-projection source-NDC.
+        let mut cam = origin_cam();
+        cam.lens = Lens::WideFov {
+            strength: WarpStrength::new(1.0).unwrap(),
+        };
+        let warp = WarpMap::from_lens(cam.lens);
+        let source_aspect = Aspect(ASPECT).source(&warp);
+
+        // A peripheral world point (well off-axis, so the warp is non-trivial).
+        let p = Vec3::new(9.0, 2.0, -12.0);
+        let pixel = world_to_screen(p, &cam, W, H);
+        // Back to presented-NDC from the pixel.
+        let presented = Vec2::new(pixel.x / W * 2.0 - 1.0, 1.0 - pixel.y / H * 2.0);
+        // The source-NDC the frag would sample.
+        let sampled_source = warp.unwarp_ndc(presented);
+        // The source-NDC the wide projection actually produced.
+        let clip = cam.view_proj(source_aspect.get()) * p.extend(1.0);
+        let raw_source = (clip.truncate() / clip.w).truncate();
+        assert!(
+            sampled_source.abs_diff_eq(raw_source, 1e-4),
+            "picking desync: sampled {sampled_source} vs projected {raw_source}"
+        );
+    }
+
+    #[test]
+    fn widefov_source_aspect_widens_frustum_to_keep_periphery() {
+        // Step 2: the WideFov source frustum (widened aspect) must keep geometry
+        // just outside the plain-rectilinear horizontal fov, or the extra periphery
+        // the tonemap resample shows would be culled before it is drawn.
+        let cam = origin_cam(); // vfov 60
+        let window = Aspect(ASPECT);
+        let base = Frustum::from_view_proj(&cam.view_proj(window.get()));
+        let wide_map = WarpMap::from_lens(Lens::WideFov {
+            strength: WarpStrength::new(1.0).unwrap(),
+        });
+        let source = window.source(&wide_map);
+        assert!(source.get() > window.get());
+        let wide = Frustum::from_view_proj(&cam.view_proj(source.get()));
+
+        // A small box midway between the base and widened horizontal half-widths
+        // at z=-10: outside the base fov, inside the widened source fov.
+        let base_half_w = (ASPECT * (30.0_f32.to_radians()).tan()) * 10.0; // ~10.26
+        let wide_half_w = base_half_w * wide_map.fov_scale(); // ~13.06
+        let mid_x = 0.5 * (base_half_w + wide_half_w);
+        let (mn, mx) = aabb_around(Vec3::new(mid_x, 0.0, -10.0), 0.2);
+        assert!(!base.intersects_aabb(mn, mx), "base should cull the periphery");
+        assert!(wide.intersects_aabb(mn, mx), "wide source must keep the periphery");
+    }
+
+    #[test]
+    fn warp_strength_rejects_nonpositive_and_clamps() {
+        assert!(WarpStrength::new(0.0).is_none());
+        assert!(WarpStrength::new(-1.0).is_none());
+        assert!(WarpStrength::new(f32::NAN).is_none());
+        assert_eq!(WarpStrength::new(10.0).unwrap().get(), WarpStrength::MAX);
+    }
+
+    #[test]
     fn frustum_near_plane_culls_closer_than_z_near() {
         let cam = origin_cam();
         let fr = Frustum::from_view_proj(&cam.view_proj(ASPECT));
@@ -360,5 +469,122 @@ mod tests {
         // so the near plane must reject it.
         let (mn, mx) = aabb_around(Vec3::new(0.0, 0.0, -0.01), 0.001);
         assert!(!fr.intersects_aabb(mn, mx));
+    }
+}
+
+// Step 0 derivation harness for the post-process wide-FOV remap. This is a
+// scratch/spec module: it pins the 1-D horizontal remap math the later WarpMap
+// (and the tonemap frag) will encode, and asserts the properties the whole
+// approach rests on, BEFORE any renderer type moves. Horizontal-only, matching
+// the De Carpentier cylinder (vertical stays rectilinear, so the widening is
+// purely horizontal and the vertical fov is untouched in both spaces).
+//
+// Model: the SOURCE is a plain rectilinear render at a *wider* horizontal fov.
+// Source-NDC x = qx ∈ [-1,1] spans that wide frustum. Display maps presented-NDC
+// x = px to source qx and samples. The two maps are the existing atan/tan pair:
+//
+//   forward  (picking):  px = atan(qx * s) / atan(s)     -- source -> presented
+//   inverse  (sampling): qx = tan(px * atan(s)) / s      -- presented -> source
+//
+// The key derived quantity is how much wider the source must be rendered so the
+// presented *center* keeps a chosen scale. Near center d(px)/d(qx) = s/atan(s),
+// i.e. the center is magnified by `fov_scale = s / atan(s)`. So to make the
+// presented center match a plain rectilinear render at the user's fov, the source
+// horizontal fov is widened by `fov_scale` in tan-space:
+//
+//   tan(source_hfov/2) = fov_scale * tan(presented_hfov/2)
+//
+// which for a (vfov, aspect) projection means source_aspect = aspect * fov_scale
+// (vfov unchanged). fov_scale is a pure function of s — a single client knob.
+#[cfg(test)]
+mod warp_derive {
+    #[inline]
+    fn warp_x(qx: f32, s: f32) -> f32 {
+        (qx * s).atan() / s.atan()
+    }
+    #[inline]
+    fn unwarp_x(px: f32, s: f32) -> f32 {
+        (px * s.atan()).tan() / s
+    }
+    #[inline]
+    fn fov_scale(s: f32) -> f32 {
+        s / s.atan()
+    }
+
+    const STRENGTHS: [f32; 6] = [0.3, 0.5, 0.8, 1.0, 1.5, 2.0];
+
+    #[test]
+    fn edges_and_center_are_fixed_points() {
+        for &s in &STRENGTHS {
+            assert!(warp_x(0.0, s).abs() < 1e-6, "center moved at s={s}");
+            assert!((warp_x(1.0, s) - 1.0).abs() < 1e-5, "right edge at s={s}");
+            assert!((warp_x(-1.0, s) + 1.0).abs() < 1e-5, "left edge at s={s}");
+        }
+    }
+
+    #[test]
+    fn inverse_sampling_stays_in_source_bounds_and_monotonic() {
+        // The load-bearing claim for "no separate wider margin than the source":
+        // every presented pixel samples a source qx inside [-1,1] (no starvation),
+        // and the map is monotonic (no folding).
+        for &s in &STRENGTHS {
+            let mut prev = unwarp_x(-1.0, s);
+            for i in -100..=100 {
+                let px = i as f32 / 100.0;
+                let qx = unwarp_x(px, s);
+                assert!(qx.abs() <= 1.0 + 1e-6, "s={s} px={px} escaped: {qx}");
+                assert!(qx > prev - 1e-6, "s={s} not monotonic at px={px}");
+                prev = qx;
+            }
+        }
+    }
+
+    #[test]
+    fn maps_round_trip() {
+        for &s in &STRENGTHS {
+            for i in -95..=95 {
+                let px = i as f32 / 100.0;
+                let back = warp_x(unwarp_x(px, s), s);
+                assert!((back - px).abs() < 1e-4, "s={s} px={px} -> {back}");
+            }
+        }
+    }
+
+    #[test]
+    fn center_magnification_equals_fov_scale() {
+        // d(warp)/dqx at 0, by finite difference, must equal fov_scale = s/atan(s).
+        for &s in &STRENGTHS {
+            let h = 1e-4;
+            let deriv = (warp_x(h, s) - warp_x(-h, s)) / (2.0 * h);
+            assert!(
+                (deriv - fov_scale(s)).abs() < 1e-2,
+                "s={s}: center slope {deriv} != fov_scale {}",
+                fov_scale(s)
+            );
+        }
+    }
+
+    #[test]
+    fn print_widening_and_compression_curves() {
+        // Not an assertion — records the numbers that size the FOV->strength ramp
+        // and the periphery supersample. Run with `cargo test -- --nocapture`.
+        let vfov_deg = 70.0_f32;
+        let aspect = 16.0 / 9.0;
+        let vhalf = (vfov_deg * 0.5).to_radians();
+        let base_hhalf = (aspect * vhalf.tan()).atan();
+        eprintln!("vfov={vfov_deg}  aspect={aspect}  base hfov={:.1}", 2.0 * base_hhalf.to_degrees());
+        for &s in &STRENGTHS {
+            let fs = fov_scale(s);
+            let src_hhalf = (fs * base_hhalf.tan()).atan();
+            // peripheral compression: source-NDC span mapped into the outer 5% of
+            // the presented edge -> how many source texels pack into one edge pixel.
+            let outer = unwarp_x(1.0, s) - unwarp_x(0.95, s);
+            let inner = unwarp_x(0.05, s) - unwarp_x(0.0, s);
+            eprintln!(
+                "s={s:>3}  fov_scale={fs:.3}  src_hfov={:.1}  edge/center source-density={:.2}x",
+                2.0 * src_hhalf.to_degrees(),
+                outer / inner
+            );
+        }
     }
 }

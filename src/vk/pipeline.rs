@@ -18,10 +18,11 @@ use crate::vk::device::FragmentShadingRate;
 use crate::vk::vertex_input::{VertexInput, vertex_struct};
 
 pub const PUSH_BYTES_3D: u32 = size_of::<Mesh3dPush>() as u32; // view_proj + SkyLight
-pub const PUSH_BYTES_DEBUG: u32 = size_of::<DebugPush>() as u32; // view_proj + warp
+pub const PUSH_BYTES_DEBUG: u32 = size_of::<DebugPush>() as u32; // view_proj
 pub const PUSH_BYTES_2D: u32 = size_of::<[f32; 2]>() as u32; // pixels_to_ndc
 pub const PUSH_BYTES_SKY: u32 = size_of::<SkyParams>() as u32; // full 128-byte sky block
-pub const PUSH_BYTES_TONEMAP: u32 = size_of::<f32>() as u32; // exposure
+// exposure + wide-FOV remap coefficients (s, atan_s); see camera::WarpPush.
+pub const PUSH_BYTES_TONEMAP: u32 = size_of::<crate::camera::WarpPush>() as u32;
 
 /// Sky lighting/fog for the mesh pipeline — the tail of [`Mesh3dPush`], read by
 /// `mesh3d`'s fragment stage. `sun_light`/`ambient` are rgb in `.xyz` (`.w`
@@ -53,17 +54,13 @@ pub struct Mesh3dPush {
     pub sky: SkyLight,
 }
 
-/// The debug/immediate-geometry pipeline's push constant: the camera matrix
-/// plus the high-FOV warp so debug cubes/lines/decals stay registered with the
-/// warped terrain. `warp.x` is the cylindrical ratio (0 = linear); `.yzw` pad
-/// the struct to a clean 16-byte multiple (no bytemuck padding). Mirrors the
-/// `ambient.w` lane the mesh pipeline uses, kept in its own field here because
-/// the debug layout carries no `SkyLight`.
+/// The debug/immediate-geometry pipeline's push constant: just the camera matrix.
+/// Debug geometry renders plain-rectilinear into the (wide) source and is
+/// compressed with the terrain by the tonemap resample, so no warp lane is needed.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DebugPush {
     pub view_proj: Mat4,
-    pub warp: [f32; 4],
 }
 
 /// The sky background pass's push constant, exactly 128 bytes (the guaranteed
@@ -81,7 +78,7 @@ pub struct SkyParams {
 }
 
 impl SkyParams {
-    pub fn compose(inv_view_proj: Mat4, desc: &SkyDesc, cylindrical_ratio: f32) -> Self {
+    pub fn compose(inv_view_proj: Mat4, desc: &SkyDesc) -> Self {
         let n = |c: crate::color::Color| [c.r, c.g, c.b].map(|v| v as f32 / 255.0);
         let s = desc.sun_dir.normalize_or_zero();
         let [zr, zg, zb] = n(desc.zenith);
@@ -91,10 +88,9 @@ impl SkyParams {
         Self {
             inv_view_proj,
             sun: [s.x, s.y, s.z, desc.exposure],
-            // zenith.w carries the high-FOV warp strength so the sky fragment
-            // can inverse-warp each NDC pixel before reconstructing its ray,
-            // keeping the sky registered with the warped terrain (0 = linear).
-            zenith: [zr, zg, zb, cylindrical_ratio],
+            // zenith.w reserved (was the high-FOV warp strength; the warp is now a
+            // post-process resample, so the sky reconstructs rays from plain NDC).
+            zenith: [zr, zg, zb, 0.0],
             horizon: [hr, hg, hb, r.cos()],
             sun_tint: [tr, tg, tb, (r * 2.0).cos()],
         }
@@ -161,6 +157,11 @@ pub struct Pipelines {
     pub tris2d: vk::Pipeline,
     /// Variant of `tris2d` that samples RGBA texture instead of R8 atlas.
     pub tris2d_tex: vk::Pipeline,
+    /// Present-format, single-sample variants of the two overlay pipelines, drawn
+    /// AFTER the tonemap resample so the wide-FOV warp never bends the HUD/minimap.
+    /// Unused in rectilinear mode (the overlay stays in the offscreen scene pass).
+    pub tris2d_present: vk::Pipeline,
+    pub tris2d_tex_present: vk::Pipeline,
     /// Vertex-less fullscreen background pass; push-constant only, no descriptor
     /// set. Depth-tests (read-only) at the reversed-Z far plane so it shades
     /// only pixels the terrain left uncovered.
@@ -522,6 +523,33 @@ impl Pipelines {
             },
         );
 
+        // Overlay variants at present format / single-sample (same modules, layout,
+        // and blend as tris2d/tris2d_tex) for the post-tonemap swapchain draw.
+        let overlay_2d_config = || PipelineConfig {
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            depth: DepthMode::Disabled,
+            cull: vk::CullModeFlags::NONE,
+            blend: true,
+            vrs: false,
+            depth_bias: None,
+        };
+        let tris2d_present = tonemap_builder.build(
+            tri2d_vert,
+            tri2d_frag,
+            &bindings_2d,
+            attributes_2d,
+            layout_2d,
+            overlay_2d_config(),
+        );
+        let tris2d_tex_present = tonemap_builder.build(
+            tri2d_vert,
+            tri2d_tex_frag,
+            &bindings_2d,
+            attributes_2d,
+            layout_2d,
+            overlay_2d_config(),
+        );
+
         unsafe {
             device.destroy_shader_module(tonemap_vert, None);
             device.destroy_shader_module(tonemap_frag, None);
@@ -554,6 +582,8 @@ impl Pipelines {
             debug_lines,
             tris2d,
             tris2d_tex,
+            tris2d_present,
+            tris2d_tex_present,
             sky,
             layout_sky,
             tonemap,
@@ -593,6 +623,8 @@ impl Pipelines {
             device.destroy_pipeline(self.debug_lines, None);
             device.destroy_pipeline(self.tris2d, None);
             device.destroy_pipeline(self.tris2d_tex, None);
+            device.destroy_pipeline(self.tris2d_present, None);
+            device.destroy_pipeline(self.tris2d_tex_present, None);
             device.destroy_pipeline(self.sky, None);
             device.destroy_pipeline(self.tonemap, None);
             device.destroy_pipeline_layout(self.layout_3d, None);

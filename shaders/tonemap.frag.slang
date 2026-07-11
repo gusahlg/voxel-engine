@@ -15,6 +15,12 @@ struct FragmentInput
 struct PushConstants
 {
     float exposure; // linear multiplier applied before the curve
+    // Wide-FOV periphery remap (camera::WarpPush). The scene is rendered into the
+    // offscreen at a WIDER rectilinear horizontal fov; here each output pixel maps
+    // its presented-NDC.x back to the source-NDC.x it should sample, compressing the
+    // periphery. `s <= 0` is rectilinear: the sample uv is untouched (no-op).
+    float s;      // cylindrical strength
+    float atan_s; // precomputed atan(s)
 };
 
 [[vk::push_constant]]
@@ -54,9 +60,21 @@ float3 linearToSrgb(float3 c)
     return select(c <= 0.0031308, lo, hi);
 }
 
+// Presented-NDC.x -> source-NDC.x. Inverse of the forward map atan(qx*s)/atan(s):
+// qx = tan(px * atan(s)) / s. Mirrors camera::WarpMap::unwarp_ndc. Horizontal only.
+float2 warpSampleUv(float2 uv, float s, float atan_s)
+{
+    if (s <= 0.0)
+        return uv;
+    float px = uv.x * 2.0 - 1.0;         // uv -> presented NDC x
+    float qx = tan(px * atan_s) / s;     // -> source NDC x (stays in [-1,1])
+    return float2(qx * 0.5 + 0.5, uv.y); // -> source uv; vertical unchanged
+}
+
 [shader("fragment")]
 float4 fragmentMain(FragmentInput input) : SV_Target
 {
-    float3 hdr = hdrTex.Sample(input.uv).rgb * pc.exposure;
+    float2 uv = warpSampleUv(input.uv, pc.s, pc.atan_s);
+    float3 hdr = hdrTex.Sample(uv).rgb * pc.exposure;
     return float4(linearToSrgb(pbrNeutral(hdr)), 1.0);
 }

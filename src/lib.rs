@@ -21,7 +21,9 @@ mod screenshot;
 mod surface;
 mod vk;
 
-pub use camera::{Camera3D, Frustum, WarpParams, Z_NEAR, world_to_screen};
+pub use camera::{
+    Aspect, Camera3D, Frustum, Lens, WarpMap, WarpPush, WarpStrength, Z_NEAR, world_to_screen,
+};
 pub use color::Color;
 pub use engine::{Config, Engine, run};
 pub use frame::{Frame, Frame3D, SkyDesc};

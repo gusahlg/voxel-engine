@@ -11,8 +11,6 @@ struct FragmentInput
     float2 ndc;
 };
 
-#include "warp.slang"
-
 struct PushConstants
 {
     float4x4 inv_view_proj; // camera rebased to origin: (ndc,0,1) → view ray
@@ -43,10 +41,10 @@ float3 srgbToLinear(float3 c)
 [shader("fragment")]
 float4 fragmentMain(FragmentInput input) : SV_Target
 {
-    // Undo the terrain's high-FOV warp (zenith.w = strength) so each pixel's
-    // sky ray matches the warped terrain shown there, then reconstruct it.
-    float2 ndc = inverseWarpNdc(input.ndc, pc.zenith.w);
-    float4 far = mul(pc.inv_view_proj, float4(ndc, 0.0, 1.0));
+    // Reconstruct the view ray from the (wide, rectilinear) source projection.
+    // The tonemap resample compresses the sky's periphery in lockstep with the
+    // terrain, so no per-pixel warp is needed here.
+    float4 far = mul(pc.inv_view_proj, float4(input.ndc, 0.0, 1.0));
     float3 ray = normalize(far.xyz);
 
     // CPU colours arrive sRGB-encoded; the sky composites in linear light

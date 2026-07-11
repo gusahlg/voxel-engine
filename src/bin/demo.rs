@@ -267,7 +267,10 @@ fn main() {
                 target: center + Vec3::new(0.0, 8.0, 0.0),
                 up: Vec3::Y,
                 fovy: 70.0,
-                warp: voxel_engine::WarpParams::new(warp_ratio),
+                lens: voxel_engine::WarpStrength::new(warp_ratio)
+                    .map_or(voxel_engine::Lens::Rectilinear, |strength| {
+                        voxel_engine::Lens::WideFov { strength }
+                    }),
             };
 
             let vsync = eng.vsync();

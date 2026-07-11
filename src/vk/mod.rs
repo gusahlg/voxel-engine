@@ -95,6 +95,16 @@ struct ImmOffsets {
     d2_tex: u64,
 }
 
+/// The 2D overlay draw parameters carried to the post-tonemap present pass when
+/// wide-FOV is active (so the HUD/minimap render in swapchain space, unwarped).
+#[derive(Clone, Copy)]
+struct OverlayPresent {
+    d2_offset: u64,
+    d2_count: u32,
+    d2_tex_offset: u64,
+    d2_tex_count: u32,
+}
+
 /// One resolved mesh draw (one direction-run of one mesh), pre-sort scratch for
 /// [`Renderer::prepare_mesh_draws`]. `first`/`count` are the index sub-range for
 /// this run (the whole mesh when face-culling is off).
@@ -731,7 +741,15 @@ impl Renderer {
 
         {
             let _p = scope(Meter::Present);
-            self.present(slot, present_target);
+            // In wide-FOV the overlay was skipped in the scene pass; draw it here,
+            // after the tonemap resample, so it stays crisp and unwarped.
+            let overlay = OverlayPresent {
+                d2_offset: offsets.d2,
+                d2_count: lists.verts_2d.len() as u32,
+                d2_tex_offset: offsets.d2_tex,
+                d2_tex_count: lists.tex_verts_2d.len() as u32,
+            };
+            self.present(slot, present_target, lists.warp_map, overlay);
         }
 
         self.slot = (self.slot + 1) % self.frames.len();
@@ -1147,7 +1165,12 @@ impl Renderer {
             }
         }
         unsafe {
-            pass.record_2d();
+            // In wide-FOV the overlay is drawn AFTER the tonemap resample (swapchain
+            // space) so the warp never bends it; here it would be compressed. In
+            // rectilinear it stays in the offscreen pass exactly as before.
+            if lists.warp_map.is_identity() {
+                pass.record_2d();
+            }
             stamp(GpuPass::Overlay);
             pass.end();
         }
@@ -1306,9 +1329,15 @@ impl Renderer {
 
     /// Copies the finished frame into the acquired swapchain image (when one
     /// was acquired in [`Self::decide_present`]) and queues the present.
-    fn present(&mut self, slot: usize, present_target: Option<u32>) {
+    fn present(
+        &mut self,
+        slot: usize,
+        present_target: Option<u32>,
+        warp_map: crate::camera::WarpMap,
+        overlay: OverlayPresent,
+    ) {
         if let Some(image_index) = present_target {
-            unsafe { self.submit_present_copy(slot, image_index) };
+            unsafe { self.submit_present_copy(slot, image_index, warp_map, overlay) };
             self.last_present = std::time::Instant::now();
         }
         if self.vsync.current() {
@@ -1320,11 +1349,84 @@ impl Renderer {
         }
     }
 
+    /// Draws the 2D overlay (text atlas + minimap) into the currently-bound
+    /// swapchain attachment, using the present-format pipeline variants. Mirrors
+    /// `RenderPass::record_2d` but for the post-tonemap pass; the caller has set a
+    /// negative-height viewport so `tris2d.vert`'s pixel→NDC mapping is correct.
+    unsafe fn record_overlay_present(
+        &self,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        overlay: OverlayPresent,
+        extent: vk::Extent2D,
+    ) {
+        let device = &self.device.device;
+        let pixels_to_ndc = [2.0 / extent.width as f32, 2.0 / extent.height as f32];
+        unsafe {
+            if overlay.d2_count > 0 {
+                device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipelines.tris2d_present,
+                );
+                self.atlas.push_descriptor(
+                    &self.device.push_descriptor,
+                    cmd,
+                    self.pipelines.layout_2d,
+                    0,
+                );
+                device.cmd_push_constants(
+                    cmd,
+                    self.pipelines.layout_2d,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    bytemuck::cast_slice(&pixels_to_ndc),
+                );
+                device.cmd_bind_vertex_buffers(cmd, 0, &[self.imm[slot].buffer], &[overlay.d2_offset]);
+                device.cmd_draw(cmd, overlay.d2_count, 1, 0, 0);
+            }
+
+            if self.minimap.ready() && overlay.d2_tex_count > 0 {
+                device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipelines.tris2d_tex_present,
+                );
+                self.minimap.push_descriptor(
+                    &self.device.push_descriptor,
+                    cmd,
+                    self.pipelines.layout_2d,
+                    slot,
+                );
+                device.cmd_push_constants(
+                    cmd,
+                    self.pipelines.layout_2d,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    bytemuck::cast_slice(&pixels_to_ndc),
+                );
+                device.cmd_bind_vertex_buffers(
+                    cmd,
+                    0,
+                    &[self.imm[slot].buffer],
+                    &[overlay.d2_tex_offset],
+                );
+                device.cmd_draw(cmd, overlay.d2_tex_count, 1, 0, 0);
+            }
+        }
+    }
+
     /// Records and submits the offscreen[slot] -> swapchain copy, then
     /// queues the present. Caller guarantees the previous copy has retired
     /// (its value reached) and the image was just acquired with
     /// `frames[slot].image_available`.
-    unsafe fn submit_present_copy(&mut self, slot: usize, image_index: u32) {
+    unsafe fn submit_present_copy(
+        &mut self,
+        slot: usize,
+        image_index: u32,
+        warp_map: crate::camera::WarpMap,
+        overlay: OverlayPresent,
+    ) {
         // A pending screenshot piggybacks on this copy: after the tonemap draw,
         // the swapchain image is read back into `readback` instead of going
         // straight to PRESENT. Allocate the host buffer before borrowing
@@ -1338,10 +1440,13 @@ impl Renderer {
         let device = &self.device.device;
         let swap_image = self.swapchain.images[image_index as usize];
         let swap_view = self.swapchain.image_views[image_index as usize];
-        // Exposure applied before the AgX curve. Render scale is handled by the
+        // Exposure applied before the tonemap curve. Render scale is handled by the
         // tonemap sampler (it reads the HDR image bilinearly at window size), so
-        // there is no separate copy/blit path anymore.
+        // there is no separate copy/blit path anymore. The same pass also applies
+        // the wide-FOV periphery remap: `warp_map` carries the coefficients, and an
+        // identity (rectilinear) map pushes `s = 0` so the frag stays a no-op.
         const EXPOSURE: f32 = 1.0;
+        let tonemap_push = warp_map.push(EXPOSURE);
         unsafe {
             device
                 .reset_command_buffer(self.copy_cmd, vk::CommandBufferResetFlags::empty())
@@ -1421,9 +1526,27 @@ impl Renderer {
                 self.pipelines.layout_tonemap,
                 vk::ShaderStageFlags::FRAGMENT,
                 0,
-                bytemuck::bytes_of(&EXPOSURE),
+                bytemuck::bytes_of(&tonemap_push),
             );
             device.cmd_draw(self.copy_cmd, 3, 1, 0, 0);
+            // Wide-FOV only: composite the 2D overlay onto the tonemapped swapchain
+            // (skipped in the offscreen scene pass) so the warp never bends it. Uses
+            // a GL-style negative-height viewport, matching what tris2d.vert expects.
+            if !warp_map.is_identity() {
+                device.cmd_set_viewport(
+                    self.copy_cmd,
+                    0,
+                    &[vk::Viewport {
+                        x: 0.0,
+                        y: extent.height as f32,
+                        width: extent.width as f32,
+                        height: -(extent.height as f32),
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    }],
+                );
+                self.record_overlay_present(self.copy_cmd, slot, overlay, extent);
+            }
             device.cmd_end_rendering(self.copy_cmd);
 
             // When capturing, detour through TRANSFER_SRC to copy the finished
@@ -1962,13 +2085,10 @@ impl<'a> RenderPass<'a> {
     unsafe fn bind_mesh3d_state(&self) {
         let r = self.r;
         let cmd = self.cmd;
-        let mut push = pipeline::Mesh3dPush {
+        let push = pipeline::Mesh3dPush {
             view_proj: self.lists.view_proj,
             sky: self.lists.sky_light,
         };
-        // High-FOV warp strength rides the unused `ambient.w` lane (see
-        // camera::WarpParams); the vertex shader applies it, 0.0 = linear.
-        push.sky.ambient[3] = self.lists.warp.cylindrical_ratio;
         unsafe {
             r.device.device.cmd_push_constants(
                 cmd,
@@ -2094,9 +2214,6 @@ impl<'a> RenderPass<'a> {
                 sky: self.lists.sky_light,
             };
             push.sky.sun_light[3] = self.lists.skin_clip;
-            // Same high-FOV warp lane as the mesh pass (ambient.w); keeps the
-            // far skin registered with the warped terrain.
-            push.sky.ambient[3] = self.lists.warp.cylindrical_ratio;
             device.cmd_push_constants(
                 cmd,
                 self.r.pipelines.layout_3d,
@@ -2151,7 +2268,6 @@ impl<'a> RenderPass<'a> {
     unsafe fn push_debug_view_proj(&self) {
         let push = pipeline::DebugPush {
             view_proj: self.lists.view_proj,
-            warp: [self.lists.warp.cylindrical_ratio, 0.0, 0.0, 0.0],
         };
         unsafe {
             self.r.device.device.cmd_push_constants(
@@ -2243,11 +2359,7 @@ impl<'a> RenderPass<'a> {
         };
         let device = &self.r.device.device;
         let cmd = self.cmd;
-        let params = pipeline::SkyParams::compose(
-            self.lists.view_proj.inverse(),
-            &desc,
-            self.lists.warp.cylindrical_ratio,
-        );
+        let params = pipeline::SkyParams::compose(self.lists.view_proj.inverse(), &desc);
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.r.pipelines.sky);
             device.cmd_push_constants(

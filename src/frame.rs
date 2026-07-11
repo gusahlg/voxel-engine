@@ -5,7 +5,7 @@ use glam::{Mat3, Mat4, Vec2, Vec3};
 
 use std::num::NonZeroU32;
 
-use crate::camera::{Camera3D, Frustum, WarpParams};
+use crate::camera::{Aspect, Camera3D, Frustum, WarpMap};
 use crate::color::Color;
 use crate::engine::Engine;
 use crate::font;
@@ -85,10 +85,10 @@ pub(crate) struct DrawLists {
     /// `tan(fovy/2)` for the current 3D camera; the renderer derives the
     /// vertical focal length (`0.5·height/tan_half`) for VRS depth thresholding.
     pub fovy_tan_half: f32,
-    /// High-FOV nonlinear projection for the current 3D scope. Its
-    /// `cylindrical_ratio` rides the otherwise-unused `ambient.w` push lane into
-    /// every 3D vertex shader; [`WarpParams::IDENTITY`] leaves rendering linear.
-    pub warp: WarpParams,
+    /// Wide-FOV lens for the current 3D scope. `Identity` in rectilinear mode. The
+    /// projection is already widened to the source frustum for `Active`; this
+    /// carries the coefficients the tonemap resample uses to compress the periphery.
+    pub warp_map: WarpMap,
     pub has_3d: bool,
     /// Procedural sky palette for this frame's background pass, or `None` to
     /// leave the flat clear colour showing. Set via [`Frame3D::set_sky`].
@@ -123,7 +123,7 @@ impl DrawLists {
             sky_light: SkyLight::IDENTITY,
             cam_pos: Vec3::ZERO,
             fovy_tan_half: 1.0,
-            warp: WarpParams::IDENTITY,
+            warp_map: WarpMap::Identity,
             has_3d: false,
             sky: None,
             mesh_draws: Vec::new(),
@@ -140,7 +140,7 @@ impl DrawLists {
     pub fn reset(&mut self) {
         self.has_3d = false;
         self.sky = None;
-        self.warp = WarpParams::IDENTITY;
+        self.warp_map = WarpMap::Identity;
         self.sky_light = SkyLight::IDENTITY;
         self.mesh_draws.clear();
         self.surface_draws.clear();
@@ -167,13 +167,18 @@ impl<'e> Frame<'e> {
     pub fn begin_3d(&mut self, cam: &Camera3D) -> Frame3D<'_, 'e> {
         let w = self.eng.client.screen_width().max(1) as f32;
         let h = self.eng.client.screen_height().max(1) as f32;
-        let aspect = w / h;
-        let view_proj = cam.view_proj(aspect);
+        // Wide-FOV renders a *wider* rectilinear source (horizontal only, so the
+        // vertical fov — and thus `fovy_tan_half`/VRS — is unchanged). The tonemap
+        // resample compresses the periphery back to the presented frame. Culling
+        // must use this widened frustum or the extra periphery is culled away.
+        let warp_map = WarpMap::from_lens(cam.lens);
+        let source_aspect = Aspect(w / h).source(&warp_map);
+        let view_proj = cam.view_proj(source_aspect.get());
         let frustum = Frustum::from_view_proj(&view_proj);
         self.eng.lists.view_proj = view_proj;
         self.eng.lists.cam_pos = cam.position;
         self.eng.lists.fovy_tan_half = (cam.fovy.to_radians() * 0.5).tan();
-        self.eng.lists.warp = cam.warp;
+        self.eng.lists.warp_map = warp_map;
         self.eng.lists.has_3d = true;
         Frame3D {
             frame: self,

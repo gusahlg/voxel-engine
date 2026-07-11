@@ -9,7 +9,6 @@
 // SV_VulkanInstanceID (not SV_InstanceID): reads the plain SPIR-V InstanceIndex,
 // so `first_instance` doubles as the draw's SSBO slot (see mesh3d.vert).
 
-#include "warp.slang"
 
 [[vk::binding(0, 0)]]
 StructuredBuffer<float4> draw_offsets;
@@ -62,8 +61,8 @@ VertexOutput vertexMain(VertexInput input)
     float3 world = input.pos * placement.w + placement.xyz;
 
     VertexOutput output;
-    // ambient.w carries the high-FOV cylindrical warp strength (0 = linear).
-    output.position = applyWarp(mul(pc.view_proj, float4(world, 1.0)), pc.ambient.w);
+    // Plain rectilinear projection; wide-FOV compression is a post-process.
+    output.position = mul(pc.view_proj, float4(world, 1.0));
     output.color = input.color;
     output.dist = length(world); // camera at the origin, so depth = distance to world
     output.boxdist = max(abs(world.x), abs(world.z)); // ground-plane box distance

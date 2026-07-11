@@ -1,6 +1,8 @@
 /// Vulkan instance creation: entry loading, optional validation layer with a
 /// debug-utils messenger, and MoltenVK portability enumeration on macOS.
-use ash::{ext, khr, vk};
+use ash::{ext, vk};
+#[cfg(target_os = "macos")]
+use ash::khr;
 use raw_window_handle::RawDisplayHandle;
 use std::ffi::{CStr, c_char, c_void};
 
@@ -46,10 +48,12 @@ impl InstanceBundle {
     pub fn new(display_handle: RawDisplayHandle) -> Self {
         let entry = load_entry();
 
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut extensions = ash_window::enumerate_required_extensions(display_handle)
             .expect("Failed to enumerate required surface extensions")
             .to_vec();
 
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut create_flags = vk::InstanceCreateFlags::empty();
         // MoltenVK is a non-conformant "portability" driver; the loader hides
         // it unless the instance opts in.

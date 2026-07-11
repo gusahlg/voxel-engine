@@ -18,8 +18,6 @@
 // derived from position + normal (the sampler is REPEAT, so greedy quads tile);
 // per-face directional shade is derived from the normal.
 
-#include "warp.slang"
-
 [[vk::binding(0, 0)]]
 StructuredBuffer<float4> draw_offsets;
 
@@ -117,8 +115,9 @@ VertexOutput vertexMain(VertexInput input)
     float3 world = float3(x, y, z) * placement.w + placement.xyz;
 
     VertexOutput output;
-    // ambient.w carries the high-FOV cylindrical warp strength (0 = linear).
-    output.position = applyWarp(mul(pc.view_proj, float4(world, 1.0)), pc.ambient.w);
+    // Plain rectilinear projection; wide-FOV compression is a post-process
+    // (tonemap resample), so the vertex path stays linear.
+    output.position = mul(pc.view_proj, float4(world, 1.0));
     // Counter-scale UV by the per-draw scale so texel density stays locked to
     // world metres: a full-res chunk (scale 1) tiles once per block, and a
     // coarse LOD tile (scale 2^k) tiles 2^k times per cell — still once per
