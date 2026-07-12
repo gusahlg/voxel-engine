@@ -1298,6 +1298,7 @@ impl Renderer {
         // classify. MSAA depth would need multisample sampling (skipped), and a
         // slot's depth is only readable once it has been rendered at least once.
         let do_vrs = lists.has_3d
+            && self.flags.vrs
             && self.targets.vrs.is_some()
             && self.targets.msaa.is_none()
             && self.vrs_ready[slot] == Some(self.scene_fingerprint);

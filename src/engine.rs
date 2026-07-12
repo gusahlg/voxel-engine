@@ -90,6 +90,14 @@ pub struct RenderFlags {
     pub shadows: bool,
     /// Procedural sky background pass; off shows the clear colour.
     pub sky: bool,
+    /// Variable-rate shading: the depth-classified rate image that coarsens
+    /// fragment shading on distant/flat regions. Off skips both the classify
+    /// dispatch and the rate attachment (full-rate shading everywhere).
+    pub vrs: bool,
+    /// Water surface animation (`anim` lane time). Off freezes the phase:
+    /// water renders, tinted and reflective, but still — the cheapest frame
+    /// for water-heavy scenes.
+    pub water_anim: bool,
 }
 
 impl Default for RenderFlags {
@@ -106,6 +114,8 @@ impl Default for RenderFlags {
             godrays: true,
             shadows: false,
             sky: true,
+            vrs: true,
+            water_anim: true,
         }
     }
 }

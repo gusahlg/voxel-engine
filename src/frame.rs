@@ -67,6 +67,11 @@ fn gate_uniforms(f: &crate::engine::RenderFlags, mut u: FrameUniformsGpu) -> Fra
     if !f.exposure {
         u.exposure_dither[0] = 1.0;
     }
+    if !f.water_anim {
+        // Freeze the animation phase: water still renders (tint, reflection),
+        // its surface just holds still.
+        u.anim[0] = 0.0;
+    }
     u
 }
 
