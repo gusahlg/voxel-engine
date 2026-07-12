@@ -548,6 +548,7 @@ impl Renderer {
 
         let caps = DeviceCaps {
             max_msaa: device.max_msaa(),
+            max_texture_layers: device.max_image_array_layers,
         };
         let reply = InitReply {
             instance: instance.instance.clone(),
@@ -710,6 +711,20 @@ impl Renderer {
     /// avoiding a load-time `device_wait_idle` stall — pipelines and descriptors
     /// untouched, since the current texture is pushed afresh each frame.
     pub fn set_block_textures(&mut self, size: u32, layers: &[Vec<u8>]) {
+        // Defense against a caller outrunning the device: creating an image
+        // with more layers than `maxImageArrayLayers` is a validation error,
+        // so truncate loudly instead. The app-side clamp (which wraps ids)
+        // should make this unreachable.
+        let cap = self.device.max_image_array_layers as usize;
+        let layers = if layers.len() > cap {
+            log::error!(
+                "set_block_textures: {} layers exceeds the device cap of {cap}; truncating",
+                layers.len()
+            );
+            &layers[..cap]
+        } else {
+            layers
+        };
         // Build new array before swapping out old to avoid double-free on panic.
         let new_textures = BlockTextures::upload(
             &self.instance.instance,

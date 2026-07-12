@@ -244,6 +244,13 @@ impl Engine {
         self.client.max_msaa()
     }
 
+    /// The device's block-texture array layer ceiling
+    /// (`limits.maxImageArrayLayers`). The app clamps how many block texture
+    /// layers it builds against this; ids past it wrap (see the game's mesher).
+    pub fn max_texture_array_layers(&self) -> u32 {
+        self.client.max_texture_layers()
+    }
+
     /// Enables opt-in six-way face culling: each mesh submits only its
     /// camera-facing direction buckets. Off by default (one draw per mesh);
     /// earns its keep only under heavy vertex load.

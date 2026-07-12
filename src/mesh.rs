@@ -7,7 +7,7 @@
 /// per-face directional shade from the normal. See the bit table below; the
 /// `SHIFT_*`/`MASK_*` consts are mirrored in `shaders/mesh3d.vert.slang`.
 ///
-/// Word 0: x[0..5] y[5..10] z[10..15] normal[15..18] layer[18..26]
+/// Word 0: x[0..5] y[5..10] z[10..15] normal[15..18] layer[18..32]
 /// Word 1: ao[0..2] skylight[2..6] blocklight[6..10]
 ///
 /// Immediate debug geometry uses the separate unpacked [`DebugVertex`].
@@ -37,7 +37,7 @@ pub const MASK_MICRO: u32 = 0x3;
 // corrupt an adjacent field; the typed API keeps values in range anyway).
 const MASK_COORD: u32 = 0x1F; // 5 bits, holds 0..=16
 const MASK_NORMAL: u32 = 0x7; // 3 bits
-const MASK_LAYER: u32 = 0xFF; // 8 bits (full u8)
+const MASK_LAYER: u32 = 0x3FFF; // 14 bits — word 0's remaining span, 16384 layers
 const MASK_AO: u32 = 0x3; // 2 bits
 const MASK_LIGHT: u32 = 0xF; // 4 bits
 
@@ -127,11 +127,11 @@ vertex_struct! {
 impl MeshVertex {
     /// The sole vertex constructor: AO and light are non-optional, so no mesher
     /// can silently default them (the bug that washed out far LOD tiles).
-    pub fn new(pos: [u8; 3], normal: Normal, layer: u8, ao: Ao, light: Light, water: bool) -> Self {
+    pub fn new(pos: [u8; 3], normal: Normal, layer: u16, ao: Ao, light: Light, water: bool) -> Self {
         Self::pack(pos, normal, layer, ao.0, light.sky, light.block, water)
     }
 
-    const fn pack(pos: [u8; 3], normal: Normal, layer: u8, ao: u8, sky: u8, block: u8, water: bool) -> Self {
+    const fn pack(pos: [u8; 3], normal: Normal, layer: u16, ao: u8, sky: u8, block: u8, water: bool) -> Self {
         // Chunk-local coords must be 0..=16. The 5-bit field also holds
         // 17..=31, so an out-of-range coord stores silently at the wrong
         // position rather than corrupting a neighbor — caught in debug only.
@@ -194,7 +194,7 @@ impl MeshVertex {
     }
 
     /// Decodes the texture-array layer.
-    pub fn layer(&self) -> u8 {
+    pub fn layer(&self) -> u16 {
         let (.., layer, _, _, _) = unpack(self.packed);
         layer
     }
@@ -216,7 +216,7 @@ impl MeshVertex {
 /// raw field integers (`pos`, normal index, layer, ao, sky, block); typed
 /// callers map from there. Keeping one decoder means the shift/mask consts are
 /// applied in exactly one place per direction (pack/unpack).
-const fn unpack(packed: [u32; 2]) -> ([u32; 3], u8, u8, u8, u8, u8) {
+const fn unpack(packed: [u32; 2]) -> ([u32; 3], u8, u16, u8, u8, u8) {
     let [w0, w1] = packed;
     let pos = [
         (w0 >> SHIFT_X) & MASK_COORD,
@@ -224,7 +224,7 @@ const fn unpack(packed: [u32; 2]) -> ([u32; 3], u8, u8, u8, u8, u8) {
         (w0 >> SHIFT_Z) & MASK_COORD,
     ];
     let normal = ((w0 >> SHIFT_NORMAL) & MASK_NORMAL) as u8;
-    let layer = ((w0 >> SHIFT_LAYER) & MASK_LAYER) as u8;
+    let layer = ((w0 >> SHIFT_LAYER) & MASK_LAYER) as u16;
     let ao = ((w1 >> SHIFT_AO) & MASK_AO) as u8;
     let sky = ((w1 >> SHIFT_SKY) & MASK_LIGHT) as u8;
     let block = ((w1 >> SHIFT_BLOCK) & MASK_LIGHT) as u8;
@@ -379,7 +379,7 @@ mod tests {
     /// Types the shared raw [`unpack`] back into the API surface — the one
     /// check no validation layer can do: that pack/unpack (and thus the
     /// const-fn shifts and the documented table) agree.
-    fn typed_unpack(v: MeshVertex) -> ([u8; 3], Normal, u8, u8, u8, u8) {
+    fn typed_unpack(v: MeshVertex) -> ([u8; 3], Normal, u16, u8, u8, u8) {
         let ([x, y, z], ni, layer, ao, sky, block) = unpack(v.packed);
         (
             [x as u8, y as u8, z as u8],
@@ -401,9 +401,12 @@ mod tests {
             Normal::PosZ,
             Normal::NegZ,
         ];
+        // The vertex must stay 8 bytes — the 14-bit layer lives in word 0's
+        // spare span, never in a wider struct.
+        assert_eq!(std::mem::size_of::<MeshVertex>(), 8);
         for pos in [[0, 0, 0], [16, 16, 16], [1, 7, 15], [16, 0, 9]] {
             for normal in normals {
-                for layer in [0u8, 1, 127, 255] {
+                for layer in [0u16, 1, 127, 255, 256, 4095, 16383] {
                     for ao in [0u8, 1, 3] {
                         for (sky, block) in [(0u8, 15u8), (15, 0), (7, 8), (15, 15)] {
                             for water in [false, true] {

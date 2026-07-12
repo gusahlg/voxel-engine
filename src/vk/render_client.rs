@@ -36,6 +36,8 @@ use crate::mesh::{MeshData, MeshHandle};
 #[derive(Clone, Copy)]
 pub(crate) struct DeviceCaps {
     pub max_msaa: u32,
+    /// Block-texture array layer ceiling (`limits.maxImageArrayLayers`).
+    pub max_texture_layers: u32,
 }
 
 /// Ordered command stream from main to render thread.
@@ -316,6 +318,10 @@ impl RenderClient {
 
     pub(crate) fn max_msaa(&self) -> u32 {
         self.caps.max_msaa
+    }
+
+    pub(crate) fn max_texture_layers(&self) -> u32 {
+        self.caps.max_texture_layers
     }
 
     pub(crate) fn set_cull_faces(&mut self, on: bool) {

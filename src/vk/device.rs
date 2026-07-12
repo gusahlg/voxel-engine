@@ -98,6 +98,9 @@ pub struct Device {
     pub timestamp_period_ns: f32,
     /// Whether all graphics/compute queues support timestamp queries.
     pub timestamps_supported: bool,
+    /// `limits.maxImageArrayLayers` — the block-texture array's layer ceiling
+    /// (spec minimum 256, commonly 2048 on desktop).
+    pub max_image_array_layers: u32,
 }
 
 struct Candidate {
@@ -274,6 +277,7 @@ impl Device {
             draw_indirect_first_instance: best.draw_indirect_first_instance,
             timestamp_period_ns: best.properties.limits.timestamp_period,
             timestamps_supported: best.properties.limits.timestamp_compute_and_graphics == vk::TRUE,
+            max_image_array_layers: best.properties.limits.max_image_array_layers,
         }
     }
 

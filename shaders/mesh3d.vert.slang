@@ -79,7 +79,7 @@ VertexOutput vertexMain(VertexInput input)
     float y = float((w0 >> 5) & 0x1F);
     float z = float((w0 >> 10) & 0x1F);
     uint normal = (w0 >> 15) & 0x7;   // 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
-    uint layer = (w0 >> 18) & 0xFF;
+    uint layer = (w0 >> 18) & 0x3FFF;
     uint ao = (w1 >> 0) & 0x3;
     uint sky = (w1 >> 2) & 0xF;
     uint block = (w1 >> 6) & 0xF;

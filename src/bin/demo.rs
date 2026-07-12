@@ -14,9 +14,9 @@ use voxel_engine::{
 
 const CHUNK: u8 = 16;
 /// Texture layer sampled by the demo (layer 0 is the white layer).
-const CHECKER_LAYER: u8 = 1;
+const CHECKER_LAYER: u16 = 1;
 /// Translucent water layer (alpha < 1), used by the transparent-pass mesh.
-const WATER_LAYER: u8 = 2;
+const WATER_LAYER: u16 = 2;
 /// World height of the water plane. Deliberately fractional: the transparent
 /// pass tests depth but doesn't depth-sort (v1), so a water plane coplanar with
 /// the integer block tops would z-fight. Sitting it between integer heights
@@ -24,7 +24,7 @@ const WATER_LAYER: u8 = 2;
 const WATER_LEVEL: f32 = 4.5;
 
 /// A quad, corners wound CCW seen from outside, with neutral (full-bright) AO/light.
-fn push_quad(data: &mut MeshData, corners: [[u8; 3]; 4], normal: Normal, layer: u8) {
+fn push_quad(data: &mut MeshData, corners: [[u8; 3]; 4], normal: Normal, layer: u16) {
     push_quad_lit(data, corners, normal, layer, Ao::NONE, Light::FULL);
 }
 
@@ -32,7 +32,7 @@ fn push_quad_lit(
     data: &mut MeshData,
     corners: [[u8; 3]; 4],
     normal: Normal,
-    layer: u8,
+    layer: u16,
     ao: Ao,
     light: Light,
 ) {
@@ -41,7 +41,7 @@ fn push_quad_lit(
 
 /// A unit cube whose top sits at `y` (so it occupies `y-1..y`), all 6 faces.
 /// `lit` optionally overrides AO/light to prove the word-1 bits modulate.
-fn push_cube(data: &mut MeshData, x: u8, y: u8, z: u8, layer: u8, lit: Option<(Ao, Light)>) {
+fn push_cube(data: &mut MeshData, x: u8, y: u8, z: u8, layer: u16, lit: Option<(Ao, Light)>) {
     let (x1, y1, z1) = (x + 1, y, z + 1);
     let y0 = y - 1;
     let faces: [([[u8; 3]; 4], Normal); 6] = [
