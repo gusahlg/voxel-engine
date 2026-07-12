@@ -647,6 +647,13 @@ impl Renderer {
         self.cull_faces = on;
     }
 
+    /// Replaces this thread's feature-flag copy. Safe mid-run: every flag gates
+    /// per-frame work only (no resource is created conditionally on a flag), so
+    /// the new set simply applies from the next recorded frame.
+    pub fn set_flags(&mut self, flags: crate::engine::RenderFlags) {
+        self.flags = flags;
+    }
+
     /// Requests a render-resolution scale; returns the clamped value that
     /// will apply at the next frame boundary.
     pub fn set_render_scale(&mut self, scale: f32) -> f32 {

@@ -62,6 +62,8 @@ pub(crate) enum RenderCmd {
     Capture(Capture),
     Resize(PhysicalSize<u32>),
     SetVsync(bool),
+    /// Replaces the render thread's feature-flag copy (see [`crate::RenderFlags`]).
+    SetFlags(crate::RenderFlags),
     /// Pre-clamped on main against cached caps.
     SetMsaa(u32),
     SetCullFaces(bool),
@@ -297,6 +299,10 @@ impl RenderClient {
         self.vsync
     }
 
+    pub(crate) fn set_flags(&mut self, flags: crate::RenderFlags) {
+        let _ = self.tx.send(RenderCmd::SetFlags(flags));
+    }
+
     pub(crate) fn set_msaa(&mut self, samples: u32) -> u32 {
         let resolved = clamp_msaa(samples, self.caps.max_msaa);
         self.msaa = resolved;
@@ -448,6 +454,7 @@ fn render_loop(
                 RenderCmd::Capture(capture) => renderer.request_capture(capture),
                 RenderCmd::Resize(size) => renderer.on_resize(size),
                 RenderCmd::SetVsync(v) => renderer.set_vsync(v),
+                RenderCmd::SetFlags(f) => renderer.set_flags(f),
                 RenderCmd::SetMsaa(m) => {
                     renderer.set_msaa(m);
                 }

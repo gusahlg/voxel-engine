@@ -217,6 +217,15 @@ impl Engine {
         self.client.set_vsync(on);
     }
 
+    /// Replaces the render feature flags at runtime (settings menu / console).
+    /// Updates both CPU copies: this thread's gate set and, via the ordered
+    /// command stream, the render thread's — so the change lands atomically at
+    /// the next frame boundary.
+    pub fn set_flags(&mut self, flags: RenderFlags) {
+        self.flags = flags;
+        self.client.set_flags(flags);
+    }
+
     pub fn vsync(&self) -> bool {
         self.client.vsync()
     }
