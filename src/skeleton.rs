@@ -109,32 +109,10 @@ pub fn jitter_at(frame_index: u64) -> JitterOffset {
 pub const FRAME_UNIFORMS_SET: u32 = 0;
 pub const FRAME_UNIFORMS_BINDING: u32 = 2;
 
-/// WIRE form of the game's `FrameSnapshot`. Every field is a `[f32; 4]` so
-/// std140 and scalar layouts cannot diverge. Colors are LINEAR f32
-/// (unclamped — HDR palettes survive). The layout below IS the contract with
-/// `common.slang`'s `FrameUniforms`; the assertions are the enforcement.
-///
-/// Constructed ONLY via the game crate's `From<&FrameSnapshot>` impl.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct FrameUniformsGpu {
-    /// xyz = sun direction (normalized), w = sun elevation (radians).
-    pub sun_dir_elev: [f32; 4],
-    /// rgb = direct light color (linear), w = day_night_mix.
-    pub light: [f32; 4],
-    /// rgb = zenith color (linear), w = turbidity.
-    pub zenith: [f32; 4],
-    /// rgb = horizon color (linear), w = fog density.
-    pub horizon: [f32; 4],
-    /// rgb = blocklight (candle) color (linear), w = ambient floor luma.
-    pub candle: [f32; 4],
-    /// x = exposure, y = dither phase [0,1), zw = jitter in pixels
-    /// (informational; jitter is applied via the matrix — zero until enabled).
-    pub exposure_dither: [f32; 4],
-    /// Reserved for future use. Always zeroed; repurposing a lane bumps
-    /// FRAME_UNIFORMS_VERSION.
-    pub reserved: [f32; 4],
-}
+// `FrameUniformsGpu` (struct + std140 offset static asserts) is GENERATED from
+// the lane_table in build.rs — the twin of `common.slang`'s `FrameUniforms`, so
+// a lane can never drift between CPU and GPU. Edit the table there, not here.
+include!(concat!(env!("OUT_DIR"), "/gen_frame_uniforms.rs"));
 
 impl FrameUniformsGpu {
     /// Fixed neutral "render lit, not black" default: full ambient, valid sun
@@ -149,16 +127,8 @@ impl FrameUniformsGpu {
     }
 }
 
-pub const FRAME_UNIFORMS_VERSION: u32 = 1;
-
-const _: () = assert!(size_of::<FrameUniformsGpu>() == 112);
-const _: () = assert!(std::mem::offset_of!(FrameUniformsGpu, sun_dir_elev) == 0);
-const _: () = assert!(std::mem::offset_of!(FrameUniformsGpu, light) == 16);
-const _: () = assert!(std::mem::offset_of!(FrameUniformsGpu, zenith) == 32);
-const _: () = assert!(std::mem::offset_of!(FrameUniformsGpu, horizon) == 48);
-const _: () = assert!(std::mem::offset_of!(FrameUniformsGpu, candle) == 64);
-const _: () = assert!(std::mem::offset_of!(FrameUniformsGpu, exposure_dither) == 80);
-const _: () = assert!(std::mem::offset_of!(FrameUniformsGpu, reserved) == 96);
+/// Bumped when the lane_table layout changes (v2 added the `anim` lane).
+pub const FRAME_UNIFORMS_VERSION: u32 = 2;
 
 // The host-visible per-frame UBO ring's real home is `vk::uniforms::UboRing`
 // (`write`/`buffer`/`current_slot` implemented there against a persistently
@@ -187,7 +157,7 @@ pub struct ExposureWrite<'a> {
 }
 
 // The double-buffered exposure ring's real home is `vk::exposure::ExposureRing`
-// (parity baked into its `views`; Shader curve + temporal smoothing in
+// (parity baked into its `views`; exposure curve + temporal smoothing in
 // `metered`). The `ExposureRead`/`ExposureWrite` view newtypes above stay here
 // (the real ring borrows them); the frozen opaque `ExposureRing` stub was
 // superseded at merge.
@@ -228,8 +198,8 @@ pub struct CascadeFit {
     pub texel_world: f32,
 }
 
-/// Shadow configuration. Every starting value is MakeUp's formula re-based
-/// and provisional: Phase D's checkpoint finalizes them.
+/// Shadow configuration. Every starting value is a re-based formula and
+/// provisional: Phase D's checkpoint finalizes them.
 pub struct ShadowCfg {
     /// Per-cascade map resolution (one D32 image, 2 layers).
     pub resolution: u32,
@@ -270,12 +240,12 @@ const _: () = assert!(std::mem::offset_of!(CascadeUniformsGpu, splits_fade) == 1
 // ============================================================================
 // ============================================================================
 
-/// FROZEN (Wave-II pre-launch): the history integrator's texel format = the HDR
+/// FROZEN: the history integrator's texel format = the HDR
 /// target's, so reprojected blends stay in unclamped linear. TAA resolves
 /// BEFORE tonemap; history is never an 8-bit sRGB image.
 pub const TAA_HISTORY_FORMAT: ash::vk::Format = ash::vk::Format::R16G16B16A16_SFLOAT;
 
-/// FROZEN pass order (Wave-II pre-launch) — the ONE cross-baseline decision the
+/// FROZEN pass order — the ONE cross-baseline decision the
 /// type system cannot police (wrong order = flicker/ghosting, a SILENT bug, not
 /// a compile error). The TAA resolve consumes the resolved HDR and writes the
 /// stabilized HDR that exposure meters and tonemap reads:
@@ -287,7 +257,7 @@ pub const TAA_HISTORY_FORMAT: ash::vk::Format = ash::vk::Format::R16G16B16A16_SF
 ///   → tonemap (+ post dither)
 /// ```
 ///
-/// Validation test (Wave-II golden): `taa_static_hold` — camera held fixed N
+/// Validation test (golden): `taa_static_hold` — camera held fixed N
 /// frames with TAA on; inter-frame `DiffStats.pct_changed` must converge toward
 /// ~0 (temporal stability); plus an orbit shot with no ghost trail (reprojection
 /// check). These catch a mis-ordered resolve that

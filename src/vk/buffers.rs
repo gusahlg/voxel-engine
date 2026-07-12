@@ -14,9 +14,8 @@ use std::num::NonZeroU32;
 
 use super::alloc::{Allocation, GpuAllocator, find_memory_type};
 use super::timeline::TimelineValue;
-use crate::frame::{MeshDraw, SurfaceDraw};
+use crate::frame::MeshDraw;
 use crate::mesh::{MeshData, MeshHandle, Pass};
-use crate::surface::{SurfaceData, SurfaceHandle, SurfaceVertex};
 
 /// GPU storage-buffer offset alignment; the 256 half of `MESH_ALIGN`.
 const GPU_OFFSET_ALIGN: u64 = 256;
@@ -87,8 +86,7 @@ impl<T> RetireQueue<T> {
 /// Vertex stride shared by the mesh pipelines (must divide [`MESH_ALIGN`]).
 const VERTEX_STRIDE: u64 = std::mem::size_of::<crate::mesh::MeshVertex>() as u64;
 
-/// Sealed bridge letting one generic [`HandleAllocator`] mint either handle
-/// type, so mesh and surface identity share exactly one implementation.
+/// Bridge letting [`HandleAllocator`] mint handles generically.
 pub(crate) trait GpuHandle: Copy {
     fn from_parts(slot: u32, generation: NonZeroU32) -> Self;
     fn slot(self) -> u32;
@@ -107,18 +105,6 @@ impl GpuHandle for MeshHandle {
     }
 }
 
-impl GpuHandle for SurfaceHandle {
-    fn from_parts(slot: u32, generation: NonZeroU32) -> Self {
-        SurfaceHandle { slot, generation }
-    }
-    fn slot(self) -> u32 {
-        self.slot
-    }
-    fn generation(self) -> NonZeroU32 {
-        self.generation
-    }
-}
-
 /// Bumps a 1-based generation, skipping the reserved 0 niche on wrap so a
 /// recycled slot never reuses a live handle's generation (and never hits 0).
 fn bump_generation(g: NonZeroU32) -> NonZeroU32 {
@@ -128,7 +114,7 @@ fn bump_generation(g: NonZeroU32) -> NonZeroU32 {
 /// The single main-thread authority for handle identity + culling metadata.
 /// Mints generational handles, recycles freed slots, and answers record-time
 /// metadata lookups. Holds NO Vulkan resources — those live render-side in the
-/// residency mirror ([`MeshResidency`]/[`SurfaceResidency`]).
+/// residency mirror ([`MeshResidency`]).
 pub(crate) struct HandleAllocator<H: GpuHandle, M> {
     meta: Vec<Option<M>>,
     /// 1-based; bumped (never to 0) when a slot is freed.
@@ -201,7 +187,6 @@ impl<H: GpuHandle, M: Copy> HandleAllocator<H, M> {
 }
 
 pub(crate) type MeshHandles = HandleAllocator<MeshHandle, MeshMeta>;
-pub(crate) type SurfaceHandles = HandleAllocator<SurfaceHandle, SurfaceMeta>;
 
 /// Main-owned, `Send + Copy` culling/draw metadata for one mesh — NO Vulkan
 /// handles. The record path reads this to frustum-cull and embeds the draw
@@ -210,9 +195,10 @@ pub(crate) type SurfaceHandles = HandleAllocator<SurfaceHandle, SurfaceMeta>;
 pub(crate) struct MeshMeta {
     pub aabb_min: Vec3,
     pub aabb_max: Vec3,
-    /// Seven absolute first-index boundaries: `bounds[dir]..bounds[dir+1]` is
-    /// direction `dir`'s index range and `bounds[0]..bounds[6]` the whole mesh.
-    /// Always increasing (see [`build_mesh_resident`]).
+    /// Seven local (0-based) index boundaries into the shared quad IBO:
+    /// `bounds[dir]..bounds[dir+1]` is direction `dir`'s range (cumulative
+    /// `6*quads` in Normal order) and `bounds[0]..bounds[6]` the whole mesh.
+    /// `bounds[0]` is always 0; always increasing (see [`build_mesh_resident`]).
     pub bounds: [u32; 7],
     /// First vertex (in vertices from block start); the command's `vertex_offset`.
     pub vertex_offset: i32,
@@ -220,22 +206,6 @@ pub(crate) struct MeshMeta {
 }
 
 impl MeshMeta {
-    pub fn aabb(&self) -> (Vec3, Vec3) {
-        (self.aabb_min, self.aabb_max)
-    }
-}
-
-/// Main-owned, `Send + Copy` metadata for one colored surface.
-#[derive(Clone, Copy)]
-pub(crate) struct SurfaceMeta {
-    pub aabb_min: Vec3,
-    pub aabb_max: Vec3,
-    pub index_first: u32,
-    pub index_count: u32,
-    pub vertex_offset: i32,
-}
-
-impl SurfaceMeta {
     pub fn aabb(&self) -> (Vec3, Vec3) {
         (self.aabb_min, self.aabb_max)
     }
@@ -249,7 +219,7 @@ struct PendingCopy {
     size: u64,
 }
 
-/// Render-owned GPU residency for one mesh/surface: the device buffer plus its
+/// Render-owned GPU residency for one mesh: the device buffer plus its
 /// deferred staging copy. `Send` because [`Allocation`] is now `Send`.
 pub(crate) struct GpuResident {
     alloc: Allocation,
@@ -260,6 +230,7 @@ pub(crate) struct GpuResident {
 /// the main-owned [`MeshMeta`] plus render-owned [`GpuResident`]. Main-thread
 /// only: touches the allocator + persistent mapping, never the timeline.
 /// `None` on empty data or OOM (the partial device alloc is freed on failure).
+/// Stores vertices only; indices are the shared per-quad pattern in [`QuadIbo`].
 pub(crate) unsafe fn build_mesh_resident(
     device: &ash::Device,
     allocator: &mut GpuAllocator,
@@ -270,23 +241,32 @@ pub(crate) unsafe fn build_mesh_resident(
         return None;
     }
 
-    let vertex_bytes: &[u8] = bytemuck::cast_slice(&data.vertices);
-    let index_start = (vertex_bytes.len() as u64).next_multiple_of(4);
-    let index_bytes_len = total_indices * std::mem::size_of::<u32>();
-    let total = index_start + index_bytes_len as u64;
+    // Permuted pool holds the same vertices reordered by bucket then quad; every
+    // vertex belongs to exactly one quad, so its length equals `data.vertices`.
+    let vertex_bytes_len = data.vertices.len() * VERTEX_STRIDE as usize;
+    let total = vertex_bytes_len as u64;
 
     let alloc = unsafe { allocator.alloc_device(device, total, MESH_ALIGN) }
         .map_err(|err| log::error!("mesh allocation failed: {err:?}"))
         .ok()?;
 
     let write_into = |dst: *mut u8| unsafe {
-        std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), dst, vertex_bytes.len());
-        let mut cursor = index_start as usize;
+        let mut cursor = 0usize;
         for bucket in &data.buckets {
-            let bytes: &[u8] = bytemuck::cast_slice(bucket);
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(cursor), bytes.len());
-            cursor += bytes.len();
+            debug_assert_eq!(bucket.len() % 6, 0, "each quad contributes 6 indices");
+            for quad in bucket.chunks_exact(6) {
+                let b = quad[0];
+                debug_assert_eq!(
+                    *quad,
+                    [b, b + 1, b + 2, b, b + 2, b + 3],
+                    "non-pattern quad indices break the shared-IBO permutation"
+                );
+                let verts: &[u8] = bytemuck::cast_slice(&data.vertices[b as usize..b as usize + 4]);
+                std::ptr::copy_nonoverlapping(verts.as_ptr(), dst.add(cursor), verts.len());
+                cursor += verts.len();
+            }
         }
+        debug_assert_eq!(cursor, vertex_bytes_len, "permutation must cover every vertex");
     };
 
     let copy = if let Some(mapped) = alloc.mapped {
@@ -325,16 +305,17 @@ pub(crate) unsafe fn build_mesh_resident(
     const _: () =
         assert!(MESH_ALIGN.is_multiple_of(VERTEX_STRIDE) && MESH_ALIGN.is_multiple_of(256));
     debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
-    debug_assert_eq!((alloc.offset + index_start) % 4, 0);
     let vertex_offset = (alloc.offset / VERTEX_STRIDE) as i32;
-    let first_index = ((alloc.offset + index_start) / 4) as u32;
 
-    let mut bounds = [first_index; 7];
+    // Local, 0-based index boundaries into the shared quad IBO: `bounds[dir]` is
+    // the cumulative `6*quads` before face `dir` (Normal order). The IBO's index
+    // value at position `6j` is `4j`, and quad `j` sits at vertices `4j..4j+4`, so
+    // adding the unchanged `vertex_offset` base reproduces the old vertex fetches.
+    let mut bounds = [0u32; 7];
     for dir in 0..6 {
         bounds[dir + 1] = bounds[dir] + data.buckets[dir].len() as u32;
     }
-    debug_assert!(bounds.windows(2).all(|w| w[0] <= w[1]));
-    debug_assert_eq!(bounds[6], first_index + total_indices as u32);
+    debug_assert_eq!(bounds[6], total_indices as u32);
 
     let meta = MeshMeta {
         aabb_min,
@@ -494,227 +475,6 @@ impl MeshResidency {
         self.retire.collect_all(|alloc| recycle(alloc));
         self.pending.clear();
         self.live = 0;
-    }
-}
-
-/// Surface vertex stride (unpacked `SurfaceVertex`: pos f32×3 + RGBA8 = 16 B).
-const SURFACE_STRIDE: u64 = std::mem::size_of::<SurfaceVertex>() as u64;
-
-/// Suballocation alignment for surfaces: 256 bytes. This ensures that vertex
-/// offsets can be correctly derived from buffer offsets.
-const SURFACE_ALIGN: u64 = {
-    let g = gcd(SURFACE_STRIDE, GPU_OFFSET_ALIGN);
-    SURFACE_STRIDE / g * GPU_OFFSET_ALIGN
-};
-const _: () = {
-    assert!(SURFACE_ALIGN == 256);
-    assert!(SURFACE_ALIGN % SURFACE_STRIDE == 0);
-};
-
-/// Allocates a device buffer for `data`, writes/stages its bytes, and returns
-/// the main-owned [`SurfaceMeta`] plus render-owned [`GpuResident`]. Main-thread
-/// only. `None` on empty data or OOM (partial alloc freed on failure).
-pub(crate) unsafe fn build_surface_resident(
-    device: &ash::Device,
-    allocator: &mut GpuAllocator,
-    data: &SurfaceData,
-) -> Option<(SurfaceMeta, GpuResident)> {
-    if data.verts.is_empty() || data.indices.is_empty() {
-        return None;
-    }
-
-    let vertex_bytes: &[u8] = bytemuck::cast_slice(&data.verts);
-    let index_bytes: &[u8] = bytemuck::cast_slice(&data.indices);
-    // 16-byte stride naturally keeps index data 4-byte aligned.
-    let index_start = (vertex_bytes.len() as u64).next_multiple_of(4);
-    let total = index_start + index_bytes.len() as u64;
-
-    let alloc = unsafe { allocator.alloc_device(device, total, SURFACE_ALIGN) }
-        .map_err(|err| log::error!("surface allocation failed: {err:?}"))
-        .ok()?;
-
-    let write_into = |dst: *mut u8| unsafe {
-        std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), dst, vertex_bytes.len());
-        std::ptr::copy_nonoverlapping(
-            index_bytes.as_ptr(),
-            dst.add(index_start as usize),
-            index_bytes.len(),
-        );
-    };
-
-    let copy = if let Some(mapped) = alloc.mapped {
-        write_into(mapped.as_ptr());
-        None
-    } else {
-        let staging = match unsafe { allocator.alloc_staging(device, total, 4) } {
-            Ok(staging) => staging,
-            Err(err) => {
-                log::error!("surface staging allocation failed: {err:?}");
-                unsafe { allocator.free(alloc) };
-                return None;
-            }
-        };
-        let mapped = staging
-            .mapped
-            .expect("staging memory is always host-visible");
-        write_into(mapped.as_ptr());
-        Some(PendingCopy {
-            dst_buffer: alloc.buffer,
-            dst_offset: alloc.offset,
-            size: total,
-            staging,
-        })
-    };
-
-    let mut aabb_min = Vec3::splat(f32::INFINITY);
-    let mut aabb_max = Vec3::splat(f32::NEG_INFINITY);
-    for v in &data.verts {
-        let p = Vec3::from_array(v.pos);
-        aabb_min = aabb_min.min(p);
-        aabb_max = aabb_max.max(p);
-    }
-
-    debug_assert_eq!(alloc.offset % SURFACE_STRIDE, 0);
-    debug_assert_eq!((alloc.offset + index_start) % 4, 0);
-    let vertex_offset = (alloc.offset / SURFACE_STRIDE) as i32;
-    let first_index = ((alloc.offset + index_start) / 4) as u32;
-
-    let meta = SurfaceMeta {
-        aabb_min,
-        aabb_max,
-        index_first: first_index,
-        index_count: data.indices.len() as u32,
-        vertex_offset,
-    };
-    Some((meta, GpuResident { alloc, copy }))
-}
-
-/// Render-side residency mirror for surfaces — the surface analogue of
-/// [`MeshResidency`] (16-byte stride, one index range, always opaque).
-pub(crate) struct SurfaceResidency {
-    slots: Vec<Option<GpuResident>>,
-    generations: Vec<NonZeroU32>,
-    pending: Vec<u32>,
-    retire: RetireQueue<Allocation>,
-}
-
-impl SurfaceResidency {
-    pub fn new() -> Self {
-        Self {
-            slots: Vec::new(),
-            generations: Vec::new(),
-            pending: Vec::new(),
-            retire: RetireQueue::new(),
-        }
-    }
-
-    fn ensure_slot(&mut self, i: usize) {
-        if self.slots.len() <= i {
-            self.slots.resize_with(i + 1, || None);
-            self.generations.resize(i + 1, NonZeroU32::MIN);
-        }
-    }
-
-    pub fn apply_upload(&mut self, slot: u32, generation: NonZeroU32, resident: GpuResident) {
-        let i = slot as usize;
-        self.ensure_slot(i);
-        if resident.copy.is_some() {
-            self.pending.push(slot);
-        }
-        self.slots[i] = Some(resident);
-        self.generations[i] = generation;
-    }
-
-    pub fn apply_free(&mut self, slot: u32, generation: NonZeroU32, done_at: TimelineValue) {
-        let i = slot as usize;
-        if self.generations.get(i).copied() != Some(generation) {
-            return;
-        }
-        if let Some(res) = self.slots.get_mut(i).and_then(Option::take) {
-            self.retire.push(done_at, res.alloc);
-            if let Some(copy) = res.copy {
-                self.retire.push(done_at, copy.staging);
-            }
-        }
-    }
-
-    pub fn resolve(&self, d: &SurfaceDraw) -> Option<vk::Buffer> {
-        let i = d.slot as usize;
-        if *self.generations.get(i)? != d.generation {
-            return None;
-        }
-        Some(self.slots.get(i)?.as_ref()?.alloc.buffer)
-    }
-
-    /// Records staged uploads into `cmd`. Returns true if a barrier was emitted.
-    pub unsafe fn flush_copies(
-        &mut self,
-        device: &ash::Device,
-        cmd: vk::CommandBuffer,
-        done_at: TimelineValue,
-    ) -> bool {
-        if self.pending.is_empty() {
-            return false;
-        }
-        let mut any = false;
-        unsafe {
-            for slot in std::mem::take(&mut self.pending) {
-                let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) else {
-                    continue;
-                };
-                let Some(copy) = res.copy.take() else { continue };
-                let region = vk::BufferCopy::default()
-                    .src_offset(copy.staging.offset)
-                    .dst_offset(copy.dst_offset)
-                    .size(copy.size);
-                device.cmd_copy_buffer(cmd, copy.staging.buffer, copy.dst_buffer, &[region]);
-                self.retire.push(done_at, copy.staging);
-                any = true;
-            }
-            if any {
-                let barrier = [vk::MemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
-                    .dst_access_mask(
-                        vk::AccessFlags2::VERTEX_ATTRIBUTE_READ | vk::AccessFlags2::INDEX_READ,
-                    )];
-                device.cmd_pipeline_barrier2(
-                    cmd,
-                    &vk::DependencyInfo::default().memory_barriers(&barrier),
-                );
-            }
-        }
-        any
-    }
-
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
-    pub fn has_garbage(&self) -> bool {
-        !self.retire.is_empty()
-    }
-
-    pub fn collect(&mut self, current: TimelineValue, recycle: &mut impl FnMut(Allocation)) {
-        self.retire.collect(current, |alloc| recycle(alloc));
-    }
-
-    pub fn collect_all(&mut self, recycle: &mut impl FnMut(Allocation)) {
-        self.retire.collect_all(|alloc| recycle(alloc));
-    }
-
-    pub fn destroy_all(&mut self, recycle: &mut impl FnMut(Allocation)) {
-        for slot in self.slots.iter_mut() {
-            if let Some(res) = slot.take() {
-                recycle(res.alloc);
-                if let Some(copy) = res.copy {
-                    recycle(copy.staging);
-                }
-            }
-        }
-        self.retire.collect_all(|alloc| recycle(alloc));
-        self.pending.clear();
     }
 }
 
@@ -878,6 +638,179 @@ impl HostBuffer {
     }
 }
 
+/// Engine-wide shared quad index buffer: the invariant per-quad pattern
+/// `[4q, 4q+1, 4q+2, 4q, 4q+2, 4q+3]` stored once and grown on demand.
+pub(crate) struct QuadIbo {
+    /// `VK_NULL_HANDLE` until the first grow; read only through [`Self::bound`].
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    /// Quads the current buffer can index; 0 until first allocation.
+    capacity: u32,
+    /// High-water quad count requested across all uploads (monotonic).
+    required: u32,
+    /// Superseded buffers, freed once the timeline passes their last use.
+    retire: RetireQueue<(vk::Buffer, vk::DeviceMemory)>,
+}
+
+/// Initial capacity in quads.
+const QUAD_IBO_MIN_QUADS: u32 = 1 << 16;
+/// Six indices per quad — the fixed `quad()` pattern width.
+const INDICES_PER_QUAD: u32 = 6;
+
+impl QuadIbo {
+    pub fn new() -> Self {
+        Self {
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            capacity: 0,
+            required: 0,
+            retire: RetireQueue::new(),
+        }
+    }
+
+    /// The device buffer, or `None` before the first grow. A recorded draw run
+    /// implies a mesh was uploaded (which raised `required`), so [`Self::ensure`]
+    /// has since allocated it — callers `.expect` it there.
+    pub fn bound(&self) -> Option<vk::Buffer> {
+        (self.buffer != vk::Buffer::null()).then_some(self.buffer)
+    }
+
+    /// Raises the required capacity to cover a newly-uploaded mesh's quad count.
+    pub fn require(&mut self, quads: u32) {
+        self.required = self.required.max(quads);
+    }
+
+    /// Grows the buffer to cover `required` quads if needed, staging the pattern
+    /// on `cmd` (ordered before any index read by a barrier) and retiring the old
+    /// buffer past `done_at`. No-op when the current buffer already suffices.
+    pub unsafe fn ensure(
+        &mut self,
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical: vk::PhysicalDevice,
+        cmd: vk::CommandBuffer,
+        done_at: TimelineValue,
+    ) {
+        if self.required <= self.capacity {
+            return;
+        }
+        let new_capacity = self.required.next_power_of_two().max(QUAD_IBO_MIN_QUADS);
+        let index_count = new_capacity as u64 * INDICES_PER_QUAD as u64;
+        let size = index_count * std::mem::size_of::<u32>() as u64;
+        let memory_props =
+            unsafe { instance.get_physical_device_memory_properties(physical) };
+
+        // Device-local destination for the pattern.
+        let (buffer, memory) = unsafe {
+            create_raw_buffer(
+                device,
+                &memory_props,
+                size,
+                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+        };
+
+        // Host-visible staging: fill the pattern, copy, then retire it — a static
+        // one-shot upload, so it need not linger like the per-slot HostBuffers do.
+        let (staging, staging_mem) = unsafe {
+            create_raw_buffer(
+                device,
+                &memory_props,
+                size,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+        };
+        unsafe {
+            let ptr = device
+                .map_memory(staging_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .expect("map quad IBO staging") as *mut u32;
+            for q in 0..new_capacity {
+                let b = q * 4;
+                let base = ptr.add(q as usize * INDICES_PER_QUAD as usize);
+                for (i, &v) in [b, b + 1, b + 2, b, b + 2, b + 3].iter().enumerate() {
+                    base.add(i).write(v);
+                }
+            }
+            device.unmap_memory(staging_mem);
+
+            let region = vk::BufferCopy::default().size(size);
+            device.cmd_copy_buffer(cmd, staging, buffer, &[region]);
+            let barrier = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
+                .dst_access_mask(vk::AccessFlags2::INDEX_READ)];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&barrier),
+            );
+        }
+
+        if self.capacity > 0 {
+            self.retire.push(done_at, (self.buffer, self.memory));
+        }
+        self.retire.push(done_at, (staging, staging_mem));
+        self.buffer = buffer;
+        self.memory = memory;
+        self.capacity = new_capacity;
+    }
+
+    /// Destroys superseded buffers the GPU has provably finished reading.
+    pub unsafe fn collect(&mut self, device: &ash::Device, current: TimelineValue) {
+        self.retire.collect(current, |(buffer, memory)| unsafe {
+            device.destroy_buffer(buffer, None);
+            device.free_memory(memory, None);
+        });
+    }
+
+    /// Destroys the live buffer and every retired one (GPU idle, at teardown).
+    pub unsafe fn destroy(&mut self, device: &ash::Device) {
+        unsafe {
+            self.retire.collect_all(|(buffer, memory)| {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            });
+            if self.buffer != vk::Buffer::null() {
+                device.destroy_buffer(self.buffer, None);
+                device.free_memory(self.memory, None);
+                self.buffer = vk::Buffer::null();
+            }
+        }
+    }
+}
+
+/// Creates a standalone buffer + bound memory of the given usage/properties.
+/// For one-off engine buffers outside the suballocator (the quad IBO); mesh
+/// storage still goes through [`GpuAllocator`].
+unsafe fn create_raw_buffer(
+    device: &ash::Device,
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+    usage: vk::BufferUsageFlags,
+    properties: vk::MemoryPropertyFlags,
+) -> (vk::Buffer, vk::DeviceMemory) {
+    unsafe {
+        let info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = device.create_buffer(&info, None).expect("create buffer");
+        let req = device.get_buffer_memory_requirements(buffer);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(find_memory_type(memory_props, req.memory_type_bits, properties));
+        let memory = device
+            .allocate_memory(&alloc_info, None)
+            .expect("allocate buffer memory");
+        device
+            .bind_buffer_memory(buffer, memory, 0)
+            .expect("bind buffer memory");
+        (buffer, memory)
+    }
+}
+
 /// Per-draw translation and scale. Naming `scale` (not `w`) avoids silent zeroing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -928,9 +861,16 @@ const _: () = {
 };
 
 /// 3D pipeline push-descriptor set: binding 0 = offsets SSBO (vertex),
-/// binding 1 = texture array (fragment), binding 2 = per-frame UBO (both).
-pub fn create_mesh3d_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout {
-    let bindings = [
+/// binding 1 = texture array (fragment), binding 2 = per-frame UBO (both),
+/// binding 3 = cascade UBO, binding 4 = shadow map. When `local_read` is set,
+/// binding 5 = the scene depth as an input attachment (fragment), read by the
+/// water-absorption blend variant; the opaque/sky pipelines share this layout
+/// but never touch binding 5 (push descriptors bind only what a shader uses).
+pub fn create_mesh3d_set_layout(
+    device: &ash::Device,
+    local_read: bool,
+) -> vk::DescriptorSetLayout {
+    let mut bindings = vec![
         vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -957,6 +897,15 @@ pub fn create_mesh3d_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
     ];
+    if local_read {
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        );
+    }
     let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
         .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
         .bindings(&bindings);
@@ -1023,6 +972,30 @@ pub fn push_mesh3d_descriptors(
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&shadow_infos),
     ];
+    unsafe {
+        push.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &writes);
+    }
+}
+
+/// Pushes only binding 5 (the scene depth as an input attachment) for the water
+/// depth-absorption blend variant. Layered on top of an already-pushed 0-4 set
+/// (same compatible layout, so the earlier writes stay live). The depth image is
+/// the current depth attachment, so its descriptor layout matches the
+/// attachment's `DEPTH_ATTACHMENT_OPTIMAL` (dynamic_rendering_local_read reads it
+/// in place — the blend pipeline never writes depth).
+pub fn push_depth_input_attachment(
+    push: &khr::push_descriptor::Device,
+    cmd: vk::CommandBuffer,
+    layout: vk::PipelineLayout,
+    depth_view: vk::ImageView,
+) {
+    let image_infos = [vk::DescriptorImageInfo::default()
+        .image_view(depth_view)
+        .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)];
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_binding(5)
+        .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
+        .image_info(&image_infos)];
     unsafe {
         push.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &writes);
     }

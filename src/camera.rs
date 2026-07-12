@@ -125,13 +125,66 @@ impl WarpMap {
         }
     }
 
-    /// GPU push bytes for the tonemap remap. Identity yields `s = 0` so the frag's
-    /// `s <= 0` branch is a no-op (rectilinear stays byte-identical).
+    /// GPU push bytes for tonemap remap. Identity yields `s = 0` so the frag skips
+    /// remapping. Godray carries sun's screen position; all-zero disables march.
     #[inline]
-    pub fn push(&self, exposure: f32, dither_phase: f32) -> WarpPush {
-        match self {
-            WarpMap::Identity => WarpPush { exposure, s: 0.0, atan_s: 0.0, dither_phase },
-            WarpMap::Active { s, atan_s } => WarpPush { exposure, s: *s, atan_s: *atan_s, dither_phase },
+    pub fn push(&self, exposure: f32, dither_phase: f32, godray: Godray) -> WarpPush {
+        let (s, atan_s) = match self {
+            WarpMap::Identity => (0.0, 0.0),
+            WarpMap::Active { s, atan_s } => (*s, *atan_s),
+        };
+        WarpPush {
+            exposure,
+            s,
+            atan_s,
+            dither_phase,
+            godray0: [godray.sun_uv[0], godray.sun_uv[1], godray.strength, 0.0],
+            godray1: [godray.tint[0], godray.tint[1], godray.tint[2], 0.0],
+        }
+    }
+}
+
+/// Per-frame godray inputs: sun's screen position, strength gate (1 = draw, 0 = off),
+/// and linear sun tint. Disables when sun is behind camera or strength = 0.
+#[derive(Clone, Copy, Debug)]
+pub struct Godray {
+    pub sun_uv: [f32; 2],
+    pub strength: f32,
+    pub tint: [f32; 3],
+}
+
+impl Godray {
+    /// The disabled/no-op value: `strength = 0` skips the march entirely.
+    pub const OFF: Self = Self { sun_uv: [0.0, 0.0], strength: 0.0, tint: [0.0, 0.0, 0.0] };
+
+    /// Projects sun to screen position and gates the veil. Returns
+    /// [`Godray::OFF`] when disabled or sun is behind camera (w <= 0).
+    /// `sun_dir` is world-space direction to the sun; `tint` is its colour.
+    pub fn project(
+        enabled: bool,
+        sun_dir: Vec3,
+        tint: [f32; 3],
+        cam: &Camera3D,
+        screen_w: f32,
+        screen_h: f32,
+    ) -> Self {
+        if !enabled {
+            return Self::OFF;
+        }
+        // A far point along the sun direction stands in for the sun at infinity.
+        let sun_point = cam.position + sun_dir.normalize_or_zero() * 1.0e6;
+        let warp = WarpMap::from_lens(cam.lens);
+        let source_aspect = Aspect(screen_w / screen_h.max(1.0)).source(&warp);
+        let clip = cam.view_proj(source_aspect.get()) * sun_point.extend(1.0);
+        // Reversed-Z: w <= 0 means behind camera.
+        if clip.w <= 0.0 {
+            return Self::OFF;
+        }
+        let px = world_to_screen(sun_point, cam, screen_w, screen_h);
+        Self {
+            sun_uv: [px.x / screen_w, px.y / screen_h],
+            strength: 1.0,
+            tint,
         }
     }
 }
@@ -148,6 +201,10 @@ pub struct WarpPush {
     /// Ordered-dither temporal phase (`DITHER_PHASE_16[frame % 16]`), fed to the
     /// tonemap frag's post-tonemap dither. Trailing lane (ABI-appended).
     pub dither_phase: f32,
+    /// Godray march: sun screen uv (xy), strength gate (z, 0 = no rays), pad (w).
+    pub godray0: [f32; 4],
+    /// Godray sun tint: veil colour (rgb), pad (w).
+    pub godray1: [f32; 4],
 }
 
 /// Perspective camera, raylib-parity: `fovy` is the vertical field of view in

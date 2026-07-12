@@ -13,13 +13,12 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
 
 use crate::camera::{self, Camera3D};
-use crate::color::Color;
+use crate::color::LinearRgb;
 use crate::font;
 use crate::frame::{DrawLists, Frame};
 use crate::input::{InputState, Key, MouseButton};
 use crate::mesh::{MeshData, MeshHandle};
-use crate::surface::{SurfaceData, SurfaceHandle};
-use crate::vk::render_client::RenderClient;
+use crate::vk::render_client::{Capture, RenderClient};
 
 #[derive(Clone)]
 pub struct Config {
@@ -41,6 +40,8 @@ pub struct Config {
     pub render_scale: f32,
     pub resizable: bool,
     pub fullscreen: bool,
+    /// CPU-side render feature flags (app is the single source; see [`RenderFlags`]).
+    pub flags: RenderFlags,
 }
 
 impl Default for Config {
@@ -55,53 +56,58 @@ impl Default for Config {
             render_scale: 1.0,
             resizable: true,
             fullscreen: false,
+            flags: RenderFlags::default(),
         }
     }
 }
 
-/// Env-gated render feature flags, read ONCE per process. `WATT_X=0` disables,
-/// `WATT_X=1` enables, unset takes the default. All gates are CPU-side: they
-/// neutralize a `FrameUniforms` lane (`frame::gate_uniforms`, applied to
-/// `Lighting::Composed`) or skip a pass's work (vk/mod.rs, vk/shadow.rs) — no
-/// shader variants.
-pub(crate) struct RenderFlags {
-    /// WATT_TAA (default OFF): camera jitter + TAA resolve, always coupled.
+/// CPU-side render feature flags, carried in [`Config`] and threaded to both the
+/// main thread ([`Engine`]) and the render thread ([`crate::vk::Renderer`]) at
+/// construction — the app is the single source (no ambient env state). All gates
+/// are CPU-side: they neutralize a `FrameUniforms` lane (`frame::gate_uniforms`,
+/// applied to `Lighting::Composed`) or skip a pass's work (vk/mod.rs,
+/// vk/shadow.rs) — no shader variants.
+#[derive(Clone, Copy)]
+pub struct RenderFlags {
+    /// Camera jitter + TAA resolve, always coupled.
     pub taa: bool,
-    /// WATT_FOG (default OFF): distance fog (`horizon.w` density).
+    /// Distance fog (`horizon.w` density).
     pub fog: bool,
-    /// WATT_BLOCKLIGHT: torch/candle light (`candle.rgb`).
+    /// Torch/candle light (`candle.rgb`).
     pub blocklight: bool,
-    /// WATT_AMBIENT (default OFF): omni ambient floor (`candle.w`) — off means black caves.
+    /// Omni ambient floor (`candle.w`) — off means black caves.
     pub ambient: bool,
-    /// WATT_SUNLIGHT: sun/skylight (`light.rgb`), also kills the sky halo glow.
+    /// Sun/skylight (`light.rgb`), also kills the sky halo glow.
     pub sunlight: bool,
-    /// WATT_EXPOSURE (default OFF): auto-exposure metering; off pins exposure at 1.0.
+    /// Auto-exposure metering; off pins exposure at 1.0.
     pub exposure: bool,
-    /// WATT_SHADOWS (default OFF): cascade occluder draws + far-field fallback; off is fully lit.
+    /// HDR bloom (threshold + downsample compute → tonemap composite). Off skips
+    /// the dispatch and clears the bloom target so the tonemap add is a no-op.
+    pub bloom: bool,
+    /// Screen-space godrays: volumetric sun rays in tonemap. Off disables them.
+    pub godrays: bool,
+    /// Cascade occluder draws + far-field fallback; off is fully lit.
     pub shadows: bool,
-    /// WATT_SKY: procedural sky background pass; off shows the clear colour.
+    /// Procedural sky background pass; off shows the clear colour.
     pub sky: bool,
 }
 
-pub(crate) fn render_flags() -> &'static RenderFlags {
-    fn flag(name: &str, default: bool) -> bool {
-        match std::env::var(name).as_deref() {
-            Ok("0") => false,
-            Ok("1") => true,
-            _ => default,
+impl Default for RenderFlags {
+    /// The shipped defaults (formerly the `WATT_*` unset-defaults).
+    fn default() -> Self {
+        Self {
+            taa: false,
+            fog: false,
+            blocklight: false,
+            ambient: false,
+            sunlight: true,
+            exposure: false,
+            bloom: true,
+            godrays: true,
+            shadows: false,
+            sky: true,
         }
     }
-    static FLAGS: std::sync::OnceLock<RenderFlags> = std::sync::OnceLock::new();
-    FLAGS.get_or_init(|| RenderFlags {
-        taa: flag("WATT_TAA", false),
-        fog: flag("WATT_FOG", false),
-        blocklight: flag("WATT_BLOCKLIGHT", false),
-        ambient: flag("WATT_AMBIENT", false),
-        sunlight: flag("WATT_SUNLIGHT", true),
-        exposure: flag("WATT_EXPOSURE", false),
-        shadows: flag("WATT_SHADOWS", false),
-        sky: flag("WATT_SKY", true),
-    })
 }
 
 pub struct Engine {
@@ -115,6 +121,10 @@ pub struct Engine {
     pub(crate) input: InputState,
     /// The frame being recorded; swapped with a pooled buffer each frame.
     pub(crate) lists: Box<DrawLists>,
+    /// CPU-side feature flags for the main/record thread (fog/blocklight/etc gate
+    /// `gate_uniforms`; `taa` gates jitter injection). The render thread holds its
+    /// own copy on `Renderer`. Both are set from `Config::flags` at construction.
+    pub(crate) flags: RenderFlags,
     /// The most recently submitted frame's draw lists, retained so a blocking
     /// deterministic capture ([`crate::screenshot_to`]) can re-present the same
     /// scene until the readback PNG lands instead of a blank frame.
@@ -140,6 +150,7 @@ impl Engine {
             window,
             input: InputState::new(),
             lists,
+            flags: config.flags,
             last_lists: Box::new(DrawLists::new()),
             target_fps: config.target_fps,
             frame_start: Instant::now(),
@@ -167,16 +178,6 @@ impl Engine {
     }
 
     /// Measured frames per second, averaged over a short window.
-    /// Whether temporal AA is enabled (off by default; `WATT_TAA=1` enables). ONE flag read
-    /// once: it gates BOTH the sub-pixel camera jitter injection (frame.rs
-    /// `begin_3d`) and the TAA resolve pass (vk/mod.rs) — the two must never
-    /// disagree (jitter without the resolve is permanent whole-frame shimmer;
-    /// the resolve without jitter is a harmless no-op blur). Diagnostic gate;
-    /// a real `gfx taa` toggle can replace it later.
-    pub(crate) fn taa_enabled() -> bool {
-        render_flags().taa
-    }
-
     pub fn fps(&self) -> i32 {
         self.fps_cached
     }
@@ -321,24 +322,6 @@ impl Engine {
         self.client.free_mesh(handle);
     }
 
-    // ---- retained colored surfaces (Zone-3 far skin) ----
-
-    /// Uploads a colored surface mesh; drawable the same frame. Returns `None`
-    /// on allocation failure (the app leaves the column unclaimed and retries).
-    pub fn upload_surface(&mut self, data: &SurfaceData) -> Option<SurfaceHandle> {
-        self.client.upload_surface(data)
-    }
-
-    /// Frees a surface mesh. Safe while the GPU still uses it (deferred).
-    pub fn free_surface(&mut self, handle: SurfaceHandle) {
-        self.client.free_surface(handle);
-    }
-
-    /// The surface's local-space AABB (`min`, `max`), or `None` if freed.
-    pub fn surface_aabb(&self, handle: SurfaceHandle) -> Option<(Vec3, Vec3)> {
-        self.client.surface_aabb(handle)
-    }
-
     // ---- screenshots ----
 
     /// Captures the next presented frame (exactly what is shown) to a
@@ -347,7 +330,8 @@ impl Engine {
     /// `None` if the directory can't be created.
     pub fn screenshot(&mut self) -> Option<std::path::PathBuf> {
         let path = crate::screenshot::next_path()?;
-        self.client.request_screenshot(path.clone());
+        // Interactive path: no reply awaited (best-effort, fire-and-forget).
+        self.client.request_capture(Capture { path: path.clone(), reply: None });
         Some(path)
     }
 
@@ -391,7 +375,7 @@ impl Engine {
 
     // ---- drawing ----
 
-    pub fn begin_frame(&mut self, clear: Color) -> Frame<'_> {
+    pub fn begin_frame(&mut self, clear: LinearRgb) -> Frame<'_> {
         self.lists.clear = clear;
         Frame { eng: self }
     }
@@ -425,11 +409,17 @@ impl Engine {
         self.client.submit_frame(next);
     }
 
-    /// Requests that the next presented frame be captured to `path` (async
-    /// write on the render thread); see [`crate::screenshot_to`] for the
-    /// blocking wrapper.
-    pub(crate) fn request_screenshot_to(&mut self, path: std::path::PathBuf) {
-        self.client.request_screenshot(path);
+    /// Requests a forced capture of the next presented frame to `path`, with a
+    /// `reply` channel that receives the real write outcome. The present is
+    /// mandatory (never dropped by the pacer); see [`crate::screenshot_to`] for
+    /// the blocking wrapper that drives and awaits it.
+    pub(crate) fn request_capture(
+        &mut self,
+        path: std::path::PathBuf,
+    ) -> std::sync::mpsc::Receiver<std::io::Result<()>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.client.request_capture(Capture { path, reply: Some(tx) });
+        rx
     }
 
     fn tick_timing(&mut self) {

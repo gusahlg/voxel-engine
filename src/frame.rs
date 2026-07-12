@@ -11,7 +11,6 @@ use crate::skeleton::{FrameUniformsGpu, JitterOffset};
 use crate::engine::Engine;
 use crate::font;
 use crate::mesh::{DebugVertex, MeshHandle, Pass};
-use crate::surface::SurfaceHandle;
 use crate::vk::pipeline::Vertex2D;
 
 /// Sky-pass-private state, set by the app inside a `begin_3d` scope: sun
@@ -39,7 +38,7 @@ pub struct SkyDesc {
 pub enum Lighting {
     /// App-composed per-frame uniforms (`FrameSnapshot` → [`FrameUniformsGpu`]):
     /// the single CPU truth for shader-side sky, fog, candle/ambient, and shadow
-    /// evaluation. Passed through the env feature gates (engine.rs `render_flags`)
+    /// evaluation. Passed through the CPU feature gates (`gate_uniforms`, `RenderFlags`)
     /// before it reaches the GPU, so a disabled feature is neutralized once, at
     /// this producer→GPU chokepoint, for every consumer.
     Composed(FrameUniformsGpu),
@@ -52,8 +51,7 @@ pub enum Lighting {
 
 /// Applies the env feature gates to composed uniforms — the ONE producer→GPU
 /// chokepoint, so terrain, sky, fog, and water all see the same disabled state.
-fn gate_uniforms(mut u: FrameUniformsGpu) -> FrameUniformsGpu {
-    let f = crate::engine::render_flags();
+fn gate_uniforms(f: &crate::engine::RenderFlags, mut u: FrameUniformsGpu) -> FrameUniformsGpu {
     if !f.fog {
         u.horizon[3] = 0.0;
     }
@@ -90,22 +88,6 @@ pub(crate) struct MeshDraw {
     pub pass: Pass,
     pub offset: Vec3,
     pub scale: f32,
-    /// Depth-biased opaque pipeline (far-LOD tiles).
-    pub biased: bool,
-}
-
-/// A fully-resolved colored-surface draw (Zone-3 far skin). Surface analogue of
-/// [`MeshDraw`]; frustum-culled at record time so the render path only resolves
-/// the buffer and issues the draw.
-#[derive(Clone, Copy)]
-pub(crate) struct SurfaceDraw {
-    pub slot: u32,
-    pub generation: NonZeroU32,
-    pub index_first: u32,
-    pub index_count: u32,
-    pub vertex_offset: i32,
-    pub offset: Vec3,
-    pub scale: f32,
 }
 
 /// CPU-side draw lists for one frame. Vec capacities persist across frames.
@@ -115,7 +97,7 @@ pub(crate) struct SurfaceDraw {
 /// the same scene until the readback PNG lands, rather than a blank frame.
 #[derive(Clone)]
 pub(crate) struct DrawLists {
-    pub clear: Color,
+    pub clear: LinearRgb,
     pub view_proj: Mat4,
     /// The current 3D scope's camera, retained so the render thread can fit the
     /// shadow cascades around this frame's frustum. `None`
@@ -159,18 +141,12 @@ pub(crate) struct DrawLists {
     /// Procedural sky palette for this frame's background pass, or `None` to
     /// leave the flat clear colour showing. Set via [`Frame3D::set_sky`].
     pub sky: Option<SkyDesc>,
-    /// Each draw: mesh handle, camera-relative offset, and uniform scale
-    /// (`1.0` for near chunks, `2^k` for LOD tiles). The `bool` selects the
-    /// depth-biased opaque pipeline (far-LOD tiles), so full-res chunks win at
-    /// coincident depth without z-fighting.
+    /// Mesh draws (chunks and LOD); full-res wins the near ground via dither,
+    /// not depth bias.
     pub mesh_draws: Vec<MeshDraw>,
-    /// Retained colored-surface draws (Zone-3 far skin): resolved snapshot.
-    /// Recorded after the opaque mesh runs, before sky.
-    pub surface_draws: Vec<SurfaceDraw>,
-    /// Horizontal radius (metres) within which the Zone-3 skin fragments are
-    /// discarded, so the skin renders only BEYOND the near zones (chunks + LOD
-    /// tiles) instead of poking through them. `0.0` (default) clips nothing.
-    pub skin_clip: f32,
+    /// Chunk→LOD dither radius; full-res chunks own the near ground by default
+    /// (0.0 disables).
+    pub lod_clip: f32,
     pub cube_verts: Vec<DebugVertex>,
     pub line_verts: Vec<DebugVertex>,
     /// Translucent ground decals (contact shadows), drawn with the blended,
@@ -190,7 +166,7 @@ pub(crate) struct DrawLists {
 impl DrawLists {
     pub fn new() -> Self {
         Self {
-            clear: Color::BLACK,
+            clear: LinearRgb([0.0, 0.0, 0.0]),
             view_proj: Mat4::IDENTITY,
             camera: None,
             frame_uniforms: None,
@@ -202,8 +178,7 @@ impl DrawLists {
             has_3d: false,
             sky: None,
             mesh_draws: Vec::new(),
-            surface_draws: Vec::new(),
-            skin_clip: 0.0,
+            lod_clip: 0.0,
             cube_verts: Vec::new(),
             line_verts: Vec::new(),
             shadow_verts: Vec::new(),
@@ -221,8 +196,7 @@ impl DrawLists {
         self.jitter = JitterOffset::ZERO;
         self.frame_uniforms = None;
         self.mesh_draws.clear();
-        self.surface_draws.clear();
-        self.skin_clip = 0.0;
+        self.lod_clip = 0.0;
         self.cube_verts.clear();
         self.line_verts.clear();
         self.shadow_verts.clear();
@@ -286,9 +260,10 @@ impl<'e> Frame<'e> {
         // mesh view-proj sees a fresh Halton offset every frame. The value only
         // travels to `jittered_clip`; it never perturbs the clean `view_proj`.
         let seq = JITTER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // WATT_TAA=0: no jitter AND no resolve, one coupled state (see
-        // `Engine::taa_enabled` — never toggle one without the other).
-        self.eng.lists.jitter = if crate::engine::Engine::taa_enabled() {
+        // taa off: no jitter AND no resolve, one coupled state — the same
+        // `flags.taa` gates the resolve pass (vk/mod.rs); never toggle one
+        // without the other (jitter without resolve is permanent shimmer).
+        self.eng.lists.jitter = if self.eng.flags.taa {
             crate::skeleton::jitter_at(seq)
         } else {
             JitterOffset::ZERO
@@ -299,7 +274,7 @@ impl<'e> Frame<'e> {
         // a 3D frame always carries lighting. `Composed` runs through the env
         // feature gates; `FullBright` is the fixed lit neutral.
         self.eng.lists.frame_uniforms = Some(match light {
-            Lighting::Composed(u) => gate_uniforms(u),
+            Lighting::Composed(u) => gate_uniforms(&self.eng.flags, u),
             Lighting::FullBright => FrameUniformsGpu::full_bright(),
         });
         Frame3D {
@@ -429,54 +404,16 @@ impl Frame3D<'_, '_> {
     /// near chunk and `2^k` for a coarser LOD tile. Skipped automatically when
     /// its scaled, translated AABB is outside the view frustum.
     pub fn draw_mesh(&mut self, handle: MeshHandle, offset: Vec3, scale: f32) {
-        self.push_mesh(handle, offset, scale, false);
+        self.push_mesh(handle, offset, scale);
     }
 
-    /// Like [`draw_mesh`](Self::draw_mesh) but draws through the depth-biased
-    /// opaque pipeline: fragments are pushed slightly toward the reversed-Z far
-    /// plane so normal opaque meshes win at coincident depth. Used for far-LOD
-    /// terrain tiles that sit behind full-res chunks over the same ground.
-    pub fn draw_mesh_biased(&mut self, handle: MeshHandle, offset: Vec3, scale: f32) {
-        self.push_mesh(handle, offset, scale, true);
+    /// Sets the chunk→LOD dither radius so full-res chunks own the near ground.
+    /// Call once per `begin_3d` with render distance; 0.0 disables.
+    pub fn set_lod_clip(&mut self, radius: f32) {
+        self.frame.eng.lists.lod_clip = radius.max(0.0);
     }
 
-    /// Records a retained colored-surface draw (Zone-3 far skin) at `offset`
-    /// with uniform `scale`, applied GPU-side so the surface stays in small
-    /// camera-relative coordinates. Skipped when its scaled, translated AABB is
-    /// outside the view frustum.
-    /// Sets the horizontal radius (metres, camera-relative) within which the
-    /// Zone-3 skin is discarded in the fragment shader, so the far grey skin
-    /// renders only BEYOND the near zones (full-res chunks + LOD tiles) instead
-    /// of poking through them. Call once inside the `begin_3d` scope with the
-    /// tile ring's outer radius; `0.0` (default) draws the whole skin.
-    pub fn set_skin_clip(&mut self, radius: f32) {
-        self.frame.eng.lists.skin_clip = radius.max(0.0);
-    }
-
-    pub fn draw_surface(&mut self, handle: SurfaceHandle, offset: Vec3, scale: f32) {
-        let Some(meta) = self.frame.eng.client.surface_meta(handle) else {
-            return;
-        };
-        let (aabb_min, aabb_max) = meta.aabb();
-        // Cull using the scaled AABB to avoid false culls at view edges.
-        if !self
-            .frustum
-            .intersects_aabb(aabb_min * scale + offset, aabb_max * scale + offset)
-        {
-            return;
-        }
-        self.frame.eng.lists.surface_draws.push(SurfaceDraw {
-            slot: handle.slot,
-            generation: handle.generation,
-            index_first: meta.index_first,
-            index_count: meta.index_count,
-            vertex_offset: meta.vertex_offset,
-            offset,
-            scale,
-        });
-    }
-
-    fn push_mesh(&mut self, handle: MeshHandle, offset: Vec3, scale: f32, biased: bool) {
+    fn push_mesh(&mut self, handle: MeshHandle, offset: Vec3, scale: f32) {
         let Some(meta) = self.frame.eng.client.mesh_meta(handle) else {
             return;
         };
@@ -500,7 +437,6 @@ impl Frame3D<'_, '_> {
             pass: meta.pass,
             offset,
             scale,
-            biased,
         });
     }
 

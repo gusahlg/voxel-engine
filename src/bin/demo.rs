@@ -9,7 +9,7 @@
 /// Keys: F fullscreen, V vsync, M cycle MSAA, Esc quit.
 use voxel_engine::{
     Ao, Camera3D, Color, Config, Key, Light, MeshData, MeshHandle, MeshVertex, Normal, Pass,
-    SkyDesc, SurfaceData, SurfaceHandle, SurfaceVertex, Vec3,
+    SkyDesc, Vec3,
 };
 
 const CHUNK: u8 = 16;
@@ -36,7 +36,7 @@ fn push_quad_lit(
     ao: Ao,
     light: Light,
 ) {
-    data.quad(corners.map(|c| MeshVertex::new(c, normal, layer, ao, light)));
+    data.quad(corners.map(|c| MeshVertex::new(c, normal, layer, ao, light, false)));
 }
 
 /// A unit cube whose top sits at `y` (so it occupies `y-1..y`), all 6 faces.
@@ -138,34 +138,6 @@ fn block_texture_layers(size: u32) -> Vec<Vec<u8>> {
     vec![white, checker, water]
 }
 
-/// Surface-lane smoke test: a small grey heightfield patch built from the
-/// retained colored-surface API (`SurfaceVertex` + `SurfaceData::quad`). Exists
-/// only to exercise the Zone-3 far-skin lane end to end in the demo binary —
-/// upload, AABB query, and per-frame `draw_surface`. A 3×3 grid of unit cells
-/// with a shallow sine bump, all flat grey.
-fn build_surface() -> SurfaceData {
-    const N: i32 = 3;
-    const GREY: [u8; 4] = [128, 128, 128, 255];
-    let h = |x: i32, z: i32| ((x as f32 * 0.7).sin() + (z as f32 * 0.7).cos()) * 0.5;
-    let mut data = SurfaceData::new();
-    for x in 0..N {
-        for z in 0..N {
-            let corner = |cx: i32, cz: i32| SurfaceVertex {
-                pos: [cx as f32, h(cx, cz), cz as f32],
-                color: GREY,
-            };
-            // CCW seen from above (+Y up).
-            data.quad([
-                corner(x, z),
-                corner(x, z + 1),
-                corner(x + 1, z + 1),
-                corner(x + 1, z),
-            ]);
-        }
-    }
-    data
-}
-
 /// Sun direction shared by the sky disc ([`SkyDesc`]) and the lighting UBO, so
 /// the disc and the terrain shading agree.
 const SUN_DIR: Vec3 = Vec3::new(0.6, 0.35, 0.2);
@@ -188,6 +160,8 @@ fn daytime_uniforms() -> voxel_engine::skeleton::FrameUniformsGpu {
         candle: [0.0, 0.0, 0.0, 0.30],
         exposure_dither: [1.0, 0.0, 0.0, 0.0],
         reserved: [0.0; 4],
+        // Static demo scene: no animated water/clouds, so time/camera phase stay zero.
+        anim: [0.0; 4],
     }
 }
 
@@ -196,7 +170,6 @@ fn main() {
 
     let mut chunk: Option<MeshHandle> = None;
     let mut water: Option<MeshHandle> = None;
-    let mut surface: Option<SurfaceHandle> = None;
     let mut angle = 0.0f32;
     // High-FOV cylindrical warp strength, cycled with G. Seeded from VOXEL_WARP
     // so headless screenshot runs can pick a value without a keypress.
@@ -270,15 +243,6 @@ fn main() {
                 eng.set_block_textures(16, &block_texture_layers(16));
                 chunk = Some(eng.upload_mesh(&build_chunk()).expect("chunk upload"));
                 water = Some(eng.upload_mesh(&build_water()).expect("water upload"));
-                // Surface-lane smoke test: upload the grey patch and assert its
-                // GPU AABB comes back finite before we ever try to draw it.
-                let handle = eng.upload_surface(&build_surface()).expect("surface upload");
-                let (lo, hi) = eng.surface_aabb(handle).expect("surface aabb");
-                assert!(
-                    lo.is_finite() && hi.is_finite(),
-                    "surface aabb must be finite: {lo:?}..{hi:?}"
-                );
-                surface = Some(handle);
             }
 
             // Scroll to zoom: each notch nudges the vertical FOV, scrolling up
@@ -306,7 +270,7 @@ fn main() {
             let cull = eng.cull_faces();
             let fps = eng.fps();
 
-            let mut frame = eng.begin_frame(Color::SKYBLUE);
+            let mut frame = eng.begin_frame(Color::SKYBLUE.to_linear());
             {
                 // Demo draws in absolute coordinates (no camera rebase): the
                 // render-space origin is the world origin, so eye = ZERO — the
@@ -356,12 +320,6 @@ fn main() {
                             f3.draw_mesh(handle, off, 1.0);
                         }
                     }
-                }
-                // Surface-lane smoke test: record the grey patch each frame so
-                // the retained colored-surface path (upload → cull → draw) is
-                // covered by a demo run. Offset it clear of the chunk grid.
-                if let Some(handle) = surface {
-                    f3.draw_surface(handle, Vec3::new(0.0, 2.0, -6.0), 1.0);
                 }
                 f3.draw_cube(
                     center + Vec3::new(0.0, 10.0, 0.0),

@@ -26,7 +26,6 @@ use ash::vk;
 use glam::{DVec3, Mat4, Vec3};
 
 use crate::camera::{Camera3D, Z_NEAR};
-use crate::mesh::Pass;
 use crate::skeleton::{
     Cascade, CascadeFit, CascadeUniformsGpu, CleanViewProj, PerCascade, ShadowCfg,
 };
@@ -326,10 +325,10 @@ impl Renderer {
         let far = &fits[Cascade::Far];
         // SHADOW_LIMIT is the far cascade's far distance (256 m); the
         // receiver smoothsteps map→fallback over `fade_band` up to it.
-        // WATT_SHADOWS=0: push the map→fallback blend out of reach so the
+        // `flags.shadows` false: push the map→fallback blend out of reach so the
         // receiver reads only the (cleared, fully-lit) map — with occluder
         // draws skipped below, every fragment passes the reversed-Z SampleCmp.
-        let shadow_limit = if crate::engine::render_flags().shadows {
+        let shadow_limit = if self.flags.shadows {
             cfg.splits[1]
         } else {
             f32::MAX
@@ -349,11 +348,8 @@ impl Renderer {
         }
     }
 
-    /// Render opaque occluders into each cascade layer. Called BEFORE the main
-    /// color pass (the merge inserts it there). Replays the SAME opaque
-    /// `draw_runs` the color pass uses, pushing each cascade's light-space
-    /// `view_proj` in the pass's own 64 B push budget. `slot` is the raw
-    /// frame-in-flight index; `cmd` is the frame command buffer.
+    /// Render opaque occluders into each cascade; replays the light-space-culled
+    /// shadow_runs subset.
     pub(crate) fn record_shadow_pass(
         &self,
         cmd: vk::CommandBuffer,
@@ -421,7 +417,7 @@ impl Renderer {
             // no handle to push. Binding 0 is pushed iff it will be consumed by a
             // draw — the push and the draw share this one `Option`, so a null
             // buffer can never reach `cmd_push_descriptor_set`.
-            let occluders = crate::engine::render_flags()
+            let occluders = self.flags
                 .shadows
                 .then(|| self.offsets[slot].bound())
                 .flatten();
@@ -499,11 +495,16 @@ impl Renderer {
         }
     }
 
-    /// Draw every opaque run (both `mesh3d` and `mesh3d_biased` share the one
-    /// depth pipeline — they are all occluders) into the currently-bound cascade
-    /// layer, indirect from `slot`'s command buffer, mirroring
+    /// Draw the light-space-culled occluder runs (`shadow_runs` — the opaque
+    /// subset whose AABBs reach a cascade footprint; `mesh3d` and `mesh3d_biased`
+    /// share the one depth pipeline) into the currently-bound cascade layer,
+    /// indirect from `slot`'s command buffer, mirroring
     /// `record_mesh_indirect`'s feature-level fallback.
     unsafe fn record_shadow_occluders(&self, cmd: vk::CommandBuffer, slot: usize) {
+        // Guard against empty shadow_runs; ensures quad IBO is allocated before use.
+        if self.shadow_runs.is_empty() {
+            return;
+        }
         let device = &self.device.device;
         const STRIDE: u64 = size_of::<DrawIndexedIndirect>() as u64;
         // Reached only when the caller found `offsets.bound()` Some — i.e. this
@@ -511,9 +512,14 @@ impl Renderer {
         let indirect = self.indirect[slot]
             .bound()
             .expect("occluder draws imply an allocated indirect buffer");
-        for run in self.draw_runs.iter().filter(|r| r.pass == Pass::Opaque) {
+        // Shared quad IBO for all occluders (run.buffer is the VERTEX buffer).
+        let quad_ibo = self
+            .quad_ibo
+            .bound()
+            .expect("occluder draws imply the quad IBO is allocated");
+        unsafe { device.cmd_bind_index_buffer(cmd, quad_ibo, 0, vk::IndexType::UINT32) };
+        for run in self.shadow_runs.iter() {
             unsafe {
-                device.cmd_bind_index_buffer(cmd, run.buffer, 0, vk::IndexType::UINT32);
                 device.cmd_bind_vertex_buffers(cmd, 0, &[run.buffer], &[0]);
                 if self.device.multi_draw_indirect && self.device.draw_indirect_first_instance {
                     device.cmd_draw_indexed_indirect(

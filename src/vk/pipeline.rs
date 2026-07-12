@@ -17,14 +17,14 @@ use crate::mesh::{DebugVertex, MeshVertex, Pass};
 use crate::vk::device::FragmentShadingRate;
 use crate::vk::vertex_input::{VertexInput, vertex_struct};
 
-pub const PUSH_BYTES_3D: u32 = size_of::<Mesh3dPush>() as u32; // view_proj + skin near-clip radius
+pub const PUSH_BYTES_3D: u32 = size_of::<Mesh3dPush>() as u32; // view_proj + LOD dither-band radius
 pub const PUSH_BYTES_DEBUG: u32 = size_of::<DebugPush>() as u32; // view_proj
 pub const PUSH_BYTES_2D: u32 = size_of::<[f32; 2]>() as u32; // pixels_to_ndc
 pub const PUSH_BYTES_SKY: u32 = size_of::<SkyParams>() as u32; // inv_view_proj + sun geom + tint
 // exposure + wide-FOV remap coefficients (s, atan_s); see camera::WarpPush.
 pub const PUSH_BYTES_TONEMAP: u32 = size_of::<crate::camera::WarpPush>() as u32;
 
-/// 3D push constant: view_proj + surface clip radius.
+/// 3D push constant: view_proj + LOD dither-band radius.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Mesh3dPush {
@@ -75,8 +75,10 @@ vertex_struct! {
 
 const MESH3D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d.vert.spv"));
 const MESH3D_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d.frag.spv"));
-const SURFACE3D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/surface3d.vert.spv"));
-const SURFACE3D_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/surface3d.frag.spv"));
+/// Shader variant with depth input attachment for water absorption; built
+/// when dynamic_rendering_local_read is available and MSAA is off.
+const MESH3D_WATER_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_water.frag.spv"));
 const DEBUG_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.vert.spv"));
 const DEBUG_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.frag.spv"));
 const TRIS2D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tris2d.vert.spv"));
@@ -86,9 +88,6 @@ const SKY_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.vert.spv")
 const SKY_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv"));
 const TONEMAP_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.vert.spv"));
 const TONEMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
-/// Shader display-space sigmoid variant, selected by `WATT_TONEMAP=makeup`.
-const TONEMAP_FRAG_MAKEUP: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/tonemap_makeup.frag.spv"));
 const VRS_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vrs.comp.spv"));
 
 /// The VRS classifier compute pipeline plus the depth sampler it reads through.
@@ -107,18 +106,12 @@ pub struct Pipelines {
     pub layout_debug: vk::PipelineLayout,
     pub layout_2d: vk::PipelineLayout,
     pub mesh3d: vk::Pipeline,
-    /// Same config as `mesh3d`, but with depth bias enabled so tiles render
-    /// slightly toward the reversed-Z far plane — full-res chunks win at
-    /// coincident depth. Selected per-draw via `DrawEntry::biased`.
-    pub mesh3d_biased: vk::Pipeline,
     /// Same vertex/fragment modules and `layout_3d` as `mesh3d`, but alpha
     /// blends and reads (never writes) depth. Selected for [`Pass::Blend`].
     pub mesh3d_transparent: vk::Pipeline,
-    /// Retained colored-surface pipeline (Zone-3 far skin): `SurfaceVertex`
-    /// attributes, reuses `layout_3d` (per-draw offset SSBO + `Mesh3dPush` clip),
-    /// double-sided, VRS, biased deeper than `mesh3d_biased`. STAGE 1: `null`
-    /// until E1 builds it in Stage 2.
-    pub surface3d: vk::Pipeline,
+    /// Water-absorption variant when dynamic_rendering_local_read is available and MSAA is off;
+    /// fallback to mesh3d_transparent otherwise.
+    pub mesh3d_transparent_absorb: Option<vk::Pipeline>,
     pub debug_tris: vk::Pipeline,
     /// Same debug modules/layout as `debug_tris`, but alpha blends and reads
     /// (never writes) depth — for translucent ground decals (contact shadows).
@@ -145,6 +138,8 @@ pub struct Pipelines {
     pub tonemap_set_layout: vk::DescriptorSetLayout,
     /// Linear-clamp sampler pushed with the HDR image for the tonemap draw.
     pub tonemap_sampler: vk::Sampler,
+    /// Point-clamp sampler pushed with the scene depth for the godray sky mask.
+    pub tonemap_depth_sampler: vk::Sampler,
     /// `Some` exactly when attachment VRS is enabled (`fsr.is_some()`).
     pub vrs_compute: Option<VrsCompute>,
 }
@@ -161,6 +156,7 @@ impl Pipelines {
         atlas_set_layout: vk::DescriptorSetLayout,
         mesh3d_set_layout: vk::DescriptorSetLayout,
         fsr: Option<&FragmentShadingRate>,
+        local_read: bool,
     ) -> Self {
         // 3D set 0: binding 0 = offsets SSBO (vertex), binding 1 = texture
         // array (fragment) — one push set (Vulkan allows at most one per
@@ -225,13 +221,27 @@ impl Pipelines {
                 .expect("Failed to create 2D pipeline layout")
         };
 
-        // Tonemap: set 0 binding 0 = combined image sampler (the HDR offscreen),
-        // pushed at record time. Plus a 4-byte exposure push constant.
-        let tonemap_binding = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        // Tonemap: set 0 binding 0 = the HDR offscreen, binding 1 = the bloom mip
+        // pyramid, both combined image samplers pushed at record time. Plus
+        // the tonemap push constant.
+        let tonemap_binding = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Binding 2: scene depth for the godray sky mask.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
         let tonemap_set_layout = unsafe {
             device
                 .create_descriptor_set_layout(
@@ -254,6 +264,21 @@ impl Pipelines {
                     None,
                 )
                 .expect("Failed to create tonemap sampler")
+        };
+        // NEAREST for depth; D32 linear isn't guaranteed, and threshold tests need
+        // no interpolation.
+        let tonemap_depth_sampler = unsafe {
+            device
+                .create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::NEAREST)
+                        .min_filter(vk::Filter::NEAREST)
+                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                    None,
+                )
+                .expect("Failed to create tonemap depth sampler")
         };
         let push_tonemap = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
@@ -282,8 +307,6 @@ impl Pipelines {
 
         let mesh_vert = create_shader_module(device, MESH3D_VERT);
         let mesh_frag = create_shader_module(device, MESH3D_FRAG);
-        let surface_vert = create_shader_module(device, SURFACE3D_VERT);
-        let surface_frag = create_shader_module(device, SURFACE3D_FRAG);
         let debug_vert = create_shader_module(device, DEBUG_VERT);
         let debug_frag = create_shader_module(device, DEBUG_FRAG);
         let tri2d_vert = create_shader_module(device, TRIS2D_VERT);
@@ -317,42 +340,6 @@ impl Pipelines {
                 depth_bias: None,
             },
         );
-        let mesh3d_biased = builder.build(
-            mesh_vert,
-            mesh_frag,
-            &bindings_3d,
-            attributes_3d,
-            layout_3d,
-            PipelineConfig {
-                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                depth: DepthMode::ReadWrite,
-                cull: vk::CullModeFlags::BACK,
-                blend: false,
-                vrs: true,
-                depth_bias: Some((-2.0, -1.0)),
-            },
-        );
-        // Zone-3 far skin: unpacked colored surface, reuses `layout_3d` (per-draw
-        // offset SSBO + Mesh3dPush clip). Double-sided (cull NONE), biased deeper
-        // than mesh3d_biased so the skin always loses the depth test to chunks AND
-        // tiles at coincident depth, leaving it visible only where nothing drew.
-        let surface_bindings = [crate::surface::SurfaceVertex::binding()];
-        let surface_attributes = crate::surface::SurfaceVertex::ATTRIBUTES;
-        let surface3d = builder.build(
-            surface_vert,
-            surface_frag,
-            &surface_bindings,
-            surface_attributes,
-            layout_3d,
-            PipelineConfig {
-                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                depth: DepthMode::ReadWrite,
-                cull: vk::CullModeFlags::NONE,
-                blend: false,
-                vrs: true,
-                depth_bias: Some((-4.0, -2.0)),
-            },
-        );
         // Blend world geometry: same modules/layout, alpha blend, depth read-only
         // (all opaque wrote depth first; blend tests but never writes). Double-sided
         // (cull NONE): the mesher emits translucent bodies as open shells (interior
@@ -373,6 +360,28 @@ impl Pipelines {
                 depth_bias: None,
             },
         );
+        // Water absorption variant (depth input attachment); only when
+        // dynamic_rendering_local_read is available and MSAA is off.
+        let absorb_ok = local_read && samples == vk::SampleCountFlags::TYPE_1;
+        let mesh3d_water_frag =
+            absorb_ok.then(|| create_shader_module(device, MESH3D_WATER_FRAG));
+        let mesh3d_transparent_absorb = mesh3d_water_frag.map(|water_frag| {
+            builder.build_depth_input(
+                mesh_vert,
+                water_frag,
+                &bindings_3d,
+                attributes_3d,
+                layout_3d,
+                PipelineConfig {
+                    topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                    depth: DepthMode::ReadOnly,
+                    cull: vk::CullModeFlags::NONE,
+                    blend: true,
+                    vrs: true,
+                    depth_bias: None,
+                },
+            )
+        });
         let debug_tris = builder.build(
             debug_vert,
             debug_frag,
@@ -475,9 +484,7 @@ impl Pipelines {
         // Tonemap: its own builder — writes the present format at single-sample
         // with no depth attachment; never VRS.
         let tonemap_vert = create_shader_module(device, TONEMAP_VERT);
-        let makeup = std::env::var_os("WATT_TONEMAP").is_some_and(|v| v == "makeup");
-        let tonemap_frag =
-            create_shader_module(device, if makeup { TONEMAP_FRAG_MAKEUP } else { TONEMAP_FRAG });
+        let tonemap_frag = create_shader_module(device, TONEMAP_FRAG);
         let tonemap_builder = PipelineBuilder {
             device,
             cache,
@@ -534,8 +541,9 @@ impl Pipelines {
             device.destroy_shader_module(tonemap_frag, None);
             device.destroy_shader_module(mesh_vert, None);
             device.destroy_shader_module(mesh_frag, None);
-            device.destroy_shader_module(surface_vert, None);
-            device.destroy_shader_module(surface_frag, None);
+            if let Some(m) = mesh3d_water_frag {
+                device.destroy_shader_module(m, None);
+            }
             device.destroy_shader_module(debug_vert, None);
             device.destroy_shader_module(debug_frag, None);
             device.destroy_shader_module(tri2d_vert, None);
@@ -553,9 +561,8 @@ impl Pipelines {
             layout_debug,
             layout_2d,
             mesh3d,
-            mesh3d_biased,
             mesh3d_transparent,
-            surface3d,
+            mesh3d_transparent_absorb,
             debug_tris,
             debug_tris_blend,
             debug_lines,
@@ -569,6 +576,7 @@ impl Pipelines {
             layout_tonemap,
             tonemap_set_layout,
             tonemap_sampler,
+            tonemap_depth_sampler,
         }
     }
 
@@ -580,8 +588,14 @@ impl Pipelines {
             // Reserved: shares the opaque pipeline (depth write, cull back) until a
             // `discard` frag variant lands. Sound because nothing emits Cutout yet.
             Pass::Cutout => self.mesh3d,
-            Pass::Blend => self.mesh3d_transparent,
+            Pass::Blend => self.blend_pipeline(),
         }
+    }
+
+    /// The pipeline for the transparent [`Pass::Blend`] draw: the water
+    /// depth-absorption variant when available, else the interim-tint fallback.
+    pub fn blend_pipeline(&self) -> vk::Pipeline {
+        self.mesh3d_transparent_absorb.unwrap_or(self.mesh3d_transparent)
     }
 
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
@@ -593,10 +607,10 @@ impl Pipelines {
                 device.destroy_sampler(v.depth_sampler, None);
             }
             device.destroy_pipeline(self.mesh3d, None);
-            device.destroy_pipeline(self.mesh3d_biased, None);
             device.destroy_pipeline(self.mesh3d_transparent, None);
-            // `null` in Stage 1 (destroying VK_NULL_HANDLE is a documented no-op).
-            device.destroy_pipeline(self.surface3d, None);
+            if let Some(p) = self.mesh3d_transparent_absorb {
+                device.destroy_pipeline(p, None);
+            }
             device.destroy_pipeline(self.debug_tris, None);
             device.destroy_pipeline(self.debug_tris_blend, None);
             device.destroy_pipeline(self.debug_lines, None);
@@ -613,6 +627,7 @@ impl Pipelines {
             device.destroy_pipeline_layout(self.layout_tonemap, None);
             device.destroy_descriptor_set_layout(self.tonemap_set_layout, None);
             device.destroy_sampler(self.tonemap_sampler, None);
+            device.destroy_sampler(self.tonemap_depth_sampler, None);
         }
     }
 }
@@ -657,6 +672,37 @@ impl PipelineBuilder<'_> {
         attributes: &[vk::VertexInputAttributeDescription],
         layout: vk::PipelineLayout,
         cfg: PipelineConfig,
+    ) -> vk::Pipeline {
+        self.build_inner(vert, frag, bindings, attributes, layout, cfg, false)
+    }
+
+    /// Like [`Self::build`], but chains `VkRenderingInputAttachmentIndexInfoKHR`
+    /// so the fragment's input-attachment index 0 maps to the depth attachment
+    /// (dynamic_rendering_local_read). Only for the water-absorption blend
+    /// pipeline; the mapping is static pipeline state, so no per-draw dynamic
+    /// `vkCmdSetRenderingInputAttachmentIndices` call is needed.
+    fn build_depth_input(
+        &self,
+        vert: vk::ShaderModule,
+        frag: vk::ShaderModule,
+        bindings: &[vk::VertexInputBindingDescription],
+        attributes: &[vk::VertexInputAttributeDescription],
+        layout: vk::PipelineLayout,
+        cfg: PipelineConfig,
+    ) -> vk::Pipeline {
+        self.build_inner(vert, frag, bindings, attributes, layout, cfg, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_inner(
+        &self,
+        vert: vk::ShaderModule,
+        frag: vk::ShaderModule,
+        bindings: &[vk::VertexInputBindingDescription],
+        attributes: &[vk::VertexInputAttributeDescription],
+        layout: vk::PipelineLayout,
+        cfg: PipelineConfig,
+        depth_input: bool,
     ) -> vk::Pipeline {
         let PipelineConfig {
             topology,
@@ -776,6 +822,14 @@ impl PipelineBuilder<'_> {
             .push_next(&mut rendering_info);
         if vrs && self.fsr_enabled {
             pipeline_info = pipeline_info.push_next(&mut fsr_state);
+        }
+        // Map the fragment's input-attachment index 0 to the depth attachment;
+        // no color input attachments. Static pipeline state (not a dynamic set).
+        let depth_input_index = 0u32;
+        let mut input_attachment_info = vk::RenderingInputAttachmentIndexInfoKHR::default()
+            .depth_input_attachment_index(&depth_input_index);
+        if depth_input {
+            pipeline_info = pipeline_info.push_next(&mut input_attachment_info);
         }
 
         unsafe {

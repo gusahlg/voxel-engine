@@ -1,4 +1,34 @@
 //! Scene exposure metering — compute-based reduction with temporal smoothing.
+//!
+//! A compute pass reduces the linear-HDR offscreen to a small per-tile buffer of
+//! mean `log2(luma)` (16×16 texels/tile, `exposure_reduce.comp`). The CPU averages
+//! the tile means after the slot's fence, maps the geometric-mean luma through the
+//! exposure curve, and temporally smooths the result — yielding the exposure
+//! multiplier the tonemap pass applies before its tone curve.
+//!
+//! All of this package's engine code lives here (not `vk/mod.rs`): the pipeline,
+//! the double-buffered readback ring, `Renderer::record_exposure_pass`, and
+//! `Engine::exposure_for_compose` are added as `impl` blocks on types owned by
+//! other modules — Rust permits inherent impls from any module of the crate.
+//!
+//! MERGE NOTES (orchestrator wires these; they are the only touches outside this
+//! file, deliberately left to the merge per the shared-tree rules):
+//!  * `vk/mod.rs` declares this module: `mod exposure;` (re-export `ExposureState`
+//!    / `ExposureShared` as needed), and `skeleton.rs`'s opaque `ExposureRing`
+//!    (+ its inherent impl) is dropped in favour of the real one here.
+//!  * `Renderer` gains a field `exposure: ExposureState`, built in `Renderer::new`
+//!    with `ExposureState::new(device, memory_props, render_extent, cache)` and
+//!    rebuilt on resize; destroyed in `Renderer::destroy`.
+//!  * `draw_frame` calls `self.record_exposure_pass(cmd, FrameSlot::new(slot))`
+//!    AFTER the HDR geometry/sky pass and BEFORE the tonemap pass.
+//!  * `Engine` gains `exposure_shared: ExposureShared`, a clone of
+//!    `ExposureState::shared()`, handed across at construction so the main-thread
+//!    `compose()` can read the render thread's latest metered value.
+//!  * `build.rs` compiles `shaders/exposure_reduce.comp.slang` → `exposure_reduce.comp.spv`.
+//!  * The tonemap push (`camera::WarpPush`) gains a trailing `dither_phase: f32`,
+//!    and `vk/mod.rs` sources the tonemap `exposure` from `exposure_shared` and
+//!    the `dither_phase` from `DITHER_PHASE_16[frame % 16]` (== FrameUniforms
+//!    `exposure_dither.y`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -8,6 +38,7 @@ use ash::vk;
 use super::alloc::find_memory_type;
 use super::buffers::FRAMES_IN_FLIGHT;
 use crate::engine::Engine;
+use crate::genconst;
 use crate::skeleton::{Exposure, ExposureRead, ExposureWrite, FrameSlot};
 
 const EXPOSURE_REDUCE_COMP: &[u8] =
@@ -16,11 +47,11 @@ const EXPOSURE_REDUCE_COMP: &[u8] =
 /// One tile = this many HDR texels per side (mirrors `TILE` in the shader).
 const TILE: u32 = 16;
 
-/// Shader curve — geometric-mean luma → exposure multiplier. Tentative; to be
-/// re-derived for our HDR range. Kept as one function so the CPU has a single owner.
-fn makeup_curve(luma: f32) -> f32 {
-    let _tuned = (-luma).exp() * 3.03 + 0.6;
-    Exposure::DEFAULT.0
+/// EV-space exposure curve with fixed point at day luma; constants from build.rs.
+fn exposure_curve(log2_luma: f32) -> f32 {
+    (genconst::EXPOSURE_EV_SLOPE * (genconst::EXPOSURE_L_DAY_LOG2 - log2_luma))
+        .exp2()
+        .clamp(genconst::EXPOSURE_CLAMP_LO, genconst::EXPOSURE_CLAMP_HI)
 }
 
 /// Local SPIR-V module builder (pipeline.rs's is private to its module).
@@ -150,7 +181,7 @@ impl ExposureRing {
     }
 
     /// CPU readback of the buffer a `views(_).1` read-view points at, plus the
-    /// MakeUp curve and temporal smoothing. Returns the exposure the next
+    /// exposure curve and temporal smoothing. Returns the exposure the next
     /// `compose()` should carry. Host-coherent memory → the mapped floats are up
     /// to date once the slot's fence has cleared (the caller's responsibility).
     pub fn metered(&self, read: ExposureRead<'_>, dt: f32, prev: Exposure) -> Exposure {
@@ -178,9 +209,7 @@ impl ExposureRing {
         if !mean_log2.is_finite() {
             return prev;
         }
-        let luma = mean_log2.exp2();
-
-        let target = makeup_curve(luma).max(1e-3); // exposure is a positive multiplier
+        let target = exposure_curve(mean_log2).max(1e-3); // exposure is a positive multiplier
         // mix(new, prev, exp(-dt·1.25)): large dt → mostly new (fast adapt on a
         // long frame), small dt → mostly prev (smooth). Frame-rate independent.
         let k = (-dt * 1.25).exp();

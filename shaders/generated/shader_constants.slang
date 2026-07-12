@@ -67,6 +67,18 @@ static const float DITHER_PHASE_16[16] = {
     0.0625f, 0.5625f, 0.3125f, 0.8125f, 0.1875f, 0.6875f, 0.4375f, 0.9375f, 
 };
 
+// TAA history feedback weight: fraction of the (reprojected, variance-clamped)
+// history kept each frame. Higher = steadier but slower to react. Read by vk/taa.rs.
+// Reduced 0.95→0.92: animated water waves and clouds demand faster per-frame
+// reactivity. 0.92 (~8% new sample) reduces ghosting while maintaining temporal
+// coherence. Range [0.85–0.98].
+static const float HISTORY_BLEND = 0.92f;
+
+// TAA neighbourhood variance-clamp width in std-devs: history is clamped to
+// YCoCg mean +/- VARIANCE_GAMMA*stddev of the 3x3 current taps. Wider = steadier
+// (less crawl) but more ghosting. Read by taa_resolve.comp.
+static const float VARIANCE_GAMMA = 1.25f;
+
 // Blocklight candle curve: candle = x*sqrt(x) + (CANDLE_HIGH_MUL*x)^CANDLE_HIGH_POW,
 // clamped to CANDLE_CLAMP. x = block light level in [0,1].
 static const float CANDLE_HIGH_MUL = 1.17f;
@@ -77,16 +89,243 @@ static const float CANDLE_HIGH_POW = 6.0f;
 // Candle curve output clamp ceiling. Tentative, pending tuning.
 static const float CANDLE_CLAMP = 4.0f;
 
+// Per-vertex anti-z-fight nudge in local units. Applied before scale so it
+// inherits LOD's 2^k scale. Read by mesh3d.vert.
+static const float MICRO_STEP = 0.01f;
+
 // Post-tonemap dither amplitude in output space (1 LSB of 8-bit = 1/255).
 // Amplitude must stay exposure-invariant.
 static const float POST_TONEMAP_DITHER_GAIN = 0.003921569f;
 
 // Sun-disc solid core as a multiple of the sun angular radius.
-static const float SUN_DISC_CORE = 1.0f;
+// Raised 1.0→1.12 (CONST-AUDIT visual cohesion): larger core keeps sun defined
+// against brighter night sky (stars now +20%, moon +8%). Complements SUN_DISC_RIM tightening.
+static const float SUN_DISC_CORE = 1.12f;
 
 // Exponent on visible_sky in the beyond-cascades shadow fallback.
 static const float SHADOW_FALLBACK_POW = 10.0f;
 
+// Cascade shadow map edge in texels. Mirror of vk/targets.rs (asserted equal
+// there); lets the PCF derive texel size without a per-fragment GetDimensions.
+static const float SHADOW_RESOLUTION = 2048.0f;
+
 // Sun-disc soft rim (fade-to-zero edge) as a multiple of the sun angular radius.
-static const float SUN_DISC_RIM = 2.0f;
+// Reduced 2.0→1.5 (CONST-AUDIT visual cohesion): tighter rim keeps sun crisp
+// against busier night sky. Complements brighter stars [4.2, 4.5, 5.2] and larger moon.
+static const float SUN_DISC_RIM = 1.5f;
+
+// Sky sun-halo exponent at low sun (small ⇒ wide golden-hour halo). Blended to
+// GLOW_POW_DAY over sun elevation (sun_dir_elev.w, [-1,1]).
+static const float GLOW_POW_SUNSET = 3.5f;
+
+// Sky sun-halo exponent at high sun: preserves the tight noon halo (the former fixed 8.0).
+static const float GLOW_POW_DAY = 8.0f;
+
+// Glow-exponent smoothstep low edge on sun elevation. Twin: palette::GLOW.edge0.
+static const float GLOW_EDGE0 = 0.0f;
+
+// Glow-exponent smoothstep high edge; at/above it the noon halo is reproduced exactly.
+// Twin: palette::GLOW.edge1.
+static const float GLOW_EDGE1 = 0.4f;
+
+// Wrap period for the `anim` FrameUniforms lane, in seconds (anim_time)
+// and metres (camera UV). Folds world time/space into [0, ANIM_PERIOD)
+// CPU-side so f32 never loses phase precision far from the origin.
+static const float ANIM_PERIOD = 512.0f;
+
+// Autoexposure fixed point: exposure=1.0 at day luma (golden image must match).
+// Read by vk/exposure.rs.
+static const float EXPOSURE_L_DAY_LOG2 = -2.2419527f;
+
+// Autoexposure EV-space slope (fitted so exposure(cave)=6.05). Gives gentle
+// darken (no cliff like old linear fit). See EXPOSURE_L_DAY_LOG2.
+static const float EXPOSURE_EV_SLOPE = 0.41935006f;
+
+// Floor on exposure multiplier (EV-space curve is always positive). Bounds
+// pathological over-metering; no longer a cliff band-aid.
+static const float EXPOSURE_CLAMP_LO = 0.25f;
+
+// Ceiling on the exposure multiplier so a near-black frame can't blow up unbounded.
+static const float EXPOSURE_CLAMP_HI = 8.0f;
+
+// Bloom soft-knee low edge on exposed luma (luma·exposure). Below this the
+// pixel contributes no spill. Read by vk/bloom.rs → bloom.comp.
+static const float BLOOM_THRESHOLD_LO = 0.85f;
+
+// Bloom soft-knee high edge: at/above this luma the spill weight is full.
+static const float BLOOM_THRESHOLD_HI = 1.0f;
+
+// Bloom spill scale applied to the thresholded colour, keeping
+// the stored spill well below the source so BLOOM_STRENGTH stays the only knob.
+static const float BLOOM_THRESHOLD_SCALE = 0.5f;
+
+// Bloom composite weight before tonemap sigmoid. Subtle spill off bright sources.
+static const float BLOOM_STRENGTH = 0.04f;
+
+// Golden-angle spiral tap count for the bloom upsample-composite. Taps
+// sample the mip chain at BLOOM_SPIRAL_LOD.
+static const float BLOOM_SPIRAL_SAMPLES = 6.0f;
+
+// Mip level the bloom spiral samples the (already downsampled) chain at — the
+// wide soft blur comes from the pyramid; the spiral just spreads and de-aliases it.
+static const float BLOOM_SPIRAL_LOD = 2.0f;
+
+// Bloom spiral radius in output uv (isotropic). Small — the mip chain already
+// carries the wide blur, so this only softens the seams between taps.
+static const float BLOOM_SPIRAL_RADIUS = 0.08f;
+
+// Dithered march taps from each pixel toward the sun's screen position. Low
+// (4); the Bayer dither() start-offset hides the step count.
+// Cast to int in the shader.
+static const float GODRAY_SAMPLES = 4.0f;
+
+// Sunward falloff exponent. Higher tightens rays around sun.
+static const float GODRAY_GLOW_EXP = 6.0f;
+
+// Godray veil composite weight before tonemap sigmoid (after bloom).
+static const float GODRAY_STRENGTH = 0.6f;
+
+// Max march length AND sunward falloff radius, in output uv (does double duty:
+// the march covers up to this distance toward the sun, and the glow fades to zero
+// beyond it). Isotropic uv space (elliptical on non-square frames — imperceptible
+// on a soft veil).
+static const float GODRAY_MAX_LEN = 0.6f;
+
+// Moon disc linear radiance (additive, HDR). Cool desaturated — no moon-phase
+// state exists, so a single fixed tint. Dimmer than the sun so it reads as a
+// soft night disc, not a second sun.
+static const float MOON_TINT[3] = {
+    0.45f, 0.5f, 0.62f, 
+};
+
+// Moon angular radius as a multiple of the sun's (pc.sun.w): a touch smaller.
+// Raised 0.85→0.92 (CONST-AUDIT Tier 2): larger moon for visibility against
+// voxel terrain; complements brighter stars. Range [0.75–1.0].
+static const float MOON_RADIUS_SCALE = 0.92f;
+
+// Star point linear radiance (additive, HDR); brightness folded in. Cool white.
+// Raised to [4.2, 4.5, 5.2] (CONST-AUDIT Tier 2): brighter stars for presence
+// against voxel terrain; still cool-toned. Range [3.0–5.5] per channel.
+static const float STAR_COLOR[3] = {
+    4.2f, 4.5f, 5.2f, 
+};
+
+// Star hash-grid resolution: cells across the hemispheric ray projection.
+// Higher ⇒ more, smaller cells (denser field). Raised 300→328 (CONST-AUDIT Tier 2):
+// slightly more presence without sparse feel; correlates with STAR_THRESHOLD for
+// ~5.5% population. Range [250–400].
+static const float STAR_DENSITY = 328.0f;
+
+// Per-cell hash cutoff for a star to exist; fraction of lit cells is
+// 1 - STAR_THRESHOLD (sparse). Lowered 0.955→0.953 (CONST-AUDIT Tier 2):
+// maintains sparse field (~5.5%) while correlating with STAR_DENSITY bump.
+static const float STAR_THRESHOLD = 0.953f;
+
+// Star point sharpness. Higher gives smaller, crisper points.
+static const float STAR_SHARP = 72.0f;
+
+// cos(angle) toward the moon above which stars fade out, so the field never
+// overlaps the moon disc. Near 1 ⇒ only a tight halo is cleared.
+static const float STAR_MOON_FADE = 0.9995f;
+
+// Star fade toward horizon (hides stars in fog band).
+static const float STAR_HORIZON_FADE = 8.0f;
+
+// World-y (metres) of the lower slab plane. Clouds render only when the
+// camera (anim.w) is below the slab and the view ray rises into it.
+static const float CLOUD_BOTTOM = 180.0f;
+
+// Vertical slab thickness (metres); the upper plane is CLOUD_BOTTOM + this.
+static const float CLOUD_THICKNESS = 60.0f;
+
+// Dithered raymarch steps between the two slab-plane intersections (N=10).
+// Cast to int in the shader; the Bayer dither() hides the low count.
+static const float CLOUD_STEPS = 10.0f;
+
+// Cloud noise spatial frequency (1/metres). World-anchored so pinned day is deterministic.
+static const float CLOUD_NOISE_SCALE = 0.0005f;
+
+// Second value-noise octave frequency, as a multiple of CLOUD_NOISE_SCALE.
+// Sampled on swapped zx so the two octaves don't align into stripes.
+// Reduced from 2.7→2.0 (CONST-AUDIT Tier 1): base frequency is now denser (0.0005),
+// so lower octave multiplier prevents over-busy detail while keeping standard FBM blend.
+static const float CLOUD_OCTAVE2_SCALE = 2.0f;
+
+// Cloud drift in noise units per second: coord += CLOUD_WIND * anim_time.
+// Deterministic at a pinned day (anim_time is derived from the pinned clock).
+static const float CLOUD_WIND[2] = {
+    0.02f, 0.007f, 
+};
+
+// Density threshold. Higher makes sky sparser.
+static const float CLOUD_COVERAGE = 0.5f;
+
+// Per-step opacity gain applied to remapped density in the front-to-back
+// accumulation. Tuned so a dense column reads opaque within CLOUD_STEPS steps.
+// Reduced 0.5→0.45 (CONST-AUDIT Tier 2): slightly more translucency allows layering
+// and depth, avoiding opaque curtain effect with denser base noise.
+static const float CLOUD_OPACITY = 0.45f;
+
+// Weight of the direct-light lane (frame.light.rgb) in the lit cloud colour.
+static const float CLOUD_LIGHT = 1.0f;
+
+// Weight of the sky/zenith lane (frame.zenith.rgb) in the lit cloud colour.
+static const float CLOUD_AMBIENT = 0.6f;
+
+// Interior darkening: cloud colour × lerp(1, CLOUD_DARK, sqrt(density)), so
+// dense cores read darker than thin edges (mix(bright,dark,sqrt(cv))).
+// Reduced 0.4→0.35 (CONST-AUDIT Tier 2): denser base noise already provides visual
+// depth; lighter cores prevent muddy interior appearance.
+static const float CLOUD_DARK = 0.35f;
+
+// Silver-lining gain: mix(col, col*CLOUD_SILVER, (1-cv^0.25)*bright^2) where
+// bright = pow(dot(ray,sun),3) — bright sunward rim on thin cloud edges.
+static const float CLOUD_SILVER = 13.0f;
+
+// Horizon hide: ray.y below this fades clouds out (they don't reach the
+// horizon band where the sky reads as fog). clamp((y-0.06)*5).
+static const float CLOUD_HORIZON_OFFSET = 0.06f;
+
+// Horizon-hide steepness: saturate((ray.y - CLOUD_HORIZON_OFFSET) * this).
+static const float CLOUD_HORIZON_FADE = 5.0f;
+
+// Wave value-noise spatial frequency (1/metres) at the base octave.
+// Higher ⇒ smaller, tighter ripples.
+static const float WATER_WAVE_FREQ = 0.35f;
+
+// Wave normal perturbation strength: how far the height gradient tilts the
+// flat water normal. Higher ⇒ choppier reflections.
+static const float WATER_WAVE_AMP = 0.18f;
+
+// Wave scroll speed (cycles/second). Applied to anim_time for deterministic goldens.
+static const float WATER_WAVE_SPEED = 1.4f;
+
+// Water reflectance at normal incidence (grazing lifts reflection to 1).
+static const float WATER_FRESNEL_F0 = 0.02f;
+
+// Sun-glint intensity: multiplies the reused sun_disc sampled along the
+// reflection ray, an HDR specular highlight on the waves.
+static const float WATER_GLINT = 2.0f;
+
+// Angular radius (radians) of the water sun-glint disc — wider than the sky
+// sun so wave-perturbed normals scatter it into a soft sparkle.
+static const float WATER_GLINT_RADIUS = 0.06f;
+
+// Deep-water linear tint the body colour is pulled toward (interim absorption
+// stand-in until true depth-difference absorption lands).
+static const float WATER_DEEP[3] = {
+    0.02f, 0.09f, 0.13f, 
+};
+
+// How far the lit block colour is mixed toward WATER_DEEP for the water body
+// (0 = keep block colour, 1 = full deep tint). Interim fallback mix used when
+// dynamic_rendering_local_read is unavailable / MSAA is on (no depth input read);
+// true depth-difference absorption (WATER_ABS) supersedes it when available.
+static const float WATER_BODY_MIX = 0.6f;
+
+// Water absorption coefficient (1/metres²). Larger saturates in shallower water.
+static const float WATER_ABS = 0.22f;
+
+// Absorption curve base. Keeps thin water sheets mostly transparent.
+static const float WATER_ABS_BASE = 1.125f;
 

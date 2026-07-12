@@ -6,8 +6,8 @@
 //!
 //! Ownership boundary (strict):
 //! - **Main** owns the window (in `Engine`), the [`GpuAllocator`] (never sent),
-//!   handle identity + culling metadata ([`MeshHandles`]/[`SurfaceHandles`]),
-//!   and a cloned [`ash::Device`] used only for alloc/map/write.
+//!   handle identity + culling metadata ([`MeshHandles`]), and a cloned
+//!   [`ash::Device`] used only for alloc/map/write.
 //! - **Render thread** owns the `Renderer` (residency mirror, swapchain,
 //!   targets, pipelines, per-frame `HostBuffer`s). The `Renderer` is *born* on
 //!   the thread — never moved to it — because its `HostBuffer`s hold a raw
@@ -24,17 +24,13 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
 use super::alloc::{Allocation, GpuAllocator};
-use super::buffers::{
-    FRAMES_IN_FLIGHT, GpuResident, MeshHandles, MeshMeta, SurfaceHandles, SurfaceMeta,
-    build_mesh_resident, build_surface_resident,
-};
+use super::buffers::{FRAMES_IN_FLIGHT, GpuResident, MeshHandles, MeshMeta, build_mesh_resident};
 use super::device::{Device, MemoryBudget};
 use super::instance::InstanceBundle;
 use super::{Renderer, Scale, clamp_msaa, display_refresh_interval};
 use crate::engine::Config;
 use crate::frame::DrawLists;
 use crate::mesh::{MeshData, MeshHandle};
-use crate::surface::{SurfaceData, SurfaceHandle};
 
 /// Device capabilities cached on main for local clamp.
 #[derive(Clone, Copy)]
@@ -47,6 +43,9 @@ pub(crate) enum RenderCmd {
     UploadMesh {
         slot: u32,
         generation: NonZeroU32,
+        /// Quad count (`bounds[6]/6`) so the render thread grows the shared quad
+        /// IBO to index this mesh before its draws record.
+        quads: u32,
         resident: GpuResident,
     },
     /// The render thread stamps `done_at` when it applies this (the timeline is
@@ -55,21 +54,12 @@ pub(crate) enum RenderCmd {
         slot: u32,
         generation: NonZeroU32,
     },
-    UploadSurface {
-        slot: u32,
-        generation: NonZeroU32,
-        resident: GpuResident,
-    },
-    FreeSurface {
-        slot: u32,
-        generation: NonZeroU32,
-    },
     SetBlockTextures {
         size: u32,
         layers: Box<[Vec<u8>]>,
     },
     UpdateMinimap(Box<[u8]>),
-    Screenshot(std::path::PathBuf),
+    Capture(Capture),
     Resize(PhysicalSize<u32>),
     SetVsync(bool),
     /// Pre-clamped on main against cached caps.
@@ -78,6 +68,17 @@ pub(crate) enum RenderCmd {
     SetRenderScale(Scale),
     Frame(Box<DrawLists>),
     Shutdown,
+}
+
+/// A capture request. A pending capture makes the next present *mandatory* (the
+/// pacer never drops it), so the frame the caller wants is guaranteed to reach
+/// the readback — a capture is a correctness obligation, not a paceable frame.
+/// `reply`, when present, carries the real encode/write outcome back to a
+/// blocking caller ([`crate::screenshot_to`]); the interactive path leaves it
+/// `None` and consumes the capture best-effort.
+pub(crate) struct Capture {
+    pub path: std::path::PathBuf,
+    pub reply: Option<Sender<std::io::Result<()>>>,
 }
 
 /// Render thread → main: recycled frame buffers and freed allocations.
@@ -104,6 +105,8 @@ pub(crate) struct RenderConfig {
     pub render_scale: f32,
     pub size: PhysicalSize<u32>,
     pub present_interval: Duration,
+    /// CPU-side feature flags for the render thread (see [`crate::RenderFlags`]).
+    pub flags: crate::RenderFlags,
 }
 
 /// The device/instance/surface handed back from the render thread at shutdown so
@@ -125,7 +128,6 @@ pub(crate) struct RenderClient {
     /// one IS the present-pacing that replaced the old spin `pace()`.
     frame_pool: Vec<Box<DrawLists>>,
     mesh_ids: MeshHandles,
-    surface_ids: SurfaceHandles,
     mesh_alloc: GpuAllocator,
     device: ash::Device,
     caps: DeviceCaps,
@@ -182,6 +184,7 @@ impl RenderClient {
             render_scale: config.render_scale,
             size,
             present_interval,
+            flags: config.flags,
         };
 
         let (cmd_tx, cmd_rx) = sync_channel::<RenderCmd>(1024);
@@ -214,7 +217,6 @@ impl RenderClient {
             ret_rx,
             frame_pool,
             mesh_ids: MeshHandles::new(),
-            surface_ids: SurfaceHandles::new(),
             mesh_alloc,
             device: reply.device,
             caps: reply.caps,
@@ -239,10 +241,14 @@ impl RenderClient {
     pub(crate) fn upload_mesh(&mut self, data: &MeshData) -> Option<MeshHandle> {
         let (meta, resident) =
             unsafe { build_mesh_resident(&self.device, &mut self.mesh_alloc, data) }?;
+        // Quad count is the whole-mesh index total / 6 (bounds are cumulative
+        // 6*quads); the shared quad IBO must index up to it.
+        let quads = meta.bounds[6] / 6;
         let handle = self.mesh_ids.alloc_slot(meta);
         let _ = self.tx.send(RenderCmd::UploadMesh {
             slot: handle.slot,
             generation: handle.generation,
+            quads,
             resident,
         });
         Some(handle)
@@ -261,37 +267,6 @@ impl RenderClient {
         self.mesh_ids.meta(handle)
     }
 
-    // ---- surfaces ----
-
-    pub(crate) fn upload_surface(&mut self, data: &SurfaceData) -> Option<SurfaceHandle> {
-        let (meta, resident) =
-            unsafe { build_surface_resident(&self.device, &mut self.mesh_alloc, data) }?;
-        let handle = self.surface_ids.alloc_slot(meta);
-        let _ = self.tx.send(RenderCmd::UploadSurface {
-            slot: handle.slot,
-            generation: handle.generation,
-            resident,
-        });
-        Some(handle)
-    }
-
-    pub(crate) fn free_surface(&mut self, handle: SurfaceHandle) {
-        if self.surface_ids.free_slot(handle) {
-            let _ = self.tx.send(RenderCmd::FreeSurface {
-                slot: handle.slot,
-                generation: handle.generation,
-            });
-        }
-    }
-
-    pub(crate) fn surface_meta(&self, handle: SurfaceHandle) -> Option<SurfaceMeta> {
-        self.surface_ids.meta(handle)
-    }
-
-    pub(crate) fn surface_aabb(&self, handle: SurfaceHandle) -> Option<(glam::Vec3, glam::Vec3)> {
-        self.surface_ids.meta(handle).map(|s| s.aabb())
-    }
-
     // ---- textures / minimap / screenshot ----
 
     pub(crate) fn set_block_textures(&mut self, size: u32, layers: &[Vec<u8>]) {
@@ -307,8 +282,8 @@ impl RenderClient {
             .send(RenderCmd::UpdateMinimap(rgba.to_vec().into_boxed_slice()));
     }
 
-    pub(crate) fn request_screenshot(&mut self, path: std::path::PathBuf) {
-        let _ = self.tx.send(RenderCmd::Screenshot(path));
+    pub(crate) fn request_capture(&mut self, capture: Capture) {
+        let _ = self.tx.send(RenderCmd::Capture(capture));
     }
 
     // ---- settings (cached on main; getters read the cache) ----
@@ -460,24 +435,17 @@ fn render_loop(
                 RenderCmd::UploadMesh {
                     slot,
                     generation,
+                    quads,
                     resident,
-                } => renderer.apply_upload_mesh(slot, generation, resident),
+                } => renderer.apply_upload_mesh(slot, generation, quads, resident),
                 RenderCmd::FreeMesh { slot, generation } => {
                     renderer.apply_free_mesh(slot, generation)
-                }
-                RenderCmd::UploadSurface {
-                    slot,
-                    generation,
-                    resident,
-                } => renderer.apply_upload_surface(slot, generation, resident),
-                RenderCmd::FreeSurface { slot, generation } => {
-                    renderer.apply_free_surface(slot, generation)
                 }
                 RenderCmd::SetBlockTextures { size, layers } => {
                     renderer.set_block_textures(size, &layers)
                 }
                 RenderCmd::UpdateMinimap(px) => renderer.update_minimap(&px),
-                RenderCmd::Screenshot(path) => renderer.request_screenshot(path),
+                RenderCmd::Capture(capture) => renderer.request_capture(capture),
                 RenderCmd::Resize(size) => renderer.on_resize(size),
                 RenderCmd::SetVsync(v) => renderer.set_vsync(v),
                 RenderCmd::SetMsaa(m) => {

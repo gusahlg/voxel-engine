@@ -44,9 +44,8 @@ const TAA_RESOLVE_OUTPUT_BINDING: u32 = 3;
 /// 0/1/2 assignments are untouched, 3 is the output.
 const TAA_RESOLVE_DEPTH_BINDING: u32 = 4;
 
-/// History feedback weight: fraction of the (reprojected, clamped) history kept
-/// each frame. Higher = smoother/more stable but slower to react.
-const HISTORY_BLEND: f32 = 0.9;
+/// History feedback weight from genconst; fraction of clamped history kept each frame.
+use crate::genconst::HISTORY_BLEND;
 
 fn create_shader_module(device: &ash::Device, bytes: &[u8]) -> vk::ShaderModule {
     let code =

@@ -84,6 +84,9 @@ pub enum Key {
     F1,
     F2,
     F3,
+    F4,
+    F5,
+    F6,
 }
 
 /// Mouse buttons the engine exposes. Other buttons are ignored.
@@ -331,6 +334,9 @@ fn map_key(code: KeyCode) -> Option<Key> {
         KeyCode::F1 => Key::F1,
         KeyCode::F2 => Key::F2,
         KeyCode::F3 => Key::F3,
+        KeyCode::F4 => Key::F4,
+        KeyCode::F5 => Key::F5,
+        KeyCode::F6 => Key::F6,
         _ => return None,
     })
 }

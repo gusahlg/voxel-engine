@@ -30,6 +30,17 @@ impl Color {
         Self { a, ..self }
     }
 
+    /// Decode this sRGB display color to linear light — the sRGB EOTF applied
+    /// per channel. The engine-boundary form for values that composite in linear
+    /// space (e.g. the HDR frame clear), so no shader re-decode is needed.
+    pub fn to_linear(self) -> LinearRgb {
+        let d = |c: u8| {
+            let c = c as f32 / 255.0;
+            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        LinearRgb([d(self.r), d(self.g), d(self.b)])
+    }
+
     pub const LIGHTGRAY: Self = Self::rgb(200, 200, 200);
     pub const GRAY: Self = Self::rgb(130, 130, 130);
     pub const DARKGRAY: Self = Self::rgb(80, 80, 80);

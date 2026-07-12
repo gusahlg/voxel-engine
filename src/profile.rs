@@ -51,7 +51,6 @@ pub enum Meter {
     // printed on their own breakdown line, so they never double-count `Record`.
     RecShadow,
     RecMesh,
-    RecSurface,
     RecSky,
     RecImmediate,
     RecOverlay,
@@ -76,7 +75,7 @@ pub enum Meter {
 }
 
 impl Meter {
-    const ALL: [Meter; 36] = [
+    const ALL: [Meter; 35] = [
         Meter::NetEvents,
         Meter::Physics,
         Meter::StreamDrain,
@@ -93,7 +92,6 @@ impl Meter {
         Meter::Record,
         Meter::RecShadow,
         Meter::RecMesh,
-        Meter::RecSurface,
         Meter::RecSky,
         Meter::RecImmediate,
         Meter::RecOverlay,
@@ -134,7 +132,6 @@ impl Meter {
             Meter::Record => "record",
             Meter::RecShadow => "rec.shadow",
             Meter::RecMesh => "rec.mesh",
-            Meter::RecSurface => "rec.surface",
             Meter::RecSky => "rec.sky",
             Meter::RecImmediate => "rec.imm",
             Meter::RecOverlay => "rec.2d",
@@ -173,7 +170,6 @@ impl Meter {
             | Meter::Record
             | Meter::RecShadow
             | Meter::RecMesh
-            | Meter::RecSurface
             | Meter::RecSky
             | Meter::RecImmediate
             | Meter::RecOverlay
@@ -194,6 +190,46 @@ impl Meter {
             | Meter::TileSample
             | Meter::TileMesh => Tier::Workers,
         }
+    }
+}
+
+/// A sampled *count* (not a duration): the last value set this frame, reported
+/// as-is. Answers "how big is the set a stage iterates" — the size-vs-cost check
+/// a timing meter can't express (e.g. why `list.world` scales).
+#[derive(Clone, Copy)]
+pub enum Gauge {
+    WorldChunks,
+    WorldChunksLive,
+    WorldTiles,
+    WorldSkins,
+}
+
+impl Gauge {
+    const ALL: [Gauge; 4] = [
+        Gauge::WorldChunks,
+        Gauge::WorldChunksLive,
+        Gauge::WorldTiles,
+        Gauge::WorldSkins,
+    ];
+    const COUNT: usize = Self::ALL.len();
+
+    fn label(self) -> &'static str {
+        match self {
+            Gauge::WorldChunks => "chunks",
+            Gauge::WorldChunksLive => "live",
+            Gauge::WorldTiles => "tiles",
+            Gauge::WorldSkins => "skins",
+        }
+    }
+}
+
+/// Last-set value per gauge (overwritten each frame, never accumulated).
+static GAUGES: [AtomicU64; Gauge::COUNT] = [const { AtomicU64::new(0) }; Gauge::COUNT];
+
+/// Record the current value of a gauge. Cheap no-op when profiling is off.
+pub fn gauge(g: Gauge, value: u64) {
+    if enabled() {
+        GAUGES[g as usize].store(value, Ordering::Relaxed);
     }
 }
 
@@ -297,14 +333,41 @@ pub fn add_ms(meter: Meter, ms: f64) {
     }
 }
 
-/// End of frame (main thread). Counts a frame and, every [`WINDOW`], emits the
-/// unified report and resets the window.
+/// Max seconds a window may run before flushing, regardless of frame count.
+/// During a stall the frame cap alone could take a long time to fill, so this
+/// forces a timely report while the badness is still on screen. Overridable
+/// via `VOXEL_PROFILE_FLUSH_MS`.
+fn flush_secs() -> f64 {
+    static SECS: OnceLock<f64> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        std::env::var("VOXEL_PROFILE_FLUSH_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|ms| ms / 1000.0)
+            .unwrap_or(1.0)
+    })
+}
+
+/// End of frame (main thread). Counts a frame, tracks the worst single-frame
+/// period, and flushes the report at whichever comes first: [`WINDOW`] frames or
+/// [`flush_secs`] of wall time — so a stall reports promptly instead of being
+/// smeared across a slow 240-frame window.
 pub fn frame_end() {
     if !enabled() {
         return;
     }
+    let now = Instant::now();
+    // Per-frame period, from the previous frame_end. Feeds the worst-frame peak
+    // so a transient spike inside an otherwise-fast window is still surfaced.
+    let dt = LAST_FRAME.replace(Some(now)).map(|p| now.duration_since(p));
+    if let Some(dt) = dt {
+        WORST_MS.with(|w| w.set(w.get().max(dt.as_secs_f64() * 1000.0)));
+    }
     let frames = METERS.frames.fetch_add(1, Ordering::Relaxed) + 1;
-    if frames < WINDOW {
+    let aged = WINDOW_START
+        .with(|s| s.get())
+        .is_some_and(|start| now.duration_since(start).as_secs_f64() >= flush_secs());
+    if frames < WINDOW && !aged {
         return;
     }
     METERS.frames.store(0, Ordering::Relaxed);
@@ -313,8 +376,12 @@ pub fn frame_end() {
 
 thread_local! {
     /// Wall-clock start of the current window, for real ms/frame and fps. Only
-    /// touched by `report` on the main thread.
+    /// touched by `report`/`frame_end` on the main thread.
     static WINDOW_START: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// End of the previous frame, for the per-frame period.
+    static LAST_FRAME: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// Worst single-frame period (ms) seen this window; reset by `report`.
+    static WORST_MS: Cell<f64> = const { Cell::new(0.0) };
 }
 
 fn report(frames: u64) {
@@ -334,13 +401,17 @@ fn report(frames: u64) {
         per_frame_count[m as usize] = c / f;
     }
 
-    // Header: real frame period (hence fps) when we have a prior window mark.
+    // Header: real frame period (hence fps) when we have a prior window mark,
+    // plus the window's worst single frame — a stall that lasted only a few
+    // frames shows here even when the average stays fast.
+    let worst = WORST_MS.replace(0.0);
     let mut header = format!("profile {frames}f");
     if let Some(secs) = wall.map(|w| w.elapsed().as_secs_f64()) {
         header.push_str(&format!(
-            " {:.2}ms/f {:.0}fps",
+            " {:.2}ms/f {:.0}fps worst {:.1}ms",
             secs * 1000.0 / f,
-            f / secs
+            f / secs,
+            worst,
         ));
     }
     let tier_total = |t: Tier| -> f64 {
@@ -399,13 +470,25 @@ fn report(frames: u64) {
         eprintln!("{line}");
     }
 
+    // Set sizes: the iterated-set counts behind the CPU list cost. `list.world`
+    // scales with these, so a jump here — not a per-item regression — is what
+    // makes it spike. Last-sampled values, not windowed averages.
+    let mut sline = String::from("  sets   :");
+    for g in Gauge::ALL {
+        sline.push_str(&format!(
+            " {} {}",
+            g.label(),
+            GAUGES[g as usize].load(Ordering::Relaxed)
+        ));
+    }
+    eprintln!("{sline}");
+
     // Record breakdown: the CPU sub-costs inside `Record`, hottest-first. These
     // are substages (not in the submit tier total); this line explains where the
     // `record` number goes without double-counting it.
     let mut rec: Vec<Meter> = [
         Meter::RecShadow,
         Meter::RecMesh,
-        Meter::RecSurface,
         Meter::RecSky,
         Meter::RecImmediate,
         Meter::RecOverlay,
@@ -430,7 +513,6 @@ fn is_substage(m: Meter) -> bool {
             | Meter::TileMesh
             | Meter::RecShadow
             | Meter::RecMesh
-            | Meter::RecSurface
             | Meter::RecSky
             | Meter::RecImmediate
             | Meter::RecOverlay

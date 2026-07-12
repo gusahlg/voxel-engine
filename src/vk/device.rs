@@ -84,6 +84,10 @@ pub struct Device {
     pub anisotropy: Option<Anisotropy>,
     /// `Some` when attachment-based variable-rate shading is available.
     pub fragment_shading_rate: Option<FragmentShadingRate>,
+    /// `VK_KHR_dynamic_rendering_local_read` enabled: lets the blend pass read
+    /// the same-scope depth attachment as an input attachment (true water
+    /// depth-difference absorption). Optional — absent ⇒ the interim tint path.
+    pub dynamic_rendering_local_read: bool,
     /// Sample counts supported by BOTH color and depth framebuffer attachments.
     pub msaa_caps: vk::SampleCountFlags,
     /// `multiDrawIndirect` enabled; otherwise renderer loops single-draw calls.
@@ -110,6 +114,9 @@ struct Candidate {
     /// `Some(texel_size)` when attachment VRS is supported; the tile size one
     /// rate-image texel covers. Optional, so absence never disqualifies.
     fragment_shading_rate: Option<vk::Extent2D>,
+    /// `true` when both the extension and the `dynamicRenderingLocalRead` feature
+    /// bit are present. Optional, so absence never disqualifies a device.
+    dynamic_rendering_local_read: bool,
     score: u32,
 }
 
@@ -152,6 +159,9 @@ impl Device {
         }
         if best.fragment_shading_rate.is_some() {
             device_extensions.push(khr::fragment_shading_rate::NAME.as_ptr());
+        }
+        if best.dynamic_rendering_local_read {
+            device_extensions.push(khr::dynamic_rendering_local_read::NAME.as_ptr());
         }
 
         // One queue per distinct family (graphics may equal present).
@@ -204,6 +214,12 @@ impl Device {
         if best.fragment_shading_rate.is_some() {
             device_create_info = device_create_info.push_next(&mut fsr_features);
         }
+        let mut local_read_features =
+            vk::PhysicalDeviceDynamicRenderingLocalReadFeaturesKHR::default()
+                .dynamic_rendering_local_read(true);
+        if best.dynamic_rendering_local_read {
+            device_create_info = device_create_info.push_next(&mut local_read_features);
+        }
 
         let device = unsafe {
             instance
@@ -252,6 +268,7 @@ impl Device {
             memory_budget,
             anisotropy: best.max_anisotropy.map(Anisotropy),
             fragment_shading_rate,
+            dynamic_rendering_local_read: best.dynamic_rendering_local_read,
             msaa_caps,
             multi_draw_indirect: best.multi_draw_indirect,
             draw_indirect_first_instance: best.draw_indirect_first_instance,
@@ -347,6 +364,16 @@ fn evaluate(
         })
         .flatten();
 
+    // Optional: same-scope depth input-attachment reads for water absorption.
+    // Requires both the extension and the feature bit; absence ⇒ interim tint.
+    let dynamic_rendering_local_read = has_extension(khr::dynamic_rendering_local_read::NAME) && {
+        let mut lr_features =
+            vk::PhysicalDeviceDynamicRenderingLocalReadFeaturesKHR::default();
+        let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut lr_features);
+        unsafe { instance.get_physical_device_features2(physical, &mut f2) };
+        lr_features.dynamic_rendering_local_read == vk::TRUE
+    };
+
     let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
     let mut graphics_family = None;
     let mut present_family = None;
@@ -385,6 +412,7 @@ fn evaluate(
         memory_budget,
         max_anisotropy,
         fragment_shading_rate,
+        dynamic_rendering_local_read,
         score,
     })
 }

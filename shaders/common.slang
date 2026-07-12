@@ -35,17 +35,9 @@ float dither(float phase, float2 frag_coord)
     return frac((b + 0.5) / 16.0 + phase) - 0.5;
 }
 
-// Per-frame uniform block (seven float4s). Mirrors voxel_engine::skeleton::FrameUniformsGpu.
-struct FrameUniforms
-{
-    float4 sun_dir_elev;    // xyz sun direction, w elevation
-    float4 light;           // rgb linear sun light, w day_night_mix
-    float4 zenith;          // rgb linear zenith, w turbidity
-    float4 horizon;         // rgb linear horizon, w fog_density
-    float4 candle;          // rgb linear candle/torch, w ambient_floor
-    float4 exposure_dither; // x exposure, y dither_phase, zw jitter px
-    float4 reserved;        // unused; reserved for future features
-};
+// Per-frame uniform block. Generated from the lane_table in build.rs (the twin of
+// voxel_engine::skeleton::FrameUniformsGpu) so a lane can never drift CPU↔GPU.
+#include "generated/frame_uniforms.slang"
 
 // Phase A/B evaluators (stubs declared here, bodies land later).
 
@@ -67,8 +59,8 @@ float3 candle_curve(float3 x)
 }
 
 // Omni ambient floor colour: the zenith tint re-scaled to `candle.w` luma
-// (`ambient_floor`), so shadowed faces and caves never read pure black yet keep
-// the sky's hue (exact CPU parity with `FrameSnapshot::legacy_env`).
+// (`ambient_floor`, composed by the game's `FrameSnapshot`), so shadowed faces
+// and caves never read pure black yet keep the sky's hue.
 float3 ambient_floor_color(FrameUniforms frame)
 {
     float floor = frame.candle.w;
@@ -76,18 +68,24 @@ float3 ambient_floor_color(FrameUniforms frame)
     return zl > 1e-6 ? frame.zenith.rgb * (floor / zl) : float3(floor);
 }
 
-// Analytic sky radiance along `ray` — the single source of truth for the
-// distance fog (fog == sky evaluated at the fragment) and water reflection.
-// Mirrors `Atmosphere::radiance_rgb` (src/sky/atmosphere.rs): an elevation
-// gradient between the horizon and zenith anchors, plus a turbidity-scaled sun
-// halo. `ray.y` below the horizon clamps to the horizon colour.
+// Analytic sky radiance along `ray` — THE sky formula, single source of truth
+// for the sky background, the distance fog (fog == sky evaluated at the
+// fragment), and water reflection: an elevation gradient between the horizon
+// and zenith anchors, plus a turbidity-scaled sun halo. `ray.y` below the
+// horizon clamps to the horizon colour. (The CPU `Atmosphere::radiance_rgb`
+// drifted from this formula and is scheduled for deletion; do not treat it
+// as a mirror.)
 float3 sky_radiance(float3 ray, FrameUniforms frame)
 {
     float up = clamp(ray.y, 0.0, 1.0);
     float3 base = lerp(frame.horizon.rgb, frame.zenith.rgb, sqrt(up));
     float3 sun = normalize(frame.sun_dir_elev.xyz);
     float c = max(dot(ray, sun), 0.0);
-    float3 glow = frame.light.rgb * (pow(c, 8.0) * (0.5 + frame.zenith.w)); // zenith.w = turbidity
+    // Halo widens as the sun drops: low exponent at/below the horizon (wide golden-hour
+    // halo), tightening to the noon look above GLOW_EDGE1. sun_dir_elev.w = elevation [-1,1].
+    float glow_pow = lerp(GLOW_POW_SUNSET, GLOW_POW_DAY,
+                          smoothstep(GLOW_EDGE0, GLOW_EDGE1, frame.sun_dir_elev.w));
+    float3 glow = frame.light.rgb * (pow(c, glow_pow) * (0.5 + frame.zenith.w)); // zenith.w = turbidity
     return base + glow;
 }
 
@@ -105,13 +103,15 @@ float3 sun_disc(float3 ray, float3 sun_dir, float3 tint, float radius)
 }
 
 // Unified lighting term. `sky` = linear skylight colour (already shadow-
-// attenuated by the caller), `block` = linear blocklight colour pre-curve, `ao`
-// the ambient-occlusion factor [0,1], `shade` the per-face directional shade
-// [0,1]. Folds in the candle curve and the omni ambient floor from `frame`.
-float3 light_eval(float3 sky, float3 block, float ao, float shade, FrameUniforms frame)
+// attenuated AND omni-shaped by the caller — the directional N·L wrap folds into
+// this direct term), `block` = linear blocklight colour
+// pre-curve, `ao` the ambient-occlusion factor [0,1]. Folds in the candle curve
+// and the omni ambient floor from `frame`. The ambient floor + AO stay global
+// (omni-directional); only `sky` carries the directional shaping.
+float3 light_eval(float3 sky, float3 block, float ao, FrameUniforms frame)
 {
     float3 diffuse = max(ambient_floor_color(frame) + sky, candle_curve(block));
-    return diffuse * (ao * shade);
+    return diffuse * ao;
 }
 
 // Far-field shadow fallback beyond shadow-map cascades. Uses baked sky-visibility

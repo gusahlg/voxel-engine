@@ -22,6 +22,16 @@ pub const SHIFT_LAYER: u32 = 18;
 pub const SHIFT_AO: u32 = 0;
 pub const SHIFT_SKY: u32 = 2;
 pub const SHIFT_BLOCK: u32 = 6;
+/// Water material bit in `w1` (bit 10). Set by mesher for liquid blocks;
+/// read by mesh3d.frag to select animated water shading in transparent pass.
+pub const SHIFT_WATER: u32 = 10;
+/// Per-axis micro-offsets in `w1` (bits 11-17): -2..=1 values that nudge vertices
+/// on double-covered LOD borders to break z-fighting. Default zero (no offset).
+pub const SHIFT_MICRO_X: u32 = 11;
+pub const SHIFT_MICRO_Y: u32 = 13;
+pub const SHIFT_MICRO_Z: u32 = 15;
+/// Two-bit mask for one micro-offset axis.
+pub const MASK_MICRO: u32 = 0x3;
 
 // Field masks (applied on pack so a debug-only out-of-range value can never
 // corrupt an adjacent field; the typed API keeps values in range anyway).
@@ -117,11 +127,11 @@ vertex_struct! {
 impl MeshVertex {
     /// The sole vertex constructor: AO and light are non-optional, so no mesher
     /// can silently default them (the bug that washed out far LOD tiles).
-    pub fn new(pos: [u8; 3], normal: Normal, layer: u8, ao: Ao, light: Light) -> Self {
-        Self::pack(pos, normal, layer, ao.0, light.sky, light.block)
+    pub fn new(pos: [u8; 3], normal: Normal, layer: u8, ao: Ao, light: Light, water: bool) -> Self {
+        Self::pack(pos, normal, layer, ao.0, light.sky, light.block, water)
     }
 
-    const fn pack(pos: [u8; 3], normal: Normal, layer: u8, ao: u8, sky: u8, block: u8) -> Self {
+    const fn pack(pos: [u8; 3], normal: Normal, layer: u8, ao: u8, sky: u8, block: u8, water: bool) -> Self {
         // Chunk-local coords must be 0..=16. The 5-bit field also holds
         // 17..=31, so an out-of-range coord stores silently at the wrong
         // position rather than corrupting a neighbor — caught in debug only.
@@ -136,8 +146,38 @@ impl MeshVertex {
             | ((layer as u32) & MASK_LAYER) << SHIFT_LAYER;
         let w1 = ((ao as u32) & MASK_AO) << SHIFT_AO
             | ((sky as u32) & MASK_LIGHT) << SHIFT_SKY
-            | ((block as u32) & MASK_LIGHT) << SHIFT_BLOCK;
+            | ((block as u32) & MASK_LIGHT) << SHIFT_BLOCK
+            | (water as u32) << SHIFT_WATER;
         Self { packed: [w0, w1] }
+    }
+
+    /// Decodes the water material bit — the mesher's per-face liquid flag,
+    /// selecting animated water shading in the transparent fragment shader.
+    pub fn is_water(&self) -> bool {
+        (self.packed[1] >> SHIFT_WATER) & 1 == 1
+    }
+
+    /// Sets per-axis micro-offsets (-2..=1) that nudge vertices on LOD borders
+    /// to break z-fighting. Chains after [`Self::new`] without widening its signature.
+    pub fn with_micro(mut self, micro: [i8; 3]) -> Self {
+        debug_assert!(
+            micro.iter().all(|&m| (-2..=1).contains(&m)),
+            "micro offset out of range -2..=1"
+        );
+        for (shift, &m) in [SHIFT_MICRO_X, SHIFT_MICRO_Y, SHIFT_MICRO_Z].iter().zip(&micro) {
+            self.packed[1] |= ((m as u32) & MASK_MICRO) << shift;
+        }
+        self
+    }
+
+    /// Decodes the per-axis micro-offsets — the two's-complement inverse of
+    /// [`Self::with_micro`]; `[0, 0, 0]` for any vertex built without it.
+    pub fn micro(&self) -> [i8; 3] {
+        let w1 = self.packed[1];
+        [SHIFT_MICRO_X, SHIFT_MICRO_Y, SHIFT_MICRO_Z].map(|shift| {
+            let raw = (w1 >> shift) & MASK_MICRO;
+            if raw >= 2 { raw as i8 - 4 } else { raw as i8 }
+        })
     }
 
     /// Decodes the chunk-local integer position as floats (for CPU-side AABBs).
@@ -366,14 +406,19 @@ mod tests {
                 for layer in [0u8, 1, 127, 255] {
                     for ao in [0u8, 1, 3] {
                         for (sky, block) in [(0u8, 15u8), (15, 0), (7, 8), (15, 15)] {
-                            let v = MeshVertex::new(
-                                pos,
-                                normal,
-                                layer,
-                                Ao::new(ao),
-                                Light::new(sky, block),
-                            );
-                            assert_eq!(typed_unpack(v), (pos, normal, layer, ao, sky, block));
+                            for water in [false, true] {
+                                let v = MeshVertex::new(
+                                    pos,
+                                    normal,
+                                    layer,
+                                    Ao::new(ao),
+                                    Light::new(sky, block),
+                                    water,
+                                );
+                                assert_eq!(typed_unpack(v), (pos, normal, layer, ao, sky, block));
+                                assert_eq!(v.is_water(), water, "water bit round-trips");
+                                assert_eq!(v.micro(), [0, 0, 0], "new() leaves micro zero");
+                            }
                         }
                     }
                 }
@@ -382,14 +427,44 @@ mod tests {
     }
 
     #[test]
+    fn micro_offsets_round_trip_two_complement() {
+        // Every encodable value including both negatives and the zero default;
+        // with_micro must not disturb the position/normal/layer/ao/light/water
+        // fields it is layered on top of.
+        for mx in [-2i8, -1, 0, 1] {
+            for my in [-2i8, -1, 0, 1] {
+                for mz in [-2i8, -1, 0, 1] {
+                    let base = MeshVertex::new(
+                        [3, 5, 7],
+                        Normal::NegY,
+                        42,
+                        Ao::new(2),
+                        Light::new(11, 4),
+                        true,
+                    );
+                    let v = base.with_micro([mx, my, mz]);
+                    assert_eq!(v.micro(), [mx, my, mz]);
+                    // Layered bits leave everything else exactly as `base`.
+                    assert_eq!(typed_unpack(v), typed_unpack(base));
+                    assert!(v.is_water());
+                }
+            }
+        }
+        // The default constructor decodes to no offset.
+        let plain = MeshVertex::new([0, 0, 0], Normal::PosX, 0, Ao::NONE, Light::DAY, false);
+        assert_eq!(plain.micro(), [0, 0, 0]);
+    }
+
+    #[test]
     fn day_light_keeps_sky_drops_block() {
-        let v = MeshVertex::new([2, 3, 4], Normal::PosY, 5, Ao::NONE, Light::DAY);
+        let v = MeshVertex::new([2, 3, 4], Normal::PosY, 5, Ao::NONE, Light::DAY, false);
         assert_eq!(typed_unpack(v), ([2, 3, 4], Normal::PosY, 5, 3, 15, 0));
+        assert!(!v.is_water(), "non-water vertex clears the water bit");
     }
 
     /// A quad wound `[0,1,2,0,2,3]` seen from outside, layer irrelevant.
     fn quad_for(normal: Normal) -> [MeshVertex; 4] {
-        std::array::from_fn(|i| MeshVertex::new([i as u8, 0, 0], normal, 0, Ao::NONE, Light::FULL))
+        std::array::from_fn(|i| MeshVertex::new([i as u8, 0, 0], normal, 0, Ao::NONE, Light::FULL, false))
     }
 
     #[test]

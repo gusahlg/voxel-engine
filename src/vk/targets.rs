@@ -21,6 +21,9 @@ pub const HDR_COLOR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// 2048² per cascade, two cascades → two array layers of ONE image.
 pub const SHADOW_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 pub const SHADOW_RESOLUTION: u32 = 2048;
+// The shader's PCF derives texel size from the generated twin (no per-fragment
+// GetDimensions); build.rs can't read this module, so the pair is pinned here.
+const _: () = assert!(crate::genconst::SHADOW_RESOLUTION == SHADOW_RESOLUTION as f32);
 /// Exactly two cascades (mirrors `skeleton::Cascade`), so exactly two layers.
 pub const SHADOW_CASCADES: u32 = 2;
 
@@ -185,6 +188,139 @@ impl ImageResources {
     }
 }
 
+/// Bloom mip chain (half-res HDR pyramid): compute threshold and downsample
+/// passes feed the tonemap composite. Per-slot to avoid races between frames.
+pub(crate) struct BloomChain {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub sample_view: vk::ImageView,
+    pub mip_views: Vec<vk::ImageView>,
+    pub mip_extents: Vec<vk::Extent2D>,
+}
+
+/// Maximum mip levels; pyramid reaches 1x1 or BLOOM_MAX_MIPS, whichever is shorter.
+const BLOOM_MAX_MIPS: u32 = 6;
+
+impl BloomChain {
+    fn new(
+        device: &ash::Device,
+        memory_props: &vk::PhysicalDeviceMemoryProperties,
+        extent: vk::Extent2D,
+    ) -> BloomChain {
+        // Half-res base; each mip halves (rounding up) to a floor of 1 texel.
+        let base = vk::Extent2D {
+            width: extent.width.div_ceil(2).max(1),
+            height: extent.height.div_ceil(2).max(1),
+        };
+        let mut mip_extents = Vec::new();
+        let mut e = base;
+        loop {
+            mip_extents.push(e);
+            if mip_extents.len() as u32 >= BLOOM_MAX_MIPS || (e.width == 1 && e.height == 1) {
+                break;
+            }
+            e = vk::Extent2D {
+                width: e.width.div_ceil(2).max(1),
+                height: e.height.div_ceil(2).max(1),
+            };
+        }
+        let levels = mip_extents.len() as u32;
+
+        // RGBA16F is a mandatory storage-image + sampled + linear-filter format,
+        // so the pyramid needs no capability query. STORAGE for the compute
+        // read/write, SAMPLED for the tonemap composite.
+        let image = unsafe {
+            device
+                .create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(HDR_COLOR_FORMAT)
+                        .extent(vk::Extent3D {
+                            width: base.width,
+                            height: base.height,
+                            depth: 1,
+                        })
+                        .mip_levels(levels)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        // TRANSFER_DST: when the bloom lane is off, the pass clears
+                        // this to black instead of generating it, so the tonemap
+                        // composite is a no-op with no shader/push-constant branch.
+                        .usage(
+                            vk::ImageUsageFlags::STORAGE
+                                | vk::ImageUsageFlags::SAMPLED
+                                | vk::ImageUsageFlags::TRANSFER_DST,
+                        )
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )
+                .expect("create bloom image")
+        };
+        let reqs = unsafe { device.get_image_memory_requirements(image) };
+        let memory = unsafe {
+            device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(reqs.size)
+                        .memory_type_index(find_memory_type(
+                            memory_props,
+                            reqs.memory_type_bits,
+                            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                        )),
+                    None,
+                )
+                .expect("allocate bloom memory")
+        };
+        unsafe {
+            device
+                .bind_image_memory(image, memory, 0)
+                .expect("bind bloom memory");
+        }
+
+        let view = |base_mip: u32, count: u32| unsafe {
+            device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(HDR_COLOR_FORMAT)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: base_mip,
+                            level_count: count,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        }),
+                    None,
+                )
+                .expect("create bloom image view")
+        };
+        let sample_view = view(0, levels);
+        let mip_views = (0..levels).map(|m| view(m, 1)).collect();
+
+        BloomChain {
+            image,
+            memory,
+            sample_view,
+            mip_views,
+            mip_extents,
+        }
+    }
+
+    unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.destroy_image_view(self.sample_view, None);
+            for v in &self.mip_views {
+                device.destroy_image_view(*v, None);
+            }
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
 pub struct RenderTargets {
     /// Per-slot so the VRS compute pass can sample this slot's depth from two
     /// cycles ago (fence-synchronised) while the other slot is in flight.
@@ -209,6 +345,9 @@ pub struct RenderTargets {
     /// re-created with the rest of the targets on resize (its resolution is
     /// swapchain-independent, 2048² per cascade, so this only re-homes ownership).
     pub(crate) shadow: ShadowMap,
+    /// Per-slot bloom mip chain. Extent-dependent, so recreated with the
+    /// rest of the targets on resize.
+    pub(crate) bloom: [BloomChain; FRAMES_IN_FLIGHT as usize],
 }
 
 impl RenderTargets {
@@ -233,8 +372,14 @@ impl RenderTargets {
                 extent,
                 depth_format,
                 samples,
-                // SAMPLED so the VRS compute classifier can read it.
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                // SAMPLED so the VRS compute classifier can read it;
+                // INPUT_ATTACHMENT so the blend pass can read it same-scope via
+                // dynamic_rendering_local_read for water depth-difference
+                // absorption (depth formats support input-attachment usage
+                // wherever they support depth-stencil-attachment usage).
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::INPUT_ATTACHMENT,
                 vk::ImageAspectFlags::DEPTH,
             )
         });
@@ -278,6 +423,8 @@ impl RenderTargets {
 
         let shadow = ShadowMap::new(device, &memory_props);
 
+        let bloom = std::array::from_fn(|_| BloomChain::new(device, &memory_props, extent));
+
         Self {
             depth,
             depth_format,
@@ -287,6 +434,7 @@ impl RenderTargets {
             color_format,
             vrs,
             shadow,
+            bloom,
         }
     }
 
@@ -305,6 +453,9 @@ impl RenderTargets {
                 vrs.destroy(device);
             }
             self.shadow.destroy(device);
+            for chain in &self.bloom {
+                chain.destroy(device);
+            }
         }
     }
 }

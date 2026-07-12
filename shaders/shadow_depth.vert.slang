@@ -26,6 +26,8 @@ ConstantBuffer<PushConstants> pc;
 [shader("vertex")]
 float4 vertexMain(VertexInput input) : SV_Position
 {
+    // The w1 micro-offset bits (mesh.rs SHIFT_MICRO_*) are deliberately ignored
+    // here: the occluder depth bias dwarfs the ±MICRO_STEP seam nudge.
     uint w0 = input.packed.x;
     float x = float((w0 >> 0) & 0x1F);
     float y = float((w0 >> 5) & 0x1F);

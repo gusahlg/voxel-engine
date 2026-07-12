@@ -3,6 +3,8 @@
 // All matrices are CLEAN (jitter only at rasterization). Reprojection is depth-aware
 // so camera translation reprojects correctly at all distances.
 
+#include "generated/shader_constants.slang" // VARIANCE_GAMMA
+
 // Descriptor set layout: current=0, history=1, reproj UBO=2, output=3.
 // The resolved-history output rides binding 3 of the same set.
 [[vk::binding(0, 0)]] Sampler2D currentTex;   // this frame's HDR offscreen
@@ -36,6 +38,10 @@ struct Push
 float2 uv_to_ndc(float2 uv) { return float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0); }
 float2 ndc_to_uv(float2 ndc) { return float2(ndc.x * 0.5 + 0.5, (1.0 - ndc.y) * 0.5); }
 
+// YCoCg ⇄ RGB. Variance clamp in YCoCg bounds luma independently of chroma.
+float3 rgb_to_ycocg(float3 c) { return float3(0.25*c.r + 0.5*c.g + 0.25*c.b, 0.5*(c.r - c.b), -0.25*c.r + 0.5*c.g - 0.25*c.b); }
+float3 ycocg_to_rgb(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void computeMain(uint3 gid: SV_DispatchThreadID)
@@ -47,19 +53,24 @@ void computeMain(uint3 gid: SV_DispatchThreadID)
     float2 uv = (float2(gid.xy) + 0.5) / texel;
     float3 current = currentTex.SampleLevel(uv, 0).rgb;
 
-    // Neighbourhood colour AABB (3×3 of the current frame) — the ghosting guard.
-    float3 nmin = current;
-    float3 nmax = current;
+    // Neighbourhood statistics (3×3) in YCoCg — avoid jitter re-injection crawl
+    // by using mean±stddev bounds instead of raw min/max from jittered samples.
+    float3 m1 = float3(0.0);
+    float3 m2 = float3(0.0);
     for (int dy = -1; dy <= 1; ++dy)
     {
         for (int dx = -1; dx <= 1; ++dx)
         {
             float2 nuv = uv + float2(dx, dy) / texel;
-            float3 c = currentTex.SampleLevel(nuv, 0).rgb;
-            nmin = min(nmin, c);
-            nmax = max(nmax, c);
+            float3 c = rgb_to_ycocg(currentTex.SampleLevel(nuv, 0).rgb);
+            m1 += c;
+            m2 += c * c;
         }
     }
+    float3 mean = m1 / 9.0;
+    float3 sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
+    float3 nmin = mean - VARIANCE_GAMMA * sigma;
+    float3 nmax = mean + VARIANCE_GAMMA * sigma;
 
     float3 resolved = current;
     if (pc.history_valid != 0)
@@ -80,11 +91,11 @@ void computeMain(uint3 gid: SV_DispatchThreadID)
             // Only integrate history that reprojects back on-screen.
             if (all(prevUv >= 0.0) && all(prevUv <= 1.0))
             {
-                float3 hist = historyTex.SampleLevel(prevUv, 0).rgb;
+                float3 hist = rgb_to_ycocg(historyTex.SampleLevel(prevUv, 0).rgb);
                 // Clamp the reprojected history into the current neighbourhood so
                 // disoccluded / mismatched samples cannot ghost.
                 hist = clamp(hist, nmin, nmax);
-                resolved = lerp(current, hist, pc.blend);
+                resolved = lerp(current, ycocg_to_rgb(hist), pc.blend);
             }
         }
     }
