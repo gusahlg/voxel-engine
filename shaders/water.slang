@@ -74,15 +74,7 @@ float water_absorption(float opaque_d, float water_d)
 // mixed toward the deep tint (WATER_BODY_MIX interim, or water_absorption() when
 // the depth input attachment is available). Returns colour + alpha for the
 // alpha-blended transparent pass (fog is applied by the caller, as for all mesh).
-//
-// `reflectivity` scales the specular terms (Fresnel sky reflection + sun glint)
-// down to zero: 1 for full-res chunk water, 0 for coarse LOD-tile water. LOD water
-// is drawn with a per-pixel dither discard at the LOD→chunk transition
-// (mesh3d.frag); a mirror-bright reflection toggling with that discard reads as
-// flicker at ground level. Damping the specular terms on LOD water leaves the
-// discard swinging only between near-identical body colours — invisible, exactly
-// as for diffuse terrain — while near water keeps its full reflection.
-float4 water_shade(float3 world, float3 base_n, float3 lit_albedo, float alpha, float absorb, float reflectivity, FrameUniforms frame)
+float4 water_shade(float3 world, float3 base_n, float3 lit_albedo, float alpha, float absorb, FrameUniforms frame)
 {
     float3 v = normalize(world); // camera → fragment (points into the surface)
 
@@ -97,13 +89,11 @@ float4 water_shade(float3 world, float3 base_n, float3 lit_albedo, float alpha, 
     // valid reflection primitive.
     float3 r = reflect(v, N);
     float3 reflection = sky_radiance(r, frame);
-    float3 glint = sun_disc(r, frame.sun_dir_elev.xyz, frame.light.rgb, WATER_GLINT_RADIUS) * WATER_GLINT * reflectivity;
+    float3 glint = sun_disc(r, frame.sun_dir_elev.xyz, frame.light.rgb, WATER_GLINT_RADIUS) * WATER_GLINT;
 
-    // Fresnel: reflection dominates at grazing angles. `1 + dot(N,v)` is
-    // `1 - cos(incidence)` since v points into the surface. Scaled by
-    // `reflectivity` so LOD water collapses to its diffuse body (see header).
+    // Fresnel: reflection dominates at grazing angles.
     float grazing = clamp(1.0 + dot(N, v), 0.0, 1.0);
-    float fresnel = (WATER_FRESNEL_F0 + (1.0 - WATER_FRESNEL_F0) * grazing * grazing) * reflectivity;
+    float fresnel = WATER_FRESNEL_F0 + (1.0 - WATER_FRESNEL_F0) * grazing * grazing;
 
     // The water body is the lit block colour pulled toward a deep tint by
     // `absorb`, so it reads as a tinted volume rather than a flat blend. `absorb`

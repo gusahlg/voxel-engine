@@ -128,7 +128,7 @@ impl WarpMap {
     /// GPU push bytes for tonemap remap. Identity yields `s = 0` so the frag skips
     /// remapping. Godray carries sun's screen position; all-zero disables march.
     #[inline]
-    pub fn push(&self, exposure: f32, dither_phase: f32, godray: Godray) -> WarpPush {
+    pub fn push(&self, exposure: f32, dither_phase: f32, godray: Godray, vignette: f32) -> WarpPush {
         let (s, atan_s) = match self {
             WarpMap::Identity => (0.0, 0.0),
             WarpMap::Active { s, atan_s } => (*s, *atan_s),
@@ -140,6 +140,7 @@ impl WarpMap {
             dither_phase,
             godray0: [godray.sun_uv[0], godray.sun_uv[1], godray.strength, 0.0],
             godray1: [godray.tint[0], godray.tint[1], godray.tint[2], 0.0],
+            vignette,
         }
     }
 }
@@ -205,6 +206,8 @@ pub struct WarpPush {
     pub godray0: [f32; 4],
     /// Godray sun tint: veil colour (rgb), pad (w).
     pub godray1: [f32; 4],
+    /// Vignette strength (0 = off). Trailing lane (ABI-appended).
+    pub vignette: f32,
 }
 
 /// Perspective camera, raylib-parity: `fovy` is the vertical field of view in

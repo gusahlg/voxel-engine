@@ -343,6 +343,24 @@ impl MeshData {
     }
 }
 
+/// LOD detail level: `FULL` (0) is full-res; each step doubles the cell size.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Detail(u8);
+
+impl Detail {
+    /// Full-resolution chunks.
+    pub const FULL: Detail = Detail(0);
+
+    pub fn new(level: u8) -> Detail {
+        Detail(level)
+    }
+
+    /// Per-draw uniform scale: `2^level` metres per cell.
+    pub fn scale(self) -> f32 {
+        (1u32 << self.0) as f32
+    }
+}
+
 /// Generational handle to a GPU mesh. Cheap to copy; freeing is explicit via
 /// `Engine::free_mesh` (deferred internally until the GPU is done with it).
 ///

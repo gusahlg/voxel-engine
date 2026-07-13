@@ -301,10 +301,6 @@ impl RenderClient {
         self.vsync
     }
 
-    pub(crate) fn set_flags(&mut self, flags: crate::RenderFlags) {
-        let _ = self.tx.send(RenderCmd::SetFlags(flags));
-    }
-
     pub(crate) fn set_msaa(&mut self, samples: u32) -> u32 {
         let resolved = clamp_msaa(samples, self.caps.max_msaa);
         self.msaa = resolved;
@@ -331,6 +327,10 @@ impl RenderClient {
 
     pub(crate) fn cull_faces(&self) -> bool {
         self.cull_faces
+    }
+
+    pub(crate) fn set_flags(&mut self, flags: crate::RenderFlags) {
+        let _ = self.tx.send(RenderCmd::SetFlags(flags));
     }
 
     pub(crate) fn set_render_scale(&mut self, scale: f32) -> f32 {

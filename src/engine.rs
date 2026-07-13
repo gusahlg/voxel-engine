@@ -98,6 +98,8 @@ pub struct RenderFlags {
     /// water renders, tinted and reflective, but still — the cheapest frame
     /// for water-heavy scenes.
     pub water_anim: bool,
+    /// Radial vignette darkening in the tonemap pass.
+    pub vignette: bool,
 }
 
 impl Default for RenderFlags {
@@ -116,6 +118,7 @@ impl Default for RenderFlags {
             sky: true,
             vrs: true,
             water_anim: true,
+            vignette: false,
         }
     }
 }

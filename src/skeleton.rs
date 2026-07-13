@@ -47,6 +47,11 @@ impl<T> PerSlot<T> {
     pub fn new(pair: [T; 2]) -> Self {
         PerSlot(pair)
     }
+
+    /// Borrow both slots for lifecycle passes that touch every frame's copy.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        self.0.iter()
+    }
 }
 
 impl<T> std::ops::Index<FrameSlot> for PerSlot<T> {
