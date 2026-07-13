@@ -874,7 +874,10 @@ impl Renderer {
                         })
                         .unwrap_or((glam::Vec3::Y, [0.0; 3]));
                     crate::camera::Godray::project(
-                        self.flags.godrays,
+                        // The tonemap shader declares a single-sample depth
+                        // texture. Until a resolved depth target exists, an
+                        // MSAA depth attachment cannot legally feed this pass.
+                        self.flags.godrays && godray_depth_sampleable(self.targets.samples),
                         sun_dir,
                         tint,
                         &cam,
@@ -1768,25 +1771,30 @@ impl Renderer {
                 &vk::DependencyInfo::default().image_memory_barriers(&to_color),
             );
 
-            // Transition depth for godray sampling, restore after draw.
-            // (Render pass already completed; VRS pattern mirrors this transition.)
+            // Transition single-sample depth for godray sampling, restore after
+            // draw. Multisampled depth cannot bind to the shader's Sampler2D;
+            // that path disables godrays and binds the already-readable HDR view
+            // as a type-compatible unused descriptor below.
+            let sample_depth = godray_depth_sampleable(self.targets.samples);
             let depth_image = self.targets.depth[slot].image;
-            let depth_to_read = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(
-                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                )
-                .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image(depth_image)
-                .subresource_range(depth_range())];
-            device.cmd_pipeline_barrier2(
-                self.copy_cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&depth_to_read),
-            );
+            if sample_depth {
+                let depth_to_read = [vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(
+                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                    )
+                    .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image(depth_image)
+                    .subresource_range(depth_range())];
+                device.cmd_pipeline_barrier2(
+                    self.copy_cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&depth_to_read),
+                );
+            }
 
             let color_attachment = [vk::RenderingAttachmentInfo::default()
                 .image_view(swap_view)
@@ -1844,11 +1852,17 @@ impl Renderer {
                 .sampler(self.bloom.composite_sampler())
                 .image_view(self.targets.bloom[slot].sample_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            // Binding 2: this slot's scene depth (transitioned above) with the
-            // point sampler, for the godray sky mask.
+            // Binding 2: single-sample scene depth for the godray sky mask. With
+            // MSAA the godray gate is zero; bind the single-sample HDR view as a
+            // legal unused Sampler2D descriptor instead of invalid MSAA depth.
+            let depth_view = if sample_depth {
+                self.targets.depth[slot].view
+            } else {
+                self.targets.offscreen[slot].view
+            };
             let depth_info = [vk::DescriptorImageInfo::default()
                 .sampler(self.pipelines.tonemap_depth_sampler)
-                .image_view(self.targets.depth[slot].view)
+                .image_view(depth_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let post_writes = [
                 vk::WriteDescriptorSet::default()
@@ -1894,24 +1908,26 @@ impl Renderer {
             self.record_overlay_present(self.copy_cmd, slot, overlay, extent);
             device.cmd_end_rendering(self.copy_cmd);
 
-            // Restore the godray depth read (above) to DEPTH_ATTACHMENT_OPTIMAL so
-            // the next 3D pass / VRS classifier finds the layout they expect.
-            let depth_to_attach = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .dst_stage_mask(
-                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                )
-                .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .image(depth_image)
-                .subresource_range(depth_range())];
-            device.cmd_pipeline_barrier2(
-                self.copy_cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&depth_to_attach),
-            );
+            // Restore the sampled depth so the next 3D pass / VRS classifier
+            // finds the layout it expects. MSAA depth never transitioned.
+            if sample_depth {
+                let depth_to_attach = [vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .dst_stage_mask(
+                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                    )
+                    .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .image(depth_image)
+                    .subresource_range(depth_range())];
+                device.cmd_pipeline_barrier2(
+                    self.copy_cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&depth_to_attach),
+                );
+            }
 
             // When capturing, detour through TRANSFER_SRC to copy the finished
             // image into the host buffer, then continue to PRESENT.
@@ -3097,6 +3113,10 @@ fn depth_range() -> vk::ImageSubresourceRange {
     }
 }
 
+fn godray_depth_sampleable(samples: vk::SampleCountFlags) -> bool {
+    samples == vk::SampleCountFlags::TYPE_1
+}
+
 /// A GPU render pass boundary, in record order. The variant ordinal indexes the
 /// per-pass accumulator (matches the tracking in [`crate::profile::Meter`]).
 #[derive(Clone, Copy, PartialEq)]
@@ -3382,6 +3402,21 @@ mod tests {
         ] {
             assert_eq!(count.as_u32(), n);
             assert_eq!(count.as_flags(), flag);
+        }
+    }
+
+    #[test]
+    fn godray_depth_requires_single_sample_target() {
+        assert!(godray_depth_sampleable(vk::SampleCountFlags::TYPE_1));
+        for samples in [
+            vk::SampleCountFlags::TYPE_2,
+            vk::SampleCountFlags::TYPE_4,
+            vk::SampleCountFlags::TYPE_8,
+            vk::SampleCountFlags::TYPE_16,
+            vk::SampleCountFlags::TYPE_32,
+            vk::SampleCountFlags::TYPE_64,
+        ] {
+            assert!(!godray_depth_sampleable(samples));
         }
     }
 
