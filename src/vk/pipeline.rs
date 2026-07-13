@@ -81,6 +81,11 @@ const MESH3D_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d.frag
 /// when dynamic_rendering_local_read is available and MSAA is off.
 const MESH3D_WATER_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_water.frag.spv"));
+/// The local-read water variant is intentionally dormant. Its current Vulkan
+/// path lacks a coherent dynamic-rendering input-attachment mapping/layout and
+/// fails validation on supported hardware. Keep compiling the shader while the
+/// complete path is repaired, but select the valid flat-tint blend fallback.
+const WATER_DEPTH_ABSORPTION_VALIDATED: bool = false;
 const DEBUG_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.vert.spv"));
 const DEBUG_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.frag.spv"));
 const TRIS2D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tris2d.vert.spv"));
@@ -362,9 +367,12 @@ impl Pipelines {
                 depth_bias: None,
             },
         );
-        // Water absorption variant (depth input attachment); only when
-        // dynamic_rendering_local_read is available and MSAA is off.
-        let absorb_ok = local_read && samples == vk::SampleCountFlags::TYPE_1;
+        // Water absorption variant (depth input attachment); only when its full
+        // local-read path has passed validation, the feature is available, and
+        // MSAA is off. Until then the ordinary blend shader uses a flat body tint.
+        let absorb_ok = WATER_DEPTH_ABSORPTION_VALIDATED
+            && local_read
+            && samples == vk::SampleCountFlags::TYPE_1;
         let mesh3d_water_frag =
             absorb_ok.then(|| create_shader_module(device, MESH3D_WATER_FRAG));
         let mesh3d_transparent_absorb = mesh3d_water_frag.map(|water_frag| {
