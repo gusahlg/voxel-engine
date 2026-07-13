@@ -159,7 +159,7 @@ fn daytime_uniforms() -> voxel_engine::skeleton::FrameUniformsGpu {
         // No blocklight; ambient floor keeps shadowed faces off pure black.
         candle: [0.0, 0.0, 0.0, 0.30],
         exposure_dither: [1.0, 0.0, 0.0, 0.0],
-        reserved: [0.0; 4],
+        extras: [1.0, 0.0, 0.0, 0.0], // x = stars gain (gated by RenderFlags::stars)
         // Static demo scene: no animated water/clouds, so time/camera phase stay zero.
         anim: [0.0; 4],
     }

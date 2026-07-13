@@ -23,9 +23,8 @@
 //!  * `build.rs`: register `shadow_depth.vert.slang → shadow_depth.vert.spv`.
 
 use ash::vk;
-use glam::{DVec3, Mat4, Vec3};
+use glam::{DVec3, Mat4};
 
-use crate::camera::{Camera3D, Z_NEAR};
 use crate::skeleton::{
     Cascade, CascadeFit, CascadeUniformsGpu, CleanViewProj, PerCascade, ShadowCfg,
 };
@@ -212,84 +211,58 @@ fn build_depth_only_pipeline(
     pipeline
 }
 
-/// Fit cascade `c` around its camera-frustum slice. Camera-relative world
-/// (camera at the origin), so the slice corners and the light-space bound are
-/// all small — no far-terrain jitter. Stable under camera *rotation* (a
-/// corner-average bounding sphere is rotation-invariant) and under *translation*
-/// (the light-space origin is snapped to whole `texel_world` increments).
+/// Tall-occluder capture margin (m): the light-space eye is pulled back this
+/// far past the covered sphere so occluders standing above the lit region
+/// still fall inside the depth range.
+const PULLBACK: f32 = 100.0;
+
+/// Lateral coverage margin (m) past the receiver's selection distance: room
+/// for the receiver's normal-offset bias (≤ ~9.5 texels ≈ 2.5 m on the far
+/// cascade) plus the PCF blur taps, so a fragment right at the selection
+/// boundary still samples inside the map.
+const BIAS_MARGIN: f32 = 4.0;
+
+/// Fit cascade `c` as an EYE-CENTRED sphere: radius = the receiver's selection
+/// distance for this cascade (`splits[c]`) plus a bias margin. The receiver
+/// picks its cascade purely by camera distance, so an eye-centred sphere
+/// covers every fragment that can ever sample it — for ANY view direction,
+/// aspect, or lens (the game ships a 220° warped FOV that no forward
+/// frustum-slice fit can cover). The fit reads no camera state at all, so the
+/// cascade matrices are bitwise-identical under camera rotation.
+///
+/// The texel grid is anchored in WORLD space, in f64: render space is
+/// camera-relative (eye at the origin), so the map centre is placed at minus
+/// the eye's within-texel phase along the light's lateral axes. Camera
+/// translation then slides the map under the world in exact whole-texel steps
+/// (no shadow-edge crawl), and f64 keeps that phase exact at extreme
+/// coordinates where an f32 ULP already exceeds a texel.
 /// Reversed-Z ortho (near→1, far→0), matching the engine depth policy.
-pub(crate) fn fit(cam: &Camera3D, sun: DVec3, c: Cascade, cfg: &ShadowCfg) -> CascadeFit {
-    // Sun is a normalized direction — f32 is ample; narrow once here (the frozen
-    // skeleton signature keeps it DVec3 to match the game's f64 world state).
-    let sun = sun.as_vec3();
-    // Slice bounds: Near covers [Z_NEAR, split0]; Far covers [split0, split1].
+pub(crate) fn fit(eye: DVec3, sun: DVec3, c: Cascade, cfg: &ShadowCfg) -> CascadeFit {
     let split = cfg.splits[c as usize];
-    let near = match c {
-        Cascade::Near => Z_NEAR,
-        Cascade::Far => cfg.splits[0],
-    };
-
-    // Camera basis (camera at origin).
-    let fwd = (cam.target - cam.position).normalize_or_zero();
-    let right = fwd.cross(cam.up).normalize_or_zero();
-    let up = right.cross(fwd);
-    let tan_y = (cam.fovy.to_radians() * 0.5).tan();
-    // A bounding sphere only needs the widest extent, so assume 16:9; a slightly
-    // loose sphere only spends a little texel density.
-    const ASSUMED_ASPECT: f32 = 16.0 / 9.0;
-    let tan_x = tan_y * ASSUMED_ASPECT;
-
-    // Eight slice corners, then the corner-average sphere (rotation-stable).
-    let mut corners = [Vec3::ZERO; 8];
-    let mut k = 0;
-    for &d in &[near, split] {
-        let cx = right * (tan_x * d);
-        let cy = up * (tan_y * d);
-        let centre = fwd * d;
-        for &sx in &[-1.0f32, 1.0] {
-            for &sy in &[-1.0f32, 1.0] {
-                corners[k] = centre + cx * sx + cy * sy;
-                k += 1;
-            }
-        }
-    }
-    let mut centre = Vec3::ZERO;
-    for corner in &corners {
-        centre += *corner;
-    }
-    centre /= 8.0;
-    let mut radius = 0.0f32;
-    for corner in &corners {
-        radius = radius.max((*corner - centre).length());
-    }
-
+    let radius = split + BIAS_MARGIN;
     let texel_world = cfg.texel_world_at(radius);
 
-    // Light basis: `sun` points TOWARD the sun, so light travels along `-sun`.
+    // Light basis in f64 — the world-anchored snap below needs the precision.
+    // `sun` points TOWARD the sun, so light travels along `-sun`.
     let light_dir = (-sun).normalize_or_zero();
     // Up hint chosen to avoid degeneracy when the sun is near the zenith.
     let up_hint = if light_dir.y.abs() > 0.99 {
-        Vec3::Z
+        DVec3::Z
     } else {
-        Vec3::Y
+        DVec3::Y
     };
     let l_right = light_dir.cross(up_hint).normalize_or_zero();
     let l_up = l_right.cross(light_dir).normalize_or_zero();
 
-    // Snap the sphere centre to whole texels along the light's lateral axes so a
-    // camera translation slides the shadow texel grid in integer steps (no
-    // shimmer). Snapping in WORLD space keeps eye and target in lockstep.
-    let snap = |axis: Vec3| {
-        let c = centre.dot(axis);
-        (c / texel_world).round() * texel_world - c
-    };
-    let snapped = centre + l_right * snap(l_right) + l_up * snap(l_up);
+    // World-anchor the texel grid: choose the camera-relative map centre so its
+    // WORLD lateral coordinates are whole multiples of `texel_world`.
+    let t = texel_world as f64;
+    let phase = |axis: DVec3| (eye.dot(axis).rem_euclid(t)) as f32;
+    let centre = -(l_right.as_vec3() * phase(l_right) + l_up.as_vec3() * phase(l_up));
 
-    // Pull the eye back past the sphere toward the sun so occluders standing
-    // above the lit region still fall inside the depth range.
-    const PULLBACK: f32 = 100.0; // tall-occluder capture margin (m)
-    let eye = snapped - light_dir * (radius + PULLBACK);
-    let view = Mat4::look_at_rh(eye, snapped, up_hint);
+    let light_dir = light_dir.as_vec3();
+    let ls_eye = centre - light_dir * (radius + PULLBACK);
+    let view = Mat4::look_at_rh(ls_eye, centre, up_hint.as_vec3());
     // Reversed-Z ortho: near/far arguments swapped so near→1, far→0.
     let proj = Mat4::orthographic_rh(
         -radius,
@@ -317,11 +290,11 @@ impl Renderer {
     /// `bias = [blur_texels, slope_bias, dist_bias, texel_world_near]`.
     pub(crate) fn shadow_uniforms(
         &self,
-        cam: &Camera3D,
+        eye: DVec3,
         sun: DVec3,
         cfg: &ShadowCfg,
     ) -> CascadeUniformsGpu {
-        let fits = PerCascade::new(CASCADES.map(|c| fit(cam, sun, c, cfg)));
+        let fits = PerCascade::new(CASCADES.map(|c| fit(eye, sun, c, cfg)));
         let near = &fits[Cascade::Near];
         let far = &fits[Cascade::Far];
         // SHADOW_LIMIT is the far cascade's far distance (256 m); the
@@ -355,7 +328,7 @@ impl Renderer {
         &self,
         cmd: vk::CommandBuffer,
         slot: usize,
-        cam: &Camera3D,
+        eye: DVec3,
         sun: DVec3,
         cfg: &ShadowCfg,
     ) {
@@ -443,7 +416,7 @@ impl Renderer {
             }
 
             for c in CASCADES {
-                let f = fit(cam, sun, c, cfg);
+                let f = fit(eye, sun, c, cfg);
                 let depth_attachment = vk::RenderingAttachmentInfo::default()
                     .image_view(shadow.layer_views[c as usize])
                     .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
@@ -536,6 +509,144 @@ impl Renderer {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::Vec3;
+
+    /// An arbitrary non-axis-aligned daytime sun.
+    const SUN: DVec3 = DVec3::new(0.3, 0.8, 0.25);
+
+    /// Project WORLD point `p` through the cascade fit built for `eye`, the way
+    /// the receiver does: camera-relative position through `view_proj`. Returns
+    /// NDC (ortho, so w = 1).
+    fn ndc(eye: DVec3, p: DVec3, c: Cascade) -> Vec3 {
+        let f = fit(eye, SUN, c, &ShadowCfg::provisional());
+        let rel = (p - eye).as_vec3();
+        let clip = f.view_proj.0 * rel.extend(1.0);
+        clip.truncate() / clip.w
+    }
+
+    /// The receiver selects a cascade purely by camera distance, so every
+    /// point within `splits[c]` of the eye — in ANY direction, including
+    /// behind and above the view — must land inside the map footprint and
+    /// depth range.
+    #[test]
+    fn every_selectable_fragment_is_covered() {
+        let cfg = ShadowCfg::provisional();
+        let eye = DVec3::new(1000.0, 80.0, -2000.0);
+        let dirs = [
+            DVec3::X,
+            DVec3::NEG_X,
+            DVec3::Y,
+            DVec3::NEG_Y,
+            DVec3::Z,
+            DVec3::NEG_Z,
+            DVec3::new(0.6, -0.5, 0.62),
+            DVec3::new(-0.7, 0.7, 0.14),
+        ];
+        for c in [Cascade::Near, Cascade::Far] {
+            let split = cfg.splits[c as usize] as f64;
+            for d in dirs {
+                let p = eye + d.normalize() * split;
+                let n = ndc(eye, p, c);
+                assert!(
+                    n.x.abs() <= 1.0 && n.y.abs() <= 1.0,
+                    "{c:?} {d:?}: lateral {n:?} outside footprint"
+                );
+                assert!((0.0..=1.0).contains(&n.z), "{c:?} {d:?}: depth {n:?} outside range");
+            }
+        }
+    }
+
+    /// The fit takes no camera orientation input, so the matrices are
+    /// bitwise-identical from frame to frame while the eye stands still —
+    /// looking around can never move a shadow.
+    #[test]
+    fn fit_is_deterministic_per_eye() {
+        let eye = DVec3::new(-31.7, 12.0, 98765.4);
+        for c in [Cascade::Near, Cascade::Far] {
+            let a = fit(eye, SUN, c, &ShadowCfg::provisional());
+            let b = fit(eye, SUN, c, &ShadowCfg::provisional());
+            assert_eq!(a.view_proj.0, b.view_proj.0);
+            assert_eq!(a.texel_world, b.texel_world);
+        }
+    }
+
+    /// World-anchored texel grid: as the eye translates (including sub-texel
+    /// steps), a fixed world point's map coordinate moves by WHOLE texels, so
+    /// shadow edges stay locked to world geometry instead of crawling.
+    #[test]
+    fn texel_grid_is_world_anchored_under_translation() {
+        let cfg = ShadowCfg::provisional();
+        let p = DVec3::new(12.3, 4.5, -67.8);
+        let base = DVec3::new(3.0, 20.0, 5.0);
+        let eyes = [
+            base,
+            base + DVec3::new(0.013, 0.0, 0.007),          // sub-texel drift
+            base + DVec3::new(1.37, -0.5, 2.11),           // walking
+            base + DVec3::new(-25.0, 3.0, 17.9),           // sprinting away
+        ];
+        for c in [Cascade::Near, Cascade::Far] {
+            let res = cfg.resolution as f32;
+            let texel = |eye: DVec3| {
+                let n = ndc(eye, p, c);
+                Vec3::new((n.x * 0.5 + 0.5) * res, (n.y * 0.5 + 0.5) * res, 0.0)
+            };
+            let t0 = texel(eyes[0]);
+            for &e in &eyes[1..] {
+                let d = texel(e) - t0;
+                for frac in [d.x - d.x.round(), d.y - d.y.round()] {
+                    assert!(
+                        frac.abs() < 1e-2,
+                        "{c:?}: eye {e:?} moved grid by fractional texel {frac}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Same anchoring must survive extreme coordinates: the phase is computed
+    /// in f64 because one f32 ULP out there is already comparable to a texel.
+    #[test]
+    fn texel_grid_stays_anchored_at_far_coordinates() {
+        let cfg = ShadowCfg::provisional();
+        let base = DVec3::new(1.0e6, 40.0, -2.5e5);
+        let p = base + DVec3::new(9.13, -6.0, 21.7);
+        let eyes = [base, base + DVec3::new(0.51, 0.25, -1.03)];
+        for c in [Cascade::Near, Cascade::Far] {
+            let res = cfg.resolution as f32;
+            let uv_texels = |eye: DVec3| {
+                let n = ndc(eye, p, c);
+                ((n.x * 0.5 + 0.5) * res, (n.y * 0.5 + 0.5) * res)
+            };
+            let (x0, y0) = uv_texels(eyes[0]);
+            let (x1, y1) = uv_texels(eyes[1]);
+            for d in [x1 - x0, y1 - y0] {
+                assert!(
+                    (d - d.round()).abs() < 5e-2,
+                    "{c:?}: far-coordinate translation broke the grid by {d}"
+                );
+            }
+        }
+    }
+
+    /// Occluders standing up to PULLBACK above the covered sphere still land
+    /// inside the reversed-Z depth range (they must cast onto it).
+    #[test]
+    fn tall_occluders_fall_inside_depth_range() {
+        let cfg = ShadowCfg::provisional();
+        let eye = DVec3::new(50.0, 10.0, 50.0);
+        let toward_sun = SUN.normalize();
+        for c in [Cascade::Near, Cascade::Far] {
+            let radius = cfg.splits[c as usize] as f64;
+            let p = eye + toward_sun * (radius + PULLBACK as f64 * 0.95);
+            let n = ndc(eye, p, c);
+            assert!((0.0..=1.0).contains(&n.z), "{c:?}: tall occluder at {n:?} clipped");
         }
     }
 }

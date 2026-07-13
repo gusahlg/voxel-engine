@@ -55,7 +55,7 @@ ConstantBuffer<PushConstants> pc;
 Sampler2DArray blockTex;
 
 // Set 0, binding 2: per-frame uniforms (FrameUniforms, common.slang) — sky
-// anchors, sun, candle/ambient, dither phase. `reserved` doubles as the
+// anchors, sun, candle/ambient, dither phase. `extras` doubles as the
 // DebugView::TerrainKey channel ([r, g, b, enabled], sRGB).
 [[vk::binding(2, 0)]]
 ConstantBuffer<FrameUniforms> frame;
@@ -179,8 +179,8 @@ float4 fragmentMain(FragmentInput input) : SV_Target
 
     // Debug-flat (TerrainKey): output the flat key colour for every covered
     // fragment; depth still writes so the sky-hole detector sees real coverage.
-    if (frame.reserved.w > 0.5) {
-        return float4(srgb_to_linear(frame.reserved.rgb), 1.0);
+    if (frame.extras.w > 0.5) {
+        return float4(srgb_to_linear(frame.extras.rgb), 1.0);
     }
 
     // Base albedo: flat far material or texture-sampled.

@@ -79,6 +79,10 @@ fn gate_uniforms(f: &crate::engine::RenderFlags, mut u: FrameUniformsGpu) -> Fra
         // its surface just holds still.
         u.anim[0] = 0.0;
     }
+    if !f.stars {
+        // Zero the stars gain; sky.frag skips the starfield evaluation.
+        u.extras[0] = 0.0;
+    }
     u
 }
 
@@ -177,7 +181,7 @@ pub(crate) struct DrawLists {
     /// every 3D mesh fragment outputs this flat key colour while still writing
     /// depth, so the sky-hole detector sees real terrain coverage (key) versus
     /// the magenta clear. `None` renders normally. Rides the per-frame UBO's
-    /// `reserved` lane. Set via [`Frame3D::set_debug_flat`].
+    /// `extras` lane. Set via [`Frame3D::set_debug_flat`].
     pub debug_flat: Option<Color>,
 }
 
@@ -489,7 +493,7 @@ impl Frame3D<'_, '_> {
     /// makes every 3D mesh fragment output `key` while still writing depth, so
     /// occlusion/silhouette stay exact and the sky-hole detector distinguishes
     /// real terrain coverage from the magenta clear. `None` restores normal
-    /// shading. Rides the per-frame UBO's `reserved` lane (no push-constant or
+    /// shading. Rides the per-frame UBO's `extras` lane (no push-constant or
     /// pipeline change).
     pub fn set_debug_flat(&mut self, color: Option<Color>) {
         self.frame.eng.lists.debug_flat = color;
@@ -756,5 +760,23 @@ impl KeyLight {
             }
             None => Self::DEFAULT,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stars gain rides `extras.x`; the flag gate must zero exactly that
+    /// channel and leave the rest of the lane (debug-flat scratch) alone.
+    #[test]
+    fn stars_gate_zeroes_extras_x() {
+        let mut u = FrameUniformsGpu::full_bright();
+        u.extras = [1.0, 0.0, 0.0, 0.0];
+        let on = gate_uniforms(&crate::engine::RenderFlags::default(), u);
+        assert_eq!(on.extras, [1.0, 0.0, 0.0, 0.0]);
+        let flags = crate::engine::RenderFlags { stars: false, ..Default::default() };
+        let off = gate_uniforms(&flags, u);
+        assert_eq!(off.extras, [0.0, 0.0, 0.0, 0.0]);
     }
 }

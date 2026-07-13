@@ -818,12 +818,14 @@ impl Renderer {
             let mut u = lists
                 .frame_uniforms
                 .unwrap_or_else(crate::skeleton::FrameUniformsGpu::full_bright);
-            // Debug-flat: claim the `reserved` lane as [r, g, b, enabled] —
+            // Debug-flat: claim the `extras` lane as [r, g, b, enabled] —
             // sRGB-encoded key channels + an enable flag. mesh3d.frag linearises rgb
             // (as it does every CPU colour) and outputs it flat while depth writes.
-            // Layout-only use of the zeroed lane; no FrameUniformsGpu changes.
+            // Overwriting `extras.x` (the stars gain) is safe: the lane's only
+            // other consumer is sky.frag, and the app never draws the sky in the
+            // debug-flat (TerrainKey) view.
             if let Some(c) = lists.debug_flat {
-                u.reserved = [
+                u.extras = [
                     c.r as f32 / 255.0,
                     c.g as f32 / 255.0,
                     c.b as f32 / 255.0,
@@ -1067,16 +1069,13 @@ impl Renderer {
 
         // Shadow pass frustum culling: only render opaque draws whose AABB
         // intersects some cascade's light-space footprint.
-        let shadow_frusta = (lists.has_3d && self.flags.shadows)
-            .then_some(())
-            .and(lists.camera)
-            .map(|cam| {
-                let cfg = crate::skeleton::ShadowCfg::provisional();
-                let sun = sun_dir(lists);
-                [crate::skeleton::Cascade::Near, crate::skeleton::Cascade::Far].map(|c| {
-                    crate::camera::Frustum::from_view_proj(&shadow::fit(&cam, sun, c, &cfg).view_proj.0)
-                })
-            });
+        let shadow_frusta = (lists.has_3d && self.flags.shadows).then(|| {
+            let cfg = crate::skeleton::ShadowCfg::provisional();
+            let sun = sun_dir(lists);
+            [crate::skeleton::Cascade::Near, crate::skeleton::Cascade::Far].map(|c| {
+                crate::camera::Frustum::from_view_proj(&shadow::fit(lists.eye, sun, c, &cfg).view_proj.0)
+            })
+        });
 
         if lists.has_3d {
             for d in &lists.mesh_draws {
@@ -1290,7 +1289,7 @@ impl Renderer {
         // occluders into the shadow map BEFORE the color pass (it leaves the map
         // in SHADER_READ_ONLY_OPTIMAL for mesh3d.frag's PCF). The mesh pass always
         // samples binding 4, so this must run whenever `has_3d`.
-        if let Some(cam) = lists.camera {
+        if lists.has_3d {
             // With shadows disabled the map holds a constant fully-lit clear and
             // its cascade UBO a constant (SHADOW_LIMIT=∞) block, so once this
             // slot has primed both there is nothing left to re-record: skip the
@@ -1301,9 +1300,9 @@ impl Renderer {
                 let _g = crate::profile::scope(crate::profile::Meter::RecShadow);
                 let cfg = crate::skeleton::ShadowCfg::provisional();
                 let sun = sun_dir(lists);
-                let cu = self.shadow_uniforms(&cam, sun, &cfg);
+                let cu = self.shadow_uniforms(lists.eye, sun, &cfg);
                 self.shadow.write_uniforms(slot, &cu);
-                self.record_shadow_pass(cmd, slot, &cam, sun, &cfg);
+                self.record_shadow_pass(cmd, slot, lists.eye, sun, &cfg);
                 self.shadow_lit_ready[slot] = !shadows_on;
             }
         }

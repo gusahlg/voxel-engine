@@ -100,6 +100,9 @@ pub struct RenderFlags {
     pub water_anim: bool,
     /// Radial vignette darkening in the tonemap pass.
     pub vignette: bool,
+    /// Night starfield in the sky pass (`extras.x` gain). Off skips the
+    /// per-pixel hash-grid star evaluation entirely.
+    pub stars: bool,
 }
 
 impl Default for RenderFlags {
@@ -119,6 +122,7 @@ impl Default for RenderFlags {
             vrs: true,
             water_anim: true,
             vignette: false,
+            stars: true,
         }
     }
 }
