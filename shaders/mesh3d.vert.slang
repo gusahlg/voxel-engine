@@ -9,8 +9,19 @@
 
 #include "common.slang"
 
+// Per-draw placement. std430 layout mirrors vk::buffers::DrawOffset exactly.
+struct DrawOffset
+{
+    float3 offset;
+    float scale;
+    float fade;
+    uint mode;      // bit0 FLAT_COLOR, bit1 FADE_OUT
+    uint flat_rgba; // sRGB RGBA8: R | G<<8 | B<<16 | A<<24
+    uint pad;
+};
+
 [[vk::binding(0, 0)]]
-StructuredBuffer<float4> draw_offsets;
+StructuredBuffer<DrawOffset> draw_offsets;
 
 struct VertexInput
 {
@@ -56,6 +67,14 @@ struct VertexOutput
     // LOD scale: packed in offsets SSBO (no extra binding)
     [[vk::location(6)]]
     nointerpolation float scale;
+
+    // Per-draw style: fade, mode, flat_rgba.
+    [[vk::location(7)]]
+    nointerpolation float fade;
+    [[vk::location(8)]]
+    nointerpolation uint mode;
+    [[vk::location(9)]]
+    nointerpolation uint flat_rgba;
 };
 
 struct PushConstants
@@ -68,6 +87,9 @@ struct PushConstants
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc;
+
+// Gameplay-tuned planet curvature: distant terrain droops below horizon, hidden by fog.
+static const float CURVE_INV_2R = 1.0 / (2.0 * 300000.0);
 
 [shader("vertex")]
 VertexOutput vertexMain(VertexInput input)
@@ -115,19 +137,28 @@ VertexOutput vertexMain(VertexInput input)
     float3 N = FACE_NORMAL[normal];
 
     // Micro-offset is added in LOCAL space so it scales with the draw (2^k LOD).
-    float4 placement = draw_offsets[input.instance]; // xyz = offset, w = scale
-    float3 world = (float3(x, y, z) + micro) * placement.w + placement.xyz;
+    DrawOffset placement = draw_offsets[input.instance];
+    float3 world = (float3(x, y, z) + micro) * placement.scale + placement.offset;
 
     VertexOutput output;
+    // Round-world horizon: curve on-screen silhouette only, preserving world position for fog/shadows.
+    float3 curved = world;
+    curved.y -= dot(world.xz, world.xz) * CURVE_INV_2R;
     // Plain rectilinear projection; wide-FOV compression is a post-process.
-    output.position = mul(pc.view_proj, float4(world, 1.0));
+    output.position = mul(pc.view_proj, float4(curved, 1.0));
+    // Resolve depth ties in coplanar LOD levels: push each farther proportionally to cell size.
+    if (placement.scale > 1.0)
+        output.position.z *= 1.0 - placement.scale / 4096.0;
     // Scale UV to maintain texel density across LOD levels.
-    output.uv = uv * placement.w;
+    output.uv = uv * placement.scale;
     output.layer = layer;
     output.world = world;
     output.nrm = N;
     output.lightparams = float3(ao_factor, sky_amount, block_amount);
     output.water = water;
-    output.scale = placement.w;
+    output.scale = placement.scale;
+    output.fade = placement.fade;
+    output.mode = placement.mode;
+    output.flat_rgba = placement.flat_rgba;
     return output;
 }

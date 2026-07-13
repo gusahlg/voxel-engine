@@ -8,7 +8,7 @@
 /// orbiting camera, immediate debug cube/wires, and the 2D overlay.
 /// Keys: F fullscreen, V vsync, M cycle MSAA, Esc quit.
 use voxel_engine::{
-    Ao, Camera3D, Color, Config, Key, Light, MeshData, MeshHandle, MeshVertex, Normal, Pass,
+    Ao, Camera3D, Color, Config, Detail, Key, Light, MeshData, MeshHandle, MeshVertex, Normal, Pass,
     SkyDesc, Vec3,
 };
 
@@ -155,7 +155,7 @@ fn daytime_uniforms() -> voxel_engine::skeleton::FrameUniformsGpu {
         light: [1.25, 1.15, 1.0, 1.0],
         // Sky anchors (linear): deep blue zenith, pale horizon; w = turbidity.
         zenith: [0.09, 0.22, 0.45, 2.0],
-        horizon: [0.55, 0.65, 0.80, 0.0], // w = fog density (off)
+        horizon: [0.55, 0.65, 0.80, 0.001], // w = fog density
         // No blocklight; ambient floor keeps shadowed faces off pure black.
         candle: [0.0, 0.0, 0.0, 0.30],
         exposure_dither: [1.0, 0.0, 0.0, 0.0],
@@ -299,12 +299,12 @@ fn main() {
                                 0.0,
                                 (gz * CHUNK as i32) as f32,
                             );
-                            f3.draw_mesh(handle, off, 1.0);
+                            f3.draw_mesh(handle, off, Detail::FULL);
                         }
                     }
                     // Same mesh at scale 2 beside the grid: double size, seamless
                     // frustum cull — proves DrawOffset.scale threads shader + cull.
-                    f3.draw_mesh(handle, Vec3::new(-2.0 * CHUNK as f32, 0.0, 0.0), 2.0);
+                    f3.draw_mesh(handle, Vec3::new(-2.0 * CHUNK as f32, 0.0, 0.0), Detail::new(1));
                 }
                 // Translucent water over each grid chunk, lifted to WATER_LEVEL
                 // (fractional, so it never coplanar-z-fights the block tops),
@@ -317,7 +317,7 @@ fn main() {
                                 WATER_LEVEL,
                                 (gz * CHUNK as i32) as f32,
                             );
-                            f3.draw_mesh(handle, off, 1.0);
+                            f3.draw_mesh(handle, off, Detail::FULL);
                         }
                     }
                 }

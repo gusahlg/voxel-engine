@@ -811,13 +811,20 @@ unsafe fn create_raw_buffer(
     }
 }
 
-/// Per-draw translation and scale. Naming `scale` (not `w`) avoids silent zeroing.
+/// Per-draw placement, mirrored std430 in mesh3d.vert (single source of truth).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrawOffset {
-    pub offset: [f32; 3],
-    pub scale: f32,
+    pub offset: [f32; 3], // 0..12  camera-relative translation
+    pub scale: f32,       // 12..16 LOD cell size, 1.0 = full-res
+    pub fade: f32,        // 16..20 screen-door coverage [0,1]; 1.0 = fully drawn
+    pub mode: u32,        // 20..24 bitflags: 1 = FLAT_COLOR, 2 = FADE_OUT
+    pub flat_rgba: u32,   // 24..28 sRGB RGBA8 (R|G<<8|B<<16|A<<24); used iff mode&1
+    pub _pad: u32,        // 28..32 zero
 }
+
+// Stride must match mesh3d.vert exactly; layout drift corrupts every draw.
+const _: () = assert!(std::mem::size_of::<DrawOffset>() == 32);
 
 /// `VkDrawIndexedIndirectCommand` as a Pod struct so a frame's command array
 /// is one `cast_slice` write into the indirect [`HostBuffer`]. ash's

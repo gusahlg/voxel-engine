@@ -145,6 +145,10 @@ struct DrawEntry {
     vertex_offset: i32,
     offset: glam::Vec3,
     scale: f32,
+    /// Per-draw style, carried from `MeshDraw` into the emitted `DrawOffset`.
+    fade: f32,
+    mode: u32,
+    flat_rgba: u32,
     /// Squared distance to AABB center (monotonic; sort key).
     dist2: f32,
     /// Whether the shadow pass replays this draw: opaque and inside some
@@ -647,6 +651,10 @@ impl Renderer {
         self.cull_faces = on;
     }
 
+    pub fn set_flags(&mut self, flags: crate::engine::RenderFlags) {
+        self.flags = flags;
+    }
+
     /// Requests a render-resolution scale; returns the clamped value that
     /// will apply at the next frame boundary.
     pub fn set_render_scale(&mut self, scale: f32) -> f32 {
@@ -1083,6 +1091,9 @@ impl Renderer {
                         vertex_offset,
                         offset,
                         scale,
+                        fade: d.fade,
+                        mode: d.mode,
+                        flat_rgba: d.flat_rgba,
                         dist2,
                         casts,
                     });
@@ -1121,6 +1132,10 @@ impl Renderer {
                 self.draw_offsets_data.push(DrawOffset {
                     offset: entry.offset.to_array(),
                     scale: entry.scale,
+                    fade: entry.fade,
+                    mode: entry.mode,
+                    flat_rgba: entry.flat_rgba,
+                    _pad: 0,
                 });
                 self.draw_commands.push(DrawIndexedIndirect {
                     index_count: entry.count,
@@ -1707,7 +1722,8 @@ impl Renderer {
             0
         };
         let dither_phase = crate::genconst::DITHER_PHASE_16[phase_index];
-        let tonemap_push = warp_map.push(exposure, dither_phase, godray);
+        let vignette = if self.flags.vignette { 1.0 } else { 0.0 };
+        let tonemap_push = warp_map.push(exposure, dither_phase, godray, vignette);
         unsafe {
             device
                 .reset_command_buffer(self.copy_cmd, vk::CommandBufferResetFlags::empty())
@@ -2426,7 +2442,7 @@ impl<'a> RenderPass<'a> {
         unsafe {
             self.push_mesh3d_descriptors();
             // Dither band: LOD transitions fade into full-res chunks near camera.
-            self.push_mesh3d_constants(self.lists.lod_clip);
+            self.push_mesh3d_constants(self.lists.lod_clip, self.lists.lod_clip_v);
         }
     }
 
@@ -2450,20 +2466,21 @@ impl<'a> RenderPass<'a> {
             r.block_textures.view,
             r.ubo_ring.buffer(crate::skeleton::FrameSlot::new(self.slot)),
             r.shadow.ubo(self.slot),
-            r.targets.shadow.sampler,
-            r.targets.shadow.sample_view,
+            r.targets.shadow[crate::skeleton::FrameSlot::new(self.slot)].sampler,
+            r.targets.shadow[crate::skeleton::FrameSlot::new(self.slot)].sample_view,
         );
         self.mesh_desc_bound.set(true);
     }
 
     /// Pushes view-proj + LOD dither radius. Pass-specific, so unconditionally
     /// pushed per pass (unlike descriptors). Jitter packaged here as a local.
-    unsafe fn push_mesh3d_constants(&self, clip: f32) {
+    unsafe fn push_mesh3d_constants(&self, clip: f32, clip_v: f32) {
         let r = self.r;
         let push = pipeline::Mesh3dPush {
             view_proj: jittered_clip(self.lists.view_proj, self.lists.jitter.0, r.render_extent),
             clip,
-            _pad: [0.0; 3],
+            clip_v,
+            _pad: [0.0; 2],
         };
         unsafe {
             r.device.device.cmd_push_constants(

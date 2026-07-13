@@ -32,6 +32,7 @@ struct PushConstants
     // Godrays: sun screen pos (xy), strength gate (z), tint in godray1.
     float4 godray0;
     float4 godray1;
+    float vignette; // radial darkening; 0 = off
 };
 
 [[vk::push_constant]]
@@ -126,6 +127,13 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // Godrays also pre-sigmoid, independent additive term (scale by exposure).
     hdr += godrays(input.uv, input.frag_coord.xy) * pc.exposure;
     float3 ldr = tonemapSigmoid(hdr);
+
+    // Radial vignette.
+    if (pc.vignette > 0.0)
+    {
+        float d = length(input.uv - 0.5) * 1.41421356;
+        ldr *= 1.0 - pc.vignette * 0.28 * smoothstep(0.5, 1.0, d);
+    }
 
     // Post-tonemap dither (output space, after tone curve). Amplitude is
     // independent of exposure to avoid scaling quantization noise.

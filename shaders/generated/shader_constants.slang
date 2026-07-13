@@ -98,8 +98,7 @@ static const float MICRO_STEP = 0.01f;
 static const float POST_TONEMAP_DITHER_GAIN = 0.003921569f;
 
 // Sun-disc solid core as a multiple of the sun angular radius.
-// Raised 1.0→1.12 (CONST-AUDIT visual cohesion): larger core keeps sun defined
-// against brighter night sky (stars now +20%, moon +8%). Complements SUN_DISC_RIM tightening.
+// Larger core keeps sun defined against brighter night sky. Complements SUN_DISC_RIM tightening.
 static const float SUN_DISC_CORE = 1.12f;
 
 // Exponent on visible_sky in the beyond-cascades shadow fallback.
@@ -110,8 +109,7 @@ static const float SHADOW_FALLBACK_POW = 10.0f;
 static const float SHADOW_RESOLUTION = 2048.0f;
 
 // Sun-disc soft rim (fade-to-zero edge) as a multiple of the sun angular radius.
-// Reduced 2.0→1.5 (CONST-AUDIT visual cohesion): tighter rim keeps sun crisp
-// against busier night sky. Complements brighter stars [4.2, 4.5, 5.2] and larger moon.
+// Tighter rim keeps sun crisp against busier night sky. Complements brighter stars [4.2, 4.5, 5.2] and larger moon.
 static const float SUN_DISC_RIM = 1.5f;
 
 // Sky sun-halo exponent at low sun (small ⇒ wide golden-hour halo). Blended to
@@ -199,26 +197,23 @@ static const float MOON_TINT[3] = {
 };
 
 // Moon angular radius as a multiple of the sun's (pc.sun.w): a touch smaller.
-// Raised 0.85→0.92 (CONST-AUDIT Tier 2): larger moon for visibility against
-// voxel terrain; complements brighter stars. Range [0.75–1.0].
+// Larger moon for visibility against voxel terrain; complements brighter stars. Range [0.75–1.0].
 static const float MOON_RADIUS_SCALE = 0.92f;
 
 // Star point linear radiance (additive, HDR); brightness folded in. Cool white.
-// Raised to [4.2, 4.5, 5.2] (CONST-AUDIT Tier 2): brighter stars for presence
-// against voxel terrain; still cool-toned. Range [3.0–5.5] per channel.
+// Brighter stars for presence against voxel terrain; still cool-toned. Range [3.0–5.5] per channel.
 static const float STAR_COLOR[3] = {
     4.2f, 4.5f, 5.2f, 
 };
 
 // Star hash-grid resolution: cells across the hemispheric ray projection.
-// Higher ⇒ more, smaller cells (denser field). Raised 300→328 (CONST-AUDIT Tier 2):
-// slightly more presence without sparse feel; correlates with STAR_THRESHOLD for
-// ~5.5% population. Range [250–400].
+// Higher ⇒ more, smaller cells (denser field). Slightly more presence without sparse
+// feel; correlates with STAR_THRESHOLD for ~5.5% population. Range [250–400].
 static const float STAR_DENSITY = 328.0f;
 
 // Per-cell hash cutoff for a star to exist; fraction of lit cells is
-// 1 - STAR_THRESHOLD (sparse). Lowered 0.955→0.953 (CONST-AUDIT Tier 2):
-// maintains sparse field (~5.5%) while correlating with STAR_DENSITY bump.
+// 1 - STAR_THRESHOLD (sparse). Maintains sparse field (~5.5%) while correlating
+// with STAR_DENSITY bump.
 static const float STAR_THRESHOLD = 0.953f;
 
 // Star point sharpness. Higher gives smaller, crisper points.
@@ -243,12 +238,10 @@ static const float CLOUD_THICKNESS = 60.0f;
 static const float CLOUD_STEPS = 10.0f;
 
 // Cloud noise spatial frequency (1/metres). World-anchored so pinned day is deterministic.
-static const float CLOUD_NOISE_SCALE = 0.0005f;
+static const float CLOUD_NOISE_SCALE = 0.0009f;
 
 // Second value-noise octave frequency, as a multiple of CLOUD_NOISE_SCALE.
 // Sampled on swapped zx so the two octaves don't align into stripes.
-// Reduced from 2.7→2.0 (CONST-AUDIT Tier 1): base frequency is now denser (0.0005),
-// so lower octave multiplier prevents over-busy detail while keeping standard FBM blend.
 static const float CLOUD_OCTAVE2_SCALE = 2.0f;
 
 // Cloud drift in noise units per second: coord += CLOUD_WIND * anim_time.
@@ -258,13 +251,11 @@ static const float CLOUD_WIND[2] = {
 };
 
 // Density threshold. Higher makes sky sparser.
-static const float CLOUD_COVERAGE = 0.5f;
+static const float CLOUD_COVERAGE = 0.58f;
 
 // Per-step opacity gain applied to remapped density in the front-to-back
 // accumulation. Tuned so a dense column reads opaque within CLOUD_STEPS steps.
-// Reduced 0.5→0.45 (CONST-AUDIT Tier 2): slightly more translucency allows layering
-// and depth, avoiding opaque curtain effect with denser base noise.
-static const float CLOUD_OPACITY = 0.45f;
+static const float CLOUD_OPACITY = 0.55f;
 
 // Weight of the direct-light lane (frame.light.rgb) in the lit cloud colour.
 static const float CLOUD_LIGHT = 1.0f;
@@ -274,8 +265,7 @@ static const float CLOUD_AMBIENT = 0.6f;
 
 // Interior darkening: cloud colour × lerp(1, CLOUD_DARK, sqrt(density)), so
 // dense cores read darker than thin edges (mix(bright,dark,sqrt(cv))).
-// Reduced 0.4→0.35 (CONST-AUDIT Tier 2): denser base noise already provides visual
-// depth; lighter cores prevent muddy interior appearance.
+// Lighter cores prevent muddy interior appearance.
 static const float CLOUD_DARK = 0.35f;
 
 // Silver-lining gain: mix(col, col*CLOUD_SILVER, (1-cv^0.25)*bright^2) where

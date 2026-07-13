@@ -79,7 +79,8 @@ float cloud_density(float2 world_xz, float time)
     float2 base = world_xz * CLOUD_NOISE_SCALE;
     float n1 = cloud_value(base + wind);
     float n2 = cloud_value(base.yx * CLOUD_OCTAVE2_SCALE - wind * 0.5);
-    float n = smoothstep(0.05, 0.95, (n1 + n2) * 0.5);
+    // Weighted FBM blend: avoid 0.5/0.5 average (washes out texture detail).
+    float n = smoothstep(0.05, 0.95, n1 * 0.65 + n2 * 0.35);
     return n > CLOUD_COVERAGE ? (n - CLOUD_COVERAGE) / (1.0 - CLOUD_COVERAGE) : 0.0;
 }
 

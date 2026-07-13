@@ -65,6 +65,8 @@ pub(crate) enum RenderCmd {
     /// Pre-clamped on main against cached caps.
     SetMsaa(u32),
     SetCullFaces(bool),
+    /// Live-swap the render thread's CPU-side feature flags (menu/`/gfx` edit).
+    SetFlags(crate::RenderFlags),
     SetRenderScale(Scale),
     Frame(Box<DrawLists>),
     Shutdown,
@@ -321,6 +323,10 @@ impl RenderClient {
         self.cull_faces
     }
 
+    pub(crate) fn set_flags(&mut self, flags: crate::RenderFlags) {
+        let _ = self.tx.send(RenderCmd::SetFlags(flags));
+    }
+
     pub(crate) fn set_render_scale(&mut self, scale: f32) -> f32 {
         let s = Scale::new(scale);
         self.render_scale = s;
@@ -452,6 +458,7 @@ fn render_loop(
                     renderer.set_msaa(m);
                 }
                 RenderCmd::SetCullFaces(c) => renderer.set_cull_faces(c),
+                RenderCmd::SetFlags(f) => renderer.set_flags(f),
                 RenderCmd::SetRenderScale(s) => {
                     renderer.set_render_scale(s.get());
                 }

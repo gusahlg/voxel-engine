@@ -10,7 +10,7 @@ use crate::color::{Color, LinearRgb};
 use crate::skeleton::{FrameUniformsGpu, JitterOffset};
 use crate::engine::Engine;
 use crate::font;
-use crate::mesh::{DebugVertex, MeshHandle, Pass};
+use crate::mesh::{DebugVertex, Detail, MeshHandle, Pass};
 use crate::vk::pipeline::Vertex2D;
 
 /// Sky-pass-private state, set by the app inside a `begin_3d` scope: sun
@@ -28,6 +28,13 @@ pub struct SkyDesc {
     /// Angular radius of the sun disc, in radians; the shader derives the disc's
     /// core/rim edge cosines from it (generated `SUN_DISC_*` cone constants).
     pub sun_angular_radius: f32,
+}
+
+/// Full-res coverage slab. Use the same value for both streaming and LOD culling.
+#[derive(Clone, Copy)]
+pub struct CoverageVolume {
+    pub radius: f32,
+    pub half_height: f32,
 }
 
 /// This 3D scope's lighting, a REQUIRED argument to [`Frame::begin_3d`]. The
@@ -88,6 +95,10 @@ pub(crate) struct MeshDraw {
     pub pass: Pass,
     pub offset: Vec3,
     pub scale: f32,
+    /// Per-draw style (fade, mode, flat_rgba).
+    pub fade: f32,
+    pub mode: u32,
+    pub flat_rgba: u32,
 }
 
 /// CPU-side draw lists for one frame. Vec capacities persist across frames.
@@ -147,6 +158,8 @@ pub(crate) struct DrawLists {
     /// Chunk→LOD dither radius; full-res chunks own the near ground by default
     /// (0.0 disables).
     pub lod_clip: f32,
+    /// Vertical half-height of the full-res slab; LOD above/below it never dithers.
+    pub lod_clip_v: f32,
     pub cube_verts: Vec<DebugVertex>,
     pub line_verts: Vec<DebugVertex>,
     /// Translucent ground decals (contact shadows), drawn with the blended,
@@ -179,6 +192,7 @@ impl DrawLists {
             sky: None,
             mesh_draws: Vec::new(),
             lod_clip: 0.0,
+            lod_clip_v: 0.0,
             cube_verts: Vec::new(),
             line_verts: Vec::new(),
             shadow_verts: Vec::new(),
@@ -197,6 +211,7 @@ impl DrawLists {
         self.frame_uniforms = None;
         self.mesh_draws.clear();
         self.lod_clip = 0.0;
+        self.lod_clip_v = 0.0;
         self.cube_verts.clear();
         self.line_verts.clear();
         self.shadow_verts.clear();
@@ -398,22 +413,36 @@ pub struct Frame3D<'f, 'e> {
 }
 
 impl Frame3D<'_, '_> {
-    /// Draws an uploaded mesh scaled by `scale` about its local origin then
+    /// Draws an uploaded mesh scaled by `detail` about its local origin then
     /// translated by `offset` (both applied GPU-side, so meshes stay in small
-    /// local coordinates for camera-relative rendering). `scale` is `1.0` for a
-    /// near chunk and `2^k` for a coarser LOD tile. Skipped automatically when
-    /// its scaled, translated AABB is outside the view frustum.
-    pub fn draw_mesh(&mut self, handle: MeshHandle, offset: Vec3, scale: f32) {
-        self.push_mesh(handle, offset, scale);
+    /// local coordinates for camera-relative rendering). Pass [`Detail::FULL`]
+    /// for a near chunk, [`Detail::new`] for a coarser LOD tile. Skipped
+    /// automatically when its scaled, translated AABB is outside the view frustum.
+    pub fn draw_mesh(&mut self, handle: MeshHandle, offset: Vec3, detail: Detail) {
+        self.push_mesh(handle, offset, detail.scale(), 1.0, 0, 0);
     }
 
-    /// Sets the chunk→LOD dither radius so full-res chunks own the near ground.
-    /// Call once per `begin_3d` with render distance; 0.0 disables.
-    pub fn set_lod_clip(&mut self, radius: f32) {
-        self.frame.eng.lists.lod_clip = radius.max(0.0);
+    /// Like [`draw_mesh`](Self::draw_mesh), with per-draw style: `fade` (screen-door coverage),
+    /// `mode` (bitflags: `1` = flat color, `2` = fade complement), `flat_rgba` (sRGB RGBA8).
+    pub fn draw_mesh_faded(
+        &mut self,
+        handle: MeshHandle,
+        offset: Vec3,
+        detail: Detail,
+        fade: f32,
+        mode: u32,
+        flat_rgba: u32,
+    ) {
+        self.push_mesh(handle, offset, detail.scale(), fade, mode, flat_rgba);
     }
 
-    fn push_mesh(&mut self, handle: MeshHandle, offset: Vec3, scale: f32) {
+    /// Sets chunk→LOD dither extents. Must equal the streamed full-res volume.
+    pub fn set_lod_clip(&mut self, v: CoverageVolume) {
+        self.frame.eng.lists.lod_clip = v.radius.max(0.0);
+        self.frame.eng.lists.lod_clip_v = v.half_height.max(0.0);
+    }
+
+    fn push_mesh(&mut self, handle: MeshHandle, offset: Vec3, scale: f32, fade: f32, mode: u32, flat_rgba: u32) {
         let Some(meta) = self.frame.eng.client.mesh_meta(handle) else {
             return;
         };
@@ -437,6 +466,9 @@ impl Frame3D<'_, '_> {
             pass: meta.pass,
             offset,
             scale,
+            fade,
+            mode,
+            flat_rgba,
         });
     }
 

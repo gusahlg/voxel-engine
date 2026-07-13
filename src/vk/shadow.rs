@@ -60,8 +60,9 @@ impl ShadowCfg {
         Self {
             resolution: SHADOW_RESOLUTION,
             blur_texels: 2.0,   // rotated 4-tap radius
-            slope_bias: 0.05,   // slope-scaled bias term
-            dist_bias: 0.005,   // per-metre bias coefficient
+            // Normal-offset bias, in shadow texels (depth-range independent).
+            slope_bias: 1.5,    // base normal offset (texels)
+            dist_bias: 2.0,     // extra offset per unit tan(grazing) (texels)
             fade_band: 16.0,    // map→fallback smoothstep width (m)
             splits: [64.0, 256.0], // near/far far-distances (SHADOW_LIMIT = 256)
         }
@@ -359,7 +360,7 @@ impl Renderer {
         cfg: &ShadowCfg,
     ) {
         let device = &self.device.device;
-        let shadow = &self.targets.shadow;
+        let shadow = &self.targets.shadow[crate::skeleton::FrameSlot::new(slot)];
         let layout = self.pipelines.layout_3d;
 
         let full_range = vk::ImageSubresourceRange {

@@ -341,10 +341,8 @@ pub struct RenderTargets {
     /// their texel size as one consistent value — there is no way to have the
     /// images without the size or vice versa.
     pub(crate) vrs: Option<super::vrs::Vrs>,
-    /// The cascaded shadow map. One D32 array image, persistent but
-    /// re-created with the rest of the targets on resize (its resolution is
-    /// swapchain-independent, 2048² per cascade, so this only re-homes ownership).
-    pub(crate) shadow: ShadowMap,
+    /// Cascaded shadow map, per-slot: avoid frame overlap glitches with type-safe indexing.
+    pub(crate) shadow: crate::skeleton::PerSlot<ShadowMap>,
     /// Per-slot bloom mip chain. Extent-dependent, so recreated with the
     /// rest of the targets on resize.
     pub(crate) bloom: [BloomChain; FRAMES_IN_FLIGHT as usize],
@@ -421,7 +419,9 @@ impl RenderTargets {
             .filter(|_| matches!(std::env::var("VOXEL_VRS").as_deref(), Ok("1")))
             .map(|f| super::vrs::Vrs::new(device, &memory_props, f, extent));
 
-        let shadow = ShadowMap::new(device, &memory_props);
+        let shadow = crate::skeleton::PerSlot::new(std::array::from_fn(|_| {
+            ShadowMap::new(device, &memory_props)
+        }));
 
         let bloom = std::array::from_fn(|_| BloomChain::new(device, &memory_props, extent));
 
@@ -452,7 +452,9 @@ impl RenderTargets {
             if let Some(vrs) = &mut self.vrs {
                 vrs.destroy(device);
             }
-            self.shadow.destroy(device);
+            for shadow in self.shadow.iter() {
+                shadow.destroy(device);
+            }
             for chain in &self.bloom {
                 chain.destroy(device);
             }

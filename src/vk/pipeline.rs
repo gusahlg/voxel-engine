@@ -30,8 +30,10 @@ pub const PUSH_BYTES_TONEMAP: u32 = size_of::<crate::camera::WarpPush>() as u32;
 pub struct Mesh3dPush {
     pub view_proj: Mat4,
     pub clip: f32,
-    /// Padding to match Mat4 alignment; shaders only read view_proj and clip.
-    pub _pad: [f32; 3],
+    /// Vertical half-height of the full-res slab.
+    pub clip_v: f32,
+    /// Padding to match Mat4 alignment.
+    pub _pad: [f32; 2],
 }
 
 /// Debug push constant: view_proj only.

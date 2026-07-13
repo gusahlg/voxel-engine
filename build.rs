@@ -359,7 +359,7 @@ fn build_table() -> Vec<Def> {
         // Sun disc core/rim radii, tuned to match the sun's real angular size.
         Def {
             name: "SUN_DISC_CORE",
-            doc: "Sun-disc solid core as a multiple of the sun angular radius.\nRaised 1.0→1.12 (CONST-AUDIT visual cohesion): larger core keeps sun defined\nagainst brighter night sky (stars now +20%, moon +8%). Complements SUN_DISC_RIM tightening.",
+            doc: "Sun-disc solid core as a multiple of the sun angular radius.\nLarger core keeps sun defined against brighter night sky. Complements SUN_DISC_RIM tightening.",
             val: Val::Scalar(1.12),
         },
         // Far-field shadow fallback steepness: only near-full sky access keeps
@@ -376,7 +376,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "SUN_DISC_RIM",
-            doc: "Sun-disc soft rim (fade-to-zero edge) as a multiple of the sun angular radius.\nReduced 2.0→1.5 (CONST-AUDIT visual cohesion): tighter rim keeps sun crisp\nagainst busier night sky. Complements brighter stars [4.2, 4.5, 5.2] and larger moon.",
+            doc: "Sun-disc soft rim (fade-to-zero edge) as a multiple of the sun angular radius.\nTighter rim keeps sun crisp against busier night sky. Complements brighter stars [4.2, 4.5, 5.2] and larger moon.",
             val: Val::Scalar(1.5),
         },
         // Sunset-glow widening: the sky sun-halo exponent lerps between these two
@@ -504,22 +504,22 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "MOON_RADIUS_SCALE",
-            doc: "Moon angular radius as a multiple of the sun's (pc.sun.w): a touch smaller.\nRaised 0.85→0.92 (CONST-AUDIT Tier 2): larger moon for visibility against\nvoxel terrain; complements brighter stars. Range [0.75–1.0].",
+            doc: "Moon angular radius as a multiple of the sun's (pc.sun.w): a touch smaller.\nLarger moon for visibility against voxel terrain; complements brighter stars. Range [0.75–1.0].",
             val: Val::Scalar(0.92),
         },
         Def {
             name: "STAR_COLOR",
-            doc: "Star point linear radiance (additive, HDR); brightness folded in. Cool white.\nRaised to [4.2, 4.5, 5.2] (CONST-AUDIT Tier 2): brighter stars for presence\nagainst voxel terrain; still cool-toned. Range [3.0–5.5] per channel.",
+            doc: "Star point linear radiance (additive, HDR); brightness folded in. Cool white.\nBrighter stars for presence against voxel terrain; still cool-toned. Range [3.0–5.5] per channel.",
             val: Val::Arr(vec![4.2, 4.5, 5.2]),
         },
         Def {
             name: "STAR_DENSITY",
-            doc: "Star hash-grid resolution: cells across the hemispheric ray projection.\nHigher ⇒ more, smaller cells (denser field). Raised 300→328 (CONST-AUDIT Tier 2):\nslightly more presence without sparse feel; correlates with STAR_THRESHOLD for\n~5.5% population. Range [250–400].",
+            doc: "Star hash-grid resolution: cells across the hemispheric ray projection.\nHigher ⇒ more, smaller cells (denser field). Slightly more presence without sparse\nfeel; correlates with STAR_THRESHOLD for ~5.5% population. Range [250–400].",
             val: Val::Scalar(328.0),
         },
         Def {
             name: "STAR_THRESHOLD",
-            doc: "Per-cell hash cutoff for a star to exist; fraction of lit cells is\n1 - STAR_THRESHOLD (sparse). Lowered 0.955→0.953 (CONST-AUDIT Tier 2):\nmaintains sparse field (~5.5%) while correlating with STAR_DENSITY bump.",
+            doc: "Per-cell hash cutoff for a star to exist; fraction of lit cells is\n1 - STAR_THRESHOLD (sparse). Maintains sparse field (~5.5%) while correlating\nwith STAR_DENSITY bump.",
             val: Val::Scalar(0.953),
         },
         Def {
@@ -556,11 +556,11 @@ fn build_table() -> Vec<Def> {
         Def {
             name: "CLOUD_NOISE_SCALE",
             doc: "Cloud noise spatial frequency (1/metres). World-anchored so pinned day is deterministic.",
-            val: Val::Scalar(0.0005),
+            val: Val::Scalar(0.0009),
         },
         Def {
             name: "CLOUD_OCTAVE2_SCALE",
-            doc: "Second value-noise octave frequency, as a multiple of CLOUD_NOISE_SCALE.\nSampled on swapped zx so the two octaves don't align into stripes.\nReduced from 2.7→2.0 (CONST-AUDIT Tier 1): base frequency is now denser (0.0005),\nso lower octave multiplier prevents over-busy detail while keeping standard FBM blend.",
+            doc: "Second value-noise octave frequency, as a multiple of CLOUD_NOISE_SCALE.\nSampled on swapped zx so the two octaves don't align into stripes.",
             val: Val::Scalar(2.0),
         },
         Def {
@@ -571,12 +571,12 @@ fn build_table() -> Vec<Def> {
         Def {
             name: "CLOUD_COVERAGE",
             doc: "Density threshold. Higher makes sky sparser.",
-            val: Val::Scalar(0.5),
+            val: Val::Scalar(0.58),
         },
         Def {
             name: "CLOUD_OPACITY",
-            doc: "Per-step opacity gain applied to remapped density in the front-to-back\naccumulation. Tuned so a dense column reads opaque within CLOUD_STEPS steps.\nReduced 0.5→0.45 (CONST-AUDIT Tier 2): slightly more translucency allows layering\nand depth, avoiding opaque curtain effect with denser base noise.",
-            val: Val::Scalar(0.45),
+            doc: "Per-step opacity gain applied to remapped density in the front-to-back\naccumulation. Tuned so a dense column reads opaque within CLOUD_STEPS steps.",
+            val: Val::Scalar(0.55),
         },
         Def {
             name: "CLOUD_LIGHT",
@@ -590,7 +590,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "CLOUD_DARK",
-            doc: "Interior darkening: cloud colour × lerp(1, CLOUD_DARK, sqrt(density)), so\ndense cores read darker than thin edges (mix(bright,dark,sqrt(cv))).\nReduced 0.4→0.35 (CONST-AUDIT Tier 2): denser base noise already provides visual\ndepth; lighter cores prevent muddy interior appearance.",
+            doc: "Interior darkening: cloud colour × lerp(1, CLOUD_DARK, sqrt(density)), so\ndense cores read darker than thin edges (mix(bright,dark,sqrt(cv))).\nLighter cores prevent muddy interior appearance.",
             val: Val::Scalar(0.35),
         },
         Def {

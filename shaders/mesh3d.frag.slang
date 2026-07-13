@@ -28,13 +28,22 @@ struct FragmentInput
 
     [[vk::location(6)]]
     nointerpolation float scale; // LOD level cell size
+
+    // Per-draw style: fade, mode, flat_rgba.
+    [[vk::location(7)]]
+    nointerpolation float fade;
+    [[vk::location(8)]]
+    nointerpolation uint mode;
+    [[vk::location(9)]]
+    nointerpolation uint flat_rgba;
 };
 
-// Push constants: vertex uses view_proj, fragment adds clip (LOD dither radius; 0 disables)
+// Push constants: view_proj + LOD dither extents.
 struct PushConstants
 {
     float4x4 view_proj;
     float clip;
+    float clip_v;
 };
 
 [[vk::push_constant]]
@@ -92,17 +101,28 @@ static const float WATER_Z_NEAR = 0.05;
 // the 4-tap kernel does not band; the dither is UN-shifted (jitter is zero until
 // Phase E). Fragments outside the cascade footprint return 1.0 — the caller's
 // fade into `shadow_fallback` covers that edge.
-float shadow_map_term(float3 world, float ndotl, uint c, float2 frag_coord)
+float shadow_map_term(float3 world, float3 N, float3 L, uint c, float2 frag_coord)
 {
-    float4 clip = mul(cascade.view_proj[c], float4(world, 1.0));
+    // Single source of truth: derive per-cascade scale directly from the light matrix.
+    float4x4 vp = cascade.view_proj[c];
+    float texel_world = 2.0 / (SHADOW_RESOLUTION * length(vp[0].xyz));
+    float ndc_per_metre = length(vp[2].xyz);
+
+    // Normal-offset bias (depth-range independent) to avoid acne without floating shadows.
+    float ndl = clamp(dot(N, L), 0.0, 1.0);
+    float tan_theta = sqrt(1.0 - ndl * ndl) / max(ndl, 0.1);
+    float offset_texels = cascade.bias.y + cascade.bias.z * min(tan_theta, 4.0);
+    float3 pos = world + N * (texel_world * offset_texels);
+
+    float4 clip = mul(vp, float4(pos, 1.0));
     float3 ndc = clip.xyz / clip.w;
     if (any(abs(ndc.xy) > 1.0))
         return 1.0;
-    float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
+    // No Y-flip: viewport is y-down. A flip would mirror shadows as the camera turns.
+    float2 uv = ndc.xy * 0.5 + 0.5;
 
-    // Slope bias: more on grazing faces/far cascades (peter-panning preferred over acne).
-    float slope = cascade.bias.y * clamp(1.0 - ndotl, 0.0, 1.0) + cascade.bias.z;
-    float ref = ndc.z + slope;
+    // Reversed-Z: positive slack biases toward lit (kills acne).
+    float ref = ndc.z + texel_world * ndc_per_metre;
 
     // Map size is a compile-time truth (SHADOW_RESOLUTION, asserted against
     // vk/targets.rs), so no per-fragment GetDimensions query.
@@ -122,7 +142,7 @@ float shadow_map_term(float3 world, float ndotl, uint c, float2 frag_coord)
 // Sun shadow factor [0,1]: the near/far cascade PCF blended into the far-field
 // `shadow_fallback` across the `fade_band` at `SHADOW_LIMIT`, so the
 // chunk→tile handoff shows no shading step.
-float sun_shadow(float3 world, float dist, float ndotl, float visible_sky, float2 frag_coord)
+float sun_shadow(float3 world, float3 N, float3 L, float dist, float visible_sky, float2 frag_coord)
 {
     float fallback = shadow_fallback(frame, visible_sky);
     float limit = cascade.splits_fade.w;
@@ -134,18 +154,26 @@ float sun_shadow(float3 world, float dist, float ndotl, float visible_sky, float
     if (fade >= 1.0)
         return fallback;
     uint c = dist < cascade.splits_fade.x ? 0u : 1u;
-    float map = shadow_map_term(world, ndotl, c, frag_coord);
+    float map = shadow_map_term(world, N, L, c, frag_coord);
     return lerp(map, fallback, fade);
 }
 
 [shader("fragment")]
 float4 fragmentMain(FragmentInput input) : SV_Target
 {
-    // Dither LOD→chunk transition: within clip radius cull LOD, beyond fade via threshold
-    // to avoid hard seams. Disabled if clip == 0.
+    // Dither LOD→chunk transition at slab extents to avoid holes showing sky.
     if (input.scale > 1.0 && pc.clip > 0.0) {
-        float band = smoothstep(pc.clip, 1.5 * pc.clip, length(input.world));
-        if (band < dither(0.0, input.position.xy) + 0.5)
+        float band_h = smoothstep(0.75 * pc.clip, pc.clip, length(input.world.xz));
+        float band_v = smoothstep(0.75 * pc.clip_v, pc.clip_v, abs(input.world.y));
+        if (max(band_h, band_v) < dither(0.0, input.position.xy) + 0.5)
+            discard;
+    }
+
+    // Temporal cross-fade with complementary dithering; CPU guarantees exact tiling.
+    if (input.fade < 1.0) {
+        float d = dither(0.0, input.position.xy) + 0.5;
+        bool keep = (input.mode & 2u) != 0u ? (d >= 1.0 - input.fade) : (d < input.fade);
+        if (!keep)
             discard;
     }
 
@@ -155,8 +183,21 @@ float4 fragmentMain(FragmentInput input) : SV_Target
         return float4(srgb_to_linear(frame.reserved.rgb), 1.0);
     }
 
-    // Texture sampled through an sRGB view, so tex.rgb is already linear.
-    float4 tex = blockTex.Sample(float3(input.uv, float(input.layer)));
+    // Base albedo: flat far material or texture-sampled.
+    // block texture. Only the albedo changes — light_eval/fog stay identical.
+    float3 base;
+    float alpha;
+    if ((input.mode & 1u) != 0u) { // FLAT_COLOR
+        uint c = input.flat_rgba;
+        float3 srgb = float3(c & 0xFFu, (c >> 8) & 0xFFu, (c >> 16) & 0xFFu) / 255.0;
+        base = srgb_to_linear(srgb); // match the sRGB-view texture path
+        alpha = 1.0;                 // coarse far material is opaque
+    } else {
+        // Texture sampled through an sRGB view, so tex.rgb is already linear.
+        float4 tex = blockTex.Sample(float3(input.uv, float(input.layer)));
+        base = tex.rgb;
+        alpha = tex.a;
+    }
 
     float ao = input.lightparams.x;
     float sky_amount = input.lightparams.y;
@@ -166,28 +207,26 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     float3 N = normalize(input.nrm);
     float3 sun = normalize(frame.sun_dir_elev.xyz);
     float raw_ndl = dot(N, sun);           // signed, unclamped
-    float ndotl = max(raw_ndl, 0.0);       // clamped: shadow-map slope bias only
 
-    // Omni directional wrap, replacing the deleted per-face shade ladder.
-    // `frame.light.w` = day_night_mix: at night it flips the lit hemisphere
-    // to the anti-sun (moon) side. Wrap in [0.75, 1.25].
+    // Omnidirectional wrap: day/night cycle flips lit hemisphere to moon side.
     float ndl = lerp(-raw_ndl, raw_ndl, frame.light.w);
     float omni = ((ndl + 1.0) * 0.25) + 0.75;
 
-    float shadow = sun_shadow(input.world, dist, ndotl, sky_amount, input.position.xy);
+    float shadow = sun_shadow(input.world, N, sun, dist, sky_amount, input.position.xy);
 
     // Skylight (sun-tinted, shadow-attenuated, omni-shaped) and pre-curve
     // blocklight, folded by the shared evaluator with the candle curve + omni
     // ambient floor. `omni` shapes the DIRECT term only; the floor stays global.
     float3 sky = frame.light.rgb * (sky_amount * shadow * omni);
     float3 block = frame.candle.rgb * block_amount;
-    float3 rgb = tex.rgb * light_eval(sky, block, ao, frame);
-    float alpha = tex.a;
+    float3 rgb = base * light_eval(sky, block, ao, frame);
 
     // Water fragments (transparent pass) replace the flat blend with animated
     // waves + fresnel sky reflection + sun glint + interim absorption tint. The
     // material bit is set per-vertex only for liquid faces (mesh.rs SHIFT_WATER),
-    // so opaque geometry never takes this branch.
+    // so opaque geometry never takes this branch. LOD-section water never sets
+    // the bit (it meshes as an opaque solid — see world/section/mesh.rs), so only
+    // full-res chunk water reaches here.
     if (input.water != 0u) {
 #ifdef WATER_DEPTH_ABSORPTION
         // True depth-difference absorption: opaque forward distance behind the
@@ -199,16 +238,12 @@ float4 fragmentMain(FragmentInput input) : SV_Target
 #else
         float absorb = WATER_BODY_MIX; // interim flat tint (no depth term)
 #endif
-        // Coarse LOD-tile water (scale > 1) drops its specular reflection so the
-        // LOD→chunk dither discard above doesn't flicker; near full-res water
-        // (scale == 1) keeps full reflectivity.
-        float reflectivity = input.scale > 1.0 ? 0.0 : 1.0;
-        float4 w = water_shade(input.world, N, rgb, alpha, absorb, reflectivity, frame);
+        float4 w = water_shade(input.world, N, rgb, alpha, absorb, frame);
         rgb = w.rgb;
         alpha = w.a;
     }
 
-    // Fog IS the sky: fade toward the analytic sky radiance along the view ray.
+    // Fog: fade toward sky radiance along the view ray.
     float3 fog_color = sky_radiance(normalize(input.world), frame);
     float fog = 1.0 - exp(-dist * frame.horizon.w); // horizon.w = fog density
     rgb = lerp(rgb, fog_color, fog);
