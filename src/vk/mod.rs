@@ -384,6 +384,12 @@ pub(crate) struct Renderer {
     last_present: std::time::Instant,
     present_interval: std::time::Duration,
     gpu_timer: GpuTimer,
+    /// Which image holds the frame's FINAL HDR per slot: the offscreen, or —
+    /// when the TAA resolve ran — the history integrator it wrote. Exposure,
+    /// bloom, and the tonemap present-copy all sample this source, which is
+    /// what let the TAA pass drop its full-res copy-back into the offscreen
+    /// (a pure ~2x-frame-size bandwidth tax measured at ~0.5 ms with TAA on).
+    hdr_source: [HdrSource; FRAMES_IN_FLIGHT as usize],
 }
 
 /// A one-shot host-visible buffer holding a screenshot's pixels, copied from
@@ -617,6 +623,7 @@ impl Renderer {
             last_present: std::time::Instant::now(),
             present_interval,
             gpu_timer,
+            hdr_source: [HdrSource::Offscreen; FRAMES_IN_FLIGHT as usize],
         };
         (renderer, reply)
     }
@@ -1365,6 +1372,10 @@ impl Renderer {
                 unsafe { self.gpu_timer.mark(device, cmd, slot, p) };
             }
         };
+        // A fresh scene render makes the offscreen the frame's HDR again; the
+        // TAA pass overrides this if it runs (set before `begin` borrows self
+        // shared for the whole pass).
+        self.hdr_source[slot] = HdrSource::Offscreen;
         let pass = {
             let _g = crate::profile::scope(crate::profile::Meter::RecTransitions);
             unsafe { RenderPass::begin(self, cmd, slot, lists, offsets, do_vrs) }
@@ -1453,9 +1464,13 @@ impl Renderer {
                     );
                 }
                 if exposure {
-                    // Reduce the offscreen to per-tile mean log2-luma, publish the
-                    // smoothed exposure, and finalize the offscreen in SHADER_READ.
+                    // Reduce the frame HDR to per-tile mean log2-luma, publish
+                    // the smoothed exposure, and finalize the HDR in SHADER_READ.
                     self.record_exposure_pass(cmd, crate::skeleton::FrameSlot::new(slot))
+                } else if self.hdr_source[slot] != HdrSource::Offscreen {
+                    // TAA published its output as the frame HDR and already
+                    // left it (and the offscreen) sampled: nothing to record.
+                    HdrReadable::new(slot)
                 } else {
                     unsafe { self.transition_offscreen_to_sampled(cmd, slot) }
                 }
@@ -1464,11 +1479,23 @@ impl Renderer {
                 unsafe { pass.end_sampled() }
             }
         };
+        // Close the resolve/finalize segment (MSAA resolve + transitions +
+        // TAA/exposure) before bloom records, so the report splits them.
+        if profiling {
+            unsafe { self.gpu_timer.mark(&self.device.device, cmd, slot, GpuPass::Resolve) };
+        }
         // Bloom: threshold + downsample the finalized HDR into this slot's
         // mip chain; the tonemap present-copy composites it. Recorded here so the
         // render→present semaphore makes the pyramid visible to the tonemap sample,
         // exactly as it does for the offscreen. A pure function of this frame.
         self.record_bloom_pass(cmd, crate::skeleton::FrameSlot::new(slot));
+        // Close the tail: without this stamp the TAA/exposure/bloom work
+        // recorded above ends after the last boundary and never reaches the
+        // report. (The tonemap/present copy runs on the copy command buffer
+        // and remains unmetered — tracked in structural opportunity #15.)
+        if profiling {
+            unsafe { self.gpu_timer.mark(&self.device.device, cmd, slot, GpuPass::Post) };
+        }
         self.gpu_timer.finish(slot);
         // The main pass just wrote (and stored) this slot's depth, so a later
         // cycle reusing this slot may read it for VRS classification. Stamp
@@ -1482,6 +1509,16 @@ impl Renderer {
                 .expect("end command buffer failed");
         }
         (rs, readable)
+    }
+
+    /// The image+view holding slot `slot`'s FINAL HDR (see `hdr_source`).
+    fn hdr_of(&self, slot: usize) -> (vk::Image, vk::ImageView) {
+        match self.hdr_source[slot] {
+            HdrSource::Offscreen => {
+                (self.targets.offscreen[slot].image, self.targets.offscreen[slot].view)
+            }
+            HdrSource::TaaHistory(i) => self.taa.history_image(i),
+        }
     }
 
     /// Transitions slot `slot`'s offscreen HDR from `COLOR_ATTACHMENT_OPTIMAL` to
@@ -1886,13 +1923,16 @@ impl Renderer {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipelines.tonemap,
             );
+            // Binding 0: the frame HDR — the offscreen, or the TAA output
+            // when the resolve ran (the copy-back is gone).
+            let hdr_view = self.hdr_of(slot).1;
             image_upload::push_combined_image_sampler(
                 &self.device.push_descriptor,
                 self.copy_cmd,
                 self.pipelines.layout_tonemap,
                 0,
                 self.pipelines.tonemap_sampler,
-                self.targets.offscreen[slot].view,
+                hdr_view,
             );
             // Binding 1: the bloom pyramid (built in the render submit, made
             // visible here by the render→present semaphore) with its mip-filtered
@@ -1907,7 +1947,7 @@ impl Renderer {
             let depth_view = if sample_depth {
                 self.targets.depth[slot].view
             } else {
-                self.targets.offscreen[slot].view
+                hdr_view
             };
             let depth_info = [vk::DescriptorImageInfo::default()
                 .sampler(self.pipelines.tonemap_depth_sampler)
@@ -2443,12 +2483,20 @@ impl<'a> RenderPass<'a> {
             let color_attachments = [color_attachment];
 
             // Reversed-Z: clear depth to 0.0, GREATER_OR_EQUAL test. Stored so a
-            // later cycle reusing this slot can classify it for VRS.
+            // later cycle reusing this slot can classify it for VRS — but ONLY
+            // single-sampled: under MSAA no consumer can ever read the stored
+            // depth (VRS, TAA, and godrays all require single-sample), so the
+            // 8x-sample store is pure resolve-phase bandwidth. DONT_CARE it.
+            let depth_store = if r.targets.msaa.is_some() {
+                vk::AttachmentStoreOp::DONT_CARE
+            } else {
+                vk::AttachmentStoreOp::STORE
+            };
             let depth_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(r.targets.depth[slot].view)
                 .image_layout(r.depth_pass_layout())
                 .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
+                .store_op(depth_store)
                 .clear_value(vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue {
                         depth: 0.0,
@@ -3224,6 +3272,15 @@ fn godray_depth_sampleable(samples: vk::SampleCountFlags) -> bool {
     samples == vk::SampleCountFlags::TYPE_1
 }
 
+/// See `Renderer::hdr_source`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HdrSource {
+    /// The scene render's offscreen target (TAA off).
+    Offscreen,
+    /// The TAA history image at this index (TAA on: the resolve output).
+    TaaHistory(usize),
+}
+
 /// A GPU render pass boundary, in record order. The variant ordinal indexes the
 /// per-pass accumulator (matches the tracking in [`crate::profile::Meter`]).
 #[derive(Clone, Copy, PartialEq)]
@@ -3235,10 +3292,17 @@ enum GpuPass {
     Shadows,
     Transparent,
     Overlay,
+    /// End of the scene pass: `cmd_end_rendering` (where the MSAA color
+    /// resolve executes), offscreen finalize transitions, TAA, and exposure.
+    Resolve,
+    /// The bloom chain — the render-command tail after the resolve. Both tail
+    /// stamps used to not exist (no closing timestamp), silently hiding the
+    /// whole post stack from the report.
+    Post,
 }
 
 impl GpuPass {
-    const ALL: [GpuPass; 7] = [
+    const ALL: [GpuPass; 9] = [
         GpuPass::Opaque,
         GpuPass::Sky,
         GpuPass::Cubes,
@@ -3246,6 +3310,8 @@ impl GpuPass {
         GpuPass::Shadows,
         GpuPass::Transparent,
         GpuPass::Overlay,
+        GpuPass::Resolve,
+        GpuPass::Post,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -3259,6 +3325,8 @@ impl GpuPass {
             GpuPass::Shadows => Meter::GpuShadows,
             GpuPass::Transparent => Meter::GpuTransparent,
             GpuPass::Overlay => Meter::GpuOverlay,
+            GpuPass::Resolve => Meter::GpuResolve,
+            GpuPass::Post => Meter::GpuPost,
         }
     }
 }

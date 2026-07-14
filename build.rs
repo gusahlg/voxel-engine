@@ -370,6 +370,11 @@ fn build_table() -> Vec<Def> {
             val: Val::Scalar(10.0),
         },
         Def {
+            name: "SHADOW_SKY_AMBIENT",
+            doc: "Floor on the skylight's lit factor under sun shadow: the sky DOME still\nlights a sun-shadowed surface (blue-sky bounce), so shadow can attenuate\nskylight only down to this fraction — never to the black pit that erased\nall material detail in shadowed cliffs. Scales with sky_amount, so caves\n(sky_amount 0) stay dark; only outdoor shadow gains the floor.",
+            val: Val::Scalar(0.22),
+        },
+        Def {
             name: "SHADOW_RESOLUTION",
             doc: "Cascade shadow map edge in texels. Mirror of vk/targets.rs (asserted equal\nthere); lets the PCF derive texel size without a per-fragment GetDimensions.",
             val: Val::Scalar(2048.0),

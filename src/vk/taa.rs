@@ -383,6 +383,12 @@ impl TaaState {
         self.prev = None;
     }
 
+    /// The history image at `i` — the finalized-HDR source `hdr_of` resolves
+    /// when the resolve wrote this frame's output there.
+    pub(super) fn history_image(&self, i: usize) -> (vk::Image, vk::ImageView) {
+        (self.history[i].image, self.history[i].view)
+    }
+
     /// Drop the temporal state without touching GPU resources: the next
     /// resolve integrates from the current frame alone. Called on a TAA flag
     /// toggle (E-03) — the pre-toggle history is a stale scene that must not
@@ -427,25 +433,29 @@ fn history_src(last: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk::AccessFla
     match last {
         // Fresh or post-resize: no prior access to order against.
         vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
-        // Last use: the copy-out read it as the resolve source.
+        // Legacy state (pre copy-back-removal sessions only); kept so the
+        // mapping stays total over anything an old frame could have left.
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL => {
             (vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::NONE)
         }
-        // Last use: the previous resolve SAMPLED it as history.
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => {
-            (vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::NONE)
-        }
+        // Last uses: the previous resolve SAMPLED it as history (compute),
+        // and — as the published frame HDR — exposure/bloom (compute) and the
+        // tonemap present-copy (fragment) sampled it too.
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+            vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::NONE,
+        ),
         other => unreachable!("untracked TAA history layout {other:?}"),
     }
 }
 
 impl super::Renderer {
     /// Record the TAA resolve. Called AFTER the HDR resolve and BEFORE `record_exposure_pass`,
-    /// only when a 3D scene was drawn. Reads the current offscreen HDR + reprojected history,
-    /// writes the stabilized image into the history integrator, then copies it back into the
-    /// offscreen so downstream (exposure/tonemap) sees the stabilized frame. Leaves the
-    /// offscreen in `COLOR_ATTACHMENT_OPTIMAL`, matching what the exposure pass's
-    /// own pre-barrier expects.
+    /// only when a 3D scene was drawn. Reads the current offscreen HDR + reprojected history
+    /// and writes the stabilized image into the history integrator, which it then PUBLISHES
+    /// as the slot's `hdr_source` — exposure, bloom, and the tonemap present-copy sample it
+    /// directly (the old full-res copy-back into the offscreen is gone). The offscreen is
+    /// left in `SHADER_READ_ONLY` (this pass's own read state).
     ///
     /// `clean_view_proj` is the camera matrix without jitter. `eye` is the world position of
     /// the render-space origin in f64 ([`DrawLists::eye`](crate::frame::DrawLists)):
@@ -625,65 +635,22 @@ impl super::Renderer {
             );
             device.cmd_dispatch(cmd, extent.width.div_ceil(8), extent.height.div_ceil(8), 1);
 
-            // Copy the resolved history back into the offscreen HDR so exposure
-            // meters and tonemap reads the stabilized image. Output → transfer
-            // src, offscreen → transfer dst, copy, offscreen → color attachment.
-            let to_copy = [
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                    .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .image(taa.history[w].image)
-                    .subresource_range(super::color_range()),
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .image(offscreen.image)
-                    .subresource_range(super::color_range()),
-            ];
-            device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_copy),
-            );
-
-            let layers = vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            };
-            let region = [vk::ImageCopy::default()
-                .src_subresource(layers)
-                .dst_subresource(layers)
-                .extent(vk::Extent3D {
-                    width: extent.width,
-                    height: extent.height,
-                    depth: 1,
-                })];
-            device.cmd_copy_image(
-                cmd,
-                taa.history[w].image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                offscreen.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &region,
-            );
-
+            // The resolve output IS the frame's final HDR: publish it as the
+            // slot's `hdr_source` and hand it straight to the downstream
+            // samplers (exposure/bloom compute, tonemap fragment). The old
+            // path copied it back into the offscreen — a full-res read+write
+            // (~2x frame size) every frame, bought nothing, and is gone.
             let mut post = vec![vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .image(offscreen.image)
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER
+                        | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                )
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(taa.history[w].image)
                 .subresource_range(super::color_range())];
             if depth_ok {
                 post.push(
@@ -710,13 +677,15 @@ impl super::Renderer {
             );
         }
 
-        // The written image rests in TRANSFER_SRC and becomes next frame's source;
-        // the just-read image (SHADER_READ) becomes next frame's write target.
-        taa.hist_layout[w] = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        // Both images rest in SHADER_READ_ONLY: the written one is this
+        // frame's published HDR (sampled by exposure/bloom/tonemap) and next
+        // frame's history source; the just-read one becomes the write target.
+        taa.hist_layout[w] = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         taa.hist_layout[r] = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         taa.read_idx = w;
         taa.valid = true;
         taa.prev = Some((clean_view_proj, eye));
+        self.hdr_source[slot.index()] = super::HdrSource::TaaHistory(w);
     }
 }
 
@@ -739,7 +708,11 @@ mod tests {
         );
         assert_eq!(
             history_src(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            (vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::NONE)
+            (
+                vk::PipelineStageFlags2::COMPUTE_SHADER
+                    | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::NONE
+            )
         );
     }
 
@@ -756,13 +729,14 @@ mod tests {
             // Both barriers must resolve (would panic on an untracked state).
             let _ = history_src(layouts[r]);
             let _ = history_src(layouts[w]);
-            // The pass's exit states.
-            layouts[w] = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+            // The pass's exit states (both rest sampled since the copy-back
+            // removal: the output IS the published frame HDR).
+            layouts[w] = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
             layouts[r] = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
             read_idx = w;
         }
-        // Steady state: source in TRANSFER_SRC, target in SHADER_READ_ONLY.
-        assert_eq!(layouts[read_idx], vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        // Steady state: both images rest sampled.
+        assert_eq!(layouts[read_idx], vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         assert_eq!(layouts[1 - read_idx], vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     }
 }

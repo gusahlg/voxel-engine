@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use ash::vk;
 
-use super::alloc::find_memory_type;
+use super::alloc::{find_memory_type, try_find_memory_type};
 use super::buffers::FRAMES_IN_FLIGHT;
 use crate::engine::Engine;
 use crate::genconst;
@@ -103,17 +103,25 @@ impl TileMeans {
                 .expect("create exposure tile-mean buffer")
         };
         let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+        // The CPU READS every tile mean every frame. Plain HOST_VISIBLE |
+        // HOST_COHERENT memory is typically write-combined — uncached for the
+        // CPU — and sequentially reading ~8k floats from it measured 1.4 ms/f
+        // (85% of the whole frame). Prefer HOST_CACHED (cached reads make the
+        // same loop ~microseconds); fall back where the device has no such
+        // host-visible type.
+        let cached = vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT
+            | vk::MemoryPropertyFlags::HOST_CACHED;
+        let plain = vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let type_index = try_find_memory_type(memory_props, reqs.memory_type_bits, cached)
+            .unwrap_or_else(|| find_memory_type(memory_props, reqs.memory_type_bits, plain));
         let memory = unsafe {
             device
                 .allocate_memory(
                     &vk::MemoryAllocateInfo::default()
                         .allocation_size(reqs.size)
-                        .memory_type_index(find_memory_type(
-                            memory_props,
-                            reqs.memory_type_bits,
-                            vk::MemoryPropertyFlags::HOST_VISIBLE
-                                | vk::MemoryPropertyFlags::HOST_COHERENT,
-                        )),
+                        .memory_type_index(type_index),
                     None,
                 )
                 .expect("allocate exposure tile-mean memory")
@@ -493,6 +501,8 @@ impl super::Renderer {
         slot: FrameSlot,
     ) -> super::HdrReadable {
         let device = &self.device.device;
+        let (hdr_image, hdr_view) = self.hdr_of(slot.index());
+        let from_offscreen = self.hdr_source[slot.index()] == super::HdrSource::Offscreen;
         let exp = &mut self.exposure;
 
         // Parity resolver: read the waited slot's buffer (frame N-2's result,
@@ -509,30 +519,33 @@ impl super::Renderer {
         // The buffer the compute dispatch fills this frame (read next frame).
         let write_buf = *exp.ring.views(slot).0.buf;
 
-        let hdr = &self.targets.offscreen[slot.index()];
         let tiles = exp.tiles;
         unsafe {
-            // HDR color-attachment write → compute sampled read. The buffer is
-            // host-coherent + freshly fence-cleared, so no pre-barrier is needed
-            // for the write target beyond the frame fence already waited.
-            let pre = [vk::ImageMemoryBarrier2::default()
+            // With the offscreen as the source: color-attachment write →
+            // compute sampled read. With the TAA output as the source, its
+            // pass already left the image SHADER_READ visible to compute —
+            // no barrier needed (the tile-mean buffer needs none either way:
+            // host-coherent + freshly fence-cleared).
+            if from_offscreen {
+                let pre = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                 .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                 .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image(hdr.image)
+                .image(hdr_image)
                 .subresource_range(super::color_range())];
-            device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&pre),
-            );
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&pre),
+                );
+            }
 
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, exp.compute.pipeline);
             let hdr_info = [vk::DescriptorImageInfo::default()
                 .sampler(exp.compute.sampler)
-                .image_view(hdr.view)
+                .image_view(hdr_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let buf_info = [vk::DescriptorBufferInfo::default()
                 .buffer(write_buf)
@@ -585,7 +598,7 @@ impl super::Renderer {
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                 .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image(hdr.image)
+                .image(hdr_image)
                 .subresource_range(super::color_range())];
             device.cmd_pipeline_barrier2(
                 cmd,
