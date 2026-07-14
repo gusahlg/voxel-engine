@@ -2,8 +2,25 @@
 // Reuses mesh3d layout (packed uint2) and same SSBO. Light-space view_proj in push budget.
 // Position only; no fragment shader (rasterizer writes depth only).
 
+// Per-draw placement. std430 layout mirrors vk::buffers::DrawOffset exactly —
+// the SAME 32-byte record mesh3d.vert reads. Declaring this as float4 (as an
+// early draft did) halves the stride: every odd instance then reads
+// fade/mode/flat_rgba bits as its placement and every later even instance
+// reads the WRONG draw's offset, scattering occluders and making shadows
+// churn whenever the distance sort reorders the draw list (i.e. whenever the
+// camera moves).
+struct DrawOffset
+{
+    float3 offset;
+    float scale;
+    float fade;
+    uint mode;
+    uint flat_rgba;
+    uint pad;
+};
+
 [[vk::binding(0, 0)]]
-StructuredBuffer<float4> draw_offsets;
+StructuredBuffer<DrawOffset> draw_offsets;
 
 struct VertexInput
 {
@@ -33,8 +50,8 @@ float4 vertexMain(VertexInput input) : SV_Position
     float y = float((w0 >> 5) & 0x1F);
     float z = float((w0 >> 10) & 0x1F);
 
-    float4 placement = draw_offsets[input.instance]; // xyz = offset, w = scale
-    float3 world = float3(x, y, z) * placement.w + placement.xyz;
+    DrawOffset placement = draw_offsets[input.instance];
+    float3 world = float3(x, y, z) * placement.scale + placement.offset;
 
     return mul(pc.view_proj, float4(world, 1.0));
 }

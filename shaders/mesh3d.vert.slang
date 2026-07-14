@@ -88,8 +88,17 @@ struct PushConstants
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc;
 
-// Gameplay-tuned planet curvature: distant terrain droops below horizon, hidden by fog.
-static const float CURVE_INV_2R = 1.0 / (2.0 * 300000.0);
+// Gameplay-tuned planet curvature: distant terrain droops below the horizon,
+// hidden by fog. PRESENTATION-ONLY by contract (E-06): the droop is applied to
+// the CLIP position alone, never to `output.world` — so fog, lighting, shadow
+// evaluation, and every CPU consumer (culling, world outputs, shadow depth)
+// agree on the flat world. The bounded artifacts that buys: frustum culling is
+// conservative near the bottom edge (a drooped tile may be drawn just
+// off-screen, never wrongly culled away), and shadows are computed for the
+// flat silhouette. The droop itself is clamped (CURVE_MAX_DROP) so an
+// arbitrarily distant vertex can neither overflow nor fold the horizon.
+static const float CURVE_INV_2R = 1.0 / (2.0 * 300000.0); // ~300 km visual radius
+static const float CURVE_MAX_DROP = 4096.0; // metres; reached ~50 km out
 
 [shader("vertex")]
 VertexOutput vertexMain(VertexInput input)
@@ -101,7 +110,7 @@ VertexOutput vertexMain(VertexInput input)
     float y = float((w0 >> 5) & 0x1F);
     float z = float((w0 >> 10) & 0x1F);
     uint normal = (w0 >> 15) & 0x7;   // 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
-    uint layer = (w0 >> 18) & 0xFF;
+    uint layer = (w0 >> 18) & 0x3FFF;
     uint ao = (w1 >> 0) & 0x3;
     uint sky = (w1 >> 2) & 0xF;
     uint block = (w1 >> 6) & 0xF;
@@ -143,7 +152,7 @@ VertexOutput vertexMain(VertexInput input)
     VertexOutput output;
     // Round-world horizon: curve on-screen silhouette only, preserving world position for fog/shadows.
     float3 curved = world;
-    curved.y -= dot(world.xz, world.xz) * CURVE_INV_2R;
+    curved.y -= min(dot(world.xz, world.xz) * CURVE_INV_2R, CURVE_MAX_DROP);
     // Plain rectilinear projection; wide-FOV compression is a post-process.
     output.position = mul(pc.view_proj, float4(curved, 1.0));
     // Resolve depth ties in coplanar LOD levels: push each farther proportionally to cell size.

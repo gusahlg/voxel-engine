@@ -128,12 +128,14 @@ impl FrameUniformsGpu {
         n.sun_dir_elev = [0.0, 1.0, 0.0, std::f32::consts::FRAC_PI_2];
         n.candle[3] = 1.0; // ambient floor luma → diffuse = 1.0
         n.exposure_dither[0] = 1.0; // neutral exposure
+        n.extras[0] = 1.0; // stars allowed (invisible anyway at full daylight)
         n
     }
 }
 
-/// Bumped when the lane_table layout changes (v2 added the `anim` lane).
-pub const FRAME_UNIFORMS_VERSION: u32 = 2;
+/// Bumped when the lane_table layout changes (v2 added the `anim` lane;
+/// v3 repurposed `reserved` as `extras` with x = stars gain).
+pub const FRAME_UNIFORMS_VERSION: u32 = 3;
 
 // The host-visible per-frame UBO ring's real home is `vk::uniforms::UboRing`
 // (`write`/`buffer`/`current_slot` implemented there against a persistently

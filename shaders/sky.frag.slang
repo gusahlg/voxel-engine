@@ -154,7 +154,11 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     float3 moon_dir = -pc.sun.xyz;
     float3 moon_tint = float3(MOON_TINT[0], MOON_TINT[1], MOON_TINT[2]);
     col += sun_disc(ray, moon_dir, moon_tint, pc.sun.w * MOON_RADIUS_SCALE) * night;
-    col += stars(ray, moon_dir, night);
+    // Uniform branch (both factors are per-frame constants): skips the whole
+    // hash-grid star evaluation by day and when `RenderFlags::stars` is off —
+    // the multiplied-out zero was still being computed for every sky pixel.
+    if (night * frame.extras.x > 0.0)
+        col += stars(ray, moon_dir, night) * frame.extras.x;
 
     // Slab clouds composite LAST so opaque cloud occludes the sun/moon/stars it
     // covers. `cover` premultiplies the hidden background out in one lerp.

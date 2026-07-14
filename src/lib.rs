@@ -29,7 +29,7 @@ pub use camera::{
 pub use capture::{Screenshot, load_png, screenshot_to};
 pub use color::{Color, LinearRgb};
 pub use engine::{Config, Engine, RenderFlags, run};
-pub use frame::{CoverageVolume, Frame, Frame3D, Lighting, SkyDesc};
+pub use frame::{CoverageVolume, FadeStyle, Frame, Frame3D, Lighting, SkyDesc};
 pub use glam::{DVec2, DVec3, IVec2, Mat3, Mat4, Vec2, Vec3};
 pub use input::{Key, MouseButton};
 pub use mesh::{Ao, DebugVertex, Detail, Light, MeshData, MeshHandle, MeshVertex, Normal, Pass};

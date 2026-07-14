@@ -688,7 +688,7 @@ fn lane_table() -> Vec<Lane> {
         Lane { name: "horizon", doc: "rgb = horizon color (linear), w = fog density." },
         Lane { name: "candle", doc: "rgb = blocklight (candle) color (linear), w = ambient floor luma." },
         Lane { name: "exposure_dither", doc: "x = exposure, y = dither phase [0,1), zw = jitter in pixels\n(informational; jitter is applied via the matrix — zero until enabled)." },
-        Lane { name: "reserved", doc: "Reserved for future use. Always zeroed; repurposing a lane bumps\nFRAME_UNIFORMS_VERSION." },
+        Lane { name: "extras", doc: "x = stars gain (1 = night starfield renders, 0 = skipped — the\n`RenderFlags::stars` gate). yzw reserved (always zero); repurposing a\nchannel bumps FRAME_UNIFORMS_VERSION." },
         Lane { name: "anim", doc: "x = anim_time = world-time seconds mod ANIM_PERIOD; yz = fract(camera_world.xz\n/ ANIM_PERIOD); w = camera world-y (metres, bounded ⇒ no wrap) for the cloud\nslab in sky.frag." },
     ]
 }

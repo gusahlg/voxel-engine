@@ -81,6 +81,18 @@ const MESH3D_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d.frag
 /// when dynamic_rendering_local_read is available and MSAA is off.
 const MESH3D_WATER_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_water.frag.spv"));
+/// The water depth-absorption local-read path is LIVE (repaired 2026-07-14 as
+/// one coherent change): the shader loads the depth input attachment as vec4
+/// (`spirv-val` clean at vulkan1.3 — the all-module test enforces it), the
+/// pipeline and the render-pass instance agree on the input-attachment
+/// mapping, the scene pass runs depth in `RENDERING_LOCAL_READ` whenever this
+/// pipeline exists (`Renderer::depth_pass_layout`), and a framebuffer-local
+/// barrier orders opaque depth writes before the water branch's reads. The
+/// validation smoke (standard + sync validation, resize, autoshot) passes
+/// with zero errors. Still gated to single-sample + the extension; MSAA keeps
+/// the flat-tint fallback.
+const WATER_DEPTH_ABSORPTION_VALIDATED: bool = true;
+
 const DEBUG_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.vert.spv"));
 const DEBUG_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.frag.spv"));
 const TRIS2D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tris2d.vert.spv"));
@@ -362,9 +374,12 @@ impl Pipelines {
                 depth_bias: None,
             },
         );
-        // Water absorption variant (depth input attachment); only when
-        // dynamic_rendering_local_read is available and MSAA is off.
-        let absorb_ok = local_read && samples == vk::SampleCountFlags::TYPE_1;
+        // Water absorption variant (depth input attachment); only when its full
+        // local-read path has passed validation, the feature is available, and
+        // MSAA is off. Until then the ordinary blend shader uses a flat body tint.
+        let absorb_ok = WATER_DEPTH_ABSORPTION_VALIDATED
+            && local_read
+            && samples == vk::SampleCountFlags::TYPE_1;
         let mesh3d_water_frag =
             absorb_ok.then(|| create_shader_module(device, MESH3D_WATER_FRAG));
         let mesh3d_transparent_absorb = mesh3d_water_frag.map(|water_frag| {
@@ -681,8 +696,10 @@ impl PipelineBuilder<'_> {
     /// Like [`Self::build`], but chains `VkRenderingInputAttachmentIndexInfoKHR`
     /// so the fragment's input-attachment index 0 maps to the depth attachment
     /// (dynamic_rendering_local_read). Only for the water-absorption blend
-    /// pipeline; the mapping is static pipeline state, so no per-draw dynamic
-    /// `vkCmdSetRenderingInputAttachmentIndices` call is needed.
+    /// pipeline. The render-pass instance must set the SAME mapping via
+    /// `vkCmdSetRenderingInputAttachmentIndices` before its draws — the
+    /// command-buffer state defaults to no mapping and must match the
+    /// pipeline's (VUID-vkCmdDrawIndexedIndirect-None-10927).
     fn build_depth_input(
         &self,
         vert: vk::ShaderModule,
@@ -825,10 +842,14 @@ impl PipelineBuilder<'_> {
         if vrs && self.fsr_enabled {
             pipeline_info = pipeline_info.push_next(&mut fsr_state);
         }
-        // Map the fragment's input-attachment index 0 to the depth attachment;
-        // no color input attachments. Static pipeline state (not a dynamic set).
+        // Map the fragment's input-attachment index 0 to the depth attachment.
+        // The color list must have ONE entry (it must equal
+        // VkPipelineRenderingCreateInfo::colorAttachmentCount) with the color
+        // attachment marked not-an-input (VUID-…-09531).
         let depth_input_index = 0u32;
+        let color_input_indices = [vk::ATTACHMENT_UNUSED];
         let mut input_attachment_info = vk::RenderingInputAttachmentIndexInfoKHR::default()
+            .color_attachment_input_indices(&color_input_indices)
             .depth_input_attachment_index(&depth_input_index);
         if depth_input {
             pipeline_info = pipeline_info.push_next(&mut input_attachment_info);

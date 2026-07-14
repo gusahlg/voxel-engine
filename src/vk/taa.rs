@@ -383,6 +383,17 @@ impl TaaState {
         self.prev = None;
     }
 
+    /// Drop the temporal state without touching GPU resources: the next
+    /// resolve integrates from the current frame alone. Called on a TAA flag
+    /// toggle (E-03) — the pre-toggle history is a stale scene that must not
+    /// ghost into the first re-enabled frame. The tracked image layouts are
+    /// left alone: they describe the images' REAL states regardless of
+    /// validity, and the next pass's barriers depend on them being truthful.
+    pub(crate) fn invalidate_history(&mut self) {
+        self.valid = false;
+        self.prev = None;
+    }
+
     pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
         unsafe {
             self.compute.destroy(device);
@@ -400,6 +411,33 @@ impl TaaState {
 // (this state lives inside the render-thread-owned `Renderer`); `Send` is needed
 // only because `Renderer` is constructed on and moved to that thread.
 unsafe impl Send for TaaState {}
+
+/// The REAL prior use of a history image, derived from its tracked layout —
+/// the `src` half of that image's next barrier. History images are SHARED
+/// across submissions (not per-frame-slot), so these dependencies genuinely
+/// order against the previous frame; declaring a wrong source (the old code
+/// claimed a compute storage write for an image last TRANSFER-read, and NO
+/// dependency at all for an image the previous frame sampled) leaves a
+/// cross-submission hazard sync validation cannot always see (E-02).
+///
+/// Reads need execution-only ordering, so `src_access` is `NONE` throughout:
+/// each state's underlying storage WRITE was already made available by the
+/// barrier that entered that state, and barrier chaining carries it forward.
+fn history_src(last: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    match last {
+        // Fresh or post-resize: no prior access to order against.
+        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
+        // Last use: the copy-out read it as the resolve source.
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => {
+            (vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::NONE)
+        }
+        // Last use: the previous resolve SAMPLED it as history.
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => {
+            (vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::NONE)
+        }
+        other => unreachable!("untracked TAA history layout {other:?}"),
+    }
+}
 
 impl super::Renderer {
     /// Record the TAA resolve. Called AFTER the HDR resolve and BEFORE `record_exposure_pass`,
@@ -420,6 +458,9 @@ impl super::Renderer {
         clean_view_proj: Mat4,
         eye: DVec3,
     ) {
+        // Captured before the &mut borrow below: the frame-wide depth layout
+        // (RENDERING_LOCAL_READ when the water-absorption path is active).
+        let depth_layout = self.depth_pass_layout();
         let taa = &mut self.taa;
         let r = taa.read_idx;
         let w = 1 - r;
@@ -449,6 +490,10 @@ impl super::Renderer {
         let depth_ok = self.targets.samples == vk::SampleCountFlags::TYPE_1;
         let depth = &self.targets.depth[slot.index()];
         let device = &self.device.device;
+        // The src half of each history barrier comes from the image's TRACKED
+        // prior state — never from an assumed pipeline shape (E-02).
+        let (r_src_stage, r_src_access) = history_src(taa.hist_layout[r]);
+        let (w_src_stage, w_src_access) = history_src(taa.hist_layout[w]);
         unsafe {
             // Inputs → shader-read; output → general (contents discarded).
             let mut pre = vec![
@@ -461,18 +506,25 @@ impl super::Renderer {
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .image(offscreen.image)
                     .subresource_range(super::color_range()),
+                // History source: last frame's copy-out TRANSFER-read it (or
+                // it is fresh); order this frame's sampling after that.
                 vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                    .src_stage_mask(r_src_stage)
+                    .src_access_mask(r_src_access)
                     .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                     .old_layout(taa.hist_layout[r])
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .image(taa.history[r].image)
                     .subresource_range(super::color_range()),
+                // Becoming output: the PREVIOUS frame sampled this image as
+                // its history source — the storage write must wait for that
+                // read (write-after-read across submissions). Contents are
+                // fully overwritten, so the layout may still discard from
+                // UNDEFINED; the dependency is what was missing.
                 vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .src_stage_mask(w_src_stage)
+                    .src_access_mask(w_src_access)
                     .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                     .old_layout(vk::ImageLayout::UNDEFINED)
@@ -493,7 +545,7 @@ impl super::Renderer {
                         .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                         .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                         .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                        .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                        .old_layout(depth_layout)
                         .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                         .image(depth.image)
                         .subresource_range(super::depth_range()),
@@ -647,7 +699,7 @@ impl super::Renderer {
                                 | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
                         )
                         .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                        .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                        .new_layout(depth_layout)
                         .image(depth.image)
                         .subresource_range(super::depth_range()),
                 );
@@ -665,5 +717,52 @@ impl super::Renderer {
         taa.read_idx = w;
         taa.valid = true;
         taa.prev = Some((clean_view_proj, eye));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// E-02: the barrier source is the image's REAL last use, per tracked
+    /// layout — a transfer read for last frame's resolve source, a compute
+    /// sample for last frame's history input, nothing for a fresh image.
+    #[test]
+    fn history_barrier_sources_match_the_tracked_prior_use() {
+        assert_eq!(
+            history_src(vk::ImageLayout::UNDEFINED),
+            (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
+        );
+        assert_eq!(
+            history_src(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+            (vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::NONE)
+        );
+        assert_eq!(
+            history_src(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            (vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::NONE)
+        );
+    }
+
+    /// The ping-pong state machine only ever leaves images in the three
+    /// layouts `history_src` tracks, from first frame through steady state —
+    /// so the barrier-source mapping is total over reachable states.
+    #[test]
+    fn ping_pong_layouts_stay_within_the_tracked_states() {
+        let mut layouts = [vk::ImageLayout::UNDEFINED; 2];
+        let mut read_idx = 0usize;
+        for _ in 0..8 {
+            let r = read_idx;
+            let w = 1 - r;
+            // Both barriers must resolve (would panic on an untracked state).
+            let _ = history_src(layouts[r]);
+            let _ = history_src(layouts[w]);
+            // The pass's exit states.
+            layouts[w] = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+            layouts[r] = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            read_idx = w;
+        }
+        // Steady state: source in TRANSFER_SRC, target in SHADER_READ_ONLY.
+        assert_eq!(layouts[read_idx], vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        assert_eq!(layouts[1 - read_idx], vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     }
 }

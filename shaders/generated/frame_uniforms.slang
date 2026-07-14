@@ -19,9 +19,10 @@ struct FrameUniforms
     // x = exposure, y = dither phase [0,1), zw = jitter in pixels
     // (informational; jitter is applied via the matrix — zero until enabled).
     float4 exposure_dither;
-    // Reserved for future use. Always zeroed; repurposing a lane bumps
-    // FRAME_UNIFORMS_VERSION.
-    float4 reserved;
+    // x = stars gain (1 = night starfield renders, 0 = skipped — the
+    // `RenderFlags::stars` gate). yzw reserved (always zero); repurposing a
+    // channel bumps FRAME_UNIFORMS_VERSION.
+    float4 extras;
     // x = anim_time = world-time seconds mod ANIM_PERIOD; yz = fract(camera_world.xz
     // / ANIM_PERIOD); w = camera world-y (metres, bounded ⇒ no wrap) for the cloud
     // slab in sky.frag.

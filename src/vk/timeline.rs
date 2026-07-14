@@ -189,11 +189,17 @@ impl CopySubmit {
         let waits = [
             vk::SemaphoreSubmitInfo::default()
                 .semaphore(wait_image.0)
-                .stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER),
+                // The acquired swapchain image is first transitioned/used as a
+                // color attachment, not by a transfer command. A transfer-only
+                // wait leaves that access unordered from presentation.
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
             vk::SemaphoreSubmitInfo::default()
                 .semaphore(timeline.sem)
                 .value(wait_render.0.raw())
-                .stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER),
+                // This submission samples render products in fragment work
+                // before any later copies/readback. Cover the real consumers;
+                // tighten only once each dependency is represented separately.
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
         ];
         let signals = [
             vk::SemaphoreSubmitInfo::default()

@@ -36,6 +36,8 @@ use crate::mesh::{MeshData, MeshHandle};
 #[derive(Clone, Copy)]
 pub(crate) struct DeviceCaps {
     pub max_msaa: u32,
+    /// Block-texture array layer ceiling (`limits.maxImageArrayLayers`).
+    pub max_texture_layers: u32,
 }
 
 /// Ordered command stream from main to render thread.
@@ -62,11 +64,11 @@ pub(crate) enum RenderCmd {
     Capture(Capture),
     Resize(PhysicalSize<u32>),
     SetVsync(bool),
+    /// Replaces the render thread's feature-flag copy (see [`crate::RenderFlags`]).
+    SetFlags(crate::RenderFlags),
     /// Pre-clamped on main against cached caps.
     SetMsaa(u32),
     SetCullFaces(bool),
-    /// Live-swap the render thread's CPU-side feature flags (menu/`/gfx` edit).
-    SetFlags(crate::RenderFlags),
     SetRenderScale(Scale),
     Frame(Box<DrawLists>),
     Shutdown,
@@ -314,6 +316,10 @@ impl RenderClient {
         self.caps.max_msaa
     }
 
+    pub(crate) fn max_texture_layers(&self) -> u32 {
+        self.caps.max_texture_layers
+    }
+
     pub(crate) fn set_cull_faces(&mut self, on: bool) {
         self.cull_faces = on;
         let _ = self.tx.send(RenderCmd::SetCullFaces(on));
@@ -454,11 +460,11 @@ fn render_loop(
                 RenderCmd::Capture(capture) => renderer.request_capture(capture),
                 RenderCmd::Resize(size) => renderer.on_resize(size),
                 RenderCmd::SetVsync(v) => renderer.set_vsync(v),
+                RenderCmd::SetFlags(f) => renderer.set_flags(f),
                 RenderCmd::SetMsaa(m) => {
                     renderer.set_msaa(m);
                 }
                 RenderCmd::SetCullFaces(c) => renderer.set_cull_faces(c),
-                RenderCmd::SetFlags(f) => renderer.set_flags(f),
                 RenderCmd::SetRenderScale(s) => {
                     renderer.set_render_scale(s.get());
                 }

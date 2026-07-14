@@ -20,8 +20,14 @@ use ash::vk;
 
 use super::device::{BudgetSnapshot, MemoryBudget};
 
-/// Default block size; larger allocations get a dedicated, larger block.
+/// Growth block size; larger allocations get a dedicated, larger block.
 const BLOCK_SIZE: u64 = 64 * 1024 * 1024;
+
+/// A pool's FIRST block is smaller: a small world (or the menu) holds a few
+/// MB of live meshes, and a 64 MiB opening reservation was most of the app's
+/// idle GPU footprint. Growth past it still comes in [`BLOCK_SIZE`] strides,
+/// so a big world pays one extra allocation, ever.
+const FIRST_BLOCK_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Consecutive `shrink_device` ticks a device block must stay completely
 /// free before it is returned to the driver. At a per-frame cadence this is
@@ -560,7 +566,10 @@ unsafe fn alloc_from_pool(
         }
     }
 
-    let block = unsafe { create_block(device, memory_props, type_prefs, budget, usage, size)? };
+    // The pool's first-ever block opens small (see FIRST_BLOCK_SIZE).
+    let floor = if blocks.iter().flatten().next().is_none() { FIRST_BLOCK_SIZE } else { BLOCK_SIZE };
+    let block =
+        unsafe { create_block(device, memory_props, type_prefs, budget, usage, size, floor)? };
     // Reuse a destroyed block's slot so existing Allocation indices stay valid.
     let index = match blocks.iter().position(|slot| slot.is_none()) {
         Some(index) => {
@@ -596,9 +605,9 @@ fn make_allocation(block: &Block, index: usize, offset: u64, size: u64, pool: Po
     }
 }
 
-/// Creates a block of at least `min_size` bytes (rounded up to BLOCK_SIZE),
-/// bound at offset 0 and persistently mapped when the chosen memory type is
-/// host-visible.
+/// Creates a block of at least `min_size` bytes (rounded up to `size_floor` —
+/// [`FIRST_BLOCK_SIZE`] or [`BLOCK_SIZE`]), bound at offset 0 and persistently
+/// mapped when the chosen memory type is host-visible.
 unsafe fn create_block(
     device: &ash::Device,
     memory_props: &vk::PhysicalDeviceMemoryProperties,
@@ -606,8 +615,9 @@ unsafe fn create_block(
     budget: Option<BudgetQuery>,
     usage: vk::BufferUsageFlags,
     min_size: u64,
+    size_floor: u64,
 ) -> Result<Block, vk::Result> {
-    let buffer_size = min_size.max(BLOCK_SIZE);
+    let buffer_size = min_size.max(size_floor);
     let buffer_info = vk::BufferCreateInfo::default()
         .size(buffer_size)
         .usage(usage)

@@ -552,6 +552,7 @@ impl Renderer {
 
         let caps = DeviceCaps {
             max_msaa: device.max_msaa(),
+            max_texture_layers: device.max_image_array_layers,
         };
         let reply = InitReply {
             instance: instance.instance.clone(),
@@ -651,7 +652,25 @@ impl Renderer {
         self.cull_faces = on;
     }
 
+    /// Replaces this thread's feature-flag copy. Safe mid-run: every flag gates
+    /// per-frame work only (no resource is created conditionally on a flag), so
+    /// the new set simply applies from the next recorded frame.
     pub fn set_flags(&mut self, flags: crate::engine::RenderFlags) {
+        // Flag transitions reset the temporal state they gate; replacing the
+        // booleans alone left stale values live (E-03):
+        // - exposure OFF used to keep the last metered value in `current()`
+        //   and the shared cell — tonemap/compose kept applying a dead meter
+        //   instead of the documented pinned 1.0;
+        // - a TAA off→on toggle used to blend the pre-toggle history frame
+        //   into the first re-enabled frame (temporal ghost of a stale scene).
+        if self.flags.exposure && !flags.exposure {
+            self.exposure.reset();
+        } else if !self.flags.exposure && flags.exposure {
+            self.exposure.rearm();
+        }
+        if self.flags.taa != flags.taa {
+            self.taa.invalidate_history();
+        }
         self.flags = flags;
     }
 
@@ -694,6 +713,19 @@ impl Renderer {
     /// what lands. A pending request replaced before it is serviced replies
     /// `Interrupted` to the superseded caller so no blocking wait is orphaned.
     pub fn request_capture(&mut self, capture: Capture) {
+        // A surface without TRANSFER_SRC swapchain images cannot be copied
+        // out: refuse up front (with the reply, so a blocking caller isn't
+        // orphaned) instead of recording a usage-violating copy.
+        if !self.swapchain.screenshot_capable {
+            log::error!("screenshot refused: surface lacks TRANSFER_SRC swapchain usage");
+            if let Some(reply) = capture.reply {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "surface does not support screenshot copies",
+                )));
+            }
+            return;
+        }
         if let Some(prev) = self.pending_capture.replace(capture) {
             if let Some(reply) = prev.reply {
                 let _ = reply.send(Err(std::io::Error::new(
@@ -711,6 +743,20 @@ impl Renderer {
     /// avoiding a load-time `device_wait_idle` stall — pipelines and descriptors
     /// untouched, since the current texture is pushed afresh each frame.
     pub fn set_block_textures(&mut self, size: u32, layers: &[Vec<u8>]) {
+        // Defense against a caller outrunning the device: creating an image
+        // with more layers than `maxImageArrayLayers` is a validation error,
+        // so truncate loudly instead. The app-side clamp (which wraps ids)
+        // should make this unreachable.
+        let cap = self.device.max_image_array_layers as usize;
+        let layers = if layers.len() > cap {
+            log::error!(
+                "set_block_textures: {} layers exceeds the device cap of {cap}; truncating",
+                layers.len()
+            );
+            &layers[..cap]
+        } else {
+            layers
+        };
         // Build new array before swapping out old to avoid double-free on panic.
         let new_textures = BlockTextures::upload(
             &self.instance.instance,
@@ -800,12 +846,14 @@ impl Renderer {
             let mut u = lists
                 .frame_uniforms
                 .unwrap_or_else(crate::skeleton::FrameUniformsGpu::full_bright);
-            // Debug-flat: claim the `reserved` lane as [r, g, b, enabled] —
+            // Debug-flat: claim the `extras` lane as [r, g, b, enabled] —
             // sRGB-encoded key channels + an enable flag. mesh3d.frag linearises rgb
             // (as it does every CPU colour) and outputs it flat while depth writes.
-            // Layout-only use of the zeroed lane; no FrameUniformsGpu changes.
+            // Overwriting `extras.x` (the stars gain) is safe: the lane's only
+            // other consumer is sky.frag, and the app never draws the sky in the
+            // debug-flat (TerrainKey) view.
             if let Some(c) = lists.debug_flat {
-                u.reserved = [
+                u.extras = [
                     c.r as f32 / 255.0,
                     c.g as f32 / 255.0,
                     c.b as f32 / 255.0,
@@ -856,7 +904,10 @@ impl Renderer {
                         })
                         .unwrap_or((glam::Vec3::Y, [0.0; 3]));
                     crate::camera::Godray::project(
-                        self.flags.godrays,
+                        // The tonemap shader declares a single-sample depth
+                        // texture. Until a resolved depth target exists, an
+                        // MSAA depth attachment cannot legally feed this pass.
+                        self.flags.godrays && godray_depth_sampleable(self.targets.samples),
                         sun_dir,
                         tint,
                         &cam,
@@ -897,6 +948,21 @@ impl Renderer {
     /// Waits until the slot's last render has completed (GPU is done with its
     /// command buffer and immediate buffer), then reclaims retired GPU memory
     /// whose last possible use the timeline has reached.
+    /// The layout the scene-pass depth image lives in for the WHOLE frame.
+    /// With the water-absorption path active it is `RENDERING_LOCAL_READ` —
+    /// the one layout valid simultaneously as depth attachment and as the
+    /// blend pass's input attachment (mid-pass transitions are illegal, so a
+    /// single frame-wide layout is the only coherent design). Every depth
+    /// barrier and attachment info reads this ONE function, so the two
+    /// configurations cannot drift apart.
+    fn depth_pass_layout(&self) -> vk::ImageLayout {
+        if self.pipelines.mesh3d_transparent_absorb.is_some() {
+            vk::ImageLayout::RENDERING_LOCAL_READ_KHR
+        } else {
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
+        }
+    }
+
     fn wait_slot_and_reclaim(&mut self, slot: usize) {
         let device = &self.device.device;
         unsafe {
@@ -1046,16 +1112,13 @@ impl Renderer {
 
         // Shadow pass frustum culling: only render opaque draws whose AABB
         // intersects some cascade's light-space footprint.
-        let shadow_frusta = (lists.has_3d && self.flags.shadows)
-            .then_some(())
-            .and(lists.camera)
-            .map(|cam| {
-                let cfg = crate::skeleton::ShadowCfg::provisional();
-                let sun = sun_dir(lists);
-                [crate::skeleton::Cascade::Near, crate::skeleton::Cascade::Far].map(|c| {
-                    crate::camera::Frustum::from_view_proj(&shadow::fit(&cam, sun, c, &cfg).view_proj.0)
-                })
-            });
+        let shadow_frusta = (lists.has_3d && self.flags.shadows).then(|| {
+            let cfg = crate::skeleton::ShadowCfg::provisional();
+            let sun = sun_dir(lists);
+            [crate::skeleton::Cascade::Near, crate::skeleton::Cascade::Far].map(|c| {
+                crate::camera::Frustum::from_view_proj(&shadow::fit(lists.eye, sun, c, &cfg).view_proj.0)
+            })
+        });
 
         if lists.has_3d {
             for d in &lists.mesh_draws {
@@ -1269,7 +1332,7 @@ impl Renderer {
         // occluders into the shadow map BEFORE the color pass (it leaves the map
         // in SHADER_READ_ONLY_OPTIMAL for mesh3d.frag's PCF). The mesh pass always
         // samples binding 4, so this must run whenever `has_3d`.
-        if let Some(cam) = lists.camera {
+        if lists.has_3d {
             // With shadows disabled the map holds a constant fully-lit clear and
             // its cascade UBO a constant (SHADOW_LIMIT=∞) block, so once this
             // slot has primed both there is nothing left to re-record: skip the
@@ -1280,9 +1343,9 @@ impl Renderer {
                 let _g = crate::profile::scope(crate::profile::Meter::RecShadow);
                 let cfg = crate::skeleton::ShadowCfg::provisional();
                 let sun = sun_dir(lists);
-                let cu = self.shadow_uniforms(&cam, sun, &cfg);
+                let cu = self.shadow_uniforms(lists.eye, sun, &cfg);
                 self.shadow.write_uniforms(slot, &cu);
-                self.record_shadow_pass(cmd, slot, &cam, sun, &cfg);
+                self.record_shadow_pass(cmd, slot, lists.eye, sun, &cfg);
                 self.shadow_lit_ready[slot] = !shadows_on;
             }
         }
@@ -1291,6 +1354,7 @@ impl Renderer {
         // classify. MSAA depth would need multisample sampling (skipped), and a
         // slot's depth is only readable once it has been rendered at least once.
         let do_vrs = lists.has_3d
+            && self.flags.vrs
             && self.targets.vrs.is_some()
             && self.targets.msaa.is_none()
             && self.vrs_ready[slot] == Some(self.scene_fingerprint);
@@ -1479,7 +1543,7 @@ impl Renderer {
                     .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                     .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .old_layout(self.depth_pass_layout())
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .image(depth.image)
                     .subresource_range(depth_range()),
@@ -1557,7 +1621,7 @@ impl Renderer {
                     )
                     .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                     .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .new_layout(self.depth_pass_layout())
                     .image(depth.image)
                     .subresource_range(depth_range()),
             ];
@@ -1715,7 +1779,14 @@ impl Renderer {
         // the wide-FOV periphery remap: `warp_map` carries the coefficients, and an
         // identity (rectilinear) map pushes `s = 0` so the frag stays a no-op.
         // Dither phase: animated if TAA, else static (no integrator to average).
-        let exposure = self.exposure.current().0;
+        // Metering off pins exposure at 1.0 structurally (the set_flags reset
+        // already published DEFAULT; this makes the pin independent of
+        // transition ordering).
+        let exposure = if self.flags.exposure {
+            self.exposure.current().0
+        } else {
+            crate::skeleton::Exposure::DEFAULT.0
+        };
         let phase_index = if self.flags.taa {
             (self.frame_index % crate::skeleton::TEMPORAL_SEQ_LEN) as usize
         } else {
@@ -1749,25 +1820,30 @@ impl Renderer {
                 &vk::DependencyInfo::default().image_memory_barriers(&to_color),
             );
 
-            // Transition depth for godray sampling, restore after draw.
-            // (Render pass already completed; VRS pattern mirrors this transition.)
+            // Transition single-sample depth for godray sampling, restore after
+            // draw. Multisampled depth cannot bind to the shader's Sampler2D;
+            // that path disables godrays and binds the already-readable HDR view
+            // as a type-compatible unused descriptor below.
+            let sample_depth = godray_depth_sampleable(self.targets.samples);
             let depth_image = self.targets.depth[slot].image;
-            let depth_to_read = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(
-                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                )
-                .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image(depth_image)
-                .subresource_range(depth_range())];
-            device.cmd_pipeline_barrier2(
-                self.copy_cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&depth_to_read),
-            );
+            if sample_depth {
+                let depth_to_read = [vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(
+                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                    )
+                    .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .old_layout(self.depth_pass_layout())
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image(depth_image)
+                    .subresource_range(depth_range())];
+                device.cmd_pipeline_barrier2(
+                    self.copy_cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&depth_to_read),
+                );
+            }
 
             let color_attachment = [vk::RenderingAttachmentInfo::default()
                 .image_view(swap_view)
@@ -1825,11 +1901,17 @@ impl Renderer {
                 .sampler(self.bloom.composite_sampler())
                 .image_view(self.targets.bloom[slot].sample_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            // Binding 2: this slot's scene depth (transitioned above) with the
-            // point sampler, for the godray sky mask.
+            // Binding 2: single-sample scene depth for the godray sky mask. With
+            // MSAA the godray gate is zero; bind the single-sample HDR view as a
+            // legal unused Sampler2D descriptor instead of invalid MSAA depth.
+            let depth_view = if sample_depth {
+                self.targets.depth[slot].view
+            } else {
+                self.targets.offscreen[slot].view
+            };
             let depth_info = [vk::DescriptorImageInfo::default()
                 .sampler(self.pipelines.tonemap_depth_sampler)
-                .image_view(self.targets.depth[slot].view)
+                .image_view(depth_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let post_writes = [
                 vk::WriteDescriptorSet::default()
@@ -1875,24 +1957,26 @@ impl Renderer {
             self.record_overlay_present(self.copy_cmd, slot, overlay, extent);
             device.cmd_end_rendering(self.copy_cmd);
 
-            // Restore the godray depth read (above) to DEPTH_ATTACHMENT_OPTIMAL so
-            // the next 3D pass / VRS classifier finds the layout they expect.
-            let depth_to_attach = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .dst_stage_mask(
-                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                )
-                .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .image(depth_image)
-                .subresource_range(depth_range())];
-            device.cmd_pipeline_barrier2(
-                self.copy_cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&depth_to_attach),
-            );
+            // Restore the sampled depth so the next 3D pass / VRS classifier
+            // finds the layout it expects. MSAA depth never transitioned.
+            if sample_depth {
+                let depth_to_attach = [vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .dst_stage_mask(
+                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                    )
+                    .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .new_layout(self.depth_pass_layout())
+                    .image(depth_image)
+                    .subresource_range(depth_range())];
+                device.cmd_pipeline_barrier2(
+                    self.copy_cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&depth_to_attach),
+                );
+            }
 
             // When capturing, detour through TRANSFER_SRC to copy the finished
             // image into the host buffer, then continue to PRESENT.
@@ -2302,7 +2386,7 @@ impl<'a> RenderPass<'a> {
                             | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
                     )
                     .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .new_layout(r.depth_pass_layout())
                     .image(r.targets.depth[slot].image)
                     .subresource_range(depth_range());
                 barrier_count += 1;
@@ -2362,7 +2446,7 @@ impl<'a> RenderPass<'a> {
             // later cycle reusing this slot can classify it for VRS.
             let depth_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(r.targets.depth[slot].view)
-                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .image_layout(r.depth_pass_layout())
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(vk::AttachmentStoreOp::STORE)
                 .clear_value(vk::ClearValue {
@@ -2526,6 +2610,34 @@ impl<'a> RenderPass<'a> {
                 self.r.pipelines.layout_3d,
                 self.r.targets.depth[self.slot].view,
             );
+            // Framebuffer-local (BY_REGION) dependency INSIDE the render pass
+            // — legal exactly because dynamic_rendering_local_read is enabled
+            // whenever this pipeline exists: the opaque passes' depth writes
+            // must be visible to the water branch's input-attachment reads.
+            // No layout change (illegal inside a pass; the frame-wide
+            // RENDERING_LOCAL_READ layout is what makes that unnecessary).
+            let dep = [vk::MemoryBarrier2::default()
+                .src_stage_mask(
+                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                )
+                .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::INPUT_ATTACHMENT_READ)];
+            unsafe {
+                self.r.device.device.cmd_pipeline_barrier2(
+                    self.cmd,
+                    &vk::DependencyInfo::default()
+                        .dependency_flags(vk::DependencyFlags::BY_REGION)
+                        .memory_barriers(&dep),
+                );
+            }
+            // The instance's input-attachment mapping must MATCH the bound
+            // pipeline at every draw. Set the absorb pipeline's mapping (depth
+            // → input 0, color not-an-input) for exactly this pass's draws;
+            // restored to the implicit identity below so the later sky/debug
+            // pipelines (created without a mapping) stay valid.
+            unsafe { self.set_input_attachment_mapping(true) };
         }
         let device = &self.r.device.device;
         let cmd = self.cmd;
@@ -2587,6 +2699,36 @@ impl<'a> RenderPass<'a> {
                 }
             }
         }
+        if pass == Pass::Blend && self.r.pipelines.mesh3d_transparent_absorb.is_some() {
+            unsafe { self.set_input_attachment_mapping(false) };
+        }
+    }
+
+    /// Sets the render-pass instance's input-attachment mapping: the absorb
+    /// pipeline's custom one (`true`: depth → fragment input 0, the color
+    /// attachment not an input), or back to the IMPLICIT identity every
+    /// mapping-less pipeline was created with (`false`: color 0 → input 0,
+    /// no depth) — the state a pipeline and the instance must agree on at
+    /// every draw (VUID-vkCmdDraw*-None-09549/10927).
+    unsafe fn set_input_attachment_mapping(&self, absorb: bool) {
+        let lr = self
+            .r
+            .device
+            .local_read
+            .as_ref()
+            .expect("absorb pipeline exists only with local_read");
+        let depth_input_index = 0u32;
+        let custom_colors = [vk::ATTACHMENT_UNUSED];
+        let identity_colors = [0u32];
+        let mapping = if absorb {
+            vk::RenderingInputAttachmentIndexInfoKHR::default()
+                .color_attachment_input_indices(&custom_colors)
+                .depth_input_attachment_index(&depth_input_index)
+        } else {
+            vk::RenderingInputAttachmentIndexInfoKHR::default()
+                .color_attachment_input_indices(&identity_colors)
+        };
+        unsafe { lr.cmd_set_rendering_input_attachment_indices(self.cmd, &mapping) };
     }
 
     /// Pushes `view_proj` to `layout_debug` for the immediate debug geometry.
@@ -3078,6 +3220,10 @@ fn depth_range() -> vk::ImageSubresourceRange {
     }
 }
 
+fn godray_depth_sampleable(samples: vk::SampleCountFlags) -> bool {
+    samples == vk::SampleCountFlags::TYPE_1
+}
+
 /// A GPU render pass boundary, in record order. The variant ordinal indexes the
 /// per-pass accumulator (matches the tracking in [`crate::profile::Meter`]).
 #[derive(Clone, Copy, PartialEq)]
@@ -3367,6 +3513,21 @@ mod tests {
     }
 
     #[test]
+    fn godray_depth_requires_single_sample_target() {
+        assert!(godray_depth_sampleable(vk::SampleCountFlags::TYPE_1));
+        for samples in [
+            vk::SampleCountFlags::TYPE_2,
+            vk::SampleCountFlags::TYPE_4,
+            vk::SampleCountFlags::TYPE_8,
+            vk::SampleCountFlags::TYPE_16,
+            vk::SampleCountFlags::TYPE_32,
+            vk::SampleCountFlags::TYPE_64,
+        ] {
+            assert!(!godray_depth_sampleable(samples));
+        }
+    }
+
+    #[test]
     fn nearest_supported_exact_values_are_unchanged() {
         for n in [1, 2, 4, 8] {
             let (count, changed) = SampleCount::nearest_supported(n, 8);
@@ -3404,4 +3565,3 @@ mod tests {
         assert!(!changed);
     }
 }
-

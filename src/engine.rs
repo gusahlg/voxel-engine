@@ -90,8 +90,19 @@ pub struct RenderFlags {
     pub shadows: bool,
     /// Procedural sky background pass; off shows the clear colour.
     pub sky: bool,
+    /// Variable-rate shading: the depth-classified rate image that coarsens
+    /// fragment shading on distant/flat regions. Off skips both the classify
+    /// dispatch and the rate attachment (full-rate shading everywhere).
+    pub vrs: bool,
+    /// Water surface animation (`anim` lane time). Off freezes the phase:
+    /// water renders, tinted and reflective, but still — the cheapest frame
+    /// for water-heavy scenes.
+    pub water_anim: bool,
     /// Radial vignette darkening in the tonemap pass.
     pub vignette: bool,
+    /// Night starfield in the sky pass (`extras.x` gain). Off skips the
+    /// per-pixel hash-grid star evaluation entirely.
+    pub stars: bool,
 }
 
 impl Default for RenderFlags {
@@ -108,7 +119,10 @@ impl Default for RenderFlags {
             godrays: true,
             shadows: false,
             sky: true,
+            vrs: true,
+            water_anim: true,
             vignette: false,
+            stars: true,
         }
     }
 }
@@ -220,6 +234,15 @@ impl Engine {
         self.client.set_vsync(on);
     }
 
+    /// Replaces the render feature flags at runtime (settings menu / console).
+    /// Updates both CPU copies: this thread's gate set and, via the ordered
+    /// command stream, the render thread's — so the change lands atomically at
+    /// the next frame boundary.
+    pub fn set_flags(&mut self, flags: RenderFlags) {
+        self.flags = flags;
+        self.client.set_flags(flags);
+    }
+
     pub fn vsync(&self) -> bool {
         self.client.vsync()
     }
@@ -238,6 +261,13 @@ impl Engine {
         self.client.max_msaa()
     }
 
+    /// The device's block-texture array layer ceiling
+    /// (`limits.maxImageArrayLayers`). The app clamps how many block texture
+    /// layers it builds against this; ids past it wrap (see the game's mesher).
+    pub fn max_texture_array_layers(&self) -> u32 {
+        self.client.max_texture_layers()
+    }
+
     /// Enables opt-in six-way face culling: each mesh submits only its
     /// camera-facing direction buckets. Off by default (one draw per mesh);
     /// earns its keep only under heavy vertex load.
@@ -247,14 +277,6 @@ impl Engine {
 
     pub fn cull_faces(&self) -> bool {
         self.client.cull_faces()
-    }
-
-    /// Live-swap the CPU-side render feature flags on both threads. The main
-    /// thread's copy gates `gate_uniforms`/jitter; the render thread's copy
-    /// gates each pass. Idempotent — cheap to call every frame.
-    pub fn set_flags(&mut self, flags: RenderFlags) {
-        self.flags = flags;
-        self.client.set_flags(flags);
     }
 
     /// Requests a render-resolution scale (0.25..=2.0); returns the value
