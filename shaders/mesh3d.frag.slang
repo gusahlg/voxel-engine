@@ -86,9 +86,13 @@ Sampler2DArrayShadow shadowMap;
 // branch to reconstruct the opaque forward distance behind the water surface —
 // dynamic_rendering_local_read, MSAA-off only. Compiled into the absorption
 // variant only; the interim-tint build omits this and the depth term.
+// Four-component by SPIR-V rule: `OpImageRead` (what `SubpassLoad` lowers to)
+// must yield a 4-component result even for a depth image — a scalar
+// `SubpassInput<float>` emits invalid SPIR-V (VUID-StandaloneSpirv-Result-04780,
+// the E-08 module defect). Depth lands in `.x`.
 [[vk::input_attachment_index(0)]]
 [[vk::binding(5, 0)]]
-SubpassInput<float> opaqueDepthInput;
+SubpassInput opaqueDepthInput;
 
 // Reversed-Z near plane: used to reconstruct forward view-space distance from depth.
 // A drift here just rescales WATER_ABS.
@@ -164,7 +168,13 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // Dither LOD→chunk transition at slab extents to avoid holes showing sky.
     if (input.scale > 1.0 && pc.clip > 0.0) {
         float band_h = smoothstep(0.75 * pc.clip, pc.clip, length(input.world.xz));
-        float band_v = smoothstep(0.75 * pc.clip_v, pc.clip_v, abs(input.world.y));
+        // Zero vertical coverage is an explicit branch: with clip_v == 0 the
+        // full-res slab has no vertical extent, so every fragment is fully
+        // outside it (band 1, LOD keeps) — never an equal-edge smoothstep,
+        // whose result is undefined.
+        float band_v = pc.clip_v > 0.0
+            ? smoothstep(0.75 * pc.clip_v, pc.clip_v, abs(input.world.y))
+            : 1.0;
         if (max(band_h, band_v) < dither(0.0, input.position.xy) + 0.5)
             discard;
     }
@@ -232,7 +242,7 @@ float4 fragmentMain(FragmentInput input) : SV_Target
         // True depth-difference absorption: opaque forward distance behind the
         // water (input attachment) minus this fragment's own forward distance,
         // both reconstructed from reversed-Z depth.
-        float opaque_d = WATER_Z_NEAR / opaqueDepthInput.SubpassLoad();
+        float opaque_d = WATER_Z_NEAR / opaqueDepthInput.SubpassLoad().x;
         float water_d = WATER_Z_NEAR / input.position.z;
         float absorb = water_absorption(opaque_d, water_d);
 #else

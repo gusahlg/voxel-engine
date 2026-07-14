@@ -37,6 +37,25 @@ pub struct CoverageVolume {
     pub half_height: f32,
 }
 
+/// Per-draw fade style for [`Frame3D::draw_mesh_faded`] — the typed form of
+/// the shader's per-draw mode bits, so undocumented raw bit patterns can't
+/// reach the GPU (E-07). `Default` is plain textured, dither-keep-inside.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct FadeStyle {
+    /// Replace texturing with the draw's `flat_rgba` colour.
+    pub flat_color: bool,
+    /// Keep the COMPLEMENT of the dither pattern — the outgoing half of a
+    /// cross-fade pair, so incoming + outgoing tile exactly.
+    pub complement: bool,
+}
+
+impl FadeStyle {
+    /// The shader-side bit encoding (`1` = flat color, `2` = complement).
+    fn bits(self) -> u32 {
+        (self.flat_color as u32) | ((self.complement as u32) << 1)
+    }
+}
+
 /// This 3D scope's lighting, a REQUIRED argument to [`Frame::begin_3d`]. The
 /// mesh, sky, and water shaders read all of their lighting from the per-frame
 /// UBO, so a 3D pass with no lighting renders pure black — making it a required
@@ -431,18 +450,21 @@ impl Frame3D<'_, '_> {
         self.push_mesh(handle, offset, detail.scale(), 1.0, 0, 0);
     }
 
-    /// Like [`draw_mesh`](Self::draw_mesh), with per-draw style: `fade` (screen-door coverage),
-    /// `mode` (bitflags: `1` = flat color, `2` = fade complement), `flat_rgba` (sRGB RGBA8).
+    /// Like [`draw_mesh`](Self::draw_mesh), with per-draw style: `fade`
+    /// (screen-door coverage, sanitized to `[0, 1]` — a non-finite value draws
+    /// fully rather than poisoning the dither compare), a typed [`FadeStyle`]
+    /// (raw mode bits can't reach the GPU), and `flat_rgba` (sRGB RGBA8).
     pub fn draw_mesh_faded(
         &mut self,
         handle: MeshHandle,
         offset: Vec3,
         detail: Detail,
         fade: f32,
-        mode: u32,
+        style: FadeStyle,
         flat_rgba: u32,
     ) {
-        self.push_mesh(handle, offset, detail.scale(), fade, mode, flat_rgba);
+        let fade = if fade.is_finite() { fade.clamp(0.0, 1.0) } else { 1.0 };
+        self.push_mesh(handle, offset, detail.scale(), fade, style.bits(), flat_rgba);
     }
 
     /// Sets chunk→LOD dither extents. Must equal the streamed full-res volume.

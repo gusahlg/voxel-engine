@@ -146,13 +146,29 @@ impl TileMeans {
     }
 }
 
-/// Double-buffered exposure readback. The compute reduction writes one
-/// slot; the CPU reads the *other* — the one whose fence has already cleared —
-/// so the readback never races an in-flight GPU write. The parity rule lives in
-/// exactly one function ([`ExposureRing::views`]); callers cannot mix the views.
+/// Per-slot exposure readback. The compute reduction writes THIS frame's slot
+/// buffer; the CPU reads THE SAME slot — whose previous write belongs to the
+/// frame two-back, the exact frame whose fence [`wait_slot_and_reclaim`] just
+/// waited. Reading `s.other()` (the old rule) touched the immediately previous
+/// frame's buffer, which can still be in flight: a torn, finite-but-wrong
+/// readback. The read happens at record time, BEFORE this frame's dispatch is
+/// submitted, so read-then-overwrite on one buffer is race-free by
+/// construction. The parity rule lives in exactly one function
+/// ([`slot_parity`], used by [`ExposureRing::views`]); callers cannot mix the
+/// views.
+///
+/// [`wait_slot_and_reclaim`]: super::Renderer::wait_slot_and_reclaim
 pub struct ExposureRing {
     slots: [TileMeans; FRAMES_IN_FLIGHT as usize],
     tile_count: usize,
+}
+
+/// The slot-index parity rule as a pure `(write, read)` mapping — extracted so
+/// the fence-safety argument is unit-testable without a device: the read index
+/// must name a buffer whose last GPU write is fence-proven complete, and the
+/// only such buffer under 2-frames-in-flight is the waited slot's own.
+fn slot_parity(waited: FrameSlot) -> (usize, usize) {
+    (waited.index(), waited.index())
 }
 
 impl ExposureRing {
@@ -167,15 +183,17 @@ impl ExposureRing {
         }
     }
 
-    /// The parity resolver: the compute pass writes `s`, the CPU reads `s.other()`.
-    /// Baked HERE so no call site can hold both views mixed up.
+    /// The parity resolver: the CPU reads the waited slot's buffer (its value
+    /// is from the frame two-back, fence-proven), then the compute pass
+    /// overwrites that same buffer. Baked HERE so no call site can mix views.
     pub fn views(&self, s: FrameSlot) -> (ExposureWrite<'_>, ExposureRead<'_>) {
+        let (write, read) = slot_parity(s);
         (
             ExposureWrite {
-                buf: &self.slots[s.index()].buffer,
+                buf: &self.slots[write].buffer,
             },
             ExposureRead {
-                buf: &self.slots[s.other().index()].buffer,
+                buf: &self.slots[read].buffer,
             },
         )
     }
@@ -201,11 +219,11 @@ impl ExposureRing {
         } else {
             0.0
         };
-        // Robustness: the read slot is the one NOT written this frame (the parity
-        // resolver), but under an unlucky fence race a partial write could yield a
-        // non-finite sum. Exposure is a slowly-varying scalar under heavy
-        // smoothing, so the correct recovery is simply to hold `prev` for a frame
-        // rather than let a NaN poison the filter forever.
+        // Defense in depth: the read buffer's last write is fence-proven
+        // complete (the parity resolver reads the waited slot), so a torn read
+        // should be impossible — but a NaN from a degenerate HDR frame (e.g.
+        // an all-inf tile) must still not poison the filter forever. Hold
+        // `prev` for a frame instead.
         if !mean_log2.is_finite() {
             return prev;
         }
@@ -400,6 +418,22 @@ impl ExposureState {
         self.shared.clone()
     }
 
+    /// Metering was switched OFF: the public contract says exposure pins to
+    /// 1.0, so publish [`Exposure::DEFAULT`] everywhere the stale meter could
+    /// otherwise linger (tonemap reads `current()`, `compose()` reads the
+    /// shared cell) and reset the smoothing clock.
+    pub(crate) fn reset(&mut self) {
+        self.exposure = Exposure::DEFAULT;
+        self.shared.store(Exposure::DEFAULT);
+        self.last = std::time::Instant::now();
+    }
+
+    /// Metering was switched back ON: restart the smoothing clock so the first
+    /// `dt` measures from the re-enable, not from whenever metering last ran.
+    pub(crate) fn rearm(&mut self) {
+        self.last = std::time::Instant::now();
+    }
+
     /// The render thread's latest metered+smoothed exposure — the multiplier the
     /// tonemap pass applies before its curve. Same value published to
     /// [`ExposureShared`], read directly here since tonemap runs render-side.
@@ -444,9 +478,10 @@ impl ExposureState {
 impl super::Renderer {
     /// Record the metering reduction and fold the previous result into the
     /// published exposure. Inserted by the orchestrator AFTER the HDR pass and
-    /// BEFORE tonemap. `slot` is this frame's slot; `views(slot)` writes it and
-    /// reads `slot.other()` (the buffer not written this frame), with `metered`
-    /// guarding the rare fence-race torn read.
+    /// BEFORE tonemap. `slot` is this frame's slot; `views(slot)` reads and
+    /// then overwrites the SAME slot's buffer — the read value is the one this
+    /// slot's fence (already waited this frame) proves complete, and the read
+    /// happens at record time, before the overwriting dispatch is submitted.
     ///
     /// This pass owns the offscreen's `COLOR_ATTACHMENT → SHADER_READ_ONLY`
     /// transition (it samples the HDR for the reduction and leaves it sampled),
@@ -460,8 +495,8 @@ impl super::Renderer {
         let device = &self.device.device;
         let exp = &mut self.exposure;
 
-        // Parity resolver: compute writes `slot`, CPU reads `slot.other()`
-        // — the buffer NOT being written this frame. `metered` guards a torn read.
+        // Parity resolver: read the waited slot's buffer (frame N-2's result,
+        // fence-proven), then let this frame's dispatch overwrite it.
         let now = std::time::Instant::now();
         let dt = now.duration_since(exp.last).as_secs_f32();
         exp.last = now;
@@ -566,13 +601,45 @@ impl super::Renderer {
 
 impl Engine {
     /// The exposure `compose()` folds into this frame's `FrameSnapshot`:
-    /// the render thread's latest metered+smoothed value. The temporal smoothing
-    /// (which needs the readback cadence) already happened render-side, so `dt`
-    /// is unused here — the seam keeps it for symmetry with `metered`.
-    ///
-    /// MERGE NOTE: reads `self.exposure_shared` (a clone of
-    /// `ExposureState::shared()` handed to `Engine` at construction).
+    /// the render thread's latest metered+smoothed value — or the pinned
+    /// [`Exposure::DEFAULT`] whenever metering is disabled, so the public
+    /// "off pins exposure at 1.0" contract holds on the main thread too (the
+    /// render-side reset covers the tonemap; this covers `compose()`). The
+    /// temporal smoothing (which needs the readback cadence) already happened
+    /// render-side, so `dt` is unused here — the seam keeps it for symmetry
+    /// with `metered`.
     pub fn exposure_for_compose(&mut self, _dt: f32) -> Exposure {
+        if !self.flags.exposure {
+            return Exposure::DEFAULT;
+        }
         self.exposure_shared.load()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fence-safety argument for the readback, as a pure timeline model:
+    /// frame `i` records on slot `i % 2` after waiting THAT slot's fence, so
+    /// the only buffer whose last GPU write is provably complete is the waited
+    /// slot's own (written by frame `i - 2`). Reading any buffer written more
+    /// recently — the old `s.other()` rule read frame `i - 1`'s — races an
+    /// in-flight dispatch.
+    #[test]
+    fn readback_reads_only_fence_proven_buffers() {
+        let mut last_writer: [Option<usize>; FRAMES_IN_FLIGHT as usize] = [None, None];
+        for frame in 0..64 {
+            let slot = FrameSlot::new(frame % FRAMES_IN_FLIGHT as usize);
+            let (write, read) = slot_parity(slot);
+            if let Some(writer) = last_writer[read] {
+                assert!(
+                    writer + FRAMES_IN_FLIGHT as usize <= frame,
+                    "frame {frame} reads a buffer last written by frame {writer}, \
+                     which the slot fence does not prove complete"
+                );
+            }
+            last_writer[write] = Some(frame);
+        }
     }
 }

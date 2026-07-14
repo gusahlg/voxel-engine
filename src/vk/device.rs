@@ -88,6 +88,9 @@ pub struct Device {
     /// the same-scope depth attachment as an input attachment (true water
     /// depth-difference absorption). Optional — absent ⇒ the interim tint path.
     pub dynamic_rendering_local_read: bool,
+    /// The extension's command table (`vkCmdSetRenderingInputAttachmentIndices`),
+    /// present exactly when `dynamic_rendering_local_read` is.
+    pub local_read: Option<khr::dynamic_rendering_local_read::Device>,
     /// Sample counts supported by BOTH color and depth framebuffer attachments.
     pub msaa_caps: vk::SampleCountFlags,
     /// `multiDrawIndirect` enabled; otherwise renderer loops single-draw calls.
@@ -259,6 +262,11 @@ impl Device {
             .fragment_shading_rate
             .map(|texel_size| FragmentShadingRate { texel_size });
 
+        // Built before the struct literal moves `device` into place.
+        let local_read = best
+            .dynamic_rendering_local_read
+            .then(|| khr::dynamic_rendering_local_read::Device::new(instance, &device));
+
         Self {
             physical: best.physical,
             device,
@@ -272,6 +280,7 @@ impl Device {
             anisotropy: best.max_anisotropy.map(Anisotropy),
             fragment_shading_rate,
             dynamic_rendering_local_read: best.dynamic_rendering_local_read,
+            local_read,
             msaa_caps,
             multi_draw_indirect: best.multi_draw_indirect,
             draw_indirect_first_instance: best.draw_indirect_first_instance,

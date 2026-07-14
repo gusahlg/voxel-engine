@@ -998,7 +998,11 @@ pub fn push_depth_input_attachment(
 ) {
     let image_infos = [vk::DescriptorImageInfo::default()
         .image_view(depth_view)
-        .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)];
+        // The whole scene pass runs depth in RENDERING_LOCAL_READ when the
+        // absorb path is active (the only caller): the one layout valid as
+        // BOTH depth attachment and input attachment, and the only truthful
+        // value here (VUID-VkWriteDescriptorSet-descriptorType-04151).
+        .image_layout(vk::ImageLayout::RENDERING_LOCAL_READ_KHR)];
     let writes = [vk::WriteDescriptorSet::default()
         .dst_binding(5)
         .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)

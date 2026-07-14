@@ -351,8 +351,16 @@ impl Detail {
     /// Full-resolution chunks.
     pub const FULL: Detail = Detail(0);
 
+    /// The coarsest representable level: `2^15` metre cells — far beyond any
+    /// real pyramid, but small enough that [`scale`](Self::scale) can never
+    /// overflow its shift. Public inputs are clamped here rather than trusted.
+    pub const MAX_LEVEL: u8 = 15;
+
+    /// A detail level, clamped to [`MAX_LEVEL`](Self::MAX_LEVEL): this is a
+    /// public draw input, and an arbitrary `u8` must yield a bounded scale,
+    /// not an overflowing `1 << level`.
     pub fn new(level: u8) -> Detail {
-        Detail(level)
+        Detail(level.min(Self::MAX_LEVEL))
     }
 
     /// Per-draw uniform scale: `2^level` metres per cell.

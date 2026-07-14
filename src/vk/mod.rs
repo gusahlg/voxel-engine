@@ -656,6 +656,21 @@ impl Renderer {
     /// per-frame work only (no resource is created conditionally on a flag), so
     /// the new set simply applies from the next recorded frame.
     pub fn set_flags(&mut self, flags: crate::engine::RenderFlags) {
+        // Flag transitions reset the temporal state they gate; replacing the
+        // booleans alone left stale values live (E-03):
+        // - exposure OFF used to keep the last metered value in `current()`
+        //   and the shared cell — tonemap/compose kept applying a dead meter
+        //   instead of the documented pinned 1.0;
+        // - a TAA off→on toggle used to blend the pre-toggle history frame
+        //   into the first re-enabled frame (temporal ghost of a stale scene).
+        if self.flags.exposure && !flags.exposure {
+            self.exposure.reset();
+        } else if !self.flags.exposure && flags.exposure {
+            self.exposure.rearm();
+        }
+        if self.flags.taa != flags.taa {
+            self.taa.invalidate_history();
+        }
         self.flags = flags;
     }
 
@@ -698,6 +713,19 @@ impl Renderer {
     /// what lands. A pending request replaced before it is serviced replies
     /// `Interrupted` to the superseded caller so no blocking wait is orphaned.
     pub fn request_capture(&mut self, capture: Capture) {
+        // A surface without TRANSFER_SRC swapchain images cannot be copied
+        // out: refuse up front (with the reply, so a blocking caller isn't
+        // orphaned) instead of recording a usage-violating copy.
+        if !self.swapchain.screenshot_capable {
+            log::error!("screenshot refused: surface lacks TRANSFER_SRC swapchain usage");
+            if let Some(reply) = capture.reply {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "surface does not support screenshot copies",
+                )));
+            }
+            return;
+        }
         if let Some(prev) = self.pending_capture.replace(capture) {
             if let Some(reply) = prev.reply {
                 let _ = reply.send(Err(std::io::Error::new(
@@ -920,6 +948,21 @@ impl Renderer {
     /// Waits until the slot's last render has completed (GPU is done with its
     /// command buffer and immediate buffer), then reclaims retired GPU memory
     /// whose last possible use the timeline has reached.
+    /// The layout the scene-pass depth image lives in for the WHOLE frame.
+    /// With the water-absorption path active it is `RENDERING_LOCAL_READ` —
+    /// the one layout valid simultaneously as depth attachment and as the
+    /// blend pass's input attachment (mid-pass transitions are illegal, so a
+    /// single frame-wide layout is the only coherent design). Every depth
+    /// barrier and attachment info reads this ONE function, so the two
+    /// configurations cannot drift apart.
+    fn depth_pass_layout(&self) -> vk::ImageLayout {
+        if self.pipelines.mesh3d_transparent_absorb.is_some() {
+            vk::ImageLayout::RENDERING_LOCAL_READ_KHR
+        } else {
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
+        }
+    }
+
     fn wait_slot_and_reclaim(&mut self, slot: usize) {
         let device = &self.device.device;
         unsafe {
@@ -1500,7 +1543,7 @@ impl Renderer {
                     .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                     .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .old_layout(self.depth_pass_layout())
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .image(depth.image)
                     .subresource_range(depth_range()),
@@ -1578,7 +1621,7 @@ impl Renderer {
                     )
                     .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                     .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .new_layout(self.depth_pass_layout())
                     .image(depth.image)
                     .subresource_range(depth_range()),
             ];
@@ -1736,7 +1779,14 @@ impl Renderer {
         // the wide-FOV periphery remap: `warp_map` carries the coefficients, and an
         // identity (rectilinear) map pushes `s = 0` so the frag stays a no-op.
         // Dither phase: animated if TAA, else static (no integrator to average).
-        let exposure = self.exposure.current().0;
+        // Metering off pins exposure at 1.0 structurally (the set_flags reset
+        // already published DEFAULT; this makes the pin independent of
+        // transition ordering).
+        let exposure = if self.flags.exposure {
+            self.exposure.current().0
+        } else {
+            crate::skeleton::Exposure::DEFAULT.0
+        };
         let phase_index = if self.flags.taa {
             (self.frame_index % crate::skeleton::TEMPORAL_SEQ_LEN) as usize
         } else {
@@ -1785,7 +1835,7 @@ impl Renderer {
                     .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                     .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .old_layout(self.depth_pass_layout())
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .image(depth_image)
                     .subresource_range(depth_range())];
@@ -1919,7 +1969,7 @@ impl Renderer {
                     )
                     .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                     .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .new_layout(self.depth_pass_layout())
                     .image(depth_image)
                     .subresource_range(depth_range())];
                 device.cmd_pipeline_barrier2(
@@ -2336,7 +2386,7 @@ impl<'a> RenderPass<'a> {
                             | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
                     )
                     .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .new_layout(r.depth_pass_layout())
                     .image(r.targets.depth[slot].image)
                     .subresource_range(depth_range());
                 barrier_count += 1;
@@ -2396,7 +2446,7 @@ impl<'a> RenderPass<'a> {
             // later cycle reusing this slot can classify it for VRS.
             let depth_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(r.targets.depth[slot].view)
-                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .image_layout(r.depth_pass_layout())
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(vk::AttachmentStoreOp::STORE)
                 .clear_value(vk::ClearValue {
@@ -2560,6 +2610,34 @@ impl<'a> RenderPass<'a> {
                 self.r.pipelines.layout_3d,
                 self.r.targets.depth[self.slot].view,
             );
+            // Framebuffer-local (BY_REGION) dependency INSIDE the render pass
+            // — legal exactly because dynamic_rendering_local_read is enabled
+            // whenever this pipeline exists: the opaque passes' depth writes
+            // must be visible to the water branch's input-attachment reads.
+            // No layout change (illegal inside a pass; the frame-wide
+            // RENDERING_LOCAL_READ layout is what makes that unnecessary).
+            let dep = [vk::MemoryBarrier2::default()
+                .src_stage_mask(
+                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                )
+                .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::INPUT_ATTACHMENT_READ)];
+            unsafe {
+                self.r.device.device.cmd_pipeline_barrier2(
+                    self.cmd,
+                    &vk::DependencyInfo::default()
+                        .dependency_flags(vk::DependencyFlags::BY_REGION)
+                        .memory_barriers(&dep),
+                );
+            }
+            // The instance's input-attachment mapping must MATCH the bound
+            // pipeline at every draw. Set the absorb pipeline's mapping (depth
+            // → input 0, color not-an-input) for exactly this pass's draws;
+            // restored to the implicit identity below so the later sky/debug
+            // pipelines (created without a mapping) stay valid.
+            unsafe { self.set_input_attachment_mapping(true) };
         }
         let device = &self.r.device.device;
         let cmd = self.cmd;
@@ -2621,6 +2699,36 @@ impl<'a> RenderPass<'a> {
                 }
             }
         }
+        if pass == Pass::Blend && self.r.pipelines.mesh3d_transparent_absorb.is_some() {
+            unsafe { self.set_input_attachment_mapping(false) };
+        }
+    }
+
+    /// Sets the render-pass instance's input-attachment mapping: the absorb
+    /// pipeline's custom one (`true`: depth → fragment input 0, the color
+    /// attachment not an input), or back to the IMPLICIT identity every
+    /// mapping-less pipeline was created with (`false`: color 0 → input 0,
+    /// no depth) — the state a pipeline and the instance must agree on at
+    /// every draw (VUID-vkCmdDraw*-None-09549/10927).
+    unsafe fn set_input_attachment_mapping(&self, absorb: bool) {
+        let lr = self
+            .r
+            .device
+            .local_read
+            .as_ref()
+            .expect("absorb pipeline exists only with local_read");
+        let depth_input_index = 0u32;
+        let custom_colors = [vk::ATTACHMENT_UNUSED];
+        let identity_colors = [0u32];
+        let mapping = if absorb {
+            vk::RenderingInputAttachmentIndexInfoKHR::default()
+                .color_attachment_input_indices(&custom_colors)
+                .depth_input_attachment_index(&depth_input_index)
+        } else {
+            vk::RenderingInputAttachmentIndexInfoKHR::default()
+                .color_attachment_input_indices(&identity_colors)
+        };
+        unsafe { lr.cmd_set_rendering_input_attachment_indices(self.cmd, &mapping) };
     }
 
     /// Pushes `view_proj` to `layout_debug` for the immediate debug geometry.
