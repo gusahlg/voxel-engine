@@ -205,7 +205,7 @@ impl super::Renderer {
         let device = &self.device.device;
         let bloom = &self.bloom;
         let chain = &self.targets.bloom[slot.index()];
-        let offscreen = &self.targets.offscreen[slot.index()];
+        let (hdr_image, hdr_view) = self.hdr_of(slot.index());
         let exposure = self.exposure.current().0;
         let levels = chain.mip_views.len();
 
@@ -279,7 +279,7 @@ impl super::Renderer {
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                 .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image(offscreen.image)
+                .image(hdr_image)
                 .subresource_range(super::color_range())];
             // Bloom image → GENERAL for storage writes. Fully overwritten every
             // frame, so discard the old contents (old layout UNDEFINED).
@@ -301,7 +301,7 @@ impl super::Renderer {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, bloom.threshold);
             let hdr_info = [vk::DescriptorImageInfo::default()
                 .sampler(bloom.sampler)
-                .image_view(offscreen.view)
+                .image_view(hdr_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let mip0_info = [vk::DescriptorImageInfo::default()
                 .image_view(chain.mip_views[0])

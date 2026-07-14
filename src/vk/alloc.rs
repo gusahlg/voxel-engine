@@ -702,16 +702,25 @@ pub fn find_memory_type(
     type_filter: u32,
     properties: vk::MemoryPropertyFlags,
 ) -> u32 {
-    for i in 0..memory_props.memory_type_count {
+    try_find_memory_type(memory_props, type_filter, properties)
+        .expect("No suitable memory type")
+}
+
+/// [`find_memory_type`] without the panic: `None` when no type matches, so a
+/// caller can express a PREFERENCE ladder (e.g. HOST_CACHED for CPU-read
+/// buffers, falling back to plain coherent memory where the device has none).
+pub fn try_find_memory_type(
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    type_filter: u32,
+    properties: vk::MemoryPropertyFlags,
+) -> Option<u32> {
+    (0..memory_props.memory_type_count).find(|&i| {
         let suitable = (type_filter & (1 << i)) != 0;
         let has_props = memory_props.memory_types[i as usize]
             .property_flags
             .contains(properties);
-        if suitable && has_props {
-            return i;
-        }
-    }
-    panic!("No suitable memory type");
+        suitable && has_props
+    })
 }
 
 /// Picks a memory type from the preference list, respecting budget constraints.

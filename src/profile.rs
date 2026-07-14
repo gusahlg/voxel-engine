@@ -65,6 +65,11 @@ pub enum Meter {
     GpuShadows,
     GpuTransparent,
     GpuOverlay,
+    /// End of the scene pass: `cmd_end_rendering` (the 8x-MSAA color resolve
+    /// lands here), the offscreen finalize transitions, and TAA/exposure.
+    GpuResolve,
+    /// The render-command tail after the resolve: the bloom chain.
+    GpuPost,
     // Tier::Workers — off-thread chunk jobs; the tile stages are sub-timings
     WorkGenerate,
     WorkMesh,
@@ -75,7 +80,7 @@ pub enum Meter {
 }
 
 impl Meter {
-    const ALL: [Meter; 35] = [
+    const ALL: [Meter; 37] = [
         Meter::NetEvents,
         Meter::Physics,
         Meter::StreamDrain,
@@ -105,6 +110,8 @@ impl Meter {
         Meter::GpuShadows,
         Meter::GpuTransparent,
         Meter::GpuOverlay,
+        Meter::GpuResolve,
+        Meter::GpuPost,
         Meter::WorkGenerate,
         Meter::WorkMesh,
         Meter::WorkLight,
@@ -145,6 +152,8 @@ impl Meter {
             Meter::GpuShadows => "shadows",
             Meter::GpuTransparent => "transparent",
             Meter::GpuOverlay => "overlay",
+            Meter::GpuResolve => "resolve",
+            Meter::GpuPost => "post",
             Meter::WorkGenerate => "generate",
             Meter::WorkMesh => "mesh",
             Meter::WorkLight => "light",
@@ -182,7 +191,9 @@ impl Meter {
             | Meter::GpuLines
             | Meter::GpuShadows
             | Meter::GpuTransparent
-            | Meter::GpuOverlay => Tier::Gpu,
+            | Meter::GpuOverlay
+            | Meter::GpuResolve
+            | Meter::GpuPost => Tier::Gpu,
             Meter::WorkGenerate
             | Meter::WorkMesh
             | Meter::WorkLight

@@ -132,15 +132,24 @@ float shadow_map_term(float3 world, float3 N, float3 L, uint c, float2 frag_coor
     // vk/targets.rs), so no per-fragment GetDimensions query.
     float2 texel = float2(1.0 / SHADOW_RESOLUTION, 1.0 / SHADOW_RESOLUTION);
 
-    float ang = (dither(frame.exposure_dither.y, frag_coord) + 0.5) * 6.2831853;
-    float2 r = float2(cos(ang), sin(ang)) * cascade.bias.x; // blur radius (texels)
-    float2 t = float2(-r.y, r.x);
-    float2 taps[4] = { r, -r, t, -t };
+    // Fixed 3x3 PCF at the configured blur spread. The old rotated 4-tap rode
+    // a per-pixel dither angle, which quantized every penumbra to quarters at
+    // a random phase — reading as loud salt-and-pepper stipple on the ground
+    // (no TAA runs by default to integrate it away). Nine fixed taps cost
+    // five more SampleCmp and resolve to smooth ninths with zero noise.
+    float spread = cascade.bias.x * 0.7071; // grid corner ~= old blur radius
+    float2 taps[9] = {
+        float2(0.0, 0.0),
+        float2(spread, 0.0), float2(-spread, 0.0),
+        float2(0.0, spread), float2(0.0, -spread),
+        float2(spread, spread), float2(spread, -spread),
+        float2(-spread, spread), float2(-spread, -spread),
+    };
 
     float lit = 0.0;
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 9; i++)
         lit += shadowMap.SampleCmpLevelZero(float3(uv + taps[i] * texel, float(c)), ref);
-    return lit * 0.25;
+    return lit * (1.0 / 9.0);
 }
 
 // Sun shadow factor [0,1]: the near/far cascade PCF blended into the far-field
@@ -227,7 +236,13 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // Skylight (sun-tinted, shadow-attenuated, omni-shaped) and pre-curve
     // blocklight, folded by the shared evaluator with the candle curve + omni
     // ambient floor. `omni` shapes the DIRECT term only; the floor stays global.
-    float3 sky = frame.light.rgb * (sky_amount * shadow * omni);
+    // The max() is the sky-dome bounce: sun shadow removes the SUN, not the
+    // sky, so the lit factor never drops below SHADOW_SKY_AMBIENT — shadowed
+    // ground keeps readable, sky-proportional light instead of collapsing to
+    // near-black. Fully lit surfaces are untouched (shadow*omni >= the floor),
+    // and caves stay dark (the whole term still scales by sky_amount).
+    float lit = max(shadow * omni, SHADOW_SKY_AMBIENT);
+    float3 sky = frame.light.rgb * (sky_amount * lit);
     float3 block = frame.candle.rgb * block_amount;
     float3 rgb = base * light_eval(sky, block, ao, frame);
 

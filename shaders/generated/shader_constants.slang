@@ -104,6 +104,13 @@ static const float SUN_DISC_CORE = 1.12f;
 // Exponent on visible_sky in the beyond-cascades shadow fallback.
 static const float SHADOW_FALLBACK_POW = 10.0f;
 
+// Floor on the skylight's lit factor under sun shadow: the sky DOME still
+// lights a sun-shadowed surface (blue-sky bounce), so shadow can attenuate
+// skylight only down to this fraction — never to the black pit that erased
+// all material detail in shadowed cliffs. Scales with sky_amount, so caves
+// (sky_amount 0) stay dark; only outdoor shadow gains the floor.
+static const float SHADOW_SKY_AMBIENT = 0.22f;
+
 // Cascade shadow map edge in texels. Mirror of vk/targets.rs (asserted equal
 // there); lets the PCF derive texel size without a per-fragment GetDimensions.
 static const float SHADOW_RESOLUTION = 2048.0f;
