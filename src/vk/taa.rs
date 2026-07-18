@@ -526,12 +526,9 @@ impl super::Renderer {
 mod tests {
     use super::*;
 
-    /// Verify TAA's footprint interferes with itself (sanity check).
-    #[test]
-    fn taa_interferes_with_itself() {
-        let m = manifest();
-        assert!(crate::producer::interferes(&m.footprint, &m.footprint));
-    }
+    // (An aspirational `taa_interferes_with_itself` test was removed here: it
+    // called a producer `manifest()` that never existed — TAA is not modelled
+    // as a scheduled producer, it runs inside the render thread.)
 
     /// Jitter sequence is centered and bounded (±0.5 px).
     #[test]
