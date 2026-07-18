@@ -1,6 +1,5 @@
-// sky.frag.slang — procedural sky for background pixels.
-// Sky and fog read the same FrameUniforms (binding 2) so they can't diverge.
-// Owns view-ray reconstruction, sun disc, and dither only.
+// Procedural sky for background pixels; handles view-ray reconstruction and sun disc.
+// Shares FrameUniforms (binding 2) with fog to prevent divergence.
 
 #include "common.slang"
 
@@ -8,8 +7,6 @@ struct FragmentInput
 {
     [[vk::location(0)]]
     float2 ndc;
-    // Framebuffer pixel position (system-generated) — the Bayer dither() for the
-    // cloud march keys off it; no vertex-output change needed.
     float4 frag_pos : SV_Position;
 };
 
@@ -28,7 +25,7 @@ ConstantBuffer<PushConstants> pc;
 [[vk::binding(2, 0)]]
 ConstantBuffer<FrameUniforms> frame;
 
-// Cheap hash in range 0–1; used only for sub-LSB dither, quality is irrelevant.
+// Fast hash for procedural stars; quality doesn't matter.
 float hash12(float2 p)
 {
     float3 p3 = frac(float3(p.xyx) * 0.1031);
@@ -86,7 +83,7 @@ float cloud_density(float2 world_xz, float time)
 
 // 2-plane slab clouds, marched camera-relative. Returns premultiplied radiance;
 // `cover` is background occlusion (opacity × horizon fade) for one-step composite.
-float3 clouds(float3 ray, FrameUniforms frame, float2 frag_coord, out float cover)
+float3 clouds(float3 ray, FrameUniforms frame, out float cover)
 {
     cover = 0.0;
     // hide == 0 for ray.y <= CLOUD_HORIZON_OFFSET (> 0), so this also guards the
@@ -111,14 +108,13 @@ float3 clouds(float3 ray, FrameUniforms frame, float2 frag_coord, out float cove
     float3 lit_col = frame.light.rgb * CLOUD_LIGHT + frame.zenith.rgb * CLOUD_AMBIENT;
 
     int steps = int(CLOUD_STEPS);
-    float dith = dither(frame.exposure_dither.y, frag_coord);
     float dt = (t_exit - t_enter) / float(steps);
 
     float trans = 1.0;
     float3 lit = float3(0.0);
     for (int i = 0; i < steps; i++)
     {
-        float t = t_enter + (float(i) + 0.5 + dith) * dt;
+        float t = t_enter + (float(i) + 0.5) * dt;
         float density = cloud_density(cam_xz + (ray * t).xz, time);
         if (density <= 0.0)
             continue;
@@ -163,7 +159,7 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // Slab clouds composite LAST so opaque cloud occludes the sun/moon/stars it
     // covers. `cover` premultiplies the hidden background out in one lerp.
     float cover;
-    float3 cloud_lit = clouds(ray, frame, input.frag_pos.xy, cover);
+    float3 cloud_lit = clouds(ray, frame, cover);
     col = col * (1.0 - cover) + cloud_lit;
 
     col += (hash12(input.ndc * 937.0) - 0.5) / 255.0;

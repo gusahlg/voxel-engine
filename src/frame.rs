@@ -3,15 +3,14 @@
 /// into reused CPU lists; submission happens when the `Frame` drops.
 use glam::{DVec3, Mat3, Mat4, Vec2, Vec3};
 
-use std::num::NonZeroU32;
-
-use crate::camera::{Aspect, Camera3D, Frustum, WarpMap};
+use crate::camera::{Aspect, Camera3D, WarpMap};
 use crate::color::{Color, LinearRgb};
-use crate::skeleton::{FrameUniformsGpu, JitterOffset};
 use crate::engine::Engine;
 use crate::font;
-use crate::mesh::{DebugVertex, Detail, MeshHandle, Pass};
+use crate::mesh::DebugVertex;
 use crate::vk::pipeline::Vertex2D;
+use crate::vk::taa::JitterOffset;
+use crate::vk::uniforms::FrameUniformsGpu;
 
 /// Sky-pass-private state, set by the app inside a `begin_3d` scope: sun
 /// geometry plus the disc tint. The sky COLOURS (zenith/horizon gradient, fog
@@ -37,22 +36,19 @@ pub struct CoverageVolume {
     pub half_height: f32,
 }
 
-/// Per-draw fade style for [`Frame3D::draw_mesh_faded`] — the typed form of
-/// the shader's per-draw mode bits, so undocumented raw bit patterns can't
-/// reach the GPU (E-07). `Default` is plain textured, dither-keep-inside.
+/// Per-mesh style for [`Engine::set_mesh_style`](crate::Engine::set_mesh_style) — the
+/// typed form of the shader's per-draw mode bits, so mode bits must go through Rust
+/// and can't bypass the GPU via raw bit patterns. `Default` is plain textured.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct FadeStyle {
     /// Replace texturing with the draw's `flat_rgba` colour.
     pub flat_color: bool,
-    /// Keep the COMPLEMENT of the dither pattern — the outgoing half of a
-    /// cross-fade pair, so incoming + outgoing tile exactly.
-    pub complement: bool,
 }
 
 impl FadeStyle {
-    /// The shader-side bit encoding (`1` = flat color, `2` = complement).
-    fn bits(self) -> u32 {
-        (self.flat_color as u32) | ((self.complement as u32) << 1)
+    /// The shader-side bit encoding (`1` = flat color).
+    pub(crate) fn bits(self) -> u32 {
+        self.flat_color as u32
     }
 }
 
@@ -105,28 +101,63 @@ fn gate_uniforms(f: &crate::engine::RenderFlags, mut u: FrameUniformsGpu) -> Fra
     u
 }
 
-/// A fully-resolved mesh draw: identity + culling metadata + placement, with NO
-/// Vulkan handle. Recorded on the main thread (culling reads the main-owned
-/// [`HandleAllocator`](crate::vk::buffers::HandleAllocator) metadata) and
-/// consumed by the render path, which resolves `slot`/`generation` against its
-/// residency mirror. `Send` POD so the whole [`DrawLists`] crosses threads.
+/// The current 3D scope's state: either a 3D scene exists with ALL its data,
+/// or none of it does (`DrawLists::scene: Option<Scene3D>`) — replaces a
+/// `has_3d` bool plus two comment-enforced-coupled `Option`s that could
+/// disagree by construction.
 #[derive(Clone, Copy)]
-pub(crate) struct MeshDraw {
-    /// Validated against the render-side generation mirror at resolve time.
-    pub slot: u32,
-    pub generation: NonZeroU32,
-    /// World-space (local) AABB, for the render-side six-way face cull.
-    pub aabb_min: Vec3,
-    pub aabb_max: Vec3,
-    pub bounds: [u32; 7],
-    pub vertex_offset: i32,
-    pub pass: Pass,
-    pub offset: Vec3,
-    pub scale: f32,
-    /// Per-draw style (fade, mode, flat_rgba).
-    pub fade: f32,
-    pub mode: u32,
-    pub flat_rgba: u32,
+pub(crate) struct Scene3D {
+    pub view_proj: Mat4,
+    /// Retained so the render thread can fit the shadow cascades around this
+    /// frame's frustum.
+    pub camera: Camera3D,
+    /// This frame's lighting uniforms, resolved from the required [`Lighting`]
+    /// argument to [`Frame::begin_3d`] — a 3D scene always carries lighting.
+    /// Written into the per-frame UBO (set 0, binding 2) each frame; the single
+    /// source of truth for shader-side sky, fog, candle/ambient, and shadow
+    /// evaluation, and for avatar key lighting (see [`KeyLight`]).
+    pub frame_uniforms: FrameUniformsGpu,
+    /// Camera world position; feeds six-way face culling (which needs the
+    /// camera in each mesh's local frame).
+    pub cam_pos: Vec3,
+    /// World-space position of the RENDER-SPACE ORIGIN (the rebase point), in
+    /// f64: a camera-at-origin app passes its true eye (the translation TAA
+    /// reprojection needs lives ONLY here); an app whose draws use absolute
+    /// world coordinates passes `DVec3::ZERO`.
+    pub eye: DVec3,
+    /// `tan(fovy/2)` for the current 3D camera; the renderer derives the
+    /// vertical focal length (`0.5*height/tan_half`) for VRS depth thresholding.
+    pub fovy_tan_half: f32,
+    /// Wide-FOV lens for this scope. `Identity` in rectilinear mode.
+    pub warp_map: WarpMap,
+    /// Sub-pixel camera jitter (PIXELS, +/-0.5) for this 3D scope, injected here
+    /// — the sole injection point. `view_proj` above stays CLEAN so culling,
+    /// VRS fingerprinting, and TAA reprojection never see the jitter.
+    pub jitter: JitterOffset,
+}
+
+#[cfg(test)]
+impl Scene3D {
+    /// Placeholder scene for tests exercising `DrawLists`/fingerprint logic
+    /// that don't care about the actual camera/lighting values.
+    pub(crate) fn test_stub() -> Self {
+        Scene3D {
+            view_proj: Mat4::IDENTITY,
+            camera: Camera3D {
+                position: Vec3::ZERO,
+                target: Vec3::ZERO,
+                up: Vec3::Y,
+                fovy: 60.0,
+                lens: crate::camera::Lens::Rectilinear,
+            },
+            frame_uniforms: FrameUniformsGpu::full_bright(),
+            cam_pos: Vec3::ZERO,
+            eye: DVec3::ZERO,
+            fovy_tan_half: 1.0,
+            warp_map: WarpMap::Identity,
+            jitter: JitterOffset::ZERO,
+        }
+    }
 }
 
 /// CPU-side draw lists for one frame. Vec capacities persist across frames.
@@ -137,57 +168,27 @@ pub(crate) struct MeshDraw {
 #[derive(Clone)]
 pub(crate) struct DrawLists {
     pub clear: LinearRgb,
-    pub view_proj: Mat4,
-    /// The current 3D scope's camera, retained so the render thread can fit the
-    /// shadow cascades around this frame's frustum. `None`
-    /// until `begin_3d`; `has_3d` gates its use.
-    pub camera: Option<Camera3D>,
-    /// This frame's lighting uniforms. Resolved from the required [`Lighting`]
-    /// argument to [`Frame::begin_3d`], so it is `Some` for every 3D frame
-    /// (`has_3d` implies this is set); `None` only on pure-2D frames, where the
-    /// renderer writes a full-bright filler the mesh shaders never sample.
-    /// Written into the per-frame UBO (set 0, binding 2) each frame; the single
-    /// source of truth for shader-side sky, fog, candle/ambient, and shadow
-    /// evaluation, and for avatar key lighting (see [`KeyLight`]).
-    pub frame_uniforms: Option<FrameUniformsGpu>,
-    /// Camera world position for the current 3D scope; feeds six-way face
-    /// culling (which needs the camera in each mesh's local frame).
-    pub cam_pos: Vec3,
-    /// World-space position of the RENDER-SPACE ORIGIN (the rebase point), in
-    /// f64 — the input TAA's reprojection translation derives from
-    /// `camera_delta = prev_eye − eye`, f64 subtract, narrowed only inside
-    /// `Reprojection::pack`). A camera-at-origin app passes its true eye here
-    /// (its `cam_pos` is zero and carries NO translation — the "whole game
-    /// jitters while moving" bug); an app drawing in absolute
-    /// coordinates passes ZERO (its translation already lives in the view
-    /// matrix; a nonzero value here would double-count it).
-    pub eye: DVec3,
-    /// `tan(fovy/2)` for the current 3D camera; the renderer derives the
-    /// vertical focal length (`0.5·height/tan_half`) for VRS depth thresholding.
-    pub fovy_tan_half: f32,
-    /// Wide-FOV lens for the current 3D scope. `Identity` in rectilinear mode. The
-    /// projection is already widened to the source frustum for `Active`; this
-    /// carries the coefficients the tonemap resample uses to compress the periphery.
-    pub warp_map: WarpMap,
-    /// Sub-pixel camera jitter (PIXELS, ±0.5) for this 3D scope, injected here —
-    /// the sole injection point. It rides to the renderer, which applies
-    /// it to the mesh view-proj *only* at push-constant packing (a local matrix
-    /// that never escapes, `vk::jittered_clip`); `view_proj` above stays CLEAN so
-    /// culling, VRS fingerprinting, and TAA reprojection never see the jitter.
-    /// `JitterOffset::ZERO` outside a 3D scope.
-    pub jitter: JitterOffset,
-    pub has_3d: bool,
+    /// `Some` for exactly the frames between `begin_3d` and the next `reset`;
+    /// `None` on pure-2D frames.
+    pub scene: Option<Scene3D>,
     /// Procedural sky palette for this frame's background pass, or `None` to
-    /// leave the flat clear colour showing. Set via [`Frame3D::set_sky`].
+    /// leave the flat clear colour showing. Set via [`Frame3D::set_sky`]; unlike
+    /// `Scene3D`'s fields this is set AFTER `begin_3d` and must survive a second
+    /// `begin_3d` call within the same frame, so it stays outside the
+    /// atomically-replaced scene.
     pub sky: Option<SkyDesc>,
-    /// Mesh draws (chunks and LOD); full-res wins the near ground via dither,
-    /// not depth bias.
-    pub mesh_draws: Vec<MeshDraw>,
-    /// Chunk→LOD dither radius; full-res chunks own the near ground by default
-    /// (0.0 disables).
+    /// Chunk->LOD slab radius; full-res chunks own the near ground by default
+    /// (0.0 disables). LOD tiles hard-discard inside this radius. Set via
+    /// [`Frame3D::set_lod_clip`]; same post-`begin_3d` lifetime as `sky`.
     pub lod_clip: f32,
-    /// Vertical half-height of the full-res slab; LOD above/below it never dithers.
+    /// Vertical half-height of the full-res slab; LOD above/below it is kept.
+    /// Same lifetime as `lod_clip`.
     pub lod_clip_v: f32,
+    /// Debug-flat override (`DebugView::TerrainKey`): when set, every 3D mesh
+    /// fragment outputs this flat key colour while still writing depth.
+    /// `None` renders normally. Set via [`Frame3D::set_debug_flat`]; same
+    /// post-`begin_3d` lifetime as `sky`.
+    pub debug_flat: Option<Color>,
     pub cube_verts: Vec<DebugVertex>,
     pub line_verts: Vec<DebugVertex>,
     /// Translucent ground decals (contact shadows), drawn with the blended,
@@ -196,56 +197,36 @@ pub(crate) struct DrawLists {
     pub verts_2d: Vec<Vertex2D>,
     /// Minimap verts (drawn by `tris2d_tex` pipeline).
     pub tex_verts_2d: Vec<Vertex2D>,
-    /// Debug-flat override (`DebugView::TerrainKey`): when set,
-    /// every 3D mesh fragment outputs this flat key colour while still writing
-    /// depth, so the sky-hole detector sees real terrain coverage (key) versus
-    /// the magenta clear. `None` renders normally. Rides the per-frame UBO's
-    /// `extras` lane. Set via [`Frame3D::set_debug_flat`].
-    pub debug_flat: Option<Color>,
 }
 
 impl DrawLists {
     pub fn new() -> Self {
         Self {
             clear: LinearRgb([0.0, 0.0, 0.0]),
-            view_proj: Mat4::IDENTITY,
-            camera: None,
-            frame_uniforms: None,
-            cam_pos: Vec3::ZERO,
-            eye: DVec3::ZERO,
-            fovy_tan_half: 1.0,
-            warp_map: WarpMap::Identity,
-            jitter: JitterOffset::ZERO,
-            has_3d: false,
+            scene: None,
             sky: None,
-            mesh_draws: Vec::new(),
             lod_clip: 0.0,
             lod_clip_v: 0.0,
+            debug_flat: None,
             cube_verts: Vec::new(),
             line_verts: Vec::new(),
             shadow_verts: Vec::new(),
             verts_2d: Vec::new(),
             tex_verts_2d: Vec::new(),
-            debug_flat: None,
         }
     }
 
     pub fn reset(&mut self) {
-        self.has_3d = false;
-        self.camera = None;
+        self.scene = None;
         self.sky = None;
-        self.warp_map = WarpMap::Identity;
-        self.jitter = JitterOffset::ZERO;
-        self.frame_uniforms = None;
-        self.mesh_draws.clear();
         self.lod_clip = 0.0;
         self.lod_clip_v = 0.0;
+        self.debug_flat = None;
         self.cube_verts.clear();
         self.line_verts.clear();
         self.shadow_verts.clear();
         self.verts_2d.clear();
         self.tex_verts_2d.clear();
-        self.debug_flat = None;
     }
 }
 
@@ -266,7 +247,7 @@ impl<'e> Frame<'e> {
     /// this frame (frustum culling, however, uses each scope's own camera).
     ///
     /// `eye` is the world-space position of the RENDER-SPACE ORIGIN in f64
-    /// (see [`DrawLists::eye`]): a camera-at-origin app passes its true eye
+    /// (see [`Scene3D::eye`]): a camera-at-origin app passes its true eye
     /// (the translation TAA reprojection needs lives ONLY here); an app whose
     /// draws use absolute world coordinates passes `DVec3::ZERO`. Taking it as
     /// a parameter — rather than an optional setter — makes forgetting it
@@ -289,41 +270,28 @@ impl<'e> Frame<'e> {
         let warp_map = WarpMap::from_lens(cam.lens);
         let source_aspect = Aspect(w / h).source(&warp_map);
         let view_proj = cam.view_proj(source_aspect.get());
-        let frustum = Frustum::from_view_proj(&view_proj);
-        self.eng.lists.view_proj = view_proj;
-        self.eng.lists.camera = Some(*cam);
-        self.eng.lists.cam_pos = cam.position;
-        self.eng.lists.eye = eye;
-        self.eng.lists.fovy_tan_half = (cam.fovy.to_radians() * 0.5).tan();
-        self.eng.lists.warp_map = warp_map;
-        // Advance the temporal jitter sequence once per 3D scope. The
-        // renderer's own `frame_index` drives reprojection/dither on the render
-        // thread; here on the record thread we keep an independent 1:1 sequence
-        // counter (each recorded frame submits exactly one `draw_frame`), so the
-        // mesh view-proj sees a fresh Halton offset every frame. The value only
-        // travels to `jittered_clip`; it never perturbs the clean `view_proj`.
         let seq = JITTER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // taa off: no jitter AND no resolve, one coupled state — the same
-        // `flags.taa` gates the resolve pass (vk/mod.rs); never toggle one
-        // without the other (jitter without resolve is permanent shimmer).
-        self.eng.lists.jitter = if self.eng.flags.taa {
+        // Jitter and TAA resolve are coupled — toggling one breaks temporal stability.
+        let jitter = if self.eng.flags.taa {
             crate::skeleton::jitter_at(seq)
         } else {
             JitterOffset::ZERO
         };
-        self.eng.lists.has_3d = true;
-        // Resolve lighting to a concrete UBO here, at the single 3D entry point,
-        // so `has_3d` and `frame_uniforms.is_some()` are established together —
-        // a 3D frame always carries lighting. `Composed` runs through the env
-        // feature gates; `FullBright` is the fixed lit neutral.
-        self.eng.lists.frame_uniforms = Some(match light {
+        let frame_uniforms = match light {
             Lighting::Composed(u) => gate_uniforms(&self.eng.flags, u),
             Lighting::FullBright => FrameUniformsGpu::full_bright(),
+        };
+        self.eng.lists.scene = Some(Scene3D {
+            view_proj,
+            camera: *cam,
+            frame_uniforms,
+            cam_pos: cam.position,
+            eye,
+            fovy_tan_half: (cam.fovy.to_radians() * 0.5).tan(),
+            warp_map,
+            jitter,
         });
-        Frame3D {
-            frame: self,
-            frustum,
-        }
+        Frame3D { frame: self }
     }
 
     pub fn screen_width(&self) -> i32 {
@@ -419,9 +387,11 @@ impl<'e> Frame<'e> {
             }
         });
         let [tl, bl, br, tr] = verts;
-        self.eng.lists.tex_verts_2d.extend_from_slice(&[tl, bl, br, tl, br, tr]);
+        self.eng
+            .lists
+            .tex_verts_2d
+            .extend_from_slice(&[tl, bl, br, tl, br, tr]);
     }
-
 }
 
 impl Drop for Frame<'_> {
@@ -437,70 +407,13 @@ impl Drop for Frame<'_> {
 
 pub struct Frame3D<'f, 'e> {
     frame: &'f mut Frame<'e>,
-    frustum: Frustum,
 }
 
 impl Frame3D<'_, '_> {
-    /// Draws an uploaded mesh scaled by `detail` about its local origin then
-    /// translated by `offset` (both applied GPU-side, so meshes stay in small
-    /// local coordinates for camera-relative rendering). Pass [`Detail::FULL`]
-    /// for a near chunk, [`Detail::new`] for a coarser LOD tile. Skipped
-    /// automatically when its scaled, translated AABB is outside the view frustum.
-    pub fn draw_mesh(&mut self, handle: MeshHandle, offset: Vec3, detail: Detail) {
-        self.push_mesh(handle, offset, detail.scale(), 1.0, 0, 0);
-    }
-
-    /// Like [`draw_mesh`](Self::draw_mesh), with per-draw style: `fade`
-    /// (screen-door coverage, sanitized to `[0, 1]` — a non-finite value draws
-    /// fully rather than poisoning the dither compare), a typed [`FadeStyle`]
-    /// (raw mode bits can't reach the GPU), and `flat_rgba` (sRGB RGBA8).
-    pub fn draw_mesh_faded(
-        &mut self,
-        handle: MeshHandle,
-        offset: Vec3,
-        detail: Detail,
-        fade: f32,
-        style: FadeStyle,
-        flat_rgba: u32,
-    ) {
-        let fade = if fade.is_finite() { fade.clamp(0.0, 1.0) } else { 1.0 };
-        self.push_mesh(handle, offset, detail.scale(), fade, style.bits(), flat_rgba);
-    }
-
-    /// Sets chunk→LOD dither extents. Must equal the streamed full-res volume.
+    /// Sets chunk→LOD slab extents. Must equal the streamed full-res volume.
     pub fn set_lod_clip(&mut self, v: CoverageVolume) {
         self.frame.eng.lists.lod_clip = v.radius.max(0.0);
         self.frame.eng.lists.lod_clip_v = v.half_height.max(0.0);
-    }
-
-    fn push_mesh(&mut self, handle: MeshHandle, offset: Vec3, scale: f32, fade: f32, mode: u32, flat_rgba: u32) {
-        let Some(meta) = self.frame.eng.client.mesh_meta(handle) else {
-            return;
-        };
-        let (aabb_min, aabb_max) = meta.aabb();
-        // The scale must thread into the frustum test too: a scaled tile's
-        // world AABB is `local * scale + offset`, and using the unscaled box
-        // would mis-cull it near the view edges.
-        if !self
-            .frustum
-            .intersects_aabb(aabb_min * scale + offset, aabb_max * scale + offset)
-        {
-            return;
-        }
-        self.frame.eng.lists.mesh_draws.push(MeshDraw {
-            slot: handle.slot,
-            generation: handle.generation,
-            aabb_min,
-            aabb_max,
-            bounds: meta.bounds,
-            vertex_offset: meta.vertex_offset,
-            pass: meta.pass,
-            offset,
-            scale,
-            fade,
-            mode,
-            flat_rgba,
-        });
     }
 
     /// Sets the procedural sky drawn behind this frame's geometry. The
@@ -766,13 +679,18 @@ impl KeyLight {
     /// NO sRGB curve (so the retarget is pixel-identical up to ±1/255). With no
     /// uniforms set (e.g. `bin/demo.rs`) fall back to [`KeyLight::DEFAULT`].
     fn from_lists(lists: &DrawLists) -> Self {
-        match lists.frame_uniforms {
+        match lists.scene.as_ref().map(|s| s.frame_uniforms) {
             Some(u) => {
-                let sun = Vec3::new(u.light[0], u.light[1], u.light[2]).clamp(Vec3::ZERO, Vec3::ONE);
+                let sun =
+                    Vec3::new(u.light[0], u.light[1], u.light[2]).clamp(Vec3::ZERO, Vec3::ONE);
                 let zenith = Vec3::new(u.zenith[0], u.zenith[1], u.zenith[2]);
                 let ambient_floor = u.candle[3];
                 let luma = 0.2126 * zenith.x + 0.7152 * zenith.y + 0.0722 * zenith.z;
-                let ambient = if luma > 0.0 { zenith * (ambient_floor / luma) } else { zenith };
+                let ambient = if luma > 0.0 {
+                    zenith * (ambient_floor / luma)
+                } else {
+                    zenith
+                };
                 let dir = Vec3::new(u.sun_dir_elev[0], u.sun_dir_elev[1], u.sun_dir_elev[2]);
                 KeyLight {
                     dir: dir.normalize_or(Self::DEFAULT.dir),
@@ -797,7 +715,10 @@ mod tests {
         u.extras = [1.0, 0.0, 0.0, 0.0];
         let on = gate_uniforms(&crate::engine::RenderFlags::default(), u);
         assert_eq!(on.extras, [1.0, 0.0, 0.0, 0.0]);
-        let flags = crate::engine::RenderFlags { stars: false, ..Default::default() };
+        let flags = crate::engine::RenderFlags {
+            stars: false,
+            ..Default::default()
+        };
         let off = gate_uniforms(&flags, u);
         assert_eq!(off.extras, [0.0, 0.0, 0.0, 0.0]);
     }

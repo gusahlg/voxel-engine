@@ -17,14 +17,36 @@ use crate::mesh::{DebugVertex, MeshVertex, Pass};
 use crate::vk::device::FragmentShadingRate;
 use crate::vk::vertex_input::{VertexInput, vertex_struct};
 
-pub const PUSH_BYTES_3D: u32 = size_of::<Mesh3dPush>() as u32; // view_proj + LOD dither-band radius
-pub const PUSH_BYTES_DEBUG: u32 = size_of::<DebugPush>() as u32; // view_proj
+pub const PUSH_BYTES_3D: u32 = size_of::<Mesh3dPush>() as u32;
+pub const PUSH_BYTES_DEBUG: u32 = size_of::<DebugPush>() as u32;
 pub const PUSH_BYTES_2D: u32 = size_of::<[f32; 2]>() as u32; // pixels_to_ndc
 pub const PUSH_BYTES_SKY: u32 = size_of::<SkyParams>() as u32; // inv_view_proj + sun geom + tint
 // exposure + wide-FOV remap coefficients (s, atan_s); see camera::WarpPush.
 pub const PUSH_BYTES_TONEMAP: u32 = size_of::<crate::camera::WarpPush>() as u32;
 
-/// 3D push constant: view_proj + LOD dither-band radius.
+/// Frame camera eye split: exact integer block + fractional part.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct EyeSplit {
+    pub block: [i32; 3],
+    pub _pad0: i32,
+    pub frac: [f32; 3],
+    pub _pad1: f32,
+}
+
+impl EyeSplit {
+    pub fn of(eye: glam::DVec3) -> Self {
+        let block = eye.floor();
+        Self {
+            block: block.as_ivec3().to_array(),
+            _pad0: 0,
+            frac: (eye - block).as_vec3().to_array(),
+            _pad1: 0.0,
+        }
+    }
+}
+
+/// 3D push constant data.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Mesh3dPush {
@@ -34,7 +56,11 @@ pub struct Mesh3dPush {
     pub clip_v: f32,
     /// Padding to match Mat4 alignment.
     pub _pad: [f32; 2],
+    pub eye: EyeSplit,
 }
+
+// Struct must fit within 128-byte push budget.
+const _: () = assert!(size_of::<Mesh3dPush>() <= 128);
 
 /// Debug push constant: view_proj only.
 #[repr(C)]
@@ -79,21 +105,9 @@ const MESH3D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d.vert
 const MESH3D_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d.frag.spv"));
 /// Shader variant with depth input attachment for water absorption; built
 /// when dynamic_rendering_local_read is available and MSAA is off.
-const MESH3D_WATER_FRAG: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_water.frag.spv"));
-/// The water depth-absorption local-read path is LIVE (repaired 2026-07-14 as
-/// one coherent change): the shader loads the depth input attachment as vec4
-/// (`spirv-val` clean at vulkan1.3 — the all-module test enforces it), the
-/// pipeline and the render-pass instance agree on the input-attachment
-/// mapping, the scene pass runs depth in `RENDERING_LOCAL_READ` whenever this
-/// pipeline exists (`Renderer::depth_pass_layout`), and a framebuffer-local
-/// barrier orders opaque depth writes before the water branch's reads. The
-/// validation smoke (standard + sync validation, resize, autoshot) passes
-/// with zero errors. Still gated to single-sample + the extension; MSAA keeps
-/// the flat-tint fallback.
-const WATER_DEPTH_ABSORPTION_VALIDATED: bool = true;
+const MESH3D_WATER_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_water.frag.spv"));
 
-const DEBUG_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.vert.spv"));
+pub(crate) const DEBUG_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.vert.spv"));
 const DEBUG_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.frag.spv"));
 const TRIS2D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tris2d.vert.spv"));
 const TRIS2D_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tris2d.frag.spv"));
@@ -374,14 +388,9 @@ impl Pipelines {
                 depth_bias: None,
             },
         );
-        // Water absorption variant (depth input attachment); only when its full
-        // local-read path has passed validation, the feature is available, and
-        // MSAA is off. Until then the ordinary blend shader uses a flat body tint.
-        let absorb_ok = WATER_DEPTH_ABSORPTION_VALIDATED
-            && local_read
-            && samples == vk::SampleCountFlags::TYPE_1;
-        let mesh3d_water_frag =
-            absorb_ok.then(|| create_shader_module(device, MESH3D_WATER_FRAG));
+        // Water absorption variant when dynamic_rendering_local_read available + single-sample.
+        let absorb_ok = local_read && samples == vk::SampleCountFlags::TYPE_1;
+        let mesh3d_water_frag = absorb_ok.then(|| create_shader_module(device, MESH3D_WATER_FRAG));
         let mesh3d_transparent_absorb = mesh3d_water_frag.map(|water_frag| {
             builder.build_depth_input(
                 mesh_vert,
@@ -399,6 +408,7 @@ impl Pipelines {
                 },
             )
         });
+
         let debug_tris = builder.build(
             debug_vert,
             debug_frag,
@@ -612,7 +622,8 @@ impl Pipelines {
     /// The pipeline for the transparent [`Pass::Blend`] draw: the water
     /// depth-absorption variant when available, else the interim-tint fallback.
     pub fn blend_pipeline(&self) -> vk::Pipeline {
-        self.mesh3d_transparent_absorb.unwrap_or(self.mesh3d_transparent)
+        self.mesh3d_transparent_absorb
+            .unwrap_or(self.mesh3d_transparent)
     }
 
     pub unsafe fn destroy(&mut self, device: &ash::Device) {

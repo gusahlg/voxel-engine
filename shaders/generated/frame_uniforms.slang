@@ -16,8 +16,8 @@ struct FrameUniforms
     float4 horizon;
     // rgb = blocklight (candle) color (linear), w = ambient floor luma.
     float4 candle;
-    // x = exposure, y = dither phase [0,1), zw = jitter in pixels
-    // (informational; jitter is applied via the matrix — zero until enabled).
+    // x = exposure, y = reserved zero (post-effect dither removed), zw = TAA jitter
+    // in pixels (informational; jitter is applied via the matrix — zero until enabled).
     float4 exposure_dither;
     // x = stars gain (1 = night starfield renders, 0 = skipped — the
     // `RenderFlags::stars` gate). yzw reserved (always zero); repurposing a

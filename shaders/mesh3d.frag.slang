@@ -6,7 +6,7 @@
 
 struct FragmentInput
 {
-    float4 position : SV_Position; // screen coords, for the PCF rotation dither
+    float4 position : SV_Position; // .z for water depth reconstruction
 
     [[vk::location(0)]]
     float2 uv;
@@ -29,16 +29,14 @@ struct FragmentInput
     [[vk::location(6)]]
     nointerpolation float scale; // LOD level cell size
 
-    // Per-draw style: fade, mode, flat_rgba.
+    // Per-draw style: flat-color mode and RGBA.
     [[vk::location(7)]]
-    nointerpolation float fade;
-    [[vk::location(8)]]
     nointerpolation uint mode;
-    [[vk::location(9)]]
+    [[vk::location(8)]]
     nointerpolation uint flat_rgba;
 };
 
-// Push constants: view_proj + LOD dither extents.
+// View-proj and LOD slab clip extents.
 struct PushConstants
 {
     float4x4 view_proj;
@@ -54,9 +52,7 @@ ConstantBuffer<PushConstants> pc;
 [[vk::binding(1, 0)]]
 Sampler2DArray blockTex;
 
-// Set 0, binding 2: per-frame uniforms (FrameUniforms, common.slang) — sky
-// anchors, sun, candle/ambient, dither phase. `extras` doubles as the
-// DebugView::TerrainKey channel ([r, g, b, enabled], sRGB).
+// Per-frame uniforms: lighting, sky, debug flags.
 [[vk::binding(2, 0)]]
 ConstantBuffer<FrameUniforms> frame;
 
@@ -81,31 +77,19 @@ ConstantBuffer<CascadeUniforms> cascade;
 Sampler2DArrayShadow shadowMap;
 
 #ifdef WATER_DEPTH_ABSORPTION
-// Set 0, binding 5: the scene depth as an input attachment (index 0 via the
-// pipeline's VkRenderingInputAttachmentIndexInfo). Read same-scope by the water
-// branch to reconstruct the opaque forward distance behind the water surface —
-// dynamic_rendering_local_read, MSAA-off only. Compiled into the absorption
-// variant only; the interim-tint build omits this and the depth term.
-// Four-component by SPIR-V rule: `OpImageRead` (what `SubpassLoad` lowers to)
-// must yield a 4-component result even for a depth image — a scalar
-// `SubpassInput<float>` emits invalid SPIR-V (VUID-StandaloneSpirv-Result-04780,
-// the E-08 module defect). Depth lands in `.x`.
+// Scene depth input attachment for water depth absorption (absorption variant only).
+// SPIR-V OpImageRead requires 4 components; depth in .x.
 [[vk::input_attachment_index(0)]]
 [[vk::binding(5, 0)]]
 SubpassInput opaqueDepthInput;
 
-// Reversed-Z near plane: used to reconstruct forward view-space distance from depth.
-// A drift here just rescales WATER_ABS.
-static const float WATER_Z_NEAR = 0.05;
+// Near plane from genconst (single source with camera.rs).
+static const float WATER_Z_NEAR = Z_NEAR;
 #endif
 
-// Rotated 4-tap PCF against cascade `c`. Returns the lit fraction [0,1]
-// (reversed-Z: SampleCmp passes where the fragment is at least as close to the
-// light as the stored occluder). The rotation angle rides the ordered dither so
-// the 4-tap kernel does not band; the dither is UN-shifted (jitter is zero until
-// Phase E). Fragments outside the cascade footprint return 1.0 — the caller's
-// fade into `shadow_fallback` covers that edge.
-float shadow_map_term(float3 world, float3 N, float3 L, uint c, float2 frag_coord)
+// 3x3 PCF shadow sampling; returns lit fraction [0,1].
+// Outside cascade footprint returns 1.0 (caller fades to fallback).
+float shadow_map_term(float3 world, float3 N, float3 L, uint c)
 {
     // Single source of truth: derive per-cascade scale directly from the light matrix.
     float4x4 vp = cascade.view_proj[c];
@@ -155,7 +139,7 @@ float shadow_map_term(float3 world, float3 N, float3 L, uint c, float2 frag_coor
 // Sun shadow factor [0,1]: the near/far cascade PCF blended into the far-field
 // `shadow_fallback` across the `fade_band` at `SHADOW_LIMIT`, so the
 // chunk→tile handoff shows no shading step.
-float sun_shadow(float3 world, float3 N, float3 L, float dist, float visible_sky, float2 frag_coord)
+float sun_shadow(float3 world, float3 N, float3 L, float dist, float visible_sky)
 {
     float fallback = shadow_fallback(frame, visible_sky);
     float limit = cascade.splits_fade.w;
@@ -167,32 +151,18 @@ float sun_shadow(float3 world, float3 N, float3 L, float dist, float visible_sky
     if (fade >= 1.0)
         return fallback;
     uint c = dist < cascade.splits_fade.x ? 0u : 1u;
-    float map = shadow_map_term(world, N, L, c, frag_coord);
+    float map = shadow_map_term(world, N, L, c);
     return lerp(map, fallback, fade);
 }
 
 [shader("fragment")]
 float4 fragmentMain(FragmentInput input) : SV_Target
 {
-    // Dither LOD→chunk transition at slab extents to avoid holes showing sky.
+    // Discard LOD tiles inside the full-res slab extent.
     if (input.scale > 1.0 && pc.clip > 0.0) {
-        float band_h = smoothstep(0.75 * pc.clip, pc.clip, length(input.world.xz));
-        // Zero vertical coverage is an explicit branch: with clip_v == 0 the
-        // full-res slab has no vertical extent, so every fragment is fully
-        // outside it (band 1, LOD keeps) — never an equal-edge smoothstep,
-        // whose result is undefined.
-        float band_v = pc.clip_v > 0.0
-            ? smoothstep(0.75 * pc.clip_v, pc.clip_v, abs(input.world.y))
-            : 1.0;
-        if (max(band_h, band_v) < dither(0.0, input.position.xy) + 0.5)
-            discard;
-    }
-
-    // Temporal cross-fade with complementary dithering; CPU guarantees exact tiling.
-    if (input.fade < 1.0) {
-        float d = dither(0.0, input.position.xy) + 0.5;
-        bool keep = (input.mode & 2u) != 0u ? (d >= 1.0 - input.fade) : (d < input.fade);
-        if (!keep)
+        bool inside_h = length(input.world.xz) < pc.clip;
+        bool inside_v = pc.clip_v > 0.0 && abs(input.world.y) < pc.clip_v;
+        if (inside_h && inside_v)
             discard;
     }
 
@@ -231,7 +201,10 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     float ndl = lerp(-raw_ndl, raw_ndl, frame.light.w);
     float omni = ((ndl + 1.0) * 0.25) + 0.75;
 
-    float shadow = sun_shadow(input.world, N, sun, dist, sky_amount, input.position.xy);
+    // Coarse LOD excluded from cascade (self-shadowing); use sky-based fallback.
+    float shadow = input.scale > 1.0
+        ? shadow_fallback(frame, sky_amount)
+        : sun_shadow(input.world, N, sun, dist, sky_amount);
 
     // Skylight (sun-tinted, shadow-attenuated, omni-shaped) and pre-curve
     // blocklight, folded by the shared evaluator with the candle curve + omni
@@ -257,7 +230,9 @@ float4 fragmentMain(FragmentInput input) : SV_Target
         // True depth-difference absorption: opaque forward distance behind the
         // water (input attachment) minus this fragment's own forward distance,
         // both reconstructed from reversed-Z depth.
-        float opaque_d = WATER_Z_NEAR / opaqueDepthInput.SubpassLoad().x;
+        // Clamp cleared-depth holes away from 0 to avoid division by zero.
+        float opaque_z = max(opaqueDepthInput.SubpassLoad().x, 1.0e-6);
+        float opaque_d = WATER_Z_NEAR / opaque_z;
         float water_d = WATER_Z_NEAR / input.position.z;
         float absorb = water_absorption(opaque_d, water_d);
 #else

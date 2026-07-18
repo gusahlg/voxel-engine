@@ -1,12 +1,5 @@
-/// Swapchain creation and recreation.
-///
-/// The pipeline is decoupled from the swapchain (dynamic viewport/scissor),
-/// so recreation only rebuilds the swapchain itself, its views, and the
-/// per-image present semaphores owned by the renderer.
-///
-/// Format/usage/composite/present-mode selection is factored into PURE
-/// selectors below (E-04): every choice is testable against surfaces this
-/// machine doesn't have, and nothing is requested without checking support.
+//! Swapchain creation, format/mode selection, and recreation.
+
 use ash::{khr, vk};
 
 use super::device::Device;
@@ -175,8 +168,6 @@ impl Swapchain {
             .image_color_space(surface_format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            // COLOR_ATTACHMENT: the tonemap pass renders into the swapchain image.
-            // TRANSFER_SRC (when supported): screenshot copies to a host buffer.
             .image_usage(usage)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(composite_alpha)
@@ -261,7 +252,10 @@ mod tests {
     use super::*;
 
     fn fmt(format: vk::Format, color_space: vk::ColorSpaceKHR) -> vk::SurfaceFormatKHR {
-        vk::SurfaceFormatKHR { format, color_space }
+        vk::SurfaceFormatKHR {
+            format,
+            color_space,
+        }
     }
 
     #[test]
@@ -269,7 +263,10 @@ mod tests {
         // The common case: both flavors offered — UNORM wins.
         let (f, ideal) = choose_format(&[
             fmt(vk::Format::B8G8R8A8_SRGB, vk::ColorSpaceKHR::SRGB_NONLINEAR),
-            fmt(vk::Format::B8G8R8A8_UNORM, vk::ColorSpaceKHR::SRGB_NONLINEAR),
+            fmt(
+                vk::Format::B8G8R8A8_UNORM,
+                vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            ),
         ]);
         assert_eq!(f.format, vk::Format::B8G8R8A8_UNORM);
         assert!(ideal);
@@ -277,7 +274,10 @@ mod tests {
         // A UNORM in an exotic colorspace still beats an sRGB format.
         let (f, ideal) = choose_format(&[
             fmt(vk::Format::R8G8B8A8_SRGB, vk::ColorSpaceKHR::SRGB_NONLINEAR),
-            fmt(vk::Format::R8G8B8A8_UNORM, vk::ColorSpaceKHR::BT709_NONLINEAR_EXT),
+            fmt(
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ColorSpaceKHR::BT709_NONLINEAR_EXT,
+            ),
         ]);
         assert_eq!(f.format, vk::Format::R8G8B8A8_UNORM);
         assert!(ideal);
@@ -299,13 +299,18 @@ mod tests {
 
         let (usage, screenshots) = choose_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT);
         assert_eq!(usage, vk::ImageUsageFlags::COLOR_ATTACHMENT);
-        assert!(!screenshots, "no TRANSFER_SRC means screenshots must be refused");
+        assert!(
+            !screenshots,
+            "no TRANSFER_SRC means screenshots must be refused"
+        );
     }
 
     #[test]
     fn composite_alpha_falls_back_to_a_supported_bit() {
         assert_eq!(
-            choose_composite(vk::CompositeAlphaFlagsKHR::OPAQUE | vk::CompositeAlphaFlagsKHR::INHERIT),
+            choose_composite(
+                vk::CompositeAlphaFlagsKHR::OPAQUE | vk::CompositeAlphaFlagsKHR::INHERIT
+            ),
             vk::CompositeAlphaFlagsKHR::OPAQUE
         );
         // A compositor offering only INHERIT (some Wayland stacks): honored,
@@ -328,9 +333,15 @@ mod tests {
             vk::PresentModeKHR::FIFO,
         ];
         assert_eq!(choose_present_mode(true, &all), vk::PresentModeKHR::FIFO);
-        assert_eq!(choose_present_mode(false, &all), vk::PresentModeKHR::IMMEDIATE);
         assert_eq!(
-            choose_present_mode(false, &[vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO]),
+            choose_present_mode(false, &all),
+            vk::PresentModeKHR::IMMEDIATE
+        );
+        assert_eq!(
+            choose_present_mode(
+                false,
+                &[vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO]
+            ),
             vk::PresentModeKHR::MAILBOX
         );
         // FIFO-only surface: the guaranteed mode is the fallback.

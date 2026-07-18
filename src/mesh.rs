@@ -1,14 +1,13 @@
-/// CPU-side mesh data and the opaque handle to its GPU copy.
+/// CPU-side mesh data and GPU handle.
 ///
-/// A [`MeshVertex`] is 8 bytes: two `u32`s packing a chunk-local integer
-/// position, a face normal, a texture-array layer, and reserved AO/light bits.
-/// The vertex stores NO uv and NO color — the shader derives uv from the
-/// position + normal (the sampler is REPEAT, so greedy quads tile) and derives
-/// per-face directional shade from the normal. See the bit table below; the
-/// `SHIFT_*`/`MASK_*` consts are mirrored in `shaders/mesh3d.vert.slang`.
+/// 8-byte vertex: two u32s packing position, normal, layer (w0) and baked light (w1).
+/// Shader derives UV from position+normal; per-face lighting from normal.
+/// See bit shifts below (SHIFT_*/MASK_*); mirrored by Slang unpack in mesh3d.vert.
 ///
-/// Word 0: x[0..5] y[5..10] z[10..15] normal[15..18] layer[18..32]
-/// Word 1: ao[0..2] skylight[2..6] blocklight[6..10]
+/// Word 0: x[0:5] y[5:10] z[10:15] normal[15:18] layer[18:32]
+/// Word 1: ao[0:2] skylight[2:6] blocklight[6:10] water[10] micro[11:17]
+///
+/// AO, skylight, blocklight baked per-vertex; read as diffuse multiplier + amounts.
 ///
 /// Immediate debug geometry uses the separate unpacked [`DebugVertex`].
 use crate::vk::vertex_input::vertex_struct;
@@ -19,7 +18,9 @@ pub const SHIFT_Y: u32 = 5;
 pub const SHIFT_Z: u32 = 10;
 pub const SHIFT_NORMAL: u32 = 15;
 pub const SHIFT_LAYER: u32 = 18;
+/// AO level in w1[0:2], 0..=3; 3=no occlusion (diffuse multiplier).
 pub const SHIFT_AO: u32 = 0;
+/// Skylight and blocklight in w1[2:6] and [6:10] respectively, 0..=15 each.
 pub const SHIFT_SKY: u32 = 2;
 pub const SHIFT_BLOCK: u32 = 6;
 /// Water material bit in `w1` (bit 10). Set by mesher for liquid blocks;
@@ -125,9 +126,8 @@ vertex_struct! {
 }
 
 impl MeshVertex {
-    /// The sole vertex constructor: AO and light are non-optional, so no mesher
-    /// can silently default them (the bug that washed out far LOD tiles).
-    pub fn new(pos: [u8; 3], normal: Normal, layer: u16, ao: Ao, light: Light, water: bool) -> Self {
+    /// Only constructor: AO and light mandatory (prevents silent defaults).
+    pub const fn new(pos: [u8; 3], normal: Normal, layer: u16, ao: Ao, light: Light, water: bool) -> Self {
         Self::pack(pos, normal, layer, ao.0, light.sky, light.block, water)
     }
 
@@ -164,7 +164,10 @@ impl MeshVertex {
             micro.iter().all(|&m| (-2..=1).contains(&m)),
             "micro offset out of range -2..=1"
         );
-        for (shift, &m) in [SHIFT_MICRO_X, SHIFT_MICRO_Y, SHIFT_MICRO_Z].iter().zip(&micro) {
+        for (shift, &m) in [SHIFT_MICRO_X, SHIFT_MICRO_Y, SHIFT_MICRO_Z]
+            .iter()
+            .zip(&micro)
+        {
             self.packed[1] |= ((m as u32) & MASK_MICRO) << shift;
         }
         self
@@ -215,7 +218,8 @@ impl MeshVertex {
 /// The sole CPU-side mirror of the Slang unpack in `mesh3d.vert.slang`. Returns
 /// raw field integers (`pos`, normal index, layer, ao, sky, block); typed
 /// callers map from there. Keeping one decoder means the shift/mask consts are
-/// applied in exactly one place per direction (pack/unpack).
+/// applied in exactly one place per direction (pack/unpack). Word-1's water/micro
+/// bits are decoded separately (they are not part of this tuple).
 const fn unpack(packed: [u32; 2]) -> ([u32; 3], u8, u16, u8, u8, u8) {
     let [w0, w1] = packed;
     let pos = [
@@ -343,29 +347,39 @@ impl MeshData {
     }
 }
 
-/// LOD detail level: `FULL` (0) is full-res; each step doubles the cell size.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct Detail(u8);
+/// Canonical detail level; single-sourced from [`crate::producer::Detail`]
+/// (also consumed cross-crate by the app scheduler).
+pub use crate::producer::Detail;
 
-impl Detail {
-    /// Full-resolution chunks.
-    pub const FULL: Detail = Detail(0);
+/// Where an uploaded mesh lives in the world: the sole constructor of its GPU
+/// placement record. `block` is an exact integer at any world coordinate (the
+/// shader subtracts the camera's integer block before any float narrowing, so
+/// far terrain never jitters); `local_off` covers non-integer placements
+/// (movers such as avatars) and stays zero for terrain.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct MeshPlacement {
+    pub block: glam::IVec3,
+    pub local_off: glam::Vec3,
+    pub detail: Detail,
+}
 
-    /// The coarsest representable level: `2^15` metre cells — far beyond any
-    /// real pyramid, but small enough that [`scale`](Self::scale) can never
-    /// overflow its shift. Public inputs are clamped here rather than trusted.
-    pub const MAX_LEVEL: u8 = 15;
-
-    /// A detail level, clamped to [`MAX_LEVEL`](Self::MAX_LEVEL): this is a
-    /// public draw input, and an arbitrary `u8` must yield a bounded scale,
-    /// not an overflowing `1 << level`.
-    pub fn new(level: u8) -> Detail {
-        Detail(level.min(Self::MAX_LEVEL))
+impl MeshPlacement {
+    /// Exact terrain placement: integer block origin, no sub-block offset.
+    pub fn terrain(block: glam::IVec3, detail: Detail) -> Self {
+        Self {
+            block,
+            local_off: glam::Vec3::ZERO,
+            detail,
+        }
     }
 
-    /// Per-draw uniform scale: `2^level` metres per cell.
-    pub fn scale(self) -> f32 {
-        (1u32 << self.0) as f32
+    /// Whether a freshly-recovered placement is a real move rather than f64
+    /// reconstruction noise: static meshes converge to a constant record
+    /// (zero patch traffic) while genuine movers always exceed the threshold.
+    pub(crate) fn supersedes(&self, prev: &Self) -> bool {
+        self.block != prev.block
+            || self.detail != prev.detail
+            || (self.local_off - prev.local_off).abs().max_element() > 1e-4
     }
 }
 
@@ -392,8 +406,7 @@ impl MeshHandle {
     pub fn from_raw_parts(index: u32, generation: u32) -> Self {
         Self {
             slot: index,
-            generation: std::num::NonZeroU32::new(generation)
-                .expect("generation is 1-based"),
+            generation: std::num::NonZeroU32::new(generation).expect("generation is 1-based"),
         }
     }
 }
@@ -458,8 +471,8 @@ mod tests {
     #[test]
     fn micro_offsets_round_trip_two_complement() {
         // Every encodable value including both negatives and the zero default;
-        // with_micro must not disturb the position/normal/layer/ao/light/water
-        // fields it is layered on top of.
+        // with_micro must not disturb the position/normal/layer/water fields it
+        // is layered on top of.
         for mx in [-2i8, -1, 0, 1] {
             for my in [-2i8, -1, 0, 1] {
                 for mz in [-2i8, -1, 0, 1] {

@@ -1,35 +1,23 @@
-// tonemap.frag.slang — samples the linear-HDR offscreen, applies exposure and
-// a display-space sigmoid, which maps linear HDR straight to
-// display-encoded output (it IS the OETF — no separate sRGB encode). The scene
-// is rendered in linear light end-to-end (sRGB texture decode, linear mips,
-// linear fog/sky). Chosen by the L10/L1 verdict (2026-07-11) over Khronos PBR
-// Neutral + sRGB OETF: the sigmoid gave better day contrast, true cave-black,
-// and dark-but-legible night. The swapchain is a UNORM surface with an
-// sRGB-nonlinear color space, so this shader owns the OETF via the sigmoid.
+// Tonemap: display-space sigmoid from linear HDR (sigmoid IS the OETF).
+// End-to-end linear rendering (sRGB texture decode, linear mips, linear fog/sky).
 
-// common.slang owns the ONE `dither()` (ordered Bayer, unit amplitude) and the
-// generated `POST_TONEMAP_DITHER_GAIN`. Post-tonemap dither is done here
-// in OUTPUT space so its amplitude is a fixed fraction of an 8-bit LSB,
-// independent of exposure and the tone curve. Dithering in HDR before the curve
-// would let exposure scale the noise, causing visible banding.
 #include "common.slang"
 
 struct FragmentInput
 {
     [[vk::location(0)]]
     float2 uv;
-    // Output-pixel coordinate for the ordered dither cell, supplied by
-    // the fullscreen vertex stage as the rasteriser system value.
+    // Pixel coordinates for bloom spiral rotation (rasterizer system value).
     float4 frag_coord : SV_Position;
 };
 
 struct PushConstants
 {
-    float exposure;   // linear multiplier before the curve
-    float s;          // cylindrical warp strength (<=0 is rectilinear)
+    float exposure;   // linear multiplier before sigmoid
+    float s;          // cylindrical warp strength (<=0 rectilinear)
     float atan_s;     // precomputed atan(s)
-    float dither_phase; // temporal dither phase
-    // Godrays: sun screen pos (xy), strength gate (z), tint in godray1.
+    float _pad0;      // float4 alignment
+    // Godrays: sun screen pos, strength gate.
     float4 godray0;
     float4 godray1;
     float vignette; // radial darkening; 0 = off
@@ -67,9 +55,7 @@ float3 bloomSpill(float2 uv, float2 pix)
     return acc / BLOOM_SPIRAL_SAMPLES;
 }
 
-// Display-space sigmoid: linear HDR → display-encoded output in one step
-// (curve + OETF fused). The 1.4 pre-gain, 2.5/0.4 sigmoid shoulder, and 1.15
-// output gamma are from the L10/L1 verdict.
+// Display-space sigmoid: linear HDR to encoded output (curve + OETF fused).
 float3 tonemapSigmoid(float3 x)
 {
     float3 c = 1.4 * x;
@@ -96,24 +82,26 @@ float3 godrays(float2 outUv, float2 frag_coord)
     float2 toSun = pc.godray0.xy - outUv;
     float sunDist = length(toSun);
     float2 dir = toSun / max(sunDist, 1.0e-6);
-    // March covers up to GODRAY_MAX_LEN toward the sun; the dither offsets the
-    // first sample so the low tap count doesn't band.
+    // March toward sun with fixed half-step offset for first sample.
     float2 step = dir * (min(sunDist, GODRAY_MAX_LEN) / GODRAY_SAMPLES);
-    float jitter = dither(pc.dither_phase, frag_coord) + 0.5; // [0,1)
+    float jitter = 0.5;
     int n = int(GODRAY_SAMPLES);
     float occ = 0.0;
     for (int i = 0; i < n; ++i)
     {
         float2 p = outUv + step * (float(i) + jitter);
-        // Depth lives in offscreen (unwarped) space, so sample through the same
-        // periphery remap as the colour. Reversed-Z: sky is the cleared 0.0.
-        float d = depthTex.SampleLevel(warpSampleUv(p, pc.s, pc.atan_s), 0.0).r;
+        // Sample depth through same warp as colour to match perspective.
+        // Depth is jittered; correct sample to avoid TAA shimmer.
+        float2 duv = warpSampleUv(p, pc.s, pc.atan_s) + float2(pc.godray0.w, pc.godray1.w);
+        float d = depthTex.SampleLevel(duv, 0.0).r;
         occ += (d < 1.0e-5) ? 1.0 : 0.0;
     }
     occ /= GODRAY_SAMPLES;
     float sunward = saturate(1.0 - sunDist / GODRAY_MAX_LEN);
     float glow = pow(sunward, GODRAY_GLOW_EXP);
-    return pc.godray1.rgb * (occ * glow * GODRAY_STRENGTH);
+    // Clamp godray term to prevent bright sun tint blowout.
+    float3 term = pc.godray1.rgb * (occ * glow * GODRAY_STRENGTH);
+    return min(term, float3(GODRAY_STRENGTH));
 }
 
 [shader("fragment")]
@@ -135,8 +123,5 @@ float4 fragmentMain(FragmentInput input) : SV_Target
         ldr *= 1.0 - pc.vignette * 0.28 * smoothstep(0.5, 1.0, d);
     }
 
-    // Post-tonemap dither (output space, after tone curve). Amplitude is
-    // independent of exposure to avoid scaling quantization noise.
-    ldr += dither(pc.dither_phase, input.frag_coord.xy) * POST_TONEMAP_DITHER_GAIN;
     return float4(ldr, 1.0);
 }

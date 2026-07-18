@@ -1,7 +1,6 @@
-// mesh3d.vert.slang — camera-relative packed world-mesh vertices. Input is a
-// single uint2 (see mesh.rs for the bit table) with position, normal, layer, AO/light.
-// Per-draw float4 carries offset (xyz) and scale (w): world = local * scale + offset.
-// Meshes use small local coords; scale = 2^k for coarse LOD.
+// Camera-relative packed mesh vertices (uint2: position, normal, layer, baked light).
+// Placement: world = local * 2^k + (block − cam_block) − cam_frac + local_off.
+// Integer subtraction exact at any world coordinate; per-vertex light interpolated.
 //
 // SV_VulkanInstanceID (not SV_InstanceID) to read plain InstanceIndex.
 //
@@ -9,19 +8,31 @@
 
 #include "common.slang"
 
-// Per-draw placement. std430 layout mirrors vk::buffers::DrawOffset exactly.
-struct DrawOffset
+// Per-mesh placement record (std430, mirrors vk::buffers::MeshRecord).
+struct MeshRecord
 {
-    float3 offset;
-    float scale;
-    float fade;
-    uint mode;      // bit0 FLAT_COLOR, bit1 FADE_OUT
-    uint flat_rgba; // sRGB RGBA8: R | G<<8 | B<<16 | A<<24
-    uint pad;
+    int3 block;       // world-space origin
+    uint detail_pass; // [0:4] detail+bias, [4:6] pass
+    float3 local_off; // mover offset; zero for terrain
+    uint _pad;        // std430 padding
+    float3 aabb_min;
+    uint index_count;
+    float3 aabb_max;
+    int vertex_offset;
+};
+
+// Per-mesh dynamic style (std430, mirrors vk::buffers::DrawDyn).
+struct DrawDyn
+{
+    uint mode;      // bit 0: FLAT_COLOR
+    uint flat_rgba; // sRGB RGBA8 encoded
 };
 
 [[vk::binding(0, 0)]]
-StructuredBuffer<DrawOffset> draw_offsets;
+StructuredBuffer<MeshRecord> mesh_records;
+
+[[vk::binding(6, 0)]]
+StructuredBuffer<DrawDyn> draw_dyn;
 
 struct VertexInput
 {
@@ -41,64 +52,53 @@ struct VertexOutput
     [[vk::location(1)]]
     nointerpolation uint layer;
 
-    // Camera-relative world position (camera sits at the origin). The fragment
-    // derives fog distance (`length(world)`), the fog/reflection view ray
-    // (`normalize(world)`), and the shadow-map light-space projection from it.
+    // Camera-relative world position for fog distance and shadow projection.
     [[vk::location(2)]]
     float3 world;
 
-    // Face normal (unit), used by the fragment stage for the shadow slope bias.
+    // Face normal for shadow slope bias.
     [[vk::location(3)]]
     nointerpolation float3 nrm;
 
-    // Fragment-side lighting inputs: x = AO factor, y = skylight amount [0,1]
-    // (also the sky-visibility term), z = blocklight amount [0,1]. Directional
-    // response is now the fragment's omni N·L term, so the
-    // old per-face `shade` lane is gone. The lighting term itself is evaluated
-    // in the fragment (candle curve, ambient floor, shadow) off the per-frame UBO.
+    // Lighting: x = AO, y = skylight, z = blocklight (all normalized).
     [[vk::location(4)]]
     float3 lightparams;
 
-    // Water material bit (w1 bit 10). Liquid faces select the animated water
-    // shading in mesh3d.frag's transparent path; opaque geometry never sets it.
+    // Water material bit; selects animated water shading in transparent path.
     [[vk::location(5)]]
     nointerpolation uint water;
 
-    // LOD scale: packed in offsets SSBO (no extra binding)
+    // LOD scale from detail_pass.
     [[vk::location(6)]]
     nointerpolation float scale;
 
-    // Per-draw style: fade, mode, flat_rgba.
+    // Per-draw style: flat-color mode and RGBA.
     [[vk::location(7)]]
-    nointerpolation float fade;
-    [[vk::location(8)]]
     nointerpolation uint mode;
-    [[vk::location(9)]]
+    [[vk::location(8)]]
     nointerpolation uint flat_rgba;
 };
 
 struct PushConstants
 {
     float4x4 view_proj;
-    // All sky/fog/candle lighting rides the per-frame UBO (set 0, binding 2);
-    // this stage needs only the camera. The push range's tail `clip` lane
-    // (surface pass only) is not declared here — a stage may declare a prefix.
+    // LOD slab extents (fragment pass only).
+    float clip;
+    float clip_v;
+    float2 pad;
+    // f64 camera eye split: eye = cam_block + cam_frac, frac in [0,1).
+    int3 cam_block;
+    int pad0;
+    float3 cam_frac;
+    float pad1;
+    // Lighting from per-frame UBO (binding 2).
 };
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc;
 
-// Gameplay-tuned planet curvature: distant terrain droops below the horizon,
-// hidden by fog. PRESENTATION-ONLY by contract (E-06): the droop is applied to
-// the CLIP position alone, never to `output.world` — so fog, lighting, shadow
-// evaluation, and every CPU consumer (culling, world outputs, shadow depth)
-// agree on the flat world. The bounded artifacts that buys: frustum culling is
-// conservative near the bottom edge (a drooped tile may be drawn just
-// off-screen, never wrongly culled away), and shadows are computed for the
-// flat silhouette. The droop itself is clamped (CURVE_MAX_DROP) so an
-// arbitrarily distant vertex can neither overflow nor fold the horizon.
-static const float CURVE_INV_2R = 1.0 / (2.0 * 300000.0); // ~300 km visual radius
-static const float CURVE_MAX_DROP = 4096.0; // metres; reached ~50 km out
+// Planet curvature: droop is visual only (CLIP position only, not world).
+// Keeps culling conservative and shadows against flat silhouette.
 
 [shader("vertex")]
 VertexOutput vertexMain(VertexInput input)
@@ -111,9 +111,7 @@ VertexOutput vertexMain(VertexInput input)
     float z = float((w0 >> 10) & 0x1F);
     uint normal = (w0 >> 15) & 0x7;   // 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
     uint layer = (w0 >> 18) & 0x3FFF;
-    uint ao = (w1 >> 0) & 0x3;
-    uint sky = (w1 >> 2) & 0xF;
-    uint block = (w1 >> 6) & 0xF;
+    // w1: AO [0:2], skylight [2:6], blocklight [6:10], water [10].
     uint water = (w1 >> 10) & 0x1;
 
     // Per-axis 2-bit two's-complement micro-offsets. Truth: mesh.rs
@@ -133,7 +131,12 @@ VertexOutput vertexMain(VertexInput input)
     else
         uv = float2(x, y);
 
-    float ao_factor = 0.4 + 0.2 * float(ao); // 3 → 1.0, 0 → 0.4
+    // Baked AO: level 0..3 → diffuse multiplier 0.4..1.0.
+    uint ao_level = w1 & 0x3;
+    float ao_factor = 0.4 + float(ao_level) * 0.2;
+    // Baked light levels: skylight [2:6], blocklight [6:10], 4-bit each.
+    uint sky = (w1 >> 2) & 0xF;
+    uint block = (w1 >> 6) & 0xF;
     float sky_amount = float(sky) / 15.0;
     float block_amount = float(block) / 15.0;
 
@@ -146,8 +149,12 @@ VertexOutput vertexMain(VertexInput input)
     float3 N = FACE_NORMAL[normal];
 
     // Micro-offset is added in LOCAL space so it scales with the draw (2^k LOD).
-    DrawOffset placement = draw_offsets[input.instance];
-    float3 world = (float3(x, y, z) + micro) * placement.scale + placement.offset;
+    MeshRecord rec = mesh_records[input.instance];
+    DrawDyn style = draw_dyn[input.instance];
+    float scale = exp2(float(rec.detail_pass & 0xFu) - float(DETAIL_GPU_BIAS));
+    // Camera-relative placement: block delta first, then fractional parts.
+    float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
+    float3 world = (float3(x, y, z) + micro) * scale + offset;
 
     VertexOutput output;
     // Round-world horizon: curve on-screen silhouette only, preserving world position for fog/shadows.
@@ -156,18 +163,17 @@ VertexOutput vertexMain(VertexInput input)
     // Plain rectilinear projection; wide-FOV compression is a post-process.
     output.position = mul(pc.view_proj, float4(curved, 1.0));
     // Resolve depth ties in coplanar LOD levels: push each farther proportionally to cell size.
-    if (placement.scale > 1.0)
-        output.position.z *= 1.0 - placement.scale / 4096.0;
+    if (scale > 1.0)
+        output.position.z *= 1.0 - scale / 4096.0;
     // Scale UV to maintain texel density across LOD levels.
-    output.uv = uv * placement.scale;
+    output.uv = uv * scale;
     output.layer = layer;
     output.world = world;
     output.nrm = N;
     output.lightparams = float3(ao_factor, sky_amount, block_amount);
     output.water = water;
-    output.scale = placement.scale;
-    output.fade = placement.fade;
-    output.mode = placement.mode;
-    output.flat_rgba = placement.flat_rgba;
+    output.scale = scale;
+    output.mode = style.mode;
+    output.flat_rgba = style.flat_rgba;
     return output;
 }

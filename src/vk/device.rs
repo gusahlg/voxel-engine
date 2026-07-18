@@ -1,20 +1,11 @@
-/// Physical device selection and logical device creation.
-///
-/// Selection requires Vulkan 1.3 (dynamic rendering + synchronization2), the
-/// swapchain extension, and graphics+present queues; among suitable devices a
-/// discrete GPU wins over an integrated one.
 use ash::{ext, khr, vk};
 
-/// Marker returned only when `VK_EXT_memory_budget` is enabled, so budget
-/// queries can't be issued without it.
+/// Proof that `VK_EXT_memory_budget` is enabled.
 #[derive(Clone, Copy)]
 pub struct MemoryBudget {
     _priv: (),
 }
 
-/// A snapshot of per-heap budget/usage from `VK_EXT_memory_budget`. Values are
-/// driver best-effort and stale the moment they are read — treat them as an
-/// admission hint, never a hard cap.
 #[derive(Clone, Copy)]
 pub struct BudgetSnapshot {
     pub heap_budget: [u64; vk::MAX_MEMORY_HEAPS],
@@ -22,13 +13,10 @@ pub struct BudgetSnapshot {
 }
 
 impl MemoryBudget {
-    /// Called only in `Device::new`, once the extension name is in the enabled
-    /// device-extension list.
     unsafe fn assume_enabled() -> Self {
         Self { _priv: () }
     }
 
-    /// Query live per-heap budget/usage (requires token, only safe with extension).
     pub unsafe fn query(
         self,
         instance: &ash::Instance,
@@ -44,24 +32,16 @@ impl MemoryBudget {
     }
 }
 
-/// Present only when `samplerAnisotropy` was enabled at device creation;
-/// carries the device's max ratio so no caller can over-request. Minted only
-/// by `Device::new`, so holding one proves the feature is on.
+/// Max anisotropy when supported.
 #[derive(Clone, Copy)]
 pub struct Anisotropy(f32);
 
 impl Anisotropy {
-    /// Clamp a desired ratio into the device-supported range [1.0, max].
     pub fn clamp(self, desired: f32) -> f32 {
         desired.clamp(1.0, self.0)
     }
 }
 
-/// Present only when `VK_KHR_fragment_shading_rate` is enabled with
-/// `attachmentFragmentShadingRate`. Attachment VRS drives shading through the
-/// core dynamic-rendering pNext chain, so only the texel size (the tile one
-/// rate-image entry covers) is needed. Minted only by `Device::new`, so holding
-/// one proves the feature is on.
 pub struct FragmentShadingRate {
     pub texel_size: vk::Extent2D,
 }
@@ -73,36 +53,23 @@ pub struct Device {
     pub present_queue: vk::Queue,
     pub graphics_family: u32,
     pub present_family: u32,
+    pub transfer_queue: vk::Queue,
+    pub transfer_family: u32,
+    pub transfer_tier: crate::vk::transfer::Tier,
     pub command_pool: vk::CommandPool,
-    /// Loader for `VK_KHR_push_descriptor` (a hard requirement): lets the
-    /// renderer push single-binding sets at record time instead of owning
-    /// pools/sets and running `vkUpdateDescriptorSets`.
     pub push_descriptor: khr::push_descriptor::Device,
-    /// `Some` when `VK_EXT_memory_budget` is enabled, gating budget queries.
     pub memory_budget: Option<MemoryBudget>,
-    /// `Some` when `samplerAnisotropy` is enabled; carries the max ratio.
     pub anisotropy: Option<Anisotropy>,
-    /// `Some` when attachment-based variable-rate shading is available.
     pub fragment_shading_rate: Option<FragmentShadingRate>,
-    /// `VK_KHR_dynamic_rendering_local_read` enabled: lets the blend pass read
-    /// the same-scope depth attachment as an input attachment (true water
-    /// depth-difference absorption). Optional — absent ⇒ the interim tint path.
     pub dynamic_rendering_local_read: bool,
-    /// The extension's command table (`vkCmdSetRenderingInputAttachmentIndices`),
-    /// present exactly when `dynamic_rendering_local_read` is.
     pub local_read: Option<khr::dynamic_rendering_local_read::Device>,
-    /// Sample counts supported by BOTH color and depth framebuffer attachments.
     pub msaa_caps: vk::SampleCountFlags,
-    /// `multiDrawIndirect` enabled; otherwise renderer loops single-draw calls.
     pub multi_draw_indirect: bool,
-    /// `drawIndirectFirstInstance` enabled; otherwise uses direct draw calls.
     pub draw_indirect_first_instance: bool,
-    /// Nanoseconds per timestamp-query tick (`limits.timestampPeriod`).
+    /// Required for GPU-driven culling; kept as field for single-source enable.
+    pub draw_indirect_count: bool,
     pub timestamp_period_ns: f32,
-    /// Whether all graphics/compute queues support timestamp queries.
     pub timestamps_supported: bool,
-    /// `limits.maxImageArrayLayers` — the block-texture array's layer ceiling
-    /// (spec minimum 256, commonly 2048 on desktop).
     pub max_image_array_layers: u32,
 }
 
@@ -110,18 +77,16 @@ struct Candidate {
     physical: vk::PhysicalDevice,
     graphics_family: u32,
     present_family: u32,
+    /// Separate transfer family, if available.
+    transfer_family: Option<u32>,
+    graphics_queue_count: u32,
     properties: vk::PhysicalDeviceProperties,
     multi_draw_indirect: bool,
     draw_indirect_first_instance: bool,
+    draw_indirect_count: bool,
     memory_budget: bool,
-    /// `Some(max_ratio)` when `samplerAnisotropy` is supported; optional, so
-    /// absence never disqualifies a device.
     max_anisotropy: Option<f32>,
-    /// `Some(texel_size)` when attachment VRS is supported; the tile size one
-    /// rate-image texel covers. Optional, so absence never disqualifies.
     fragment_shading_rate: Option<vk::Extent2D>,
-    /// `true` when both the extension and the `dynamicRenderingLocalRead` feature
-    /// bit are present. Optional, so absence never disqualifies a device.
     dynamic_rendering_local_read: bool,
     score: u32,
 }
@@ -142,7 +107,7 @@ impl Device {
             .into_iter()
             .filter_map(|pd| evaluate(instance, pd, surface_loader, surface))
             .max_by_key(|c| c.score)
-            .expect("No suitable Vulkan 1.3 GPU found (needs dynamic rendering + synchronization2 + swapchain)");
+            .expect("No suitable Vulkan 1.3 GPU found (needs dynamic rendering + synchronization2 + drawIndirectCount + swapchain)");
 
         log::info!(
             "Using GPU: {}",
@@ -158,8 +123,6 @@ impl Device {
         ];
         #[cfg(target_os = "macos")]
         device_extensions.push(khr::portability_subset::NAME.as_ptr());
-        // Only request the extension when the device advertises it; requesting
-        // an unsupported extension makes create_device fail outright.
         if best.memory_budget {
             device_extensions.push(ext::memory_budget::NAME.as_ptr());
         }
@@ -170,32 +133,55 @@ impl Device {
             device_extensions.push(khr::dynamic_rendering_local_read::NAME.as_ptr());
         }
 
-        // One queue per distinct family (graphics may equal present).
-        let queue_priorities = [1.0_f32];
+        // Pick transfer tier based on available queues.
+        let transfer_tier = if best.transfer_family.is_some() {
+            crate::vk::transfer::Tier::DedicatedFamily
+        } else if best.graphics_queue_count > 1 {
+            crate::vk::transfer::Tier::SecondQueueSameFamily
+        } else {
+            crate::vk::transfer::Tier::SameQueueFallback
+        };
+
+        // Create queues: one per family, plus second graphics queue if needed.
+        let single_priority = [1.0_f32];
+        let dual_priority = [1.0_f32, 1.0_f32];
         let mut queue_infos = vec![
             vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(best.graphics_family)
-                .queue_priorities(&queue_priorities),
+                .queue_priorities(
+                    if transfer_tier == crate::vk::transfer::Tier::SecondQueueSameFamily {
+                        &dual_priority[..]
+                    } else {
+                        &single_priority[..]
+                    },
+                ),
         ];
         if best.present_family != best.graphics_family {
             queue_infos.push(
                 vk::DeviceQueueCreateInfo::default()
                     .queue_family_index(best.present_family)
-                    .queue_priorities(&queue_priorities),
+                    .queue_priorities(&single_priority),
+            );
+        }
+        if let Some(family) = best.transfer_family
+            && family != best.graphics_family
+            && family != best.present_family
+        {
+            queue_infos.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(family)
+                    .queue_priorities(&single_priority),
             );
         }
 
         let mut vulkan_13_features = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true);
-        let mut vulkan_12_features =
-            vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
-        // The vertex-less sky triangle reads SV_VertexID, which Slang lowers via
-        // the DrawParameters capability — core in Vulkan 1.1, but must be opted in.
+        let mut vulkan_12_features = vk::PhysicalDeviceVulkan12Features::default()
+            .timeline_semaphore(true)
+            .draw_indirect_count(best.draw_indirect_count);
         let mut vulkan_11_features =
             vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
-        // Batched indirect draws want both; each is optional with a fallback
-        // draw path in the renderer, so enable exactly what the device has.
         let device_features = vk::PhysicalDeviceFeatures::default()
             .multi_draw_indirect(best.multi_draw_indirect)
             .draw_indirect_first_instance(best.draw_indirect_first_instance)
@@ -238,6 +224,19 @@ impl Device {
         let graphics_queue = unsafe { device.get_device_queue(best.graphics_family, 0) };
         let present_queue = unsafe { device.get_device_queue(best.present_family, 0) };
 
+        let (transfer_family, transfer_queue) = match transfer_tier {
+            crate::vk::transfer::Tier::DedicatedFamily => {
+                let family = best
+                    .transfer_family
+                    .expect("DedicatedFamily tier implies a transfer family");
+                (family, unsafe { device.get_device_queue(family, 0) })
+            }
+            crate::vk::transfer::Tier::SecondQueueSameFamily => (best.graphics_family, unsafe {
+                device.get_device_queue(best.graphics_family, 1)
+            }),
+            crate::vk::transfer::Tier::SameQueueFallback => (best.graphics_family, graphics_queue),
+        };
+
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(best.graphics_family)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -250,19 +249,14 @@ impl Device {
         let msaa_caps = best.properties.limits.framebuffer_color_sample_counts
             & best.properties.limits.framebuffer_depth_sample_counts;
 
-        // SAFETY: the extension is in `device_extensions` above exactly when
-        // `best.memory_budget` is true, so the token matches the enabled state.
         let memory_budget = best
             .memory_budget
             .then(|| unsafe { MemoryBudget::assume_enabled() });
 
-        // SAFETY: the extension + feature are enabled above exactly when
-        // `best.fragment_shading_rate` is `Some`, so the loader is valid to use.
         let fragment_shading_rate = best
             .fragment_shading_rate
             .map(|texel_size| FragmentShadingRate { texel_size });
 
-        // Built before the struct literal moves `device` into place.
         let local_read = best
             .dynamic_rendering_local_read
             .then(|| khr::dynamic_rendering_local_read::Device::new(instance, &device));
@@ -274,6 +268,9 @@ impl Device {
             present_queue,
             graphics_family: best.graphics_family,
             present_family: best.present_family,
+            transfer_queue,
+            transfer_family,
+            transfer_tier,
             command_pool,
             push_descriptor,
             memory_budget,
@@ -284,13 +281,13 @@ impl Device {
             msaa_caps,
             multi_draw_indirect: best.multi_draw_indirect,
             draw_indirect_first_instance: best.draw_indirect_first_instance,
+            draw_indirect_count: best.draw_indirect_count,
             timestamp_period_ns: best.properties.limits.timestamp_period,
             timestamps_supported: best.properties.limits.timestamp_compute_and_graphics == vk::TRUE,
             max_image_array_layers: best.properties.limits.max_image_array_layers,
         }
     }
 
-    /// Largest supported sample count out of {1, 2, 4, 8}.
     pub fn max_msaa(&self) -> u32 {
         for (flag, n) in [
             (vk::SampleCountFlags::TYPE_8, 8),
@@ -320,7 +317,6 @@ fn evaluate(
 ) -> Option<Candidate> {
     let properties = unsafe { instance.get_physical_device_properties(physical) };
 
-    // Chaining a Vulkan13Features struct is only valid on API >= 1.3 devices.
     if vk::api_version_major(properties.api_version) < 1
         || (vk::api_version_major(properties.api_version) == 1
             && vk::api_version_minor(properties.api_version) < 3)
@@ -329,15 +325,20 @@ fn evaluate(
     }
 
     let mut vulkan_13_features = vk::PhysicalDeviceVulkan13Features::default();
-    let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan_13_features);
+    let mut vulkan_12_features = vk::PhysicalDeviceVulkan12Features::default();
+    let mut features2 = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut vulkan_13_features)
+        .push_next(&mut vulkan_12_features);
     unsafe { instance.get_physical_device_features2(physical, &mut features2) };
     let multi_draw_indirect = features2.features.multi_draw_indirect == vk::TRUE;
     let draw_indirect_first_instance = features2.features.draw_indirect_first_instance == vk::TRUE;
-    // Optional: anisotropic filtering; absence just falls back to plain mips.
     let max_anisotropy = (features2.features.sampler_anisotropy == vk::TRUE)
         .then_some(properties.limits.max_sampler_anisotropy);
+    // Required for GPU-driven culling; reject devices that lack it.
+    let draw_indirect_count = vulkan_12_features.draw_indirect_count == vk::TRUE;
     if vulkan_13_features.dynamic_rendering != vk::TRUE
         || vulkan_13_features.synchronization2 != vk::TRUE
+        || !draw_indirect_count
     {
         return None;
     }
@@ -368,8 +369,7 @@ fn evaluate(
             let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut fsr_features);
             unsafe { instance.get_physical_device_features2(physical, &mut f2) };
             (fsr_features.attachment_fragment_shading_rate == vk::TRUE).then(|| {
-                let mut fsr_props =
-                    vk::PhysicalDeviceFragmentShadingRatePropertiesKHR::default();
+                let mut fsr_props = vk::PhysicalDeviceFragmentShadingRatePropertiesKHR::default();
                 let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut fsr_props);
                 unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
                 fsr_props.max_fragment_shading_rate_attachment_texel_size
@@ -380,8 +380,7 @@ fn evaluate(
     // Optional: same-scope depth input-attachment reads for water absorption.
     // Requires both the extension and the feature bit; absence ⇒ interim tint.
     let dynamic_rendering_local_read = has_extension(khr::dynamic_rendering_local_read::NAME) && {
-        let mut lr_features =
-            vk::PhysicalDeviceDynamicRenderingLocalReadFeaturesKHR::default();
+        let mut lr_features = vk::PhysicalDeviceDynamicRenderingLocalReadFeaturesKHR::default();
         let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut lr_features);
         unsafe { instance.get_physical_device_features2(physical, &mut f2) };
         lr_features.dynamic_rendering_local_read == vk::TRUE
@@ -390,10 +389,18 @@ fn evaluate(
     let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
     let mut graphics_family = None;
     let mut present_family = None;
+    // Look for dedicated TRANSFER-only family.
+    let mut transfer_family = None;
     for (index, family) in families.iter().enumerate() {
         let index = index as u32;
         if family.queue_flags.contains(vk::QueueFlags::GRAPHICS) && graphics_family.is_none() {
             graphics_family = Some(index);
+        }
+        if family.queue_flags.contains(vk::QueueFlags::TRANSFER)
+            && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            && transfer_family.is_none()
+        {
+            transfer_family = Some(index);
         }
         let supports_present = unsafe {
             surface_loader
@@ -407,6 +414,9 @@ fn evaluate(
             present_family = Some(index);
         }
     }
+    let graphics_queue_count = graphics_family
+        .map(|f| families[f as usize].queue_count)
+        .unwrap_or(0);
 
     let score = match properties.device_type {
         vk::PhysicalDeviceType::DISCRETE_GPU => 100,
@@ -419,9 +429,12 @@ fn evaluate(
         physical,
         graphics_family: graphics_family?,
         present_family: present_family?,
+        transfer_family,
+        graphics_queue_count,
         properties,
         multi_draw_indirect,
         draw_indirect_first_instance,
+        draw_indirect_count,
         memory_budget,
         max_anisotropy,
         fragment_shading_rate,

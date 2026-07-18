@@ -7,6 +7,7 @@ use ash::vk;
 
 use super::alloc::find_memory_type;
 use super::buffers::FRAMES_IN_FLIGHT;
+use super::image::{ImageDesc, ImageResource};
 
 /// Linear-HDR format for the offscreen/MSAA color targets. Rendering,
 /// lighting, and fog all happen here in linear space at float precision; a
@@ -46,10 +47,7 @@ pub(crate) struct ShadowMap {
 }
 
 impl ShadowMap {
-    fn new(
-        device: &ash::Device,
-        memory_props: &vk::PhysicalDeviceMemoryProperties,
-    ) -> Self {
+    fn new(device: &ash::Device, memory_props: &vk::PhysicalDeviceMemoryProperties) -> Self {
         let extent = vk::Extent3D {
             width: SHADOW_RESOLUTION,
             height: SHADOW_RESOLUTION,
@@ -165,23 +163,6 @@ impl ShadowMap {
                 device.destroy_image_view(*view, None);
             }
             device.destroy_image_view(self.sample_view, None);
-            device.destroy_image(self.image, None);
-            device.free_memory(self.memory, None);
-        }
-    }
-}
-
-/// One image + its backing memory + view, freed together.
-pub(crate) struct ImageResources {
-    pub image: vk::Image,
-    pub memory: vk::DeviceMemory,
-    pub view: vk::ImageView,
-}
-
-impl ImageResources {
-    pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
-        unsafe {
-            device.destroy_image_view(self.view, None);
             device.destroy_image(self.image, None);
             device.free_memory(self.memory, None);
         }
@@ -324,15 +305,19 @@ impl BloomChain {
 pub struct RenderTargets {
     /// Per-slot so the VRS compute pass can sample this slot's depth from two
     /// cycles ago (fence-synchronised) while the other slot is in flight.
-    pub(crate) depth: [ImageResources; FRAMES_IN_FLIGHT as usize],
+    pub(crate) depth: [ImageResource; FRAMES_IN_FLIGHT as usize],
+    /// Per-slot single-sample MSAA depth resolve target; `Some` only when
+    /// multisampled. The MS `depth` can't feed a `Sampler2D`, so the geometry
+    /// pass resolves (SAMPLE_ZERO) into this and VRS/TAA/godrays sample it.
+    pub(crate) resolved_depth: [Option<ImageResource>; FRAMES_IN_FLIGHT as usize],
     pub depth_format: vk::Format,
     /// `Some` only when multisampled; `None` is single-sampled (no MSAA image).
-    pub(crate) msaa: Option<ImageResources>,
+    pub(crate) msaa: Option<ImageResource>,
     /// Per-slot offscreen color targets (swapchain format/extent, single
     /// sampled): each frame draws — or MSAA-resolves — into `offscreen[slot]`,
     /// and presentation is a separate copy from it into a swapchain image.
     /// TRANSFER_SRC for that copy.
-    pub(crate) offscreen: [ImageResources; FRAMES_IN_FLIGHT as usize],
+    pub(crate) offscreen: [ImageResource; FRAMES_IN_FLIGHT as usize],
     pub samples: vk::SampleCountFlags,
     /// The HDR format shared by `msaa` + `offscreen`; the geometry pipelines
     /// must be built with this same format. Never the swapchain format.
@@ -364,50 +349,77 @@ impl RenderTargets {
         let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
 
         let depth = std::array::from_fn(|_| {
-            create_image(
+            ImageResource::create(
                 device,
                 &memory_props,
-                extent,
-                depth_format,
-                samples,
-                // SAMPLED so the VRS compute classifier can read it;
-                // INPUT_ATTACHMENT so the blend pass can read it same-scope via
-                // dynamic_rendering_local_read for water depth-difference
-                // absorption (depth formats support input-attachment usage
-                // wherever they support depth-stencil-attachment usage).
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::INPUT_ATTACHMENT,
-                vk::ImageAspectFlags::DEPTH,
+                &ImageDesc {
+                    extent,
+                    format: depth_format,
+                    // Sampled by VRS + input attachment for water absorption.
+                    usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                        | vk::ImageUsageFlags::SAMPLED
+                        | vk::ImageUsageFlags::INPUT_ATTACHMENT,
+                    mips: 1,
+                    layers: 1,
+                    aspect: vk::ImageAspectFlags::DEPTH,
+                    samples,
+                },
             )
         });
 
+        let resolved_depth = std::array::from_fn(|_| {
+            (samples != vk::SampleCountFlags::TYPE_1).then(|| {
+                ImageResource::create(
+                    device,
+                    &memory_props,
+                    &ImageDesc {
+                        extent,
+                        format: depth_format,
+                        // MSAA resolve target for post-pass sampling.
+                        usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                            | vk::ImageUsageFlags::SAMPLED,
+                        mips: 1,
+                        layers: 1,
+                        aspect: vk::ImageAspectFlags::DEPTH,
+                        samples: vk::SampleCountFlags::TYPE_1,
+                    },
+                )
+            })
+        });
+
         let msaa = (samples != vk::SampleCountFlags::TYPE_1).then(|| {
-            create_image(
+            ImageResource::create(
                 device,
                 &memory_props,
-                extent,
-                color_format,
-                samples,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
-                vk::ImageAspectFlags::COLOR,
+                &ImageDesc {
+                    extent,
+                    format: color_format,
+                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
+                    mips: 1,
+                    layers: 1,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    samples,
+                },
             )
         });
 
         let offscreen = std::array::from_fn(|_| {
-            create_image(
+            ImageResource::create(
                 device,
                 &memory_props,
-                extent,
-                color_format,
-                vk::SampleCountFlags::TYPE_1,
-                // SAMPLED: the tonemap + exposure passes read this as a texture.
-                // TRANSFER_DST: the TAA resolve copies the stabilized HDR
-                // back into the offscreen so exposure meters and tonemap reads it.
-                vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::TRANSFER_DST,
-                vk::ImageAspectFlags::COLOR,
+                &ImageDesc {
+                    extent,
+                    format: color_format,
+                    // Sampled by tonemap + TAA resolve destination.
+                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        | vk::ImageUsageFlags::SAMPLED
+                        | vk::ImageUsageFlags::TRANSFER_DST,
+                    mips: 1,
+                    layers: 1,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                },
             )
         });
 
@@ -427,6 +439,7 @@ impl RenderTargets {
 
         Self {
             depth,
+            resolved_depth,
             depth_format,
             msaa,
             offscreen,
@@ -438,10 +451,23 @@ impl RenderTargets {
         }
     }
 
+    /// The single-sample depth VRS/TAA/godrays sample: the MSAA resolve target
+    /// when multisampled, else the (already single-sample) `depth`. Both rest in
+    /// `DEPTH_ATTACHMENT_OPTIMAL` between passes, so consumers share one barrier
+    /// shape regardless of sample count.
+    pub(crate) fn sampleable_depth(&self, slot: usize) -> &ImageResource {
+        self.resolved_depth[slot]
+            .as_ref()
+            .unwrap_or(&self.depth[slot])
+    }
+
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe {
             for depth in &self.depth {
                 depth.destroy(device);
+            }
+            for resolved in self.resolved_depth.iter().flatten() {
+                resolved.destroy(device);
             }
             if let Some(msaa) = &self.msaa {
                 msaa.destroy(device);
@@ -462,7 +488,6 @@ impl RenderTargets {
     }
 }
 
-
 fn pick_depth_format(instance: &ash::Instance, physical: vk::PhysicalDevice) -> vk::Format {
     for format in [
         vk::Format::D32_SFLOAT,
@@ -481,80 +506,4 @@ fn pick_depth_format(instance: &ash::Instance, physical: vk::PhysicalDevice) -> 
     // Unreachable: Vulkan guarantees D16_UNORM (last candidate) supports
     // DEPTH_STENCIL_ATTACHMENT on every implementation.
     unreachable!("no depth format despite spec-guaranteed D16_UNORM support");
-}
-
-fn create_image(
-    device: &ash::Device,
-    memory_props: &vk::PhysicalDeviceMemoryProperties,
-    extent: vk::Extent2D,
-    format: vk::Format,
-    samples: vk::SampleCountFlags,
-    usage: vk::ImageUsageFlags,
-    aspect: vk::ImageAspectFlags,
-) -> ImageResources {
-    let image_info = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(format)
-        .extent(vk::Extent3D {
-            width: extent.width,
-            height: extent.height,
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(samples)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .initial_layout(vk::ImageLayout::UNDEFINED);
-
-    let image = unsafe {
-        device
-            .create_image(&image_info, None)
-            .expect("Failed to create render target image")
-    };
-
-    let requirements = unsafe { device.get_image_memory_requirements(image) };
-    let memory_type = find_memory_type(
-        memory_props,
-        requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    );
-
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(requirements.size)
-        .memory_type_index(memory_type);
-    let memory = unsafe {
-        device
-            .allocate_memory(&alloc_info, None)
-            .expect("Failed to allocate render target memory")
-    };
-    unsafe {
-        device
-            .bind_image_memory(image, memory, 0)
-            .expect("Failed to bind render target memory");
-    }
-
-    let view_info = vk::ImageViewCreateInfo::default()
-        .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
-        .format(format)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: aspect,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        });
-    let view = unsafe {
-        device
-            .create_image_view(&view_info, None)
-            .expect("Failed to create render target view")
-    };
-
-    ImageResources {
-        image,
-        memory,
-        view,
-    }
 }

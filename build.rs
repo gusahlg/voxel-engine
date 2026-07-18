@@ -93,6 +93,12 @@ const SHADERS: &[Shader] = &[
         dst: "exposure_reduce.comp.spv",
     },
     Shader {
+        src: "shaders/cull.comp.slang",
+        stage: "compute",
+        entry: "computeMain",
+        dst: "cull.comp.spv",
+    },
+    Shader {
         src: "shaders/taa_resolve.comp.slang",
         stage: "compute",
         entry: "computeMain",
@@ -141,6 +147,9 @@ fn main() {
     let fallback_dir = Path::new("shaders_spv");
     fs::create_dir_all(fallback_dir).unwrap();
 
+    // Ensure tunables use generated includes, not hand-written constants.
+    lint_slang_constants();
+
     let slangc = have_slangc();
 
     for shader in SHADERS {
@@ -164,15 +173,150 @@ fn main() {
         &mesh3d_water,
         &["-DWATER_DEPTH_ABSORPTION"],
     );
+
+    // Substrate probe: compute shaders for BDA, QUAD, STORAGE, and occupancy tests.
+    // Gated behind VOXEL_BUILD_PROBE to avoid requiring extended SPIR-V profile.
+    if env::var("VOXEL_BUILD_PROBE").is_ok() {
+        compile_probe(slangc, &out_dir, fallback_dir);
+    }
 }
 
-fn compile(
-    slangc: bool,
-    out_dir: &Path,
-    fallback_dir: &Path,
-    shader: &Shader,
-    defines: &[&str],
-) {
+/// Compile probe shaders at higher SPIR-V profile for BDA and subgroup-quad ops.
+fn compile_probe(slangc: bool, out_dir: &Path, fallback_dir: &Path) {
+    const PROBE_SHADERS: &[Shader] = &[
+        Shader { src: "shaders/probe_bda.comp.slang", stage: "compute", entry: "computeMain", dst: "probe_bda.comp.spv" },
+        Shader { src: "shaders/probe_quad.comp.slang", stage: "compute", entry: "computeMain", dst: "probe_quad.comp.spv" },
+        Shader { src: "shaders/probe_storage.comp.slang", stage: "compute", entry: "computeMain", dst: "probe_storage.comp.spv" },
+        Shader { src: "shaders/probe_occupancy.comp.slang", stage: "compute", entry: "computeMain", dst: "probe_occupancy.comp.spv" },
+    ];
+    for shader in PROBE_SHADERS {
+        let out_path = out_dir.join(shader.dst);
+        let fallback_path = fallback_dir.join(shader.dst);
+        if !slangc {
+            assert!(
+                fallback_path.exists(),
+                "VOXEL_BUILD_PROBE set but slangc missing and no prebuilt {} — install Slang",
+                fallback_path.display()
+            );
+            fs::copy(&fallback_path, &out_path).unwrap();
+            continue;
+        }
+        let output = Command::new("slangc")
+            .args([
+                shader.src,
+                "-target", "spirv",
+                "-profile", "spirv_1_5",
+                "-entry", shader.entry,
+                "-stage", shader.stage,
+                "-matrix-layout-column-major",
+                "-capability", "spvGroupNonUniformQuad",
+                "-capability", "spvPhysicalStorageBufferAddresses",
+            ])
+            .arg("-o")
+            .arg(&out_path)
+            .output()
+            .expect("failed to run slangc for probe shader");
+        if !output.status.success() {
+            eprintln!("slangc failed while compiling probe {}", shader.src);
+            eprintln!("--- stdout ---\n{}", String::from_utf8_lossy(&output.stdout));
+            eprintln!("--- stderr ---\n{}", String::from_utf8_lossy(&output.stderr));
+            panic!("probe shader compilation failed");
+        }
+        let _ = fs::copy(&out_path, &fallback_path);
+    }
+}
+
+// Slang constant lint: prevent duplicates of tunable values.
+// Allow only math facts as hand-written constants, never tunables.
+
+/// Names allowed as hand-written constants because they're math facts, not tunables.
+/// Each entry must carry a justification.
+const SLANG_CONST_ALLOWLIST: &[(&str, &str)] = &[(
+    "FACE_NORMAL",
+    "the 6 unit cube-face normals are fixed by the packed-vertex normal \
+         index convention (mesh.rs), not a tunable value",
+)];
+
+/// Lint static consts; allowlist-exempt those referencing generated symbols.
+fn lint_slang_constants() {
+    let shaders_dir = Path::new("shaders");
+    let mut violations = Vec::new();
+
+    for entry in fs::read_dir(shaders_dir).expect("read shaders dir") {
+        let entry = entry.expect("read shaders dir entry");
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("slang") {
+            continue;
+        }
+        lint_slang_file(&path, &mut violations);
+    }
+
+    if !violations.is_empty() {
+        panic!(
+            "Slang constant lint failed: hand-written numeric `static const` \
+             outside the genconst-generated include. Route tunables through \
+             build.rs's build_table(), or add a justified entry to \
+             SLANG_CONST_ALLOWLIST for a pure math constant.\n\n{}",
+            violations.join("\n")
+        );
+    }
+}
+
+fn lint_slang_file(path: &Path, violations: &mut Vec<String>) {
+    let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let lines: Vec<&str> = src.lines().collect();
+
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        if !trimmed.starts_with("static const") {
+            i += 1;
+            continue;
+        }
+        let decl_line = i + 1; // 1-based line numbers for error messages
+
+        // Accumulate multi-line array initializers until the terminating `;`.
+        let mut stmt = String::new();
+        loop {
+            stmt.push_str(lines[i]);
+            stmt.push('\n');
+            if lines[i].contains(';') || i + 1 >= lines.len() {
+                break;
+            }
+            i += 1;
+        }
+
+        // Extract name after type, stripping array suffix if present.
+        let after_type = trimmed
+            .trim_start_matches("static const")
+            .trim_start()
+            .splitn(2, char::is_whitespace)
+            .nth(1)
+            .unwrap_or("");
+        let name: String = after_type
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+
+        let rhs = stmt.splitn(2, '=').nth(1).unwrap_or("");
+        let has_numeric_literal = rhs.char_indices().any(|(idx, c)| {
+            c.is_ascii_digit() && !rhs[..idx].ends_with(|p: char| p.is_alphanumeric() || p == '_')
+        });
+
+        if has_numeric_literal && !SLANG_CONST_ALLOWLIST.iter().any(|(n, _)| *n == name) {
+            violations.push(format!(
+                "{}:{decl_line}: static const `{name}` has a hand-written numeric literal \
+                 and is not in SLANG_CONST_ALLOWLIST",
+                path.display()
+            ));
+        }
+
+        i += 1;
+    }
+}
+
+fn compile(slangc: bool, out_dir: &Path, fallback_dir: &Path, shader: &Shader, defines: &[&str]) {
     let out_path = out_dir.join(shader.dst);
     let fallback_path = fallback_dir.join(shader.dst);
 
@@ -221,7 +365,6 @@ fn compile(
     let _ = fs::copy(&out_path, &fallback_path);
 }
 
-// ---------------------------------------------------------------------------
 // Shared constants: single source of truth for Rust and Slang.
 //
 // One table (`build_table`) is rendered into two files that MUST agree:
@@ -230,10 +373,10 @@ fn compile(
 // Any constant that appears in both CPU-side sky/lighting math and its shader
 // twin lives here so CPU↔GPU drift becomes impossible-to-forget instead of a
 // silent fog seam. The .slang is `#include`d by common.slang.
-// ---------------------------------------------------------------------------
 
 enum Val {
     Scalar(f32),
+    UInt(u32),
     Arr(Vec<f32>),
     Arr2(Vec<[f32; 2]>),
 }
@@ -279,22 +422,9 @@ fn build_table() -> Vec<Def> {
     let mut halton = Vec::with_capacity(16);
     for k in 0u32..16 {
         let i = k + 1;
-        halton.push([
-            radical_inverse(i, 2) - 0.5,
-            radical_inverse(i, 3) - 0.5,
-        ]);
+        halton.push([radical_inverse(i, 2) - 0.5, radical_inverse(i, 3) - 0.5]);
     }
 
-    // Bit-reverse the phase order so cycling through it over time doesn't
-    // step linearly (which would show up as visible dither banding).
-    let mut dither = Vec::with_capacity(16);
-    for k in 0u32..16 {
-        let mut rev = 0u32;
-        for b in 0..4 {
-            rev |= ((k >> b) & 1) << (3 - b);
-        }
-        dither.push(rev as f32 / 16.0);
-    }
 
     // Autoexposure curve fitted in EV space (gentle log-linear response, no cliff).
     // Key anchors: exposure(day_luma)=1.0 (day image must match golden), exposure(cave_luma)=6.05.
@@ -315,11 +445,6 @@ fn build_table() -> Vec<Def> {
             name: "HALTON_23",
             doc: "Halton(2,3) low-discrepancy jitter offsets in [-0.5, 0.5), index 1..=16.\nMean ~= 0 per axis. TAA sub-pixel jitter source.",
             val: Val::Arr2(halton),
-        },
-        Def {
-            name: "DITHER_PHASE_16",
-            doc: "Ordered dither phases: 4-bit bit-reversal permutation of k/16.",
-            val: Val::Arr(dither),
         },
         Def {
             name: "HISTORY_BLEND",
@@ -351,11 +476,6 @@ fn build_table() -> Vec<Def> {
             doc: "Per-vertex anti-z-fight nudge in local units. Applied before scale so it\ninherits LOD's 2^k scale. Read by mesh3d.vert.",
             val: Val::Scalar(0.01),
         },
-        Def {
-            name: "POST_TONEMAP_DITHER_GAIN",
-            doc: "Post-tonemap dither amplitude in output space (1 LSB of 8-bit = 1/255).\nAmplitude must stay exposure-invariant.",
-            val: Val::Scalar(1.0 / 255.0),
-        },
         // Sun disc core/rim radii, tuned to match the sun's real angular size.
         Def {
             name: "SUN_DISC_CORE",
@@ -378,6 +498,16 @@ fn build_table() -> Vec<Def> {
             name: "SHADOW_RESOLUTION",
             doc: "Cascade shadow map edge in texels. Mirror of vk/targets.rs (asserted equal\nthere); lets the PCF derive texel size without a per-fragment GetDimensions.",
             val: Val::Scalar(2048.0),
+        },
+        Def {
+            name: "CULL_WORKGROUP",
+            doc: "GPU cull dispatch workgroup width (one thread per mesh slot). The CPU-side\ndispatch partition math (vk/cull.rs) must divide by the same value.",
+            val: Val::UInt(64),
+        },
+        Def {
+            name: "EXPOSURE_TILE",
+            doc: "Exposure metering tile edge in HDR texels. The CPU-side tile-grid dimensions\n(vk/exposure.rs) are ceil(hdr_dim / EXPOSURE_TILE) and must agree.",
+            val: Val::UInt(16),
         },
         Def {
             name: "SUN_DISC_RIM",
@@ -480,7 +610,7 @@ fn build_table() -> Vec<Def> {
         // Screen-space godrays: dithered march toward sun, composite veil in tonemap.
         Def {
             name: "GODRAY_SAMPLES",
-            doc: "Dithered march taps from each pixel toward the sun's screen position. Low\n(4); the Bayer dither() start-offset hides the step count.\nCast to int in the shader.",
+            doc: "March taps from each pixel toward the sun's screen position. Low (4); a\nfixed half-step start-offset centres the first sample.\nCast to int in the shader.",
             val: Val::Scalar(4.0),
         },
         Def {
@@ -555,7 +685,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "CLOUD_STEPS",
-            doc: "Dithered raymarch steps between the two slab-plane intersections (N=10).\nCast to int in the shader; the Bayer dither() hides the low count.",
+            doc: "Raymarch steps between the two slab-plane intersections (N=10).\nCast to int in the shader.",
             val: Val::Scalar(10.0),
         },
         Def {
@@ -665,10 +795,36 @@ fn build_table() -> Vec<Def> {
             doc: "Absorption curve base. Keeps thin water sheets mostly transparent.",
             val: Val::Scalar(1.125),
         },
+        // Unified source of truth for previously-duplicated shader constants.
+        Def {
+            name: "Z_NEAR",
+            doc: "Reversed-Z near-plane distance. Single source for the projection\nmatrix (camera.rs, which re-exports this) and the water depth-absorption\npass's forward-distance reconstruction (mesh3d.frag.slang's `WATER_Z_NEAR`\nalias) — previously two independently hand-written 0.05s.",
+            val: Val::Scalar(0.05),
+        },
+        Def {
+            name: "CURVE_INV_2R",
+            doc: "Gameplay-tuned planet curvature: inverse of 2x the visual planet\nradius (~300 km). Read by mesh3d.vert's horizon droop (CURVE_MAX_DROP-clamped,\npresentation-only — does not affect gameplay).",
+            val: Val::Scalar(1.0 / (2.0 * 300_000.0)),
+        },
+        Def {
+            name: "CURVE_MAX_DROP",
+            doc: "Planet-curvature horizon droop clamp, in metres (reached ~50 km out).\nBounds mesh3d.vert's CURVE_INV_2R droop so distant vertices can't overflow\nor fold the horizon.",
+            val: Val::Scalar(4096.0),
+        },
+        Def {
+            name: "LUMA_FLOOR",
+            doc: "Exposure metering luma floor: keeps log2(luma) finite on black tiles.\nRead by exposure_reduce.comp.",
+            val: Val::Scalar(1e-4),
+        },
+        // Detail level bias for GPU encoding (shared with shaders).
+        Def {
+            name: "DETAIL_GPU_BIAS",
+            doc: "Bias added to the signed detail level k before it is stored in the\n4-bit detail field of MeshRecord.detail_pass. Decode: 2^k = exp2(bits - bias).",
+            val: Val::UInt(2),
+        },
     ]
 }
 
-// ---------------------------------------------------------------------------
 // Per-frame uniform block: single source of truth for the std140 lane layout
 // shared by `voxel_engine::skeleton::FrameUniformsGpu` (Rust wire form) and
 // `common.slang`'s `FrameUniforms`. One table drives BOTH so a lane can never
@@ -677,7 +833,6 @@ fn build_table() -> Vec<Def> {
 //   * $OUT_DIR/gen_frame_uniforms.rs        — included by skeleton.rs
 //   * shaders/generated/frame_uniforms.slang — #included by common.slang
 // Every lane is one float4; semantics are smuggled into `.w`/spare channels.
-// ---------------------------------------------------------------------------
 
 struct Lane {
     name: &'static str,
@@ -687,14 +842,38 @@ struct Lane {
 
 fn lane_table() -> Vec<Lane> {
     vec![
-        Lane { name: "sun_dir_elev", doc: "xyz = sun direction (normalized), w = sun elevation (radians)." },
-        Lane { name: "light", doc: "rgb = direct light color (linear), w = day_night_mix." },
-        Lane { name: "zenith", doc: "rgb = zenith color (linear), w = turbidity." },
-        Lane { name: "horizon", doc: "rgb = horizon color (linear), w = fog density." },
-        Lane { name: "candle", doc: "rgb = blocklight (candle) color (linear), w = ambient floor luma." },
-        Lane { name: "exposure_dither", doc: "x = exposure, y = dither phase [0,1), zw = jitter in pixels\n(informational; jitter is applied via the matrix — zero until enabled)." },
-        Lane { name: "extras", doc: "x = stars gain (1 = night starfield renders, 0 = skipped — the\n`RenderFlags::stars` gate). yzw reserved (always zero); repurposing a\nchannel bumps FRAME_UNIFORMS_VERSION." },
-        Lane { name: "anim", doc: "x = anim_time = world-time seconds mod ANIM_PERIOD; yz = fract(camera_world.xz\n/ ANIM_PERIOD); w = camera world-y (metres, bounded ⇒ no wrap) for the cloud\nslab in sky.frag." },
+        Lane {
+            name: "sun_dir_elev",
+            doc: "xyz = sun direction (normalized), w = sun elevation (radians).",
+        },
+        Lane {
+            name: "light",
+            doc: "rgb = direct light color (linear), w = day_night_mix.",
+        },
+        Lane {
+            name: "zenith",
+            doc: "rgb = zenith color (linear), w = turbidity.",
+        },
+        Lane {
+            name: "horizon",
+            doc: "rgb = horizon color (linear), w = fog density.",
+        },
+        Lane {
+            name: "candle",
+            doc: "rgb = blocklight (candle) color (linear), w = ambient floor luma.",
+        },
+        Lane {
+            name: "exposure_dither",
+            doc: "x = exposure, y = reserved zero (post-effect dither removed), zw = TAA jitter\nin pixels (informational; jitter is applied via the matrix — zero until enabled).",
+        },
+        Lane {
+            name: "extras",
+            doc: "x = stars gain (1 = night starfield renders, 0 = skipped — the\n`RenderFlags::stars` gate). yzw reserved (always zero); repurposing a\nchannel bumps FRAME_UNIFORMS_VERSION.",
+        },
+        Lane {
+            name: "anim",
+            doc: "x = anim_time = world-time seconds mod ANIM_PERIOD; yz = fract(camera_world.xz\n/ ANIM_PERIOD); w = camera world-y (metres, bounded ⇒ no wrap) for the cloud\nslab in sky.frag.",
+        },
     ]
 }
 
@@ -706,7 +885,9 @@ fn emit_rust_uniforms(lanes: &[Lane]) -> String {
     s.push_str("/// WIRE form of the game's `FrameSnapshot`. Every lane is a `[f32; 4]` so\n");
     s.push_str("/// std140 and scalar layouts cannot diverge. Colors are LINEAR f32\n");
     s.push_str("/// (unclamped — HDR palettes survive). The layout below IS the contract with\n");
-    s.push_str("/// `common.slang`'s `FrameUniforms`; the offset asserts below are the enforcement.\n");
+    s.push_str(
+        "/// `common.slang`'s `FrameUniforms`; the offset asserts below are the enforcement.\n",
+    );
     s.push_str("///\n");
     s.push_str("/// Constructed ONLY via the game crate's `From<&FrameSnapshot>` impl.\n");
     s.push_str("#[repr(C)]\n");
@@ -736,7 +917,9 @@ fn emit_slang_uniforms(lanes: &[Lane]) -> String {
     s.push_str("// @generated by voxel-engine/build.rs — DO NOT EDIT.\n");
     s.push_str("// Source of truth: the lane_table() function in build.rs.\n");
     s.push_str("// Twin file: voxel_engine::skeleton::FrameUniformsGpu (same lanes/order).\n");
-    s.push_str("// Consumed via: #include \"generated/frame_uniforms.slang\" (from common.slang).\n\n");
+    s.push_str(
+        "// Consumed via: #include \"generated/frame_uniforms.slang\" (from common.slang).\n\n",
+    );
     s.push_str("// Per-frame uniform block. Mirrors voxel_engine::skeleton::FrameUniformsGpu.\n");
     s.push_str("struct FrameUniforms\n{\n");
     for l in lanes {
@@ -766,6 +949,9 @@ fn emit_rust(defs: &[Def]) -> String {
             Val::Scalar(x) => {
                 s.push_str(&format!("pub const {}: f32 = {};\n\n", d.name, lit(*x)));
             }
+            Val::UInt(x) => {
+                s.push_str(&format!("pub const {}: u32 = {};\n\n", d.name, x));
+            }
             Val::Arr(v) => {
                 s.push_str(&format!("pub const {}: [f32; {}] = [\n", d.name, v.len()));
                 for chunk in v.chunks(8) {
@@ -779,7 +965,11 @@ fn emit_rust(defs: &[Def]) -> String {
                 s.push_str("];\n\n");
             }
             Val::Arr2(v) => {
-                s.push_str(&format!("pub const {}: [[f32; 2]; {}] = [\n", d.name, v.len()));
+                s.push_str(&format!(
+                    "pub const {}: [[f32; 2]; {}] = [\n",
+                    d.name,
+                    v.len()
+                ));
                 for p in v {
                     s.push_str(&format!("    [{}, {}],\n", lit(p[0]), lit(p[1])));
                 }
@@ -795,12 +985,21 @@ fn emit_slang(defs: &[Def]) -> String {
     s.push_str("// @generated by voxel-engine/build.rs — DO NOT EDIT.\n");
     s.push_str("// Source of truth: the build_table() function in build.rs.\n");
     s.push_str("// Twin file: voxel_engine::genconst (Rust, same names).\n");
-    s.push_str("// Consumed via: #include \"generated/shader_constants.slang\" (from common.slang).\n\n");
+    s.push_str(
+        "// Consumed via: #include \"generated/shader_constants.slang\" (from common.slang).\n\n",
+    );
     for d in defs {
         doc_lines(d.doc, "// ", &mut s);
         match &d.val {
             Val::Scalar(x) => {
-                s.push_str(&format!("static const float {} = {}f;\n\n", d.name, lit(*x)));
+                s.push_str(&format!(
+                    "static const float {} = {}f;\n\n",
+                    d.name,
+                    lit(*x)
+                ));
+            }
+            Val::UInt(x) => {
+                s.push_str(&format!("static const uint {} = {};\n\n", d.name, x));
             }
             Val::Arr(v) => {
                 s.push_str(&format!(
@@ -838,7 +1037,9 @@ fn emit_slang(defs: &[Def]) -> String {
 /// the generated .slang) cannot spin into a rebuild loop and stale outputs
 /// never survive a table edit.
 fn write_if_changed(path: &Path, content: &str) {
-    let differs = fs::read_to_string(path).map(|old| old != content).unwrap_or(true);
+    let differs = fs::read_to_string(path)
+        .map(|old| old != content)
+        .unwrap_or(true);
     if differs {
         fs::write(path, content).unwrap();
     }
@@ -853,6 +1054,12 @@ fn generate_shared_constants(out_dir: &Path) {
     write_if_changed(&gen_dir.join("shader_constants.slang"), &emit_slang(&defs));
 
     let lanes = lane_table();
-    write_if_changed(&out_dir.join("gen_frame_uniforms.rs"), &emit_rust_uniforms(&lanes));
-    write_if_changed(&gen_dir.join("frame_uniforms.slang"), &emit_slang_uniforms(&lanes));
+    write_if_changed(
+        &out_dir.join("gen_frame_uniforms.rs"),
+        &emit_rust_uniforms(&lanes),
+    );
+    write_if_changed(
+        &gen_dir.join("frame_uniforms.slang"),
+        &emit_slang_uniforms(&lanes),
+    );
 }

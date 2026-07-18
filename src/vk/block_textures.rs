@@ -5,6 +5,7 @@ use ash::vk;
 
 use super::device::Anisotropy;
 use super::image_upload::{ImageUpload, upload_image};
+use super::transfer::TransferLane;
 
 pub struct BlockTextures {
     pub image: vk::Image,
@@ -17,12 +18,15 @@ pub struct BlockTextures {
 
 impl BlockTextures {
     /// 1x1, one all-white layer — the init-time placeholder.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_default(
         instance: &ash::Instance,
         device: &ash::Device,
         physical: vk::PhysicalDevice,
         graphics_queue: vk::Queue,
+        graphics_family: u32,
         command_pool: vk::CommandPool,
+        lane: &mut TransferLane,
         anisotropy: Option<Anisotropy>,
     ) -> Self {
         Self::upload(
@@ -30,7 +34,9 @@ impl BlockTextures {
             device,
             physical,
             graphics_queue,
+            graphics_family,
             command_pool,
+            lane,
             anisotropy,
             1,
             &[vec![255, 255, 255, 255]],
@@ -40,12 +46,15 @@ impl BlockTextures {
     /// Uploads `layers` RGBA8 images of `size`x`size` as a device-local
     /// texture array with a full CPU-built mip chain per layer. Blocks until
     /// the copy completes.
+    #[allow(clippy::too_many_arguments)]
     pub fn upload(
         instance: &ash::Instance,
         device: &ash::Device,
         physical: vk::PhysicalDevice,
         graphics_queue: vk::Queue,
+        graphics_family: u32,
         command_pool: vk::CommandPool,
+        lane: &mut TransferLane,
         anisotropy: Option<Anisotropy>,
         size: u32,
         layers: &[Vec<u8>],
@@ -102,7 +111,9 @@ impl BlockTextures {
             device,
             physical,
             graphics_queue,
+            graphics_family,
             command_pool,
+            lane,
             &ImageUpload {
                 extent: vk::Extent2D {
                     width: size,
@@ -134,7 +145,9 @@ impl BlockTextures {
             .min_lod(0.0)
             .max_lod(mip_levels as f32);
         if let Some(a) = anisotropy {
-            sampler_info = sampler_info.anisotropy_enable(true).max_anisotropy(a.clamp(8.0));
+            sampler_info = sampler_info
+                .anisotropy_enable(true)
+                .max_anisotropy(a.clamp(8.0));
         }
         let sampler = unsafe {
             device
@@ -239,7 +252,10 @@ mod tests {
         base[15] = 200;
         let chain = build_mip_chain(&base, 2, 2);
         assert_eq!(chain[1].len(), 4);
-        assert!((chain[1][0] as i32 - 100).abs() <= 1, "linear mean of a constant");
+        assert!(
+            (chain[1][0] as i32 - 100).abs() <= 1,
+            "linear mean of a constant"
+        );
         assert_eq!(chain[1][1], 0);
         assert_eq!(chain[1][3], 100, "alpha arithmetic mean");
     }

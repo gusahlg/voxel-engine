@@ -61,12 +61,6 @@ static const float2 HALTON_23[16] = {
     float2(-0.46875f, 0.0925926f),
 };
 
-// Ordered dither phases: 4-bit bit-reversal permutation of k/16.
-static const float DITHER_PHASE_16[16] = {
-    0.0f, 0.5f, 0.25f, 0.75f, 0.125f, 0.625f, 0.375f, 0.875f, 
-    0.0625f, 0.5625f, 0.3125f, 0.8125f, 0.1875f, 0.6875f, 0.4375f, 0.9375f, 
-};
-
 // TAA history feedback weight: fraction of the (reprojected, variance-clamped)
 // history kept each frame. Higher = steadier but slower to react. Read by vk/taa.rs.
 // Reduced 0.95→0.92: animated water waves and clouds demand faster per-frame
@@ -93,10 +87,6 @@ static const float CANDLE_CLAMP = 4.0f;
 // inherits LOD's 2^k scale. Read by mesh3d.vert.
 static const float MICRO_STEP = 0.01f;
 
-// Post-tonemap dither amplitude in output space (1 LSB of 8-bit = 1/255).
-// Amplitude must stay exposure-invariant.
-static const float POST_TONEMAP_DITHER_GAIN = 0.003921569f;
-
 // Sun-disc solid core as a multiple of the sun angular radius.
 // Larger core keeps sun defined against brighter night sky. Complements SUN_DISC_RIM tightening.
 static const float SUN_DISC_CORE = 1.12f;
@@ -114,6 +104,14 @@ static const float SHADOW_SKY_AMBIENT = 0.22f;
 // Cascade shadow map edge in texels. Mirror of vk/targets.rs (asserted equal
 // there); lets the PCF derive texel size without a per-fragment GetDimensions.
 static const float SHADOW_RESOLUTION = 2048.0f;
+
+// GPU cull dispatch workgroup width (one thread per mesh slot). The CPU-side
+// dispatch partition math (vk/cull.rs) must divide by the same value.
+static const uint CULL_WORKGROUP = 64;
+
+// Exposure metering tile edge in HDR texels. The CPU-side tile-grid dimensions
+// (vk/exposure.rs) are ceil(hdr_dim / EXPOSURE_TILE) and must agree.
+static const uint EXPOSURE_TILE = 16;
 
 // Sun-disc soft rim (fade-to-zero edge) as a multiple of the sun angular radius.
 // Tighter rim keeps sun crisp against busier night sky. Complements brighter stars [4.2, 4.5, 5.2] and larger moon.
@@ -179,8 +177,8 @@ static const float BLOOM_SPIRAL_LOD = 2.0f;
 // carries the wide blur, so this only softens the seams between taps.
 static const float BLOOM_SPIRAL_RADIUS = 0.08f;
 
-// Dithered march taps from each pixel toward the sun's screen position. Low
-// (4); the Bayer dither() start-offset hides the step count.
+// March taps from each pixel toward the sun's screen position. Low (4); a
+// fixed half-step start-offset centres the first sample.
 // Cast to int in the shader.
 static const float GODRAY_SAMPLES = 4.0f;
 
@@ -240,8 +238,8 @@ static const float CLOUD_BOTTOM = 180.0f;
 // Vertical slab thickness (metres); the upper plane is CLOUD_BOTTOM + this.
 static const float CLOUD_THICKNESS = 60.0f;
 
-// Dithered raymarch steps between the two slab-plane intersections (N=10).
-// Cast to int in the shader; the Bayer dither() hides the low count.
+// Raymarch steps between the two slab-plane intersections (N=10).
+// Cast to int in the shader.
 static const float CLOUD_STEPS = 10.0f;
 
 // Cloud noise spatial frequency (1/metres). World-anchored so pinned day is deterministic.
@@ -325,4 +323,28 @@ static const float WATER_ABS = 0.22f;
 
 // Absorption curve base. Keeps thin water sheets mostly transparent.
 static const float WATER_ABS_BASE = 1.125f;
+
+// Reversed-Z near-plane distance. Single source for the projection
+// matrix (camera.rs, which re-exports this) and the water depth-absorption
+// pass's forward-distance reconstruction (mesh3d.frag.slang's `WATER_Z_NEAR`
+// alias) — previously two independently hand-written 0.05s.
+static const float Z_NEAR = 0.05f;
+
+// Gameplay-tuned planet curvature: inverse of 2x the visual planet
+// radius (~300 km). Read by mesh3d.vert's horizon droop (CURVE_MAX_DROP-clamped,
+// presentation-only — does not affect gameplay).
+static const float CURVE_INV_2R = 1.6666667e-6f;
+
+// Planet-curvature horizon droop clamp, in metres (reached ~50 km out).
+// Bounds mesh3d.vert's CURVE_INV_2R droop so distant vertices can't overflow
+// or fold the horizon.
+static const float CURVE_MAX_DROP = 4096.0f;
+
+// Exposure metering luma floor: keeps log2(luma) finite on black tiles.
+// Read by exposure_reduce.comp.
+static const float LUMA_FLOOR = 0.0001f;
+
+// Bias added to the signed detail level k before it is stored in the
+// 4-bit detail field of MeshRecord.detail_pass. Decode: 2^k = exp2(bits - bias).
+static const uint DETAIL_GPU_BIAS = 2;
 

@@ -10,8 +10,29 @@
 
 use ash::vk;
 
-use crate::skeleton::{FrameSlot, FrameUniformsGpu, PerSlot};
+use crate::rev::{FrameSlot, PerSlot};
 use crate::vk::buffers::HostBuffer;
+
+pub const FRAME_UNIFORMS_SET: u32 = 0;
+pub const FRAME_UNIFORMS_BINDING: u32 = 2;
+
+// FrameUniformsGpu is generated from build.rs; edit the lane_table there.
+include!(concat!(env!("OUT_DIR"), "/gen_frame_uniforms.rs"));
+
+impl FrameUniformsGpu {
+    /// Neutral fully-lit default.
+    pub fn full_bright() -> Self {
+        let mut n = <Self as bytemuck::Zeroable>::zeroed();
+        n.sun_dir_elev = [0.0, 1.0, 0.0, std::f32::consts::FRAC_PI_2];
+        n.candle[3] = 1.0; // ambient
+        n.exposure_dither[0] = 1.0; // exposure
+        n.extras[0] = 1.0; // stars
+        n
+    }
+}
+
+// Bumped when lane_table layout changes.
+pub const FRAME_UNIFORMS_VERSION: u32 = 3;
 
 /// The per-frame UBO ring. Indexed only by [`FrameSlot`] (the parity type),
 /// so raw-usize slot confusion is inexpressible here.

@@ -117,7 +117,7 @@ impl Default for RenderFlags {
             exposure: false,
             bloom: true,
             godrays: true,
-            shadows: false,
+            shadows: true,
             sky: true,
             vrs: true,
             water_anim: true,
@@ -345,14 +345,54 @@ impl Engine {
 
     // ---- meshes ----
 
-    /// Uploads a mesh; drawable in the same frame. Returns None for empty data.
+    /// Upload a tracked mesh; placement recovered from draw offset (movers).
+    /// Static geometry should use [`upload_mesh_placed`](Self::upload_mesh_placed).
     pub fn upload_mesh(&mut self, data: &MeshData) -> Option<MeshHandle> {
         self.client.upload_mesh(data)
+    }
+
+    /// Upload terrain mesh with pinned placement; draws only gate visibility.
+    pub fn upload_mesh_placed(
+        &mut self,
+        data: &MeshData,
+        placement: crate::mesh::MeshPlacement,
+    ) -> Option<MeshHandle> {
+        self.client.upload_mesh_placed(data, placement)
     }
 
     /// Frees a mesh. Safe while the GPU still uses it (deferred internally).
     pub fn free_mesh(&mut self, handle: MeshHandle) {
         self.client.free_mesh(handle);
+    }
+
+    /// Gate mesh visibility for GPU culling (coarse "app wants drawn").
+    pub fn set_visible(&mut self, handle: MeshHandle, on: bool) {
+        self.client.set_visible(handle.slot, on);
+    }
+
+    /// Set per-draw style (FadeStyle + flat sRGB RGBA8); only changed values patch.
+    pub fn set_mesh_style(
+        &mut self,
+        handle: MeshHandle,
+        style: crate::frame::FadeStyle,
+        flat_rgba: u32,
+    ) {
+        self.client.set_mesh_style(
+            handle,
+            crate::vk::buffers::DrawDyn {
+                mode: style.bits(),
+                flat_rgba,
+            },
+        );
+    }
+
+    /// Update mover mesh placement (avatars only; terrain ignores this).
+    pub fn set_mesh_placement(
+        &mut self,
+        handle: MeshHandle,
+        placement: crate::mesh::MeshPlacement,
+    ) {
+        self.client.set_mesh_placement(handle, placement);
     }
 
     // ---- screenshots ----
@@ -364,7 +404,10 @@ impl Engine {
     pub fn screenshot(&mut self) -> Option<std::path::PathBuf> {
         let path = crate::screenshot::next_path()?;
         // Interactive path: no reply awaited (best-effort, fire-and-forget).
-        self.client.request_capture(Capture { path: path.clone(), reply: None });
+        self.client.request_capture(Capture {
+            path: path.clone(),
+            reply: None,
+        });
         Some(path)
     }
 
@@ -451,7 +494,10 @@ impl Engine {
         path: std::path::PathBuf,
     ) -> std::sync::mpsc::Receiver<std::io::Result<()>> {
         let (tx, rx) = std::sync::mpsc::channel();
-        self.client.request_capture(Capture { path, reply: Some(tx) });
+        self.client.request_capture(Capture {
+            path,
+            reply: Some(tx),
+        });
         rx
     }
 

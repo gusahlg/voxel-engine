@@ -1,8 +1,8 @@
+#[cfg(target_os = "macos")]
+use ash::khr;
 /// Vulkan instance creation: entry loading, optional validation layer with a
 /// debug-utils messenger, and MoltenVK portability enumeration on macOS.
 use ash::{ext, vk};
-#[cfg(target_os = "macos")]
-use ash::khr;
 use raw_window_handle::RawDisplayHandle;
 use std::ffi::{CStr, c_char, c_void};
 

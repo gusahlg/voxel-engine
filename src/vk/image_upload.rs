@@ -1,9 +1,10 @@
-/// Shared image upload: create device-local image, stage via temp buffer,
-/// and copy with one blocking submit. Font atlas and block textures both use
-/// this; callers pack their own bytes and copy regions.
+/// Shared image upload: device-local with temp staging, transfer-lane copy.
+/// Font atlas and block textures use this; blocks until copy completes.
 use ash::{khr, vk};
 
 use super::alloc::find_memory_type;
+use super::timeline::Timeline;
+use super::transfer::{LaneRecording, TransferLane};
 
 /// Push-descriptor set layout shared by the font atlas and block texture
 /// array: binding 0 = combined image sampler, fragment stage.
@@ -46,9 +47,6 @@ pub fn push_combined_image_sampler(
     }
 }
 
-/// Describes one image to upload. `bytes` is the fully-packed staging blob;
-/// `regions` addresses ranges of it into the image's mip levels / array
-/// layers (built by the caller, since packing differs per texture kind).
 pub struct ImageUpload<'a> {
     pub extent: vk::Extent2D,
     pub format: vk::Format,
@@ -59,22 +57,20 @@ pub struct ImageUpload<'a> {
     pub regions: &'a [vk::BufferImageCopy],
 }
 
-/// Creates image + memory + view, uploads bytes, destroys staging buffer.
-/// Returns (image, memory, view); blocks until copy completes.
+#[allow(clippy::too_many_arguments)]
 pub fn upload_image(
     instance: &ash::Instance,
     device: &ash::Device,
     physical: vk::PhysicalDevice,
     graphics_queue: vk::Queue,
+    graphics_family: u32,
     command_pool: vk::CommandPool,
+    lane: &mut TransferLane,
     params: &ImageUpload,
 ) -> (vk::Image, vk::DeviceMemory, vk::ImageView) {
-    // Query memory properties once and reuse for both the image and the
-    // staging buffer.
     let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
     let size = params.bytes.len() as vk::DeviceSize;
 
-    // Image
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(params.format)
@@ -113,7 +109,6 @@ pub fn upload_image(
             .expect("Failed to bind image memory");
     }
 
-    // Staging buffer (temporary, destroyed after the blocking upload).
     let staging_info = vk::BufferCreateInfo::default()
         .size(size)
         .usage(vk::BufferUsageFlags::TRANSFER_SRC)
@@ -147,18 +142,6 @@ pub fn upload_image(
         device.unmap_memory(staging_memory);
     }
 
-    // One-time upload with layout transitions.
-    let alloc = vk::CommandBufferAllocateInfo::default()
-        .command_pool(command_pool)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(1);
-    let cmd = unsafe {
-        device
-            .allocate_command_buffers(&alloc)
-            .expect("Failed to allocate upload command buffer")[0]
-    };
-    let begin =
-        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     let subresource = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
@@ -166,11 +149,52 @@ pub fn upload_image(
         base_array_layer: 0,
         layer_count: params.array_layers,
     };
-    unsafe {
-        device
-            .begin_command_buffer(cmd, &begin)
-            .expect("Failed to begin upload command buffer");
 
+    let separate_queue = lane.is_separate_queue();
+    let needs_qfot = lane.needs_ownership_transfer();
+    /// Who owns the end of the buffer these copies are recorded into: the
+    /// lane (which ends it on submit/discard), or us (a one-shot buffer we
+    /// allocated, end, and free).
+    enum Batch {
+        Lane(LaneRecording),
+        OneShot(vk::CommandBuffer),
+    }
+    impl Batch {
+        fn cmd(&self) -> vk::CommandBuffer {
+            match self {
+                Batch::Lane(batch) => batch.cmd(),
+                Batch::OneShot(cmd) => *cmd,
+            }
+        }
+    }
+
+    // The copy itself: recorded on the lane's own queue when it has one
+    // (`Delivery::OnceBeforeUse`), else inline on a one-shot graphics
+    // buffer exactly as before this lane existed.
+    let batch = if separate_queue {
+        Batch::Lane(unsafe { lane.begin(device) })
+    } else {
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd = unsafe {
+            device
+                .allocate_command_buffers(&alloc)
+                .expect("Failed to allocate upload command buffer")[0]
+        };
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            device
+                .begin_command_buffer(cmd, &begin)
+                .expect("Failed to begin upload command buffer");
+        }
+        Batch::OneShot(cmd)
+    };
+    let copy_cmd = batch.cmd();
+
+    unsafe {
         let to_transfer = [vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::NONE)
             .src_access_mask(vk::AccessFlags2::NONE)
@@ -181,46 +205,129 @@ pub fn upload_image(
             .image(image)
             .subresource_range(subresource)];
         device.cmd_pipeline_barrier2(
-            cmd,
+            copy_cmd,
             &vk::DependencyInfo::default().image_memory_barriers(&to_transfer),
         );
 
         device.cmd_copy_buffer_to_image(
-            cmd,
+            copy_cmd,
             staging,
             image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             params.regions,
         );
 
-        let to_sampled = [vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COPY)
-            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+        // First use of a fresh image: ownership undefined until first established.
+        // Same-queue (fallback) or same-family (no ownership to transfer):
+        // one full transition does both the layout change and the memory
+        // dependency. Dedicated-family tier: this is the RELEASE half only
+        // (the layout change lands here; the second scope is empty — the
+        // matching ACQUIRE below finishes the transfer, no memory
+        // dependency needed there since the timeline wait already covers
+        // visibility, same as the mesh path).
+        let to_sampled = if needs_qfot {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                .dst_access_mask(vk::AccessFlags2::NONE)
+                .src_queue_family_index(lane.family())
+                .dst_queue_family_index(graphics_family)
+        } else {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+        };
+        let to_sampled = [to_sampled
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image(image)
             .subresource_range(subresource)];
         device.cmd_pipeline_barrier2(
-            cmd,
+            copy_cmd,
             &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
         );
 
-        device
-            .end_command_buffer(cmd)
-            .expect("Failed to end upload command buffer");
+        match batch {
+            Batch::Lane(batch) => {
+                let value = lane.submit(device, batch);
+                if needs_qfot {
+                    // Ownership-transfer ACQUIRE: a small graphics-side
+                    // submission that waits on the lane's semaphore, finishes
+                    // the transfer (no memory dependency needed — the wait
+                    // already provides visibility), and is itself waited out
+                    // before this call returns (the blocking contract callers
+                    // rely on).
+                    let acquire_alloc = vk::CommandBufferAllocateInfo::default()
+                        .command_pool(command_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1);
+                    let acquire_cmd = device
+                        .allocate_command_buffers(&acquire_alloc)
+                        .expect("Failed to allocate acquire command buffer")[0];
+                    let begin = vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+                    device
+                        .begin_command_buffer(acquire_cmd, &begin)
+                        .expect("Failed to begin acquire command buffer");
+                    let acquire = [vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                        .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_queue_family_index(lane.family())
+                        .dst_queue_family_index(graphics_family)
+                        .image(image)
+                        .subresource_range(subresource)];
+                    device.cmd_pipeline_barrier2(
+                        acquire_cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&acquire),
+                    );
+                    device
+                        .end_command_buffer(acquire_cmd)
+                        .expect("Failed to end acquire command buffer");
+                    // Signal a throwaway timeline on the acquire submission and
+                    // host-wait it (blocking OnceBeforeUse contract), waiting out
+                    // the lane's copy value first — same counter vocabulary, host
+                    // wait rather than a full-queue drain.
+                    let mut done = Timeline::new(device);
+                    let rs = done.begin_render(acquire_cmd);
+                    let completion = rs.submit(
+                        device,
+                        graphics_queue,
+                        &done,
+                        Some((lane.semaphore(), value)),
+                    );
+                    done.wait(device, completion.value());
+                    done.destroy(device);
+                    device.free_command_buffers(command_pool, &[acquire_cmd]);
+                } else {
+                    // Same-family second queue: no ownership to transfer, and
+                    // memory visibility is already covered by the timeline
+                    // wait — just wait the lane itself, no graphics submission.
+                    lane.wait(device, value);
+                }
+            }
+            Batch::OneShot(copy_cmd) => {
+                device
+                    .end_command_buffer(copy_cmd)
+                    .expect("Failed to end upload command buffer");
+                // No lane sync object under this tier: signal a throwaway timeline
+                // on the graphics submission and host-wait it (blocking
+                // OnceBeforeUse contract), a host wait rather than a queue drain.
+                let mut done = Timeline::new(device);
+                let rs = done.begin_render(copy_cmd);
+                let completion = rs.submit(device, graphics_queue, &done, None);
+                done.wait(device, completion.value());
+                done.destroy(device);
+                device.free_command_buffers(command_pool, &[copy_cmd]);
+            }
+        }
 
-        let buffers = [cmd];
-        let submit = vk::SubmitInfo::default().command_buffers(&buffers);
-        device
-            .queue_submit(graphics_queue, &[submit], vk::Fence::null())
-            .expect("Failed to submit image upload");
-        device
-            .queue_wait_idle(graphics_queue)
-            .expect("Image upload wait failed");
-
-        device.free_command_buffers(command_pool, &buffers);
         device.destroy_buffer(staging, None);
         device.free_memory(staging_memory, None);
     }

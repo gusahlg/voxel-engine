@@ -1,15 +1,7 @@
-/// Visual smoke test for the packed-vertex world-mesh path. Builds ONE
-/// chunk-local mesh via the typed `MeshVertex` API (integer coords ≤16³, a
-/// `Normal` per face, a texture layer) and draws it as a 2×2 grid of chunks,
-/// each 16 units apart via a per-draw offset — so the tiles only line up
-/// seamlessly if every draw reads its own offsets-SSBO slot. Plus a flat floor
-/// quad spanning the full 16 units to exercise UV-from-position + REPEAT
-/// tiling, one darkened region to prove the AO/light bits modulate output, an
-/// orbiting camera, immediate debug cube/wires, and the 2D overlay.
-/// Keys: F fullscreen, V vsync, M cycle MSAA, Esc quit.
+/// Smoke test: packed-vertex mesh via typed API, 2×2 grid with offset-per-draw,
+/// flat floor, orbiting camera, debug overlay. Keys: F fullscreen, V vsync, M MSAA, Esc quit.
 use voxel_engine::{
-    Ao, Camera3D, Color, Config, Detail, Key, Light, MeshData, MeshHandle, MeshVertex, Normal, Pass,
-    SkyDesc, Vec3,
+    Ao, Camera3D, Color, Config, Detail, Key, Light, MeshData, MeshVertex, Normal, Pass, SkyDesc, Vec3,
 };
 
 const CHUNK: u8 = 16;
@@ -23,25 +15,13 @@ const WATER_LAYER: u16 = 2;
 /// keeps it strictly in front of the terrain it covers.
 const WATER_LEVEL: f32 = 4.5;
 
-/// A quad, corners wound CCW seen from outside, with neutral (full-bright) AO/light.
+/// Quad with CCW winding; neutral daylight (no baked light/AO).
 fn push_quad(data: &mut MeshData, corners: [[u8; 3]; 4], normal: Normal, layer: u16) {
-    push_quad_lit(data, corners, normal, layer, Ao::NONE, Light::FULL);
-}
-
-fn push_quad_lit(
-    data: &mut MeshData,
-    corners: [[u8; 3]; 4],
-    normal: Normal,
-    layer: u16,
-    ao: Ao,
-    light: Light,
-) {
-    data.quad(corners.map(|c| MeshVertex::new(c, normal, layer, ao, light, false)));
+    data.quad(corners.map(|c| MeshVertex::new(c, normal, layer, Ao::NONE, Light::DAY, false)));
 }
 
 /// A unit cube whose top sits at `y` (so it occupies `y-1..y`), all 6 faces.
-/// `lit` optionally overrides AO/light to prove the word-1 bits modulate.
-fn push_cube(data: &mut MeshData, x: u8, y: u8, z: u8, layer: u16, lit: Option<(Ao, Light)>) {
+fn push_cube(data: &mut MeshData, x: u8, y: u8, z: u8, layer: u16) {
     let (x1, y1, z1) = (x + 1, y, z + 1);
     let y0 = y - 1;
     let faces: [([[u8; 3]; 4], Normal); 6] = [
@@ -71,10 +51,7 @@ fn push_cube(data: &mut MeshData, x: u8, y: u8, z: u8, layer: u16, lit: Option<(
         ),
     ];
     for (corners, normal) in faces {
-        match lit {
-            Some((ao, light)) => push_quad_lit(data, corners, normal, layer, ao, light),
-            None => push_quad(data, corners, normal, layer),
-        }
+        push_quad(data, corners, normal, layer);
     }
 }
 
@@ -93,9 +70,7 @@ fn build_chunk() -> MeshData {
         for z in 0..CHUNK {
             let h = ((x as f32 * 0.6).sin() + (z as f32 * 0.5).cos()) * 2.0;
             let y = (h.round() as i32 + 4).clamp(1, 8) as u8;
-            // Darken one quadrant to prove AO/light modulation.
-            let lit = (x < CHUNK / 2 && z < CHUNK / 2).then_some((Ao::new(0), Light::new(5, 5)));
-            push_cube(&mut data, x, y, z, CHECKER_LAYER, lit);
+            push_cube(&mut data, x, y, z, CHECKER_LAYER);
         }
     }
     data
@@ -168,8 +143,9 @@ fn daytime_uniforms() -> voxel_engine::skeleton::FrameUniformsGpu {
 fn main() {
     env_logger::init();
 
-    let mut chunk: Option<MeshHandle> = None;
-    let mut water: Option<MeshHandle> = None;
+    // Upload meshes once; GPU records drive draws while resident+visible.
+    // `big` exercises upload_mesh (Tracked) with set_mesh_placement.
+    let mut uploaded = false;
     let mut angle = 0.0f32;
     // High-FOV cylindrical warp strength, cycled with G. Seeded from VOXEL_WARP
     // so headless screenshot runs can pick a value without a keypress.
@@ -239,10 +215,37 @@ fn main() {
                 };
             }
 
-            if chunk.is_none() {
+            if !uploaded {
+                uploaded = true;
                 eng.set_block_textures(16, &block_texture_layers(16));
-                chunk = Some(eng.upload_mesh(&build_chunk()).expect("chunk upload"));
-                water = Some(eng.upload_mesh(&build_water()).expect("water upload"));
+                let chunk_data = build_chunk();
+                let water_data = build_water();
+                for gx in 0..2i32 {
+                    for gz in 0..2i32 {
+                        let block =
+                            voxel_engine::IVec3::new(gx * CHUNK as i32, 0, gz * CHUNK as i32);
+                        let placed = voxel_engine::MeshPlacement::terrain(block, Detail::FULL);
+                        eng.upload_mesh_placed(&chunk_data, placed)
+                            .expect("chunk upload");
+                        // Water at fractional WATER_LEVEL via local_off.
+                        let wet = voxel_engine::MeshPlacement {
+                            block,
+                            local_off: Vec3::new(0.0, WATER_LEVEL, 0.0),
+                            detail: Detail::FULL,
+                        };
+                        eng.upload_mesh_placed(&water_data, wet)
+                            .expect("water upload");
+                    }
+                }
+                // Scale-2 mesh tests LOD threading and placement patching.
+                let handle = eng.upload_mesh(&chunk_data).expect("big chunk upload");
+                eng.set_mesh_placement(
+                    handle,
+                    voxel_engine::MeshPlacement::terrain(
+                        voxel_engine::IVec3::new(-2 * CHUNK as i32, 0, 0),
+                        Detail::new(1),
+                    ),
+                );
             }
 
             // Scroll to zoom: each notch nudges the vertical FOV, scrolling up
@@ -289,38 +292,7 @@ fn main() {
                     sun_tint: voxel_engine::LinearRgb([0.87, 0.30, 0.06]),
                     sun_angular_radius: 0.03,
                 });
-                if let Some(handle) = chunk {
-                    // 2×2 grid, each chunk offset by 16 — seamless only if each
-                    // draw reads its own per-draw offset slot.
-                    for gx in 0..2 {
-                        for gz in 0..2 {
-                            let off = Vec3::new(
-                                (gx * CHUNK as i32) as f32,
-                                0.0,
-                                (gz * CHUNK as i32) as f32,
-                            );
-                            f3.draw_mesh(handle, off, Detail::FULL);
-                        }
-                    }
-                    // Same mesh at scale 2 beside the grid: double size, seamless
-                    // frustum cull — proves DrawOffset.scale threads shader + cull.
-                    f3.draw_mesh(handle, Vec3::new(-2.0 * CHUNK as f32, 0.0, 0.0), Detail::new(1));
-                }
-                // Translucent water over each grid chunk, lifted to WATER_LEVEL
-                // (fractional, so it never coplanar-z-fights the block tops),
-                // drawn after all opaque.
-                if let Some(handle) = water {
-                    for gx in 0..2 {
-                        for gz in 0..2 {
-                            let off = Vec3::new(
-                                (gx * CHUNK as i32) as f32,
-                                WATER_LEVEL,
-                                (gz * CHUNK as i32) as f32,
-                            );
-                            f3.draw_mesh(handle, off, Detail::FULL);
-                        }
-                    }
-                }
+                // All meshes draw automatically from persistent records.
                 f3.draw_cube(
                     center + Vec3::new(0.0, 10.0, 0.0),
                     Vec3::splat(2.0),

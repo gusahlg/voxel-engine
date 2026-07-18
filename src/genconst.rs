@@ -49,22 +49,8 @@ mod tests {
     }
 
     #[test]
-    fn dither_is_permutation_of_k_over_16() {
-        // Every k/16 for k in 0..16 appears exactly once.
-        let mut seen = [false; 16];
-        for &phase in &DITHER_PHASE_16 {
-            let k = (phase * 16.0).round() as usize;
-            assert!((phase * 16.0 - k as f32).abs() < 1e-6, "phase {phase} not k/16");
-            assert!(!seen[k], "phase k={k} repeated");
-            seen[k] = true;
-        }
-        assert!(seen.iter().all(|&b| b), "dither phases are not a full permutation");
-    }
-
-    #[test]
     fn scalars_present() {
         assert_eq!(CANDLE_CLAMP, 4.0);
         assert!(CANDLE_HIGH_MUL > 1.0);
-        assert!((POST_TONEMAP_DITHER_GAIN - 1.0 / 255.0).abs() < 1e-9);
     }
 }

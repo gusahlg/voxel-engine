@@ -13,9 +13,13 @@ use glam::Vec3;
 use std::num::NonZeroU32;
 
 use super::alloc::{Allocation, GpuAllocator, find_memory_type};
+use super::cull::ArenaDirectory;
 use super::timeline::TimelineValue;
-use crate::frame::MeshDraw;
-use crate::mesh::{MeshData, MeshHandle, Pass};
+use super::transfer::TransferLane;
+use crate::mesh::{Detail, MeshData, MeshHandle, Pass};
+
+/// Mesh-copy staging budget per frame; amortizes bursty uploads.
+const TRANSFER_BUDGET_BYTES_PER_FRAME: u64 = 8 * 1024 * 1024;
 
 /// GPU storage-buffer offset alignment; the 256 half of `MESH_ALIGN`.
 const GPU_OFFSET_ALIGN: u64 = 256;
@@ -177,12 +181,12 @@ impl<H: GpuHandle, M: Copy> HandleAllocator<H, M> {
         }
     }
 
-    /// Gen-checked metadata; the record path reads this to frustum-cull.
-    pub fn meta(&self, h: H) -> Option<M> {
+    /// Mutable metadata with generation check.
+    pub fn meta_mut(&mut self, h: H) -> Option<&mut M> {
         if *self.generations.get(h.slot() as usize)? != h.generation() {
             return None;
         }
-        self.meta[h.slot() as usize]
+        self.meta.get_mut(h.slot() as usize)?.as_mut()
     }
 }
 
@@ -203,11 +207,49 @@ pub(crate) struct MeshMeta {
     /// First vertex (in vertices from block start); the command's `vertex_offset`.
     pub vertex_offset: i32,
     pub pass: Pass,
+    /// GPU record placement on the main side.
+    pub placement: PlacementState,
+    /// GPU dyn lane cache; patched only on change.
+    pub dyn_lane: DrawDyn,
 }
 
-impl MeshMeta {
-    pub fn aabb(&self) -> (Vec3, Vec3) {
-        (self.aabb_min, self.aabb_max)
+/// Mesh placement sync strategy: pinned (immutable) or tracked (recovered and patched).
+#[derive(Clone, Copy)]
+pub(crate) enum PlacementState {
+    /// Immutable at upload (terrain).
+    Pinned,
+    /// Recovered and patched on drift (movers).
+    Tracked(Option<crate::mesh::MeshPlacement>),
+}
+
+impl MeshRecord {
+    /// Decode pass bits from detail_pass.
+    pub(crate) fn pass(&self) -> Pass {
+        match (self.detail_pass >> 4) & 3 {
+            0 => Pass::Opaque,
+            1 => Pass::Cutout,
+            _ => Pass::Blend,
+        }
+    }
+
+    /// Decode per-draw scale from biased detail field.
+    pub(crate) fn detail_scale(&self) -> f32 {
+        Detail::from_gpu_bits((self.detail_pass & 0xF) as u8).scale()
+    }
+
+    /// Compose a GPU record from mesh metadata and placement.
+    pub(crate) fn compose(meta: &MeshMeta, p: crate::mesh::MeshPlacement) -> Self {
+        Self {
+            block: p.block.to_array(),
+            // Detail in bits 0..4, pass in bits 4..6.
+            detail_pass: u32::from(p.detail.to_gpu_bits()) | ((meta.pass as u32) << 4),
+            local_off: p.local_off.to_array(),
+            _pad: 0,
+            aabb_min: meta.aabb_min.to_array(),
+            index_count: meta.bounds[6],
+            aabb_max: meta.aabb_max.to_array(),
+            vertex_offset: meta.vertex_offset,
+        }
     }
 }
 
@@ -224,6 +266,15 @@ struct PendingCopy {
 pub(crate) struct GpuResident {
     alloc: Allocation,
     copy: Option<PendingCopy>,
+    /// Timeline value ordering copy before reads; `None` while budget-deferred.
+    arrived_at: Option<TimelineValue>,
+}
+
+impl GpuResident {
+    /// Get the device buffer.
+    pub fn buffer(&self) -> vk::Buffer {
+        self.alloc.buffer
+    }
 }
 
 /// Allocates a device buffer for `data`, writes/stages its bytes, and returns
@@ -266,7 +317,10 @@ pub(crate) unsafe fn build_mesh_resident(
                 cursor += verts.len();
             }
         }
-        debug_assert_eq!(cursor, vertex_bytes_len, "permutation must cover every vertex");
+        debug_assert_eq!(
+            cursor, vertex_bytes_len,
+            "permutation must cover every vertex"
+        );
     };
 
     let copy = if let Some(mapped) = alloc.mapped {
@@ -323,8 +377,21 @@ pub(crate) unsafe fn build_mesh_resident(
         bounds,
         vertex_offset,
         pass: data.pass,
+        placement: PlacementState::Tracked(None),
+        dyn_lane: DrawDyn::resting(),
     };
-    Some((meta, GpuResident { alloc, copy }))
+    // No staged copy (unified memory: already written above) is immediately
+    // drawable; a staged copy gates drawability until `flush_copies` submits
+    // it (see [`GpuResident::arrived_at`]).
+    let arrived_at = copy.is_none().then_some(TimelineValue::START);
+    Some((
+        meta,
+        GpuResident {
+            alloc,
+            copy,
+            arrived_at,
+        },
+    ))
 }
 
 /// Render-side residency mirror for meshes: keyed by the main-assigned slot,
@@ -335,8 +402,13 @@ pub(crate) struct MeshResidency {
     slots: Vec<Option<GpuResident>>,
     generations: Vec<NonZeroU32>,
     pending: Vec<u32>,
+    /// Device buffers and same-queue staging (render-Rev).
     retire: RetireQueue<Allocation>,
+    /// Staging for separate transfer queue (lane-Rev).
+    transfer_retire: RetireQueue<Allocation>,
     live: usize,
+    /// Slots with just-submitted copies, ready to expose in arena word.
+    arrived_since_flush: Vec<u32>,
 }
 
 impl MeshResidency {
@@ -346,8 +418,23 @@ impl MeshResidency {
             generations: Vec::new(),
             pending: Vec::new(),
             retire: RetireQueue::new(),
+            transfer_retire: RetireQueue::new(),
             live: 0,
+            arrived_since_flush: Vec::new(),
         }
+    }
+
+    /// Check if slot's bytes are visible to the cull dispatch.
+    pub fn is_arrived(&self, slot: u32) -> bool {
+        self.slots
+            .get(slot as usize)
+            .and_then(|s| s.as_ref())
+            .is_some_and(|r| r.arrived_at.is_some())
+    }
+
+    /// Drain arrived slots so RecordTable re-reads their arena words.
+    pub fn take_arrived(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.arrived_since_flush)
     }
 
     fn ensure_slot(&mut self, i: usize) {
@@ -388,58 +475,195 @@ impl MeshResidency {
         }
     }
 
-    /// Gen-checked buffer resolve for a recorded draw. `None` (Option-skip) when
-    /// the mirror generation moved on — a stale snapshot referencing a
-    /// since-freed/realloc'd slot (the transient-hole case).
-    pub fn resolve(&self, d: &MeshDraw) -> Option<vk::Buffer> {
-        let i = d.slot as usize;
-        if *self.generations.get(i)? != d.generation {
-            return None;
-        }
-        Some(self.slots.get(i)?.as_ref()?.alloc.buffer)
-    }
-
-    /// Records staged uploads into `cmd`. Returns true if a barrier guarding
-    /// transfer -> vertex/index reads was emitted.
+    /// Drains `self.pending` up to [`TRANSFER_BUDGET_BYTES_PER_FRAME`] (the
+    /// first item is always serviced regardless of size, a forward-progress
+    /// floor). A barrier cannot scope a cross-queue dependency, so only the
+    /// `SameQueueFallback` tier gets an in-command-buffer barrier; separate-
+    /// queue copies order via the returned timeline value instead.
+    ///
+    /// Returns `Some(value)` when copies were submitted on the lane's own
+    /// queue: the caller's render submission must wait on the lane's
+    /// semaphore for `value` before touching the copied ranges. `graphics_cmd`
+    /// must always be a real, valid (reset-and-begun) command buffer — even
+    /// under a separate transfer queue, `DedicatedFamily` needs an ACQUIRE
+    /// barrier recorded into it, and the caller is responsible for submitting
+    /// `graphics_cmd` afterward (waiting on the returned value's semaphore
+    /// when `Some`).
     pub unsafe fn flush_copies(
         &mut self,
         device: &ash::Device,
-        cmd: vk::CommandBuffer,
-        done_at: TimelineValue,
-    ) -> bool {
+        lane: &mut TransferLane,
+        graphics_cmd: vk::CommandBuffer,
+        graphics_family: u32,
+        render_done_at: TimelineValue,
+    ) -> Option<TimelineValue> {
         if self.pending.is_empty() {
-            return false;
+            return None;
         }
-        let mut any = false;
+        let _scope = crate::profile::scope(crate::profile::Meter::Upload);
+
+        // Take first item unconditionally, then more while under budget.
+        let mut budget = TRANSFER_BUDGET_BYTES_PER_FRAME;
+        let mut take = 0;
+        for (i, &slot) in self.pending.iter().enumerate() {
+            let size = self
+                .slots
+                .get(slot as usize)
+                .and_then(|s| s.as_ref())
+                .and_then(|r| r.copy.as_ref())
+                .map_or(0, |c| c.size);
+            if i > 0 && size > budget {
+                break;
+            }
+            budget = budget.saturating_sub(size);
+            take = i + 1;
+        }
+        let remainder = self.pending.split_off(take);
+        let batch = std::mem::replace(&mut self.pending, remainder);
+
+        let separate_queue = lane.is_separate_queue();
+        let needs_qfot = lane.needs_ownership_transfer();
+        let lane_batch = separate_queue.then(|| unsafe { lane.begin(device) });
+        let record_cmd = lane_batch.as_ref().map_or(graphics_cmd, |b| b.cmd());
+
+        let mut bytes = 0u64;
+        // Barrier handling depends on tier: same-queue scoped barrier,
+        // or release/acquire for ownership transfer.
+        let mut same_queue_barriers: Vec<vk::BufferMemoryBarrier2> = Vec::new();
+        let mut release_barriers: Vec<vk::BufferMemoryBarrier2> = Vec::new();
+        let mut acquire_barriers: Vec<vk::BufferMemoryBarrier2> = Vec::new();
+        let mut copied_slots: Vec<u32> = Vec::with_capacity(batch.len());
+        // Stamp value depends on tier (render-Rev or lane-Rev).
+        let mut staging: Vec<Allocation> = Vec::with_capacity(batch.len());
         unsafe {
-            for slot in std::mem::take(&mut self.pending) {
+            for slot in batch {
                 let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) else {
                     continue;
                 };
-                let Some(copy) = res.copy.take() else { continue };
+                let Some(copy) = res.copy.take() else {
+                    continue;
+                };
                 let region = vk::BufferCopy::default()
                     .src_offset(copy.staging.offset)
                     .dst_offset(copy.dst_offset)
                     .size(copy.size);
-                device.cmd_copy_buffer(cmd, copy.staging.buffer, copy.dst_buffer, &[region]);
-                self.retire.push(done_at, copy.staging);
-                any = true;
+                device.cmd_copy_buffer(record_cmd, copy.staging.buffer, copy.dst_buffer, &[region]);
+                bytes += copy.size;
+                let (buffer, offset, size) = (copy.dst_buffer, copy.dst_offset, copy.size);
+                if !separate_queue {
+                    same_queue_barriers.push(
+                        vk::BufferMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
+                            .dst_access_mask(
+                                vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
+                                    | vk::AccessFlags2::INDEX_READ,
+                            )
+                            .buffer(buffer)
+                            .offset(offset)
+                            .size(size),
+                    );
+                } else if needs_qfot {
+                    release_barriers.push(
+                        vk::BufferMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                            .dst_access_mask(vk::AccessFlags2::NONE)
+                            .src_queue_family_index(lane.family())
+                            .dst_queue_family_index(graphics_family)
+                            .buffer(buffer)
+                            .offset(offset)
+                            .size(size),
+                    );
+                    acquire_barriers.push(
+                        vk::BufferMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                            .src_access_mask(vk::AccessFlags2::NONE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
+                            .dst_access_mask(
+                                vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
+                                    | vk::AccessFlags2::INDEX_READ,
+                            )
+                            .src_queue_family_index(lane.family())
+                            .dst_queue_family_index(graphics_family)
+                            .buffer(buffer)
+                            .offset(offset)
+                            .size(size),
+                    );
+                }
+                // else: SecondQueueSameFamily — no queue-family ownership
+                // transfer (same family), and memory visibility is already
+                // guaranteed by the timeline semaphore signal/wait pair
+                // below; no barrier at all.
+                staging.push(copy.staging);
+                copied_slots.push(slot);
             }
-            if any {
-                let barrier = [vk::MemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
-                    .dst_access_mask(
-                        vk::AccessFlags2::VERTEX_ATTRIBUTE_READ | vk::AccessFlags2::INDEX_READ,
-                    )];
+        }
+
+        if copied_slots.is_empty() {
+            // Every batched resident was freed before this flush ran (nothing
+            // actually copied), so there is no completion to hand back.
+            if let Some(lane_batch) = lane_batch {
+                unsafe { lane.discard(device, lane_batch) };
+            }
+            return None;
+        }
+        crate::profile::gauge(crate::profile::Gauge::UploadBytes, bytes);
+
+        if !release_barriers.is_empty() {
+            unsafe {
                 device.cmd_pipeline_barrier2(
-                    cmd,
-                    &vk::DependencyInfo::default().memory_barriers(&barrier),
+                    record_cmd,
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&release_barriers),
                 );
             }
         }
-        any
+
+        let arrived_at = if let Some(lane_batch) = lane_batch {
+            // Cross-queue: a timeline wait (folded into the caller's next
+            // graphics submission) orders graphics against these copies; an
+            // in-command-buffer barrier cannot scope a cross-queue
+            // dependency. `graphics_cmd` still gets the ACQUIRE half of the
+            // ownership-transfer pair when the tier needs one.
+            let value = unsafe { lane.submit(device, lane_batch) };
+            if !acquire_barriers.is_empty() {
+                unsafe {
+                    device.cmd_pipeline_barrier2(
+                        graphics_cmd,
+                        &vk::DependencyInfo::default().buffer_memory_barriers(&acquire_barriers),
+                    );
+                }
+            }
+            value
+        } else {
+            // Same queue: barrier in graphics_cmd orders the copies.
+            unsafe {
+                device.cmd_pipeline_barrier2(
+                    record_cmd,
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&same_queue_barriers),
+                );
+            }
+            render_done_at
+        };
+        // Retire staging on its own timeline (separate queue) or render (fallback).
+        let staging_queue = if separate_queue {
+            &mut self.transfer_retire
+        } else {
+            &mut self.retire
+        };
+        for alloc in staging {
+            staging_queue.push(arrived_at, alloc);
+        }
+        for slot in copied_slots {
+            if let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) {
+                res.arrived_at = Some(arrived_at);
+                self.arrived_since_flush.push(slot);
+            }
+        }
+
+        separate_queue.then_some(arrived_at)
     }
 
     pub fn has_pending(&self) -> bool {
@@ -447,18 +671,29 @@ impl MeshResidency {
     }
 
     pub fn has_garbage(&self) -> bool {
-        !self.retire.is_empty()
+        !self.retire.is_empty() || !self.transfer_retire.is_empty()
     }
 
-    /// Reclaims retired allocations the GPU has passed, handing each to `recycle`
-    /// (which returns it to the main-owned allocator freelist).
+    /// Reclaim render-timeline allocations the GPU has passed.
     pub fn collect(&mut self, current: TimelineValue, recycle: &mut impl FnMut(Allocation)) {
         self.retire.collect(current, |alloc| recycle(alloc));
     }
 
-    /// Reclaims every retired allocation (GPU idle + copies flushed).
+    /// Reclaim transfer-timeline allocations (tighter bound than render).
+    pub fn collect_transfer(
+        &mut self,
+        current: TimelineValue,
+        recycle: &mut impl FnMut(Allocation),
+    ) {
+        self.transfer_retire
+            .collect(current, |alloc| recycle(alloc));
+    }
+
+    /// Reclaims every retired allocation, both queues (GPU idle + copies
+    /// flushed).
     pub fn collect_all(&mut self, recycle: &mut impl FnMut(Allocation)) {
         self.retire.collect_all(|alloc| recycle(alloc));
+        self.transfer_retire.collect_all(|alloc| recycle(alloc));
     }
 
     /// Recycles every resident + retired allocation (GPU idle). Leaves the
@@ -473,6 +708,7 @@ impl MeshResidency {
             }
         }
         self.retire.collect_all(|alloc| recycle(alloc));
+        self.transfer_retire.collect_all(|alloc| recycle(alloc));
         self.pending.clear();
         self.live = 0;
     }
@@ -480,36 +716,26 @@ impl MeshResidency {
 
 /// Smallest immediate-buffer capacity (also the floor the decay stops at).
 const IMM_MIN_CAPACITY: u64 = 64 * 1024;
-/// Frames per decay window: capacity shrinks only when it stayed > 4x the
-/// window's high-water mark for this many consecutive frames.
+/// Decay window for capacity shrinking.
 const IMM_SHRINK_WINDOW: u32 = 600;
 
 /// A growable host-visible buffer written each frame, one per frame-in-flight.
 /// Used for immediate geometry, offsets, and indirect commands.
 pub struct HostBuffer {
-    /// Private: `VK_NULL_HANDLE` until the first non-empty write, so it must
-    /// never be handed out raw. Consumers obtain it through [`Self::bound`],
-    /// which yields `None` while unallocated — turning "bound/pushed a null
-    /// buffer" (a validation error + potential GPU hang) into a `None` the call
-    /// site is forced to handle.
+    /// Null until first write; use [`Self::bound`] to obtain safely.
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: *mut u8,
     capacity: u64,
     usage: vk::BufferUsageFlags,
-    /// Largest `needed` seen in the current decay window.
+    /// Peak need in decay window.
     window_peak: u64,
-    /// Frames elapsed in the current decay window.
+    /// Frame count in decay window.
     window_frames: u32,
 }
 
 impl HostBuffer {
-    /// The device buffer handle, or `None` if nothing has been written yet (the
-    /// handle is still `VK_NULL_HANDLE`). This is the ONLY way to read the
-    /// handle: binding it as a vertex/index buffer or pushing it as a descriptor
-    /// requires a valid handle, so routing every such use through this `Option`
-    /// makes an empty-frame null bind a compile-visible case rather than a
-    /// runtime validation error in a pass far from this buffer.
+    /// Get the buffer handle, or `None` if unallocated.
     pub fn bound(&self) -> Option<vk::Buffer> {
         (self.buffer != vk::Buffer::null()).then_some(self.buffer)
     }
@@ -526,9 +752,7 @@ impl HostBuffer {
         }
     }
 
-    /// Ensures capacity and shrinks oversized buffers when needed.
-    /// Must be called after the frame fence is waited (GPU idle).
-    /// Returns `true` if the buffer handle changed.
+    /// Maintain capacity and shrink if needed. Call after fence is waited.
     pub unsafe fn maintain(
         &mut self,
         instance: &ash::Instance,
@@ -575,28 +799,14 @@ impl HostBuffer {
         unsafe {
             self.destroy(device);
 
-            let info = vk::BufferCreateInfo::default()
-                .size(new_capacity)
-                .usage(self.usage)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let buffer = device
-                .create_buffer(&info, None)
-                .expect("Failed to create immediate buffer");
-            let requirements = device.get_buffer_memory_requirements(buffer);
             let memory_props = instance.get_physical_device_memory_properties(physical);
-            let alloc_info = vk::MemoryAllocateInfo::default()
-                .allocation_size(requirements.size)
-                .memory_type_index(find_memory_type(
-                    &memory_props,
-                    requirements.memory_type_bits,
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                ));
-            let memory = device
-                .allocate_memory(&alloc_info, None)
-                .expect("Failed to allocate immediate buffer memory");
-            device
-                .bind_buffer_memory(buffer, memory, 0)
-                .expect("Failed to bind immediate buffer memory");
+            let (buffer, memory) = create_raw_buffer(
+                device,
+                &memory_props,
+                new_capacity,
+                self.usage,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
             let mapped = device
                 .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
                 .expect("Failed to map immediate buffer") as *mut u8;
@@ -648,8 +858,14 @@ pub(crate) struct QuadIbo {
     capacity: u32,
     /// High-water quad count requested across all uploads (monotonic).
     required: u32,
-    /// Superseded buffers, freed once the timeline passes their last use.
+    /// Superseded live buffers (render-Rev — read only by draws on the
+    /// render timeline) and same-queue-fallback staging (render-Rev covers
+    /// it too, since that copy rides the graphics cmd buffer).
     retire: RetireQueue<(vk::Buffer, vk::DeviceMemory)>,
+    /// Staging for a pattern copy submitted on a SEPARATE transfer queue:
+    /// stamped with the lane's OWN timeline value — see [`MeshResidency`]'s
+    /// field of the same name for the full argument.
+    transfer_retire: RetireQueue<(vk::Buffer, vk::DeviceMemory)>,
 }
 
 /// Initial capacity in quads.
@@ -665,6 +881,7 @@ impl QuadIbo {
             capacity: 0,
             required: 0,
             retire: RetireQueue::new(),
+            transfer_retire: RetireQueue::new(),
         }
     }
 
@@ -680,25 +897,31 @@ impl QuadIbo {
         self.required = self.required.max(quads);
     }
 
-    /// Grows the buffer to cover `required` quads if needed, staging the pattern
-    /// on `cmd` (ordered before any index read by a barrier) and retiring the old
-    /// buffer past `done_at`. No-op when the current buffer already suffices.
+    /// Grows the buffer to cover `required` quads if needed, staging the
+    /// pattern via the transfer lane (mirrors `MeshResidency::flush_copies`'s
+    /// tier/barrier handling) and retiring the old buffer past `done_at`.
+    /// No-op (`None`) when the current buffer already suffices. Returns
+    /// `Some(value)` when the pattern copy submitted on a separate queue:
+    /// `graphics_cmd`'s submission must wait on the lane's semaphore for
+    /// `value` before any draw indexes this buffer.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn ensure(
         &mut self,
         instance: &ash::Instance,
         device: &ash::Device,
         physical: vk::PhysicalDevice,
-        cmd: vk::CommandBuffer,
+        lane: &mut TransferLane,
+        graphics_cmd: vk::CommandBuffer,
+        graphics_family: u32,
         done_at: TimelineValue,
-    ) {
+    ) -> Option<TimelineValue> {
         if self.required <= self.capacity {
-            return;
+            return None;
         }
         let new_capacity = self.required.next_power_of_two().max(QUAD_IBO_MIN_QUADS);
         let index_count = new_capacity as u64 * INDICES_PER_QUAD as u64;
         let size = index_count * std::mem::size_of::<u32>() as u64;
-        let memory_props =
-            unsafe { instance.get_physical_device_memory_properties(physical) };
+        let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
 
         // Device-local destination for the pattern.
         let (buffer, memory) = unsafe {
@@ -722,6 +945,12 @@ impl QuadIbo {
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             )
         };
+
+        let separate_queue = lane.is_separate_queue();
+        let needs_qfot = lane.needs_ownership_transfer();
+        let lane_batch = separate_queue.then(|| unsafe { lane.begin(device) });
+        let record_cmd = lane_batch.as_ref().map_or(graphics_cmd, |b| b.cmd());
+
         unsafe {
             let ptr = device
                 .map_memory(staging_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
@@ -736,28 +965,78 @@ impl QuadIbo {
             device.unmap_memory(staging_mem);
 
             let region = vk::BufferCopy::default().size(size);
-            device.cmd_copy_buffer(cmd, staging, buffer, &[region]);
-            let barrier = [vk::MemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
-                .dst_access_mask(vk::AccessFlags2::INDEX_READ)];
-            device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().memory_barriers(&barrier),
-            );
+            device.cmd_copy_buffer(record_cmd, staging, buffer, &[region]);
+
+            if !separate_queue {
+                let barrier = [vk::BufferMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
+                    .dst_access_mask(vk::AccessFlags2::INDEX_READ)
+                    .buffer(buffer)
+                    .size(size)];
+                device.cmd_pipeline_barrier2(
+                    record_cmd,
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&barrier),
+                );
+            } else if needs_qfot {
+                let release = [vk::BufferMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .dst_access_mask(vk::AccessFlags2::NONE)
+                    .src_queue_family_index(lane.family())
+                    .dst_queue_family_index(graphics_family)
+                    .buffer(buffer)
+                    .size(size)];
+                device.cmd_pipeline_barrier2(
+                    record_cmd,
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&release),
+                );
+            }
+            // else: SecondQueueSameFamily — no barrier needed.
         }
 
+        let arrived_at = if let Some(lane_batch) = lane_batch {
+            let value = unsafe { lane.submit(device, lane_batch) };
+            if needs_qfot {
+                let acquire = [vk::BufferMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
+                    .dst_access_mask(vk::AccessFlags2::INDEX_READ)
+                    .src_queue_family_index(lane.family())
+                    .dst_queue_family_index(graphics_family)
+                    .buffer(buffer)
+                    .size(size)];
+                unsafe {
+                    device.cmd_pipeline_barrier2(
+                        graphics_cmd,
+                        &vk::DependencyInfo::default().buffer_memory_barriers(&acquire),
+                    );
+                }
+            }
+            Some(value)
+        } else {
+            None
+        };
+
+        // Retire old buffer on render timeline, staging on its own (or render).
         if self.capacity > 0 {
             self.retire.push(done_at, (self.buffer, self.memory));
         }
-        self.retire.push(done_at, (staging, staging_mem));
+        match arrived_at {
+            Some(value) => self.transfer_retire.push(value, (staging, staging_mem)),
+            None => self.retire.push(done_at, (staging, staging_mem)),
+        }
         self.buffer = buffer;
         self.memory = memory;
         self.capacity = new_capacity;
+
+        arrived_at
     }
 
-    /// Destroys superseded buffers the GPU has provably finished reading.
+    /// Destroy render-timeline buffers the GPU has passed.
     pub unsafe fn collect(&mut self, device: &ash::Device, current: TimelineValue) {
         self.retire.collect(current, |(buffer, memory)| unsafe {
             device.destroy_buffer(buffer, None);
@@ -765,10 +1044,23 @@ impl QuadIbo {
         });
     }
 
-    /// Destroys the live buffer and every retired one (GPU idle, at teardown).
+    /// Destroy transfer-timeline buffers the GPU has passed.
+    pub unsafe fn collect_transfer(&mut self, device: &ash::Device, current: TimelineValue) {
+        self.transfer_retire
+            .collect(current, |(buffer, memory)| unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            });
+    }
+
+    /// Destroy all buffers.
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe {
             self.retire.collect_all(|(buffer, memory)| {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            });
+            self.transfer_retire.collect_all(|(buffer, memory)| {
                 device.destroy_buffer(buffer, None);
                 device.free_memory(memory, None);
             });
@@ -781,9 +1073,7 @@ impl QuadIbo {
     }
 }
 
-/// Creates a standalone buffer + bound memory of the given usage/properties.
-/// For one-off engine buffers outside the suballocator (the quad IBO); mesh
-/// storage still goes through [`GpuAllocator`].
+/// Create standalone buffer + memory (for one-off engine buffers).
 unsafe fn create_raw_buffer(
     device: &ash::Device,
     memory_props: &vk::PhysicalDeviceMemoryProperties,
@@ -800,7 +1090,11 @@ unsafe fn create_raw_buffer(
         let req = device.get_buffer_memory_requirements(buffer);
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
-            .memory_type_index(find_memory_type(memory_props, req.memory_type_bits, properties));
+            .memory_type_index(find_memory_type(
+                memory_props,
+                req.memory_type_bits,
+                properties,
+            ));
         let memory = device
             .allocate_memory(&alloc_info, None)
             .expect("allocate buffer memory");
@@ -811,25 +1105,221 @@ unsafe fn create_raw_buffer(
     }
 }
 
-/// Per-draw placement, mirrored std430 in mesh3d.vert (single source of truth).
+/// Persistent per-mesh record, indexed by slot, mirrored in shaders.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct DrawOffset {
-    pub offset: [f32; 3], // 0..12  camera-relative translation
-    pub scale: f32,       // 12..16 LOD cell size, 1.0 = full-res
-    pub fade: f32,        // 16..20 screen-door coverage [0,1]; 1.0 = fully drawn
-    pub mode: u32,        // 20..24 bitflags: 1 = FLAT_COLOR, 2 = FADE_OUT
-    pub flat_rgba: u32,   // 24..28 sRGB RGBA8 (R|G<<8|B<<16|A<<24); used iff mode&1
-    pub _pad: u32,        // 28..32 zero
+pub struct MeshRecord {
+    pub block: [i32; 3],
+    pub detail_pass: u32,
+    pub local_off: [f32; 3],
+    pub _pad: u32,
+    pub aabb_min: [f32; 3],
+    pub index_count: u32,
+    pub aabb_max: [f32; 3],
+    pub vertex_offset: i32,
 }
 
-// Stride must match mesh3d.vert exactly; layout drift corrupts every draw.
-const _: () = assert!(std::mem::size_of::<DrawOffset>() == 32);
+// Stride must match the vertex shaders exactly; layout drift corrupts every draw.
+const _: () = assert!(std::mem::size_of::<MeshRecord>() == 64);
 
-/// `VkDrawIndexedIndirectCommand` as a Pod struct so a frame's command array
-/// is one `cast_slice` write into the indirect [`HostBuffer`]. ash's
-/// `vk::DrawIndexedIndirectCommand` is not `bytemuck::Pod`, so we define this
-/// mirror; the `const _` below pins its layout to ash's at compile time.
+/// Per-mesh dynamic style, patched on change.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DrawDyn {
+    pub mode: u32,
+    pub flat_rgba: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<DrawDyn>() == 8);
+
+impl DrawDyn {
+    /// Rest state: plain textured.
+    pub fn resting() -> Self {
+        Self {
+            mode: 0,
+            flat_rgba: 0,
+        }
+    }
+}
+
+/// Persistent record store with deferred writes per frame.
+pub(crate) struct RecordTable {
+    records: Vec<MeshRecord>,
+    dyns: Vec<DrawDyn>,
+    gpu: [RecordCopy; FRAMES_IN_FLIGHT as usize],
+    /// Incremented when drawable meshes change (signals shadow cache).
+    occluder_rev: u64,
+}
+
+struct RecordCopy {
+    records: HostBuffer,
+    dyns: HostBuffer,
+    arenas: HostBuffer,
+    /// Slots to flush on next upload.
+    dirty: Vec<u32>,
+}
+
+/// Flushed buffers for descriptor pushes.
+#[derive(Clone, Copy)]
+pub(crate) struct RecordBuffers {
+    pub records: vk::Buffer,
+    pub dyns: vk::Buffer,
+    pub arenas: vk::Buffer,
+    /// Table length in slots.
+    pub slots: u32,
+}
+
+impl RecordTable {
+    pub fn new() -> Self {
+        Self {
+            records: Vec::new(),
+            dyns: Vec::new(),
+            gpu: std::array::from_fn(|_| RecordCopy {
+                records: HostBuffer::new(vk::BufferUsageFlags::STORAGE_BUFFER),
+                dyns: HostBuffer::new(vk::BufferUsageFlags::STORAGE_BUFFER),
+                arenas: HostBuffer::new(vk::BufferUsageFlags::STORAGE_BUFFER),
+                dirty: Vec::new(),
+            }),
+            occluder_rev: 0,
+        }
+    }
+
+    /// The current occluder-set revision, read by the shadow cache each frame.
+    pub(crate) fn occluder_rev(&self) -> u64 {
+        self.occluder_rev
+    }
+
+    fn mark(&mut self, slot: u32) {
+        for copy in &mut self.gpu {
+            copy.dirty.push(slot);
+        }
+    }
+
+    /// Install a freshly-uploaded mesh's record.
+    pub fn install(&mut self, slot: u32, record: MeshRecord) {
+        let n = slot as usize + 1;
+        if self.records.len() < n {
+            self.records.resize(n, bytemuck::Zeroable::zeroed());
+            self.dyns.resize(n, DrawDyn::resting());
+        }
+        self.records[slot as usize] = record;
+        self.dyns[slot as usize] = DrawDyn::resting();
+        self.occluder_rev += 1;
+        self.mark(slot);
+    }
+
+    /// Mark freed slot dirty to read its dead arena word.
+    pub fn clear_arena(&mut self, slot: u32) {
+        if (slot as usize) < self.records.len() {
+            self.occluder_rev += 1;
+            self.mark(slot);
+        }
+    }
+
+    /// Mark arrived slots dirty to re-read their arena words.
+    pub fn mark_arrived(&mut self, slots: &[u32]) {
+        if !slots.is_empty() {
+            self.occluder_rev += 1;
+        }
+        for &slot in slots {
+            self.mark(slot);
+        }
+    }
+
+    /// Reads a slot's record. `None` for a slot no mesh ever occupied.
+    pub fn record(&self, slot: u32) -> Option<&MeshRecord> {
+        self.records.get(slot as usize)
+    }
+
+    /// Replaces a mover's record (recomposed main-side); the dyn lane is
+    /// untouched so a mover keeps its style.
+    pub fn set_record(&mut self, slot: u32, record: MeshRecord) {
+        let Some(rec) = self.records.get_mut(slot as usize) else {
+            return;
+        };
+        *rec = record;
+        self.occluder_rev += 1; // recomposed geometry moves the occluder
+        self.mark(slot);
+    }
+
+    /// Patch the dynamic style.
+    pub fn set_dyn(&mut self, slot: u32, dyn_lane: DrawDyn) {
+        let Some(d) = self.dyns.get_mut(slot as usize) else {
+            return;
+        };
+        *d = dyn_lane;
+        self.mark(slot);
+    }
+
+    /// Flush slot's pending writes. Must run after fence is waited.
+    pub unsafe fn flush(
+        &mut self,
+        slot: usize,
+        dir: &ArenaDirectory,
+        mesh_res: &MeshResidency,
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical: vk::PhysicalDevice,
+    ) -> Option<RecordBuffers> {
+        let copy = &mut self.gpu[slot];
+        let rec_bytes: &[u8] = bytemuck::cast_slice(&self.records);
+        let dyn_bytes: &[u8] = bytemuck::cast_slice(&self.dyns);
+        const ARENA: usize = std::mem::size_of::<u32>();
+        let arena_len = (self.records.len() * ARENA) as u64;
+        let arena_word =
+            |s: usize| if mesh_res.is_arrived(s as u32) { dir.arena_word(s) } else { 0 };
+        unsafe {
+            let grew = copy
+                .records
+                .maintain(instance, device, physical, rec_bytes.len() as u64)
+                | copy
+                    .dyns
+                    .maintain(instance, device, physical, dyn_bytes.len() as u64)
+                | copy.arenas.maintain(instance, device, physical, arena_len);
+            if rec_bytes.is_empty() {
+                return None;
+            }
+            if grew {
+                // Buffer reallocated; rewrite all contents.
+                let arena_words: Vec<u32> = (0..self.records.len()).map(arena_word).collect();
+                copy.records.write(0, rec_bytes);
+                copy.dyns.write(0, dyn_bytes);
+                copy.arenas.write(0, bytemuck::cast_slice(&arena_words));
+            } else {
+                const REC: usize = std::mem::size_of::<MeshRecord>();
+                const DYN: usize = std::mem::size_of::<DrawDyn>();
+                for &s in &copy.dirty {
+                    let s = s as usize;
+                    copy.records
+                        .write((s * REC) as u64, &rec_bytes[s * REC..(s + 1) * REC]);
+                    copy.dyns
+                        .write((s * DYN) as u64, &dyn_bytes[s * DYN..(s + 1) * DYN]);
+                    copy.arenas
+                        .write((s * ARENA) as u64, &arena_word(s).to_ne_bytes());
+                }
+            }
+        }
+        copy.dirty.clear();
+        Some(RecordBuffers {
+            records: copy.records.bound()?,
+            dyns: copy.dyns.bound()?,
+            arenas: copy.arenas.bound()?,
+            slots: self.records.len() as u32,
+        })
+    }
+
+    pub unsafe fn destroy(&mut self, device: &ash::Device) {
+        for copy in &mut self.gpu {
+            unsafe {
+                copy.records.destroy(device);
+                copy.dyns.destroy(device);
+                copy.arenas.destroy(device);
+            }
+        }
+    }
+}
+
+/// Pod mirror of VkDrawIndexedIndirectCommand for HostBuffer writes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrawIndexedIndirect {
@@ -837,7 +1327,7 @@ pub struct DrawIndexedIndirect {
     pub instance_count: u32,
     pub first_index: u32,
     pub vertex_offset: i32,
-    /// Slot index in the offsets SSBO (instance_count is always 1).
+    /// Slot index in the SSBO.
     pub first_instance: u32,
 }
 
@@ -867,12 +1357,7 @@ const _: () = {
     );
 };
 
-/// 3D pipeline push-descriptor set: binding 0 = offsets SSBO (vertex),
-/// binding 1 = texture array (fragment), binding 2 = per-frame UBO (both),
-/// binding 3 = cascade UBO, binding 4 = shadow map. When `local_read` is set,
-/// binding 5 = the scene depth as an input attachment (fragment), read by the
-/// water-absorption blend variant; the opaque/sky pipelines share this layout
-/// but never touch binding 5 (push descriptors bind only what a shader uses).
+/// Create mesh3d push-descriptor set layout.
 pub fn create_mesh3d_set_layout(
     device: &ash::Device,
     local_read: bool,
@@ -903,6 +1388,11 @@ pub fn create_mesh3d_set_layout(
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(6)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX),
     ];
     if local_read {
         bindings.push(
@@ -923,13 +1413,14 @@ pub fn create_mesh3d_set_layout(
     }
 }
 
-/// Push-descriptor call for mesh3d set 0 bindings 0-4.
+/// Push mesh3d descriptors.
 #[allow(clippy::too_many_arguments)]
 pub fn push_mesh3d_descriptors(
     push: &khr::push_descriptor::Device,
     cmd: vk::CommandBuffer,
     layout: vk::PipelineLayout,
-    offsets: vk::Buffer,
+    records: vk::Buffer,
+    dyns: vk::Buffer,
     tex_sampler: vk::Sampler,
     tex_view: vk::ImageView,
     ubo: vk::Buffer,
@@ -938,7 +1429,11 @@ pub fn push_mesh3d_descriptors(
     shadow_view: vk::ImageView,
 ) {
     let buffer_infos = [vk::DescriptorBufferInfo::default()
-        .buffer(offsets)
+        .buffer(records)
+        .offset(0)
+        .range(vk::WHOLE_SIZE)];
+    let dyn_infos = [vk::DescriptorBufferInfo::default()
+        .buffer(dyns)
         .offset(0)
         .range(vk::WHOLE_SIZE)];
     let image_infos = [vk::DescriptorImageInfo::default()
@@ -978,6 +1473,10 @@ pub fn push_mesh3d_descriptors(
             .dst_binding(4)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&shadow_infos),
+        vk::WriteDescriptorSet::default()
+            .dst_binding(6)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&dyn_infos),
     ];
     unsafe {
         push.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &writes);
@@ -1046,12 +1545,12 @@ mod tests {
         let h0 = a.alloc_slot(10);
         assert_eq!(h0.slot, 0);
         assert_eq!(h0.generation.get(), 1, "generations are 1-based");
-        assert_eq!(a.meta(h0), Some(10));
+        assert_eq!(a.meta_mut(h0).copied(), Some(10));
         assert_eq!(a.live_count(), 1);
 
         assert!(a.free_slot(h0));
         // A stale handle resolves to nothing after its slot is freed.
-        assert_eq!(a.meta(h0), None);
+        assert_eq!(a.meta_mut(h0).copied(), None);
         // Double free is rejected (generation already moved on).
         assert!(!a.free_slot(h0));
         assert_eq!(a.live_count(), 0);
@@ -1060,9 +1559,9 @@ mod tests {
         let h1 = a.alloc_slot(20);
         assert_eq!(h1.slot, 0);
         assert_eq!(h1.generation.get(), 2);
-        assert_eq!(a.meta(h1), Some(20));
+        assert_eq!(a.meta_mut(h1).copied(), Some(20));
         // The old handle still doesn't alias the reused slot.
-        assert_eq!(a.meta(h0), None);
+        assert_eq!(a.meta_mut(h0).copied(), None);
         assert_eq!(a.live_count(), 1);
     }
 
@@ -1117,5 +1616,32 @@ mod tests {
         // The 2x target is always strictly below the old capacity.
         let target = shrink_capacity(16 << 20, 100 << 10).unwrap();
         assert!(target.next_power_of_two().max(IMM_MIN_CAPACITY) < 16 << 20);
+    }
+
+    /// Verify detail_pass encoding/decoding is consistent.
+    #[test]
+    fn compose_then_detail_scale_matches_placement_scale() {
+        use super::{DrawDyn, MeshMeta, MeshRecord, PlacementState};
+        use crate::mesh::{Detail, MeshPlacement};
+        for k in -2..=13i8 {
+            let detail = Detail(k);
+            let meta = MeshMeta {
+                aabb_min: glam::Vec3::ZERO,
+                aabb_max: glam::Vec3::ONE,
+                bounds: [0; 7],
+                vertex_offset: 0,
+                pass: crate::mesh::Pass::Opaque,
+                placement: PlacementState::Pinned,
+                dyn_lane: DrawDyn::resting(),
+            };
+            let p = MeshPlacement::terrain(glam::IVec3::ZERO, detail);
+            let rec = MeshRecord::compose(&meta, p);
+            assert_eq!(
+                rec.detail_scale(),
+                detail.scale(),
+                "biased detail_pass must decode to the placement's scale (k={k})"
+            );
+            assert_eq!(rec.pass(), crate::mesh::Pass::Opaque, "pass bits intact");
+        }
     }
 }

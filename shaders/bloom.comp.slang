@@ -13,7 +13,7 @@
 //
 // Determinism: a pure function of this frame's HDR — no temporal state, no clock.
 
-static const float3 LUMA_709 = float3(0.2126, 0.7152, 0.0722);
+#include "common.slang"
 
 struct Push
 {
@@ -41,7 +41,7 @@ void threshold(uint3 gid: SV_DispatchThreadID)
     // Half-res texel centre → one bilinear tap averages the 2×2 full-res block.
     float2 uv = (float2(gid.xy) + 0.5) / float2(pc.dst_dim);
     float3 hdr = hdrTex.SampleLevel(uv, 0).rgb;
-    float luma = dot(hdr, LUMA_709);
+    float luma = luma709(hdr);
     float knee = smoothstep(pc.thr_lo, pc.thr_hi, luma * pc.exposure);
     dstMip[gid.xy] = float4(hdr * knee * pc.thr_scale, 1.0);
 }

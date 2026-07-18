@@ -9,8 +9,8 @@
 
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
-/// Near plane distance shared by rendering and culling.
-pub const Z_NEAR: f32 = 0.05;
+/// Near plane distance (single source with shader's WATER_Z_NEAR from genconst).
+pub use crate::genconst::Z_NEAR;
 
 /// Validated cylindrical warp strength for the wide-FOV lens: finite and
 /// `0 < s <= MAX`. The *absence* of warp is [`Lens::Rectilinear`], not a zero
@@ -86,7 +86,10 @@ impl WarpMap {
             Lens::Rectilinear => WarpMap::Identity,
             Lens::WideFov { strength } => {
                 let s = strength.get();
-                WarpMap::Active { s, atan_s: s.atan() }
+                WarpMap::Active {
+                    s,
+                    atan_s: s.atan(),
+                }
             }
         }
     }
@@ -128,7 +131,12 @@ impl WarpMap {
     /// GPU push bytes for tonemap remap. Identity yields `s = 0` so the frag skips
     /// remapping. Godray carries sun's screen position; all-zero disables march.
     #[inline]
-    pub fn push(&self, exposure: f32, dither_phase: f32, godray: Godray, vignette: f32) -> WarpPush {
+    pub fn push(
+        &self,
+        exposure: f32,
+        godray: Godray,
+        vignette: f32,
+    ) -> WarpPush {
         let (s, atan_s) = match self {
             WarpMap::Identity => (0.0, 0.0),
             WarpMap::Active { s, atan_s } => (*s, *atan_s),
@@ -137,9 +145,10 @@ impl WarpMap {
             exposure,
             s,
             atan_s,
-            dither_phase,
-            godray0: [godray.sun_uv[0], godray.sun_uv[1], godray.strength, 0.0],
-            godray1: [godray.tint[0], godray.tint[1], godray.tint[2], 0.0],
+            _pad0: 0.0,
+            // Godray jitter correction in .w lanes.
+            godray0: [godray.sun_uv[0], godray.sun_uv[1], godray.strength, godray.jitter_uv[0]],
+            godray1: [godray.tint[0], godray.tint[1], godray.tint[2], godray.jitter_uv[1]],
             vignette,
         }
     }
@@ -152,11 +161,18 @@ pub struct Godray {
     pub sun_uv: [f32; 2],
     pub strength: f32,
     pub tint: [f32; 3],
+    /// Raster jitter in UV; corrects godray depth samples to prevent TAA shimmer.
+    pub jitter_uv: [f32; 2],
 }
 
 impl Godray {
     /// The disabled/no-op value: `strength = 0` skips the march entirely.
-    pub const OFF: Self = Self { sun_uv: [0.0, 0.0], strength: 0.0, tint: [0.0, 0.0, 0.0] };
+    pub const OFF: Self = Self {
+        sun_uv: [0.0, 0.0],
+        strength: 0.0,
+        tint: [0.0, 0.0, 0.0],
+        jitter_uv: [0.0, 0.0],
+    };
 
     /// Projects sun to screen position and gates the veil. Returns
     /// [`Godray::OFF`] when disabled or sun is behind camera (w <= 0).
@@ -168,6 +184,7 @@ impl Godray {
         cam: &Camera3D,
         screen_w: f32,
         screen_h: f32,
+        jitter_uv: [f32; 2],
     ) -> Self {
         if !enabled {
             return Self::OFF;
@@ -186,6 +203,7 @@ impl Godray {
             sun_uv: [px.x / screen_w, px.y / screen_h],
             strength: 1.0,
             tint,
+            jitter_uv,
         }
     }
 }
@@ -199,12 +217,11 @@ pub struct WarpPush {
     pub exposure: f32,
     pub s: f32,
     pub atan_s: f32,
-    /// Ordered-dither temporal phase (`DITHER_PHASE_16[frame % 16]`), fed to the
-    /// tonemap frag's post-tonemap dither. Trailing lane (ABI-appended).
-    pub dither_phase: f32,
-    /// Godray march: sun screen uv (xy), strength gate (z, 0 = no rays), pad (w).
+    /// Pad aligning the following `godray0` float4 to 16 bytes.
+    pub _pad0: f32,
+    /// Godray march: sun screen uv (xy), strength gate (z, 0 = no rays), jitter.x (w).
     pub godray0: [f32; 4],
-    /// Godray sun tint: veil colour (rgb), pad (w).
+    /// Godray sun tint: veil colour (rgb), jitter.y (w).
     pub godray1: [f32; 4],
     /// Vignette strength (0 = off). Trailing lane (ABI-appended).
     pub vignette: f32,
@@ -287,6 +304,11 @@ impl Frustum {
 
     /// Conservative test: checks the corner farthest along each plane normal.
     /// If any corner is outside a plane, the whole box is culled.
+    /// The raw planes (normal.xyz, d), for the GPU cull's identical p-vertex test.
+    pub(crate) fn planes(&self) -> [Vec4; 5] {
+        self.planes
+    }
+
     pub fn intersects_aabb(&self, min: Vec3, max: Vec3) -> bool {
         for plane in &self.planes {
             let n = plane.truncate();
@@ -439,10 +461,14 @@ mod tests {
         // they approach the edge, so a fixed interval near the periphery spans
         // fewer presented-NDC units than the same interval near center.
         let wp = active_map(1.0);
-        let w = |a: f32, b: f32| wp.warp_ndc(Vec2::new(b, 0.0)).x - wp.warp_ndc(Vec2::new(a, 0.0)).x;
+        let w =
+            |a: f32, b: f32| wp.warp_ndc(Vec2::new(b, 0.0)).x - wp.warp_ndc(Vec2::new(a, 0.0)).x;
         let central = w(0.0, 0.1);
         let peripheral = w(0.85, 0.95);
-        assert!(peripheral < central, "peripheral {peripheral} !< central {central}");
+        assert!(
+            peripheral < central,
+            "peripheral {peripheral} !< central {central}"
+        );
     }
 
     #[test]
@@ -510,8 +536,14 @@ mod tests {
         let wide_half_w = base_half_w * wide_map.fov_scale(); // ~13.06
         let mid_x = 0.5 * (base_half_w + wide_half_w);
         let (mn, mx) = aabb_around(Vec3::new(mid_x, 0.0, -10.0), 0.2);
-        assert!(!base.intersects_aabb(mn, mx), "base should cull the periphery");
-        assert!(wide.intersects_aabb(mn, mx), "wide source must keep the periphery");
+        assert!(
+            !base.intersects_aabb(mn, mx),
+            "base should cull the periphery"
+        );
+        assert!(
+            wide.intersects_aabb(mn, mx),
+            "wide source must keep the periphery"
+        );
     }
 
     #[test]
@@ -611,7 +643,10 @@ mod warp_derive {
         let aspect = 16.0 / 9.0;
         let vhalf = (vfov_deg * 0.5).to_radians();
         let base_hhalf = (aspect * vhalf.tan()).atan();
-        eprintln!("vfov={vfov_deg}  aspect={aspect}  base hfov={:.1}", 2.0 * base_hhalf.to_degrees());
+        eprintln!(
+            "vfov={vfov_deg}  aspect={aspect}  base hfov={:.1}",
+            2.0 * base_hhalf.to_degrees()
+        );
         for &s in &STRENGTHS {
             let fs = fov_scale(s);
             let src_hhalf = (fs * base_hhalf.tan()).atan();

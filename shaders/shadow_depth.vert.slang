@@ -1,26 +1,22 @@
-// shadow_depth.vert.slang — depth-only occluder pass for cascaded shadow map.
-// Reuses mesh3d layout (packed uint2) and same SSBO. Light-space view_proj in push budget.
-// Position only; no fragment shader (rasterizer writes depth only).
+// Depth-only shadow map occluder pass; reuses mesh3d vertex format and record layout.
+#include "common.slang"
 
-// Per-draw placement. std430 layout mirrors vk::buffers::DrawOffset exactly —
-// the SAME 32-byte record mesh3d.vert reads. Declaring this as float4 (as an
-// early draft did) halves the stride: every odd instance then reads
-// fade/mode/flat_rgba bits as its placement and every later even instance
-// reads the WRONG draw's offset, scattering occluders and making shadows
-// churn whenever the distance sort reorders the draw list (i.e. whenever the
-// camera moves).
-struct DrawOffset
+// Per-mesh record: mirrors mesh3d's MeshRecord exactly (std430, 64 bytes).
+// Changing the struct stride breaks instance offset calculation.
+struct MeshRecord
 {
-    float3 offset;
-    float scale;
-    float fade;
-    uint mode;
-    uint flat_rgba;
-    uint pad;
+    int3 block;       // world-space origin
+    uint detail_pass; // [0:4] detail+bias, [4:6] pass
+    float3 local_off; // mover offset; zero for terrain
+    uint pad0;
+    float3 aabb_min;
+    uint index_count;
+    float3 aabb_max;
+    int vertex_offset;
 };
 
 [[vk::binding(0, 0)]]
-StructuredBuffer<DrawOffset> draw_offsets;
+StructuredBuffer<MeshRecord> mesh_records;
 
 struct VertexInput
 {
@@ -32,9 +28,15 @@ struct VertexInput
 
 struct PushConstants
 {
-    // One cascade's light-space CleanViewProj, pushed per cascade in the pass's
-    // own push budget (64 B of the guaranteed 128 B minimum).
+    // Light-space view-proj per cascade (mirrors Mesh3dPush layout).
     float4x4 view_proj;
+    float clip;
+    float clip_v;
+    float2 pad;
+    int3 cam_block;
+    int pad0;
+    float3 cam_frac;
+    float pad1;
 };
 
 [[vk::push_constant]]
@@ -50,8 +52,10 @@ float4 vertexMain(VertexInput input) : SV_Position
     float y = float((w0 >> 5) & 0x1F);
     float z = float((w0 >> 10) & 0x1F);
 
-    DrawOffset placement = draw_offsets[input.instance];
-    float3 world = float3(x, y, z) * placement.scale + placement.offset;
+    MeshRecord rec = mesh_records[input.instance];
+    float scale = exp2(float(rec.detail_pass & 0xFu) - float(DETAIL_GPU_BIAS));
+    float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
+    float3 world = float3(x, y, z) * scale + offset;
 
     return mul(pc.view_proj, float4(world, 1.0));
 }

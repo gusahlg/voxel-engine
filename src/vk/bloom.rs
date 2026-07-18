@@ -20,17 +20,16 @@
 
 use ash::vk;
 
+use super::pass;
 use crate::genconst;
-use crate::skeleton::FrameSlot;
+use crate::rev::FrameSlot;
 
 const BLOOM_THRESHOLD_COMP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/bloom_threshold.comp.spv"));
 const BLOOM_DOWNSAMPLE_COMP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/bloom_downsample.comp.spv"));
 
-/// Push constants for both `bloom.comp` entry points (layout matches the Slang
-/// `Push` struct exactly). `src_dim`/`exposure`/`thr_*` are used by whichever
-/// stage needs them; the other stage ignores the unused fields.
+// Shared push constants for threshold and downsample pipelines.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct BloomPush {
@@ -42,35 +41,16 @@ struct BloomPush {
     thr_scale: f32,
 }
 
-fn create_shader_module(device: &ash::Device, bytes: &[u8]) -> vk::ShaderModule {
-    let code =
-        ash::util::read_spv(&mut std::io::Cursor::new(bytes)).expect("invalid embedded SPIR-V");
-    unsafe {
-        device
-            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
-            .expect("create bloom shader module")
-    }
-}
-
-/// The two bloom compute pipelines (shared layout) plus the linear-clamp sampler
-/// the `threshold` stage reads the HDR offscreen through. Set 0 is push-descriptor:
-/// binding 0 = HDR offscreen (combined image sampler), binding 1 = source mip
-/// (storage), binding 2 = destination mip (storage).
 pub(crate) struct BloomState {
     threshold: vk::Pipeline,
     downsample: vk::Pipeline,
     layout: vk::PipelineLayout,
     set_layout: vk::DescriptorSetLayout,
-    /// HDR-offscreen read sampler for the `threshold` stage (linear, no mips).
     sampler: vk::Sampler,
-    /// Mip-filtered sampler the tonemap pass composites the pyramid through.
     composite_sampler: vk::Sampler,
 }
 
 impl BloomState {
-    /// The mip-filtered sampler the tonemap present-copy pairs with the pyramid's
-    /// `sample_view` (binding 1) — LINEAR mip mode so `SampleLevel` blurs across
-    /// the downsampled levels.
     pub(crate) fn composite_sampler(&self) -> vk::Sampler {
         self.composite_sampler
     }
@@ -95,66 +75,29 @@ impl BloomState {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
-        let set_layout = unsafe {
-            device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default()
-                        .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
-                        .bindings(&bindings),
-                    None,
-                )
-                .expect("create bloom set layout")
-        };
-        let push = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(size_of::<BloomPush>() as u32)];
-        let set_layouts = [set_layout];
-        let layout = unsafe {
-            device
-                .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default()
-                        .set_layouts(&set_layouts)
-                        .push_constant_ranges(&push),
-                    None,
-                )
-                .expect("create bloom pipeline layout")
-        };
+        let (set_layout, layout) = pass::push_descriptor_layouts(
+            device,
+            &bindings,
+            size_of::<BloomPush>() as u32,
+            "bloom",
+        );
 
-        let build = |bytes: &[u8]| {
-            let module = create_shader_module(device, bytes);
-            let stage = vk::PipelineShaderStageCreateInfo::default()
-                .module(module)
-                .name(c"main")
-                .stage(vk::ShaderStageFlags::COMPUTE);
-            let info = vk::ComputePipelineCreateInfo::default()
-                .stage(stage)
-                .layout(layout);
-            let pipeline = unsafe {
-                device
-                    .create_compute_pipelines(cache, &[info], None)
-                    .map_err(|(_, err)| err)
-                    .expect("create bloom compute pipeline")[0]
-            };
-            unsafe { device.destroy_shader_module(module, None) };
-            pipeline
-        };
-        let threshold = build(BLOOM_THRESHOLD_COMP);
-        let downsample = build(BLOOM_DOWNSAMPLE_COMP);
+        let threshold = pass::compute_pipeline(
+            device,
+            cache,
+            layout,
+            BLOOM_THRESHOLD_COMP,
+            "bloom threshold",
+        );
+        let downsample = pass::compute_pipeline(
+            device,
+            cache,
+            layout,
+            BLOOM_DOWNSAMPLE_COMP,
+            "bloom downsample",
+        );
 
-        let sampler = unsafe {
-            device
-                .create_sampler(
-                    &vk::SamplerCreateInfo::default()
-                        .mag_filter(vk::Filter::LINEAR)
-                        .min_filter(vk::Filter::LINEAR)
-                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
-                    None,
-                )
-                .expect("create bloom HDR sampler")
-        };
+        let sampler = pass::linear_clamp_sampler(device, "bloom HDR");
         let composite_sampler = unsafe {
             device
                 .create_sampler(
@@ -194,13 +137,6 @@ impl BloomState {
 }
 
 impl super::Renderer {
-    /// Build this slot's bloom pyramid from its finalized HDR offscreen. Recorded
-    /// after the offscreen reaches `SHADER_READ_ONLY_OPTIMAL` (the [`HdrReadable`]
-    /// finalize); leaves the pyramid in `SHADER_READ_ONLY_OPTIMAL` for the tonemap
-    /// present-copy. `exposure` is the metered multiplier the tonemap will apply,
-    /// used only in the threshold knee so the spill tracks the displayed frame.
-    ///
-    /// [`HdrReadable`]: super::HdrReadable
     pub(crate) fn record_bloom_pass(&self, cmd: vk::CommandBuffer, slot: FrameSlot) {
         let device = &self.device.device;
         let bloom = &self.bloom;
@@ -209,7 +145,7 @@ impl super::Renderer {
         let exposure = self.exposure.current().0;
         let levels = chain.mip_views.len();
 
-        // Subresource spanning every mip (color_range() is a single level).
+        // All mip levels.
         let all_mips = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
@@ -260,10 +196,7 @@ impl super::Renderer {
         }
 
         unsafe {
-            // (1) Offscreen is SHADER_READ_ONLY (finalized) but was only made
-            // visible to the tonemap's FRAGMENT stage; extend visibility to this
-            // COMPUTE read. src masks cover every finalize path (render-pass store,
-            // TAA transfer copy, exposure compute) so the barrier is path-agnostic.
+            // Transition HDR image for compute sampling.
             let to_compute = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(
                     vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
@@ -281,8 +214,7 @@ impl super::Renderer {
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .image(hdr_image)
                 .subresource_range(super::color_range())];
-            // Bloom image → GENERAL for storage writes. Fully overwritten every
-            // frame, so discard the old contents (old layout UNDEFINED).
+            // Transition pyramid to storage layout.
             let to_general = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
                 .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
@@ -297,7 +229,6 @@ impl super::Renderer {
                     .image_memory_barriers(&[to_compute[0], to_general[0]]),
             );
 
-            // (2) Threshold → mip 0 (bilinear tap = 2×2 average + soft knee).
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, bloom.threshold);
             let hdr_info = [vk::DescriptorImageInfo::default()
                 .sampler(bloom.sampler)
@@ -326,7 +257,6 @@ impl super::Renderer {
             let mip0 = chain.mip_extents[0];
             let push = BloomPush {
                 dst_dim: [mip0.width, mip0.height],
-                // Threshold samples the offscreen via uv, so src_dim is unused here.
                 src_dim: [self.render_extent.width, self.render_extent.height],
                 exposure,
                 thr_lo: genconst::BLOOM_THRESHOLD_LO,
@@ -342,8 +272,7 @@ impl super::Renderer {
             );
             device.cmd_dispatch(cmd, mip0.width.div_ceil(8), mip0.height.div_ceil(8), 1);
 
-            // (3) Downsample chain: each level reads the previous (RAW → a compute
-            // write→read barrier between dispatches).
+            // Downsample remaining mip levels.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, bloom.downsample);
             for i in 1..levels {
                 let rw = [vk::MemoryBarrier2::default()
@@ -399,7 +328,6 @@ impl super::Renderer {
                 device.cmd_dispatch(cmd, dst.width.div_ceil(8), dst.height.div_ceil(8), 1);
             }
 
-            // (4) Whole pyramid → SHADER_READ_ONLY for the tonemap composite.
             let to_sampled = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
@@ -416,3 +344,4 @@ impl super::Renderer {
         }
     }
 }
+

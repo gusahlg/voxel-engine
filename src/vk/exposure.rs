@@ -25,10 +25,7 @@
 //!    `ExposureState::shared()`, handed across at construction so the main-thread
 //!    `compose()` can read the render thread's latest metered value.
 //!  * `build.rs` compiles `shaders/exposure_reduce.comp.slang` → `exposure_reduce.comp.spv`.
-//!  * The tonemap push (`camera::WarpPush`) gains a trailing `dither_phase: f32`,
-//!    and `vk/mod.rs` sources the tonemap `exposure` from `exposure_shared` and
-//!    the `dither_phase` from `DITHER_PHASE_16[frame % 16]` (== FrameUniforms
-//!    `exposure_dither.y`).
+//!  * `vk/mod.rs` sources the tonemap `exposure` from `exposure_shared`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -37,32 +34,40 @@ use ash::vk;
 
 use super::alloc::{find_memory_type, try_find_memory_type};
 use super::buffers::FRAMES_IN_FLIGHT;
+use super::pass;
 use crate::engine::Engine;
 use crate::genconst;
-use crate::skeleton::{Exposure, ExposureRead, ExposureWrite, FrameSlot};
+use crate::rev::FrameSlot;
+
+/// Exposure multiplier applied before tonemapping.
+#[derive(Clone, Copy, Debug)]
+pub struct Exposure(pub f32);
+
+impl Exposure {
+    /// Neutral default (1.0).
+    pub const DEFAULT: Exposure = Exposure(1.0);
+}
+
+/// Read view of previous-frame exposure (CPU-read side).
+pub struct ExposureRead<'a> {
+    pub(crate) buf: &'a ash::vk::Buffer,
+}
+/// Write view for current-frame exposure (GPU-write side).
+pub struct ExposureWrite<'a> {
+    pub(crate) buf: &'a ash::vk::Buffer,
+}
 
 const EXPOSURE_REDUCE_COMP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/exposure_reduce.comp.spv"));
 
-/// One tile = this many HDR texels per side (mirrors `TILE` in the shader).
-const TILE: u32 = 16;
+// Tile size; matches shader constant.
+const TILE: u32 = crate::genconst::EXPOSURE_TILE;
 
 /// EV-space exposure curve with fixed point at day luma; constants from build.rs.
 fn exposure_curve(log2_luma: f32) -> f32 {
     (genconst::EXPOSURE_EV_SLOPE * (genconst::EXPOSURE_L_DAY_LOG2 - log2_luma))
         .exp2()
         .clamp(genconst::EXPOSURE_CLAMP_LO, genconst::EXPOSURE_CLAMP_HI)
-}
-
-/// Local SPIR-V module builder (pipeline.rs's is private to its module).
-fn create_shader_module(device: &ash::Device, bytes: &[u8]) -> vk::ShaderModule {
-    let code =
-        ash::util::read_spv(&mut std::io::Cursor::new(bytes)).expect("invalid embedded SPIR-V");
-    unsafe {
-        device
-            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
-            .expect("create exposure shader module")
-    }
 }
 
 /// Push constants for `exposure_reduce.comp`.
@@ -103,17 +108,11 @@ impl TileMeans {
                 .expect("create exposure tile-mean buffer")
         };
         let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
-        // The CPU READS every tile mean every frame. Plain HOST_VISIBLE |
-        // HOST_COHERENT memory is typically write-combined — uncached for the
-        // CPU — and sequentially reading ~8k floats from it measured 1.4 ms/f
-        // (85% of the whole frame). Prefer HOST_CACHED (cached reads make the
-        // same loop ~microseconds); fall back where the device has no such
-        // host-visible type.
+        // Prefer HOST_CACHED for performance; fall back to HOST_COHERENT.
         let cached = vk::MemoryPropertyFlags::HOST_VISIBLE
             | vk::MemoryPropertyFlags::HOST_COHERENT
             | vk::MemoryPropertyFlags::HOST_CACHED;
-        let plain = vk::MemoryPropertyFlags::HOST_VISIBLE
-            | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let plain = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let type_index = try_find_memory_type(memory_props, reqs.memory_type_bits, cached)
             .unwrap_or_else(|| find_memory_type(memory_props, reqs.memory_type_bits, plain));
         let memory = unsafe {
@@ -154,18 +153,7 @@ impl TileMeans {
     }
 }
 
-/// Per-slot exposure readback. The compute reduction writes THIS frame's slot
-/// buffer; the CPU reads THE SAME slot — whose previous write belongs to the
-/// frame two-back, the exact frame whose fence [`wait_slot_and_reclaim`] just
-/// waited. Reading `s.other()` (the old rule) touched the immediately previous
-/// frame's buffer, which can still be in flight: a torn, finite-but-wrong
-/// readback. The read happens at record time, BEFORE this frame's dispatch is
-/// submitted, so read-then-overwrite on one buffer is race-free by
-/// construction. The parity rule lives in exactly one function
-/// ([`slot_parity`], used by [`ExposureRing::views`]); callers cannot mix the
-/// views.
-///
-/// [`wait_slot_and_reclaim`]: super::Renderer::wait_slot_and_reclaim
+/// Fence-safe double-buffered exposure readback: read last frame, write this frame from same slot.
 pub struct ExposureRing {
     slots: [TileMeans; FRAMES_IN_FLIGHT as usize],
     tile_count: usize,
@@ -227,11 +215,7 @@ impl ExposureRing {
         } else {
             0.0
         };
-        // Defense in depth: the read buffer's last write is fence-proven
-        // complete (the parity resolver reads the waited slot), so a torn read
-        // should be impossible — but a NaN from a degenerate HDR frame (e.g.
-        // an all-inf tile) must still not poison the filter forever. Hold
-        // `prev` for a frame instead.
+        // Reject NaN from degenerate HDR frames; hold previous value.
         if !mean_log2.is_finite() {
             return prev;
         }
@@ -282,63 +266,17 @@ impl ExposureCompute {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
-        let set_layout = unsafe {
-            device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default()
-                        .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
-                        .bindings(&bindings),
-                    None,
-                )
-                .expect("create exposure set layout")
-        };
-        let push = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(size_of::<ExposurePush>() as u32)];
-        let set_layouts = [set_layout];
-        let layout = unsafe {
-            device
-                .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default()
-                        .set_layouts(&set_layouts)
-                        .push_constant_ranges(&push),
-                    None,
-                )
-                .expect("create exposure pipeline layout")
-        };
-
-        let module = create_shader_module(device, EXPOSURE_REDUCE_COMP);
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .module(module)
-            .name(c"main")
-            .stage(vk::ShaderStageFlags::COMPUTE);
-        let info = vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
-            .layout(layout);
-        let pipeline = unsafe {
-            device
-                .create_compute_pipelines(cache, &[info], None)
-                .map_err(|(_, err)| err)
-                .expect("create exposure compute pipeline")[0]
-        };
-        unsafe { device.destroy_shader_module(module, None) };
-
+        let (set_layout, layout) = pass::push_descriptor_layouts(
+            device,
+            &bindings,
+            size_of::<ExposurePush>() as u32,
+            "exposure",
+        );
+        let pipeline =
+            pass::compute_pipeline(device, cache, layout, EXPOSURE_REDUCE_COMP, "exposure");
         // Linear clamp: tile means smooth a little over the box; edge clamp keeps
         // the border tiles from wrapping.
-        let sampler = unsafe {
-            device
-                .create_sampler(
-                    &vk::SamplerCreateInfo::default()
-                        .mag_filter(vk::Filter::LINEAR)
-                        .min_filter(vk::Filter::LINEAR)
-                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
-                    None,
-                )
-                .expect("create exposure HDR sampler")
-        };
+        let sampler = pass::linear_clamp_sampler(device, "exposure HDR");
 
         ExposureCompute {
             pipeline,
@@ -502,7 +440,7 @@ impl super::Renderer {
     ) -> super::HdrReadable {
         let device = &self.device.device;
         let (hdr_image, hdr_view) = self.hdr_of(slot.index());
-        let from_offscreen = self.hdr_source[slot.index()] == super::HdrSource::Offscreen;
+        let from_offscreen = self.slots[slot].hdr_source == super::HdrSource::Offscreen;
         let exp = &mut self.exposure;
 
         // Parity resolver: read the waited slot's buffer (frame N-2's result,
@@ -528,14 +466,14 @@ impl super::Renderer {
             // host-coherent + freshly fence-cleared).
             if from_offscreen {
                 let pre = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image(hdr_image)
-                .subresource_range(super::color_range())];
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image(hdr_image)
+                    .subresource_range(super::color_range())];
                 device.cmd_pipeline_barrier2(
                     cmd,
                     &vk::DependencyInfo::default().image_memory_barriers(&pre),
@@ -584,13 +522,11 @@ impl super::Renderer {
 
             // Compute storage write → host read (next cycle) and HDR back to
             // color-attachment layout for the tonemap sample.
-            let post = [
-                vk::MemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-                    .dst_access_mask(vk::AccessFlags2::HOST_READ),
-            ];
+            let post = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                .dst_access_mask(vk::AccessFlags2::HOST_READ)];
             let img_post = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)

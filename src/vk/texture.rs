@@ -6,6 +6,7 @@ use ash::{khr, vk};
 use super::image_upload::{
     ImageUpload, create_sampler_set_layout, push_combined_image_sampler, upload_image,
 };
+use super::transfer::TransferLane;
 use crate::font;
 
 pub struct FontAtlas {
@@ -22,7 +23,9 @@ impl FontAtlas {
         device: &ash::Device,
         physical: vk::PhysicalDevice,
         graphics_queue: vk::Queue,
+        graphics_family: u32,
         command_pool: vk::CommandPool,
+        lane: &mut TransferLane,
     ) -> Self {
         let pixels = font::build_atlas();
         let extent = vk::Extent2D {
@@ -48,7 +51,9 @@ impl FontAtlas {
             device,
             physical,
             graphics_queue,
+            graphics_family,
             command_pool,
+            lane,
             &ImageUpload {
                 extent,
                 format: vk::Format::R8_UNORM,

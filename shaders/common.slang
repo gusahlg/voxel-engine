@@ -1,6 +1,5 @@
-// common.slang — shared shader math. Single source of truth for sRGB→linear,
-// dither, and atmosphere/lighting evaluators. Generated constants come from
-// build.rs (voxel_engine::genconst); generated file must exist before shader compile.
+// Shared shader math: sRGB↔linear and atmosphere/lighting.
+// Generated constants from voxel_engine::genconst.
 
 #ifndef VOXEL_COMMON_SLANG
 #define VOXEL_COMMON_SLANG
@@ -17,29 +16,10 @@ float3 srgb_to_linear(float3 c)
     return select(c <= 0.04045, lo, hi);
 }
 
-// 4x4 ordered Bayer dither. Returns signed threshold in [-0.5, +0.5).
-// Caller scales by gain before quantization. Phase rotates pattern frame-to-frame.
-float dither(float phase, float2 frag_coord)
-{
-    // Standard 4x4 Bayer matrix, values 0..15, row-major.
-    const float bayer[16] = {
-         0.0,  8.0,  2.0, 10.0,
-        12.0,  4.0, 14.0,  6.0,
-         3.0, 11.0,  1.0,  9.0,
-        15.0,  7.0, 13.0,  5.0,
-    };
-    int2 p = int2(frag_coord) & 3;
-    float b = bayer[p.y * 4 + p.x];
-    // Normalize the cell to [0,1), add the temporal phase and wrap, then
-    // recentre to [-0.5, +0.5) so the mean offset is ~0 (no DC brightening).
-    return frac((b + 0.5) / 16.0 + phase) - 0.5;
-}
 
 // Per-frame uniform block. Generated from the lane_table in build.rs (the twin of
 // voxel_engine::skeleton::FrameUniformsGpu) so a lane can never drift CPU↔GPU.
 #include "generated/frame_uniforms.slang"
-
-// Phase A/B evaluators (stubs declared here, bodies land later).
 
 // Rec.709 relative luminance of a linear colour (the one weighting used for
 // every luma below — no second copy).

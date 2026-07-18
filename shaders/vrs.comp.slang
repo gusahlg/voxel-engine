@@ -51,5 +51,7 @@ void computeMain(uint3 gid: SV_DispatchThreadID) {
 
     bool farTile = dmax < pc.dThreshold;
     bool flat = (dmax - dmin) < (pc.dThreshold * 0.5);
-    rateOut[gid.xy] = (farTile && flat) ? uint((1u << 2) | 1u) : 0u;
+    // Empty tiles forced to full rate (genuine far has dmax > 0).
+    bool hole = dmax < 1.0e-6;
+    rateOut[gid.xy] = (farTile && flat && !hole) ? uint((1u << 2) | 1u) : 0u;
 }

@@ -44,6 +44,7 @@ pub enum Meter {
     // Tier::CpuSubmit — submit-side CPU (draw_frame)
     Fence,
     Acquire,
+    Upload,
     Pack,
     Record,
     // Record sub-stages: the CPU cost of recording each pass inside `Record`.
@@ -80,7 +81,7 @@ pub enum Meter {
 }
 
 impl Meter {
-    const ALL: [Meter; 37] = [
+    const ALL: [Meter; 38] = [
         Meter::NetEvents,
         Meter::Physics,
         Meter::StreamDrain,
@@ -93,6 +94,7 @@ impl Meter {
         Meter::ListHud,
         Meter::Fence,
         Meter::Acquire,
+        Meter::Upload,
         Meter::Pack,
         Meter::Record,
         Meter::RecShadow,
@@ -135,6 +137,7 @@ impl Meter {
             Meter::ListHud => "list.hud",
             Meter::Fence => "fence",
             Meter::Acquire => "acquire",
+            Meter::Upload => "upload",
             Meter::Pack => "pack",
             Meter::Record => "record",
             Meter::RecShadow => "rec.shadow",
@@ -175,6 +178,7 @@ impl Meter {
             Meter::ListSky | Meter::ListWorld | Meter::ListHud => Tier::CpuList,
             Meter::Fence
             | Meter::Acquire
+            | Meter::Upload
             | Meter::Pack
             | Meter::Record
             | Meter::RecShadow
@@ -213,14 +217,18 @@ pub enum Gauge {
     WorldChunksLive,
     WorldTiles,
     WorldSkins,
+    UploadBytes,
+    DrawsPacked,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 4] = [
+    const ALL: [Gauge; 6] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
         Gauge::WorldSkins,
+        Gauge::UploadBytes,
+        Gauge::DrawsPacked,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -230,6 +238,8 @@ impl Gauge {
             Gauge::WorldChunksLive => "live",
             Gauge::WorldTiles => "tiles",
             Gauge::WorldSkins => "skins",
+            Gauge::UploadBytes => "upload.bytes",
+            Gauge::DrawsPacked => "draws.packed",
         }
     }
 }

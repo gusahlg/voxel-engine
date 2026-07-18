@@ -36,7 +36,11 @@ impl Color {
     pub fn to_linear(self) -> LinearRgb {
         let d = |c: u8| {
             let c = c as f32 / 255.0;
-            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
         };
         LinearRgb([d(self.r), d(self.g), d(self.b)])
     }

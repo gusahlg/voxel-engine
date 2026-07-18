@@ -5,19 +5,9 @@
 //! a timeline handle can never reach acquire/present.
 use ash::vk;
 
-/// A point on the render timeline (opaque, created only by Timeline).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub struct TimelineValue(u64);
+// Monotonic timeline value (canonical counter for GPU sync).
+pub use crate::rev::Rev as TimelineValue;
 
-impl TimelineValue {
-    /// The initial timeline value.
-    pub const START: TimelineValue = TimelineValue(0);
-    pub fn raw(self) -> u64 {
-        self.0
-    }
-}
-
-/// The timeline counter (strictly increasing by design).
 pub struct Timeline {
     sem: vk::Semaphore,
     next: u64,
@@ -37,18 +27,20 @@ impl Timeline {
         Self { sem, next: 0 }
     }
 
-    /// Reserve and return the next timeline value.
     fn reserve(&mut self) -> TimelineValue {
         self.next += 1;
         TimelineValue(self.next)
     }
 
-    /// The highest value ever reserved (for idle/teardown drains).
     pub fn last_reserved(&self) -> TimelineValue {
         TimelineValue(self.next)
     }
 
-    /// Begin a render submission with a reserved signal value.
+    /// The underlying Vulkan semaphore handle.
+    pub fn semaphore(&self) -> vk::Semaphore {
+        self.sem
+    }
+
     pub fn begin_render(&mut self, cmd: vk::CommandBuffer) -> RenderSubmit {
         RenderSubmit {
             value: self.reserve(),
@@ -56,7 +48,6 @@ impl Timeline {
         }
     }
 
-    /// Begin a present-copy submission (mixed binary+timeline).
     pub fn begin_copy(&mut self, cmd: vk::CommandBuffer) -> CopySubmit {
         CopySubmit {
             value: self.reserve(),
@@ -64,7 +55,6 @@ impl Timeline {
         }
     }
 
-    /// Non-blocking current GPU-side counter.
     pub unsafe fn counter(&self, device: &ash::Device) -> TimelineValue {
         let v = unsafe {
             device
@@ -74,7 +64,6 @@ impl Timeline {
         TimelineValue(v)
     }
 
-    /// Blocking wait until the GPU reaches `value`.
     pub unsafe fn wait(&self, device: &ash::Device, value: TimelineValue) {
         let sems = [self.sem];
         let vals = [value.raw()];
@@ -88,7 +77,7 @@ impl Timeline {
         }
     }
 
-    /// A non-blocking probe with NO wait method — hand to the mailbox path.
+    /// Non-blocking probe of the current timeline value.
     pub fn probe<'a>(&self, device: &'a ash::Device) -> TimelineProbe<'a> {
         TimelineProbe {
             sem: self.sem,
@@ -101,7 +90,6 @@ impl Timeline {
     }
 }
 
-/// Non-blocking read of timeline progress (cannot stall).
 #[derive(Clone, Copy)]
 pub struct TimelineProbe<'a> {
     sem: vk::Semaphore,
@@ -119,7 +107,7 @@ impl TimelineProbe<'_> {
     }
 }
 
-/// A render submission in flight (must be submitted to signal the timeline).
+/// Must be submitted to signal timeline.
 #[must_use = "a reserved render submission must be submitted or the timeline stalls"]
 pub struct RenderSubmit {
     value: TimelineValue,
@@ -127,25 +115,36 @@ pub struct RenderSubmit {
 }
 
 impl RenderSubmit {
-    /// Get the value this render will signal.
     pub fn value(&self) -> TimelineValue {
         self.value
     }
 
+    /// Submit with optional cross-queue dependency via `extra_wait`.
     pub unsafe fn submit(
         self,
         device: &ash::Device,
         queue: vk::Queue,
         timeline: &Timeline,
+        extra_wait: Option<(vk::Semaphore, TimelineValue)>,
     ) -> RenderCompletion {
         let signal = [vk::SemaphoreSubmitInfo::default()
             .semaphore(timeline.sem)
             .value(self.value.raw())
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
         let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(self.cmd)];
-        let submit = [vk::SubmitInfo2::default()
+        let waits = extra_wait.map(|(sem, value)| {
+            [vk::SemaphoreSubmitInfo::default()
+                .semaphore(sem)
+                .value(value.raw())
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)]
+        });
+        let mut submit = vk::SubmitInfo2::default()
             .command_buffer_infos(&cmds)
-            .signal_semaphore_infos(&signal)];
+            .signal_semaphore_infos(&signal);
+        if let Some(waits) = &waits {
+            submit = submit.wait_semaphore_infos(waits);
+        }
+        let submit = [submit];
         unsafe {
             device
                 .queue_submit2(queue, &submit, vk::Fence::null())
@@ -155,7 +154,6 @@ impl RenderSubmit {
     }
 }
 
-/// Handle to a completed render (tracked by timeline value).
 #[derive(Clone, Copy)]
 pub struct RenderCompletion(TimelineValue);
 
@@ -168,7 +166,7 @@ impl RenderCompletion {
     }
 }
 
-/// A present-copy submission (mixes binary and timeline synchronization).
+/// Copy submission with binary + timeline sync.
 #[must_use = "a reserved copy submission must be submitted or the timeline stalls"]
 pub struct CopySubmit {
     value: TimelineValue,
@@ -189,16 +187,10 @@ impl CopySubmit {
         let waits = [
             vk::SemaphoreSubmitInfo::default()
                 .semaphore(wait_image.0)
-                // The acquired swapchain image is first transitioned/used as a
-                // color attachment, not by a transfer command. A transfer-only
-                // wait leaves that access unordered from presentation.
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
             vk::SemaphoreSubmitInfo::default()
                 .semaphore(timeline.sem)
                 .value(wait_render.0.raw())
-                // This submission samples render products in fragment work
-                // before any later copies/readback. Cover the real consumers;
-                // tighten only once each dependency is represented separately.
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
         ];
         let signals = [
@@ -224,7 +216,7 @@ impl CopySubmit {
     }
 }
 
-/// A binary semaphore (distinct from the timeline semaphore).
+/// Binary semaphore (type-distinct from timeline).
 #[derive(Clone, Copy)]
 pub struct BinarySemaphore(vk::Semaphore);
 
@@ -244,7 +236,6 @@ impl BinarySemaphore {
     }
 }
 
-/// Typed acquire: cannot be passed a timeline semaphore.
 pub unsafe fn acquire_next_image(
     loader: &ash::khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
@@ -254,7 +245,6 @@ pub unsafe fn acquire_next_image(
     unsafe { loader.acquire_next_image(swapchain, timeout, signal.0, vk::Fence::null()) }
 }
 
-/// Typed present: wait set is binary-only by type.
 pub unsafe fn queue_present(
     loader: &ash::khr::swapchain::Device,
     queue: vk::Queue,

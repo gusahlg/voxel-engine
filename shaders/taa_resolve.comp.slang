@@ -26,10 +26,11 @@ struct Reproj
 struct Push
 {
     float4x4 inv_cur_view_proj; // current inverse view-proj
-    uint2 dim;                  // output size in texels
-    float blend;                // history feedback weight (kept fraction)
-    uint history_valid;         // 0 on the first frame / after a resize
-    uint depth_valid;           // 0 under MSAA: fall back to far-plane unproject
+    uint2 dim;                  // output resolution in texels
+    float2 jitter_px;           // raster jitter this frame
+    float blend;                // history feedback weight
+    uint history_valid;         // 0 first frame or after resize
+    uint depth_valid;           // 0 under MSAA: use far-plane unproject
 };
 [[vk::push_constant]] Push pc;
 
@@ -75,25 +76,20 @@ void computeMain(uint3 gid: SV_DispatchThreadID)
     float3 resolved = current;
     if (pc.history_valid != 0)
     {
-        // Unproject the current texel at the far plane (reversed-Z far depth = 0),
-        // giving a far camera-relative world point (direction), then reproject it
-        // into the previous frame's clip space.
+        // Unproject current texel, then reproject to previous frame clip space.
         float2 ndc = uv_to_ndc(uv);
-        // Texel-centre sample returns the exact stored depth (no filtering
-        // ambiguity at (gid+0.5)/dim). depth 0 = the far-plane fallback.
-        float d = pc.depth_valid != 0 ? depthTex.SampleLevel(uv, 0).x : 0.0;
+        // Depth sampled at jittered position (clean ray passes jitter/dim offset).
+        float2 depth_uv = uv + pc.jitter_px / float2(pc.dim);
+        float d = pc.depth_valid != 0 ? depthTex.SampleLevel(depth_uv, 0).x : 0.0;
+        // Reproject in homogeneous space (avoids inf on far plane).
         float4 worldH = mul(pc.inv_cur_view_proj, float4(ndc, d, 1.0));
-        float3 world = worldH.xyz / worldH.w;
-        float4 prevClip = mul(reproj.prev_view_proj, float4(world, 1.0));
+        float4 prevClip = mul(reproj.prev_view_proj, worldH);
         if (prevClip.w > 0.0)
         {
             float2 prevUv = ndc_to_uv(prevClip.xy / prevClip.w);
-            // Only integrate history that reprojects back on-screen.
             if (all(prevUv >= 0.0) && all(prevUv <= 1.0))
             {
                 float3 hist = rgb_to_ycocg(historyTex.SampleLevel(prevUv, 0).rgb);
-                // Clamp the reprojected history into the current neighbourhood so
-                // disoccluded / mismatched samples cannot ghost.
                 hist = clamp(hist, nmin, nmax);
                 resolved = lerp(current, ycocg_to_rgb(hist), pc.blend);
             }
