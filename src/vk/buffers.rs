@@ -254,6 +254,61 @@ impl MeshRecord {
 }
 
 /// A staged host→device copy owned by a not-yet-flushed [`GpuResident`].
+/// The role of one staged-copy buffer barrier: the same-queue copy→draw
+/// barrier, or the release/acquire halves of a queue-family ownership
+/// transfer. Six call sites used to restate the stage/access pairings
+/// field-by-field — the exact part a reviewer must get right — so the
+/// pairings live here once and a site states only its buffer range, its
+/// draw-side reads, and its role.
+enum CopyBarrier {
+    /// Same queue: copy → vertex input, visible in this submission.
+    Draw,
+    /// QFOT release on the transfer queue: copy → nothing (ownership leaves).
+    Release { src_family: u32, dst_family: u32 },
+    /// QFOT acquire on graphics: nothing → vertex input (ownership arrives).
+    Acquire { src_family: u32, dst_family: u32 },
+}
+
+/// Build one staged-copy barrier for `role` over `buffer[offset..offset+size]`;
+/// `reads` is the draw-side access the data feeds (vertex+index for meshes,
+/// index-only for the shared quad IBO). Ignored by `Release`, whose
+/// destination half is the acquire's job.
+fn copy_barrier(
+    buffer: vk::Buffer,
+    offset: u64,
+    size: u64,
+    reads: vk::AccessFlags2,
+    role: CopyBarrier,
+) -> vk::BufferMemoryBarrier2<'static> {
+    let barrier = vk::BufferMemoryBarrier2::default().buffer(buffer).offset(offset).size(size);
+    match role {
+        CopyBarrier::Draw => barrier
+            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
+            .dst_access_mask(reads),
+        CopyBarrier::Release { src_family, dst_family } => barrier
+            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+            .dst_access_mask(vk::AccessFlags2::NONE)
+            .src_queue_family_index(src_family)
+            .dst_queue_family_index(dst_family),
+        CopyBarrier::Acquire { src_family, dst_family } => barrier
+            .src_stage_mask(vk::PipelineStageFlags2::NONE)
+            .src_access_mask(vk::AccessFlags2::NONE)
+            .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
+            .dst_access_mask(reads)
+            .src_queue_family_index(src_family)
+            .dst_queue_family_index(dst_family),
+    }
+}
+
+/// The draw-side reads a mesh buffer feeds (interleaved vertices + indices).
+fn mesh_reads() -> vk::AccessFlags2 {
+    vk::AccessFlags2::VERTEX_ATTRIBUTE_READ | vk::AccessFlags2::INDEX_READ
+}
+
 struct PendingCopy {
     staging: Allocation,
     dst_buffer: vk::Buffer,
@@ -551,47 +606,34 @@ impl MeshResidency {
                 bytes += copy.size;
                 let (buffer, offset, size) = (copy.dst_buffer, copy.dst_offset, copy.size);
                 if !separate_queue {
-                    same_queue_barriers.push(
-                        vk::BufferMemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
-                            .dst_access_mask(
-                                vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
-                                    | vk::AccessFlags2::INDEX_READ,
-                            )
-                            .buffer(buffer)
-                            .offset(offset)
-                            .size(size),
-                    );
+                    same_queue_barriers.push(copy_barrier(
+                        buffer,
+                        offset,
+                        size,
+                        mesh_reads(),
+                        CopyBarrier::Draw,
+                    ));
                 } else if needs_qfot {
-                    release_barriers.push(
-                        vk::BufferMemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                            .dst_access_mask(vk::AccessFlags2::NONE)
-                            .src_queue_family_index(lane.family())
-                            .dst_queue_family_index(graphics_family)
-                            .buffer(buffer)
-                            .offset(offset)
-                            .size(size),
-                    );
-                    acquire_barriers.push(
-                        vk::BufferMemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                            .src_access_mask(vk::AccessFlags2::NONE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
-                            .dst_access_mask(
-                                vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
-                                    | vk::AccessFlags2::INDEX_READ,
-                            )
-                            .src_queue_family_index(lane.family())
-                            .dst_queue_family_index(graphics_family)
-                            .buffer(buffer)
-                            .offset(offset)
-                            .size(size),
-                    );
+                    release_barriers.push(copy_barrier(
+                        buffer,
+                        offset,
+                        size,
+                        mesh_reads(),
+                        CopyBarrier::Release {
+                            src_family: lane.family(),
+                            dst_family: graphics_family,
+                        },
+                    ));
+                    acquire_barriers.push(copy_barrier(
+                        buffer,
+                        offset,
+                        size,
+                        mesh_reads(),
+                        CopyBarrier::Acquire {
+                            src_family: lane.family(),
+                            dst_family: graphics_family,
+                        },
+                    ));
                 }
                 // else: SecondQueueSameFamily — no queue-family ownership
                 // transfer (same family), and memory visibility is already
@@ -968,27 +1010,20 @@ impl QuadIbo {
             device.cmd_copy_buffer(record_cmd, staging, buffer, &[region]);
 
             if !separate_queue {
-                let barrier = [vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
-                    .dst_access_mask(vk::AccessFlags2::INDEX_READ)
-                    .buffer(buffer)
-                    .size(size)];
+                let barrier =
+                    [copy_barrier(buffer, 0, size, vk::AccessFlags2::INDEX_READ, CopyBarrier::Draw)];
                 device.cmd_pipeline_barrier2(
                     record_cmd,
                     &vk::DependencyInfo::default().buffer_memory_barriers(&barrier),
                 );
             } else if needs_qfot {
-                let release = [vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .dst_access_mask(vk::AccessFlags2::NONE)
-                    .src_queue_family_index(lane.family())
-                    .dst_queue_family_index(graphics_family)
-                    .buffer(buffer)
-                    .size(size)];
+                let release = [copy_barrier(
+                    buffer,
+                    0,
+                    size,
+                    vk::AccessFlags2::INDEX_READ,
+                    CopyBarrier::Release { src_family: lane.family(), dst_family: graphics_family },
+                )];
                 device.cmd_pipeline_barrier2(
                     record_cmd,
                     &vk::DependencyInfo::default().buffer_memory_barriers(&release),
@@ -1000,15 +1035,13 @@ impl QuadIbo {
         let arrived_at = if let Some(lane_batch) = lane_batch {
             let value = unsafe { lane.submit(device, lane_batch) };
             if needs_qfot {
-                let acquire = [vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
-                    .dst_access_mask(vk::AccessFlags2::INDEX_READ)
-                    .src_queue_family_index(lane.family())
-                    .dst_queue_family_index(graphics_family)
-                    .buffer(buffer)
-                    .size(size)];
+                let acquire = [copy_barrier(
+                    buffer,
+                    0,
+                    size,
+                    vk::AccessFlags2::INDEX_READ,
+                    CopyBarrier::Acquire { src_family: lane.family(), dst_family: graphics_family },
+                )];
                 unsafe {
                     device.cmd_pipeline_barrier2(
                         graphics_cmd,
