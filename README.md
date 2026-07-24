@@ -1,8 +1,17 @@
+<!--
+SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
+SPDX-License-Identifier: CC-BY-SA-4.0
+-->
+
 # voxel_engine
 
 A small, fast Vulkan 1.3 voxel renderer in Rust (`ash` + `winit`), built as a
 library with a raylib-shaped polling API. Written to power
 [project_watt_cubed](../project_watt_cubed), usable by any voxel game.
+
+<!-- SPDX-SnippetBegin -->
+<!-- SPDX-SnippetCopyrightText: 2026 Project Watt Cubed contributors -->
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 
 ```rust
 use voxel_engine::{run, Config, Camera3D, Color, Key, Vec3, WarpParams};
@@ -25,6 +34,8 @@ fn main() {
     });
 }
 ```
+
+<!-- SPDX-SnippetEnd -->
 
 ## What it does
 
@@ -71,3 +82,11 @@ cat ~/.cargo/config.toml
 linker = "clang"
 rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=mold"]
 ```
+
+## Licensing and contributions
+
+Project-owned software, including Slang shaders and generated SPIR-V, is
+`AGPL-3.0-or-later`. Project-owned documentation is `CC-BY-SA-4.0`; the
+embedded `font8x8_basic` glyph data retains its upstream public-domain status.
+See [LICENSE.md](LICENSE.md), [THIRD_PARTY.md](THIRD_PARTY.md), and
+[CONTRIBUTING.md](CONTRIBUTING.md).

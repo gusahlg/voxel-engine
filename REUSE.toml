@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
+# SPDX-License-Identifier: CC-BY-SA-4.0
+
+version = 1
+
+SPDX-PackageName = "Project Watt Cubed voxel_engine"
+SPDX-PackageSupplier = "Project Watt Cubed contributors"
+SPDX-PackageDownloadLocation = "https://github.com/gusahlg/voxel-engine"
+
+[[annotations]]
+path = [
+  ".codex",
+  ".gitignore",
+  "Cargo.lock",
+  "Cargo.toml",
+  "deny.toml",
+  "build.rs",
+  "flake.lock",
+  "flake.nix",
+  "nix-run.sh",
+  "scripts/**",
+  "src/**/*.rs",
+  "tests/**/*.rs",
+  "shaders/**/*.slang",
+  "tools/**",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Project Watt Cubed contributors"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = [
+  "AGENTS.md",
+  "README.md",
+  "CONTRIBUTING.md",
+  "CONTRIBUTORS.md",
+  "GOVERNANCE.md",
+  "LICENSE.md",
+  "LICENSING-AUDIT.md",
+  "SECURITY.md",
+  "THIRD_PARTY.md",
+  "TRADEMARKS.md",
+  "REUSE.toml",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Project Watt Cubed contributors"
+SPDX-License-Identifier = "CC-BY-SA-4.0"

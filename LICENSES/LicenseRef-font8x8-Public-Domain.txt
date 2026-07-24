@@ -1,0 +1,17 @@
+LicenseRef-font8x8-Public-Domain
+
+The font8x8 project identifies its font8x8_basic glyph data as:
+
+    License: Public Domain
+
+The upstream header credits Daniel Hepper <daniel@hepper.net>, says that it is
+based on public-domain IBM VGA fonts collected by Marcel Sondaar, and repeats
+that the source material is public domain.
+
+This LicenseRef records the upstream public-domain declaration. It does not
+claim copyright in the underlying glyph data or impose additional conditions.
+
+Upstream project: https://github.com/dhepper/font8x8
+Upstream revision: 8e279d2d864e79128e96188a6b9526cfa3fbfef9
+Upstream file: https://github.com/dhepper/font8x8/blob/8e279d2d864e79128e96188a6b9526cfa3fbfef9/font8x8_basic.h
+Upstream file SHA-256: 49d8df366296b203ca3211bc0672cf2a762135bf12710735b6292756b19dffd5

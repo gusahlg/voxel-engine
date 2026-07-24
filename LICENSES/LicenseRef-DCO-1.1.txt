@@ -1,0 +1,4 @@
+Copyright (C) 2004, 2006 The Linux Foundation and its contributors.
+
+Everyone is permitted to copy and distribute verbatim copies of the
+Developer Certificate of Origin version 1.1, but changing it is not allowed.

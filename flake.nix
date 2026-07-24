@@ -25,10 +25,13 @@
       {
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
+            cargo-deny
             rustc
             cargo
             rustfmt
             clippy
+            python3
+            reuse
             shader-slang
             vulkan-headers
             vulkan-tools
@@ -54,5 +57,17 @@
 
           meta.mainProgram = "demo";
         };
+
+        checks.package = self.packages.${system}.default;
+
+        checks.reuse = pkgs.runCommand "reuse-lint" {
+          nativeBuildInputs = [ pkgs.reuse ];
+        } ''
+          cp -R ${self} source
+          chmod -R u+w source
+          cd source
+          reuse lint
+          touch "$out"
+        '';
       });
 }
