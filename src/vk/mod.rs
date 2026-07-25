@@ -964,6 +964,18 @@ impl Renderer {
         SlotGuard(slot)
     }
 
+    /// SUBOPTIMAL from acquire/present warrants a rebuild only when the
+    /// swapchain no longer matches the window size. Some presentation stacks
+    /// (Windows compositor states, Wine) report SUBOPTIMAL persistently even
+    /// for a correctly sized swapchain; recreating on the flag alone then
+    /// rebuilds the swapchain and render targets every frame, indefinitely.
+    /// Genuine size changes still recreate via `on_resize`/OUT_OF_DATE.
+    fn recreate_if_stale(&mut self) {
+        if self.swapchain.extent != self.size {
+            self.needs_recreate = true;
+        }
+    }
+
     /// Present eligibility, decided before the render submit. Strict ordering:
     /// the previous copy's completion is probed first (non-blocking, so the
     /// mailbox drop never stalls), the acquire is only attempted once we know a
@@ -1010,7 +1022,7 @@ impl Renderer {
                 ) {
                     Ok((image_index, suboptimal)) => {
                         if suboptimal {
-                            self.needs_recreate = true;
+                            self.recreate_if_stale();
                         }
                         present_target = Some(image_index);
                     }
@@ -2180,7 +2192,7 @@ impl Renderer {
             ) {
                 Ok(sub) => {
                     if sub {
-                        self.needs_recreate = true;
+                        self.recreate_if_stale();
                     }
                 }
                 // OUT_OF_DATE/SURFACE_LOST: recreate next frame. Other errors: fatal.
