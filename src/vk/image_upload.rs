@@ -272,12 +272,17 @@ pub fn upload_image(
                     device
                         .begin_command_buffer(acquire_cmd, &begin)
                         .expect("Failed to begin acquire command buffer");
+                    // A queue-family ownership release/acquire pair must carry
+                    // identical old/new layouts in both halves. The transition
+                    // is performed once across the pair; spelling this as
+                    // SHADER_READ→SHADER_READ here leaves validation (and some
+                    // drivers) tracking the image in TRANSFER_DST.
                     let acquire = [vk::ImageMemoryBarrier2::default()
                         .src_stage_mask(vk::PipelineStageFlags2::NONE)
                         .src_access_mask(vk::AccessFlags2::NONE)
                         .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                         .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                        .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                         .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                         .src_queue_family_index(lane.family())
                         .dst_queue_family_index(graphics_family)

@@ -360,9 +360,10 @@ impl super::Renderer {
         eye: DVec3,
         jitter_px: Vec2,
     ) {
-        // Captured before the &mut borrow below: the frame-wide depth layout
-        // (RENDERING_LOCAL_READ when the water-absorption path is active).
-        let depth_layout = self.depth_pass_layout();
+        // Captured before the &mut borrow below. Under MSAA the sampleable image
+        // is the resolve target, written at COLOR_ATTACHMENT_OUTPUT rather than
+        // by early/late depth tests.
+        let (depth_layout, depth_stage, depth_access) = self.sampleable_depth_attachment_state();
         let taa = &mut self.taa;
         let r = taa.read_idx;
         let w = 1 - r;
@@ -401,15 +402,12 @@ impl super::Renderer {
                     .subresource_range(super::color_range()),
             ];
             // Depth → shader-read. Under MSAA the producer is the render pass's
-            // SAMPLE_ZERO resolve (LATE_FRAGMENT_TESTS/DEPTH_STENCIL_ATTACHMENT_WRITE),
-            // covered by this src; restored to `depth_layout` after the dispatch.
+            // SAMPLE_ZERO resolve at COLOR_ATTACHMENT_OUTPUT; single-sampled it
+            // is the ordinary depth attachment. Restore the matching scope below.
             pre.push(
                 vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(
-                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    )
-                    .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .src_stage_mask(depth_stage)
+                    .src_access_mask(depth_access)
                     .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                     .old_layout(depth_layout)
@@ -497,14 +495,8 @@ impl super::Renderer {
             let post = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .dst_stage_mask(
-                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                )
-                .dst_access_mask(
-                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                )
+                .dst_stage_mask(depth_stage)
+                .dst_access_mask(depth_access)
                 .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .new_layout(depth_layout)
                 .image(depth.image())

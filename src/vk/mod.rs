@@ -420,10 +420,8 @@ impl Renderer {
             &mut transfer_lane,
             device.anisotropy,
         );
-        let mesh3d_set_layout = buffers::create_mesh3d_set_layout(
-            &device.device,
-            device.dynamic_rendering_local_read,
-        );
+        let mesh3d_set_layout =
+            buffers::create_mesh3d_set_layout(&device.device, device.dynamic_rendering_local_read);
 
         let minimap = MinimapTexture::new(
             &instance.instance,
@@ -915,6 +913,17 @@ impl Renderer {
         } else {
             vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
         }
+    }
+
+    /// Layout and write scope of the single-sample depth image consumed by
+    /// VRS/TAA/godrays. With MSAA this is a resolve attachment: Vulkan executes
+    /// dynamic-rendering resolves at COLOR_ATTACHMENT_OUTPUT, even for depth.
+    /// Treating it as an ordinary depth-test write leaves the resolve unordered
+    /// on drivers that implement those stages independently.
+    fn sampleable_depth_attachment_state(
+        &self,
+    ) -> (vk::ImageLayout, vk::PipelineStageFlags2, vk::AccessFlags2) {
+        sampleable_depth_attachment_state(self.targets.samples, self.depth_pass_layout())
     }
 
     fn wait_slot_and_reclaim(&mut self, slot: usize) {
@@ -1654,19 +1663,17 @@ impl Renderer {
         // MSAA: the classifier samples the single-sample resolve of this slot's
         // depth from two cycles ago; single-sampled it is that depth directly.
         let depth = self.targets.sampleable_depth(slot);
+        let (depth_layout, depth_stage, depth_access) = self.sampleable_depth_attachment_state();
         let tiles = vrs.tiles();
         unsafe {
             // depth: read for sampling; rate: write target.
             let pre = [
                 vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(
-                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    )
-                    .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .src_stage_mask(depth_stage)
+                    .src_access_mask(depth_access)
                     .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .old_layout(self.depth_pass_layout())
+                    .old_layout(depth_layout)
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .image(depth.image())
                     .subresource_range(depth_range()),
@@ -1738,13 +1745,10 @@ impl Renderer {
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .dst_stage_mask(
-                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    )
-                    .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .dst_stage_mask(depth_stage)
+                    .dst_access_mask(depth_access)
                     .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .new_layout(self.depth_pass_layout())
+                    .new_layout(depth_layout)
                     .image(depth.image())
                     .subresource_range(depth_range()),
             ];
@@ -1952,16 +1956,15 @@ impl Renderer {
             // `depth` is never touched here. Always bound: the tonemap layout
             // declares the depth sampler even when godrays are off (strength 0).
             let depth_image = self.targets.sampleable_depth(slot).image();
+            let (depth_layout, depth_stage, depth_access) =
+                self.sampleable_depth_attachment_state();
             {
                 let depth_to_read = [vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(
-                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    )
-                    .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .src_stage_mask(depth_stage)
+                    .src_access_mask(depth_access)
                     .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .old_layout(self.depth_pass_layout())
+                    .old_layout(depth_layout)
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .image(depth_image)
                     .subresource_range(depth_range())];
@@ -2088,13 +2091,10 @@ impl Renderer {
                 let depth_to_attach = [vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                     .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .dst_stage_mask(
-                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    )
-                    .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .dst_stage_mask(depth_stage)
+                    .dst_access_mask(depth_access)
                     .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .new_layout(self.depth_pass_layout())
+                    .new_layout(depth_layout)
                     .image(depth_image)
                     .subresource_range(depth_range())];
                 device.cmd_pipeline_barrier2(
@@ -2560,16 +2560,10 @@ impl<'a> RenderPass<'a> {
             // restored it to DEPTH_ATTACHMENT_OPTIMAL after sampling.
             if !do_vrs && let Some(resolved) = &r.targets.resolved_depth[slot] {
                 image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(
-                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    )
-                    .dst_access_mask(
-                        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                    )
+                    .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                     .image(resolved.image())
@@ -3171,17 +3165,11 @@ impl<'a> RenderPass<'a> {
         }
     }
 
-    /// Ends dynamic rendering and transitions the offscreen image to be sampled
-    /// by the tonemap pass. Ordering across the render/tonemap submits is
-    /// enforced by the timeline; this barrier only owns the layout + visibility.
-    /// Ends dynamic rendering. When `transition_offscreen` the offscreen is left
-    /// in `SHADER_READ_ONLY_OPTIMAL` for the present-copy tonemap; the exposure
-    /// metering pass (which itself transitions COLOR_ATTACHMENT→SHADER_READ)
-    /// passes `false` so it owns that barrier instead.
-    /// Ends dynamic rendering AND transitions the offscreen to
-    /// `SHADER_READ_ONLY_OPTIMAL`, returning the [`HdrReadable`] proof. Use when
-    /// no later pass writes the offscreen (the common path: TAA and exposure both
-    /// off), so this pass owns the finalization.
+    /// Ends dynamic rendering, transitions the offscreen image to
+    /// `SHADER_READ_ONLY_OPTIMAL`, and returns the [`HdrReadable`] proof. The
+    /// timeline orders later submits; this barrier owns layout and visibility.
+    /// Use when no later pass writes the offscreen, so this pass owns the final
+    /// transition for tonemapping.
     unsafe fn end_sampled(self) -> HdrReadable {
         let slot = self.slot;
         unsafe { self.end(true) };
@@ -3515,6 +3503,30 @@ fn depth_range() -> vk::ImageSubresourceRange {
     }
 }
 
+/// Synchronization state of the depth image sampled by post-processing.
+/// Multisampled rendering writes that image through a resolve operation, whose
+/// synchronization scope is COLOR_ATTACHMENT_OUTPUT/COLOR_ATTACHMENT_WRITE.
+fn sampleable_depth_attachment_state(
+    samples: vk::SampleCountFlags,
+    scene_depth_layout: vk::ImageLayout,
+) -> (vk::ImageLayout, vk::PipelineStageFlags2, vk::AccessFlags2) {
+    if samples == vk::SampleCountFlags::TYPE_1 {
+        (
+            scene_depth_layout,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )
+    } else {
+        (
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        )
+    }
+}
+
 /// See `SlotState::hdr_source`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HdrSource {
@@ -3767,6 +3779,23 @@ mod tests {
             assert_eq!(count.as_u32(), n);
             assert_eq!(count.as_flags(), flag);
         }
+    }
+
+    #[test]
+    fn sampled_depth_resolve_uses_color_output_sync_scope() {
+        let scene_layout = vk::ImageLayout::RENDERING_LOCAL_READ_KHR;
+        let (layout, stage, access) =
+            sampleable_depth_attachment_state(vk::SampleCountFlags::TYPE_8, scene_layout);
+        assert_eq!(layout, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL);
+        assert_eq!(stage, vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
+        assert_eq!(access, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE);
+
+        let (layout, stage, access) =
+            sampleable_depth_attachment_state(vk::SampleCountFlags::TYPE_1, scene_layout);
+        assert_eq!(layout, scene_layout);
+        assert!(stage.contains(vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS));
+        assert!(stage.contains(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS));
+        assert!(access.contains(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE));
     }
 
     #[test]
