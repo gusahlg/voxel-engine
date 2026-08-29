@@ -1,6 +1,6 @@
 <!--
-SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
-SPDX-License-Identifier: CC-BY-SA-4.0
+SPDX-FileCopyrightText: 2026 voxel-engine contributors
+SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
 # voxel_engine
@@ -59,10 +59,17 @@ linker = "clang"
 rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=mold"]
 ```
 
-## Licensing and contributions
+## License
 
-Project-owned software, including Slang shaders and generated SPIR-V, is
-`AGPL-3.0-or-later`. Project-owned documentation is `CC-BY-SA-4.0`; the
-embedded `font8x8_basic` glyph data retains its upstream public-domain status.
-See [LICENSE.md](LICENSE.md), [THIRD_PARTY.md](THIRD_PARTY.md), and
-[CONTRIBUTING.md](CONTRIBUTING.md).
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt))
+- MIT License ([LICENSES/MIT.txt](LICENSES/MIT.txt))
+
+at your option. The embedded `font8x8_basic` glyph data retains its upstream
+public-domain status; see [THIRD_PARTY.md](THIRD_PARTY.md).
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions. See [LICENSE.md](LICENSE.md) and [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -1,12 +1,12 @@
 <!--
-SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
-SPDX-License-Identifier: CC-BY-SA-4.0
+SPDX-FileCopyrightText: 2026 voxel-engine contributors
+SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
 # Third-party material
 
 This file records material included in or required to build `voxel_engine` that
-is not owned by Project Watt Cubed contributors.
+is not owned by the voxel-engine contributors.
 
 ## Embedded `font8x8_basic` glyph data
 
@@ -30,8 +30,8 @@ embedded Rust table:
 python3 tools/gen_font.py --check src/font.rs
 ```
 
-The public-domain glyph data is not relicensed as CC BY-SA. The surrounding
-Rust atlas-building code is `AGPL-3.0-or-later`.
+The glyph data retains its public-domain status. The surrounding Rust
+atlas-building code is `MIT OR Apache-2.0`.
 
 ## Rust dependencies
 
@@ -65,5 +65,4 @@ versions remain warnings.
 The Nix development environment currently resolves `shader-slang` 2026.5.2,
 reported by Nixpkgs as `Apache-2.0` with `LLVM-exception`. It is a build tool,
 not vendored into this repository. The checked-in SPIR-V files are generated
-from Project Watt Cubed's AGPL-covered Slang source and remain
-`AGPL-3.0-or-later`.
+from this project's Slang source and are `MIT OR Apache-2.0` like that source.

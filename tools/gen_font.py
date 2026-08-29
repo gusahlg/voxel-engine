@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 voxel-engine contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
 
 """Reproduce and verify the printable-ASCII font8x8 Rust table."""
 

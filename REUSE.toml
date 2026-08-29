@@ -1,10 +1,10 @@
-# SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
-# SPDX-License-Identifier: CC-BY-SA-4.0
+# SPDX-FileCopyrightText: 2026 voxel-engine contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
 
 version = 1
 
-SPDX-PackageName = "Project Watt Cubed voxel_engine"
-SPDX-PackageSupplier = "Project Watt Cubed contributors"
+SPDX-PackageName = "voxel_engine"
+SPDX-PackageSupplier = "voxel-engine contributors"
 SPDX-PackageDownloadLocation = "https://github.com/gusahlg/voxel-engine"
 
 [[annotations]]
@@ -22,11 +22,12 @@ path = [
   "src/**/*.rs",
   "tests/**/*.rs",
   "shaders/**/*.slang",
+  "shaders_spv/**",
   "tools/**",
 ]
 precedence = "aggregate"
-SPDX-FileCopyrightText = "2026 Project Watt Cubed contributors"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-FileCopyrightText = "2026 voxel-engine contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
 
 [[annotations]]
 path = [
@@ -34,14 +35,11 @@ path = [
   "README.md",
   "CONTRIBUTING.md",
   "CONTRIBUTORS.md",
-  "GOVERNANCE.md",
   "LICENSE.md",
-  "LICENSING-AUDIT.md",
   "SECURITY.md",
   "THIRD_PARTY.md",
-  "TRADEMARKS.md",
   "REUSE.toml",
 ]
 precedence = "aggregate"
-SPDX-FileCopyrightText = "2026 Project Watt Cubed contributors"
-SPDX-License-Identifier = "CC-BY-SA-4.0"
+SPDX-FileCopyrightText = "2026 voxel-engine contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"

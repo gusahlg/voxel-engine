@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 voxel-engine contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
 
 set -euo pipefail
 

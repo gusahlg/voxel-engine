@@ -1,22 +1,21 @@
 <!--
-SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
-SPDX-License-Identifier: CC-BY-SA-4.0
+SPDX-FileCopyrightText: 2026 voxel-engine contributors
+SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
 # Contributing
 
-Thank you for improving Project Watt Cubed and `voxel_engine`.
+Thank you for improving `voxel_engine`.
 
 ## Inbound equals outbound
 
-By contributing, you agree that your software contribution is licensed under
-`AGPL-3.0-or-later` and your creative-content contribution is licensed under
-`CC-BY-SA-4.0`, unless the file clearly records another approved compatible
-licence. You retain your copyright. You grant no separate proprietary
-relicensing permission.
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed under `MIT OR Apache-2.0` as described in
+[LICENSE.md](LICENSE.md), without any additional terms or conditions. You
+retain your copyright.
 
-The project does not require copyright assignment or a proprietary-relicensing
-CLA.
+The project does not require copyright assignment or a CLA.
 
 ## Developer Certificate of Origin
 
@@ -70,8 +69,9 @@ edit it directly. Refresh it with
 review the generated diff, then run `cargo test --test shader_validation`.
 Changes to generated shader constants belong in `build.rs`.
 
-When the repository enables them, contributors must also pass `reuse lint`,
-`cargo deny check`, shader validation and reproducibility checks.
+Licensing metadata and dependency policy are checked with
+`scripts/check-licensing.sh` (`reuse lint`, `cargo deny check`, and the font
+provenance check); `nix flake check` runs `reuse lint` as well.
 
 ## Review
 

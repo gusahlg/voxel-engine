@@ -940,8 +940,8 @@ fn lane_table() -> Vec<Lane> {
 
 fn emit_generated_spdx(s: &mut String) {
     // REUSE-IgnoreStart
-    s.push_str("// SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors\n");
-    s.push_str("// SPDX-License-Identifier: AGPL-3.0-or-later\n\n");
+    s.push_str("// SPDX-FileCopyrightText: 2026 voxel-engine contributors\n");
+    s.push_str("// SPDX-License-Identifier: MIT OR Apache-2.0\n\n");
     // REUSE-IgnoreEnd
 }
 

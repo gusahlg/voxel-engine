@@ -1,6 +1,6 @@
 <!--
-SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
-SPDX-License-Identifier: CC-BY-SA-4.0
+SPDX-FileCopyrightText: 2026 voxel-engine contributors
+SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
 # Security policy

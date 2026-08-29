@@ -1,6 +1,6 @@
 <!--
-SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
-SPDX-License-Identifier: CC-BY-SA-4.0
+SPDX-FileCopyrightText: 2026 voxel-engine contributors
+SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
 # Contributors
@@ -19,9 +19,7 @@ Both contributors retain copyright in their contributions.
 
 Before the first licensed release, replace this paragraph with durable
 references to the dated written confirmations from both contributors that
-their software contributions may be licensed under `AGPL-3.0-or-later` and
-their documentation or creative-content contributions under
-`CC-BY-SA-4.0`.
+their contributions may be licensed under `MIT OR Apache-2.0`.
 
 Commit `6c247bf` is titled “Apply supplied voxel-engine patch” and does not
 record its source in Git metadata. During the 2026-07-24 audit, the maintainer
