@@ -4,6 +4,7 @@ use ash::vk;
 use super::buffers::{FRAMES_IN_FLIGHT, HostBuffer};
 use super::image::{ImageDesc, ImageResource, LayoutUse};
 use super::image_upload::push_combined_image_sampler;
+use super::pass;
 use crate::color::Color;
 
 pub(crate) struct MinimapTexture {
@@ -41,7 +42,6 @@ impl MinimapTexture {
                     },
                     format: vk::Format::R8G8B8A8_UNORM,
                     usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-                    mips: 1,
                     layers: 1,
                     aspect: vk::ImageAspectFlags::COLOR,
                     samples: vk::SampleCountFlags::TYPE_1,
@@ -57,17 +57,7 @@ impl MinimapTexture {
             unsafe { s.maintain(instance, device, physical, byte_len) };
         }
 
-        let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
-        let sampler = unsafe {
-            device
-                .create_sampler(&sampler_info, None)
-                .expect("Failed to create minimap sampler")
-        };
+        let sampler = pass::linear_clamp_sampler(device, "minimap");
 
         let white = Color::rgb(255, 255, 255);
         let mut pixels = vec![0u8; byte_len as usize];

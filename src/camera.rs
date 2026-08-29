@@ -131,12 +131,7 @@ impl WarpMap {
     /// GPU push bytes for tonemap remap. Identity yields `s = 0` so the frag skips
     /// remapping. Godray carries sun's screen position; all-zero disables march.
     #[inline]
-    pub fn push(
-        &self,
-        exposure: f32,
-        godray: Godray,
-        vignette: f32,
-    ) -> WarpPush {
+    pub fn push(&self, exposure: f32, godray: Godray, vignette: f32) -> WarpPush {
         let (s, atan_s) = match self {
             WarpMap::Identity => (0.0, 0.0),
             WarpMap::Active { s, atan_s } => (*s, *atan_s),
@@ -147,8 +142,18 @@ impl WarpMap {
             atan_s,
             _pad0: 0.0,
             // Godray jitter correction in .w lanes.
-            godray0: [godray.sun_uv[0], godray.sun_uv[1], godray.strength, godray.jitter_uv[0]],
-            godray1: [godray.tint[0], godray.tint[1], godray.tint[2], godray.jitter_uv[1]],
+            godray0: [
+                godray.sun_uv[0],
+                godray.sun_uv[1],
+                godray.strength,
+                godray.jitter_uv[0],
+            ],
+            godray1: [
+                godray.tint[0],
+                godray.tint[1],
+                godray.tint[2],
+                godray.jitter_uv[1],
+            ],
             vignette,
         }
     }
@@ -631,33 +636,6 @@ mod warp_derive {
                 (deriv - fov_scale(s)).abs() < 1e-2,
                 "s={s}: center slope {deriv} != fov_scale {}",
                 fov_scale(s)
-            );
-        }
-    }
-
-    #[test]
-    fn print_widening_and_compression_curves() {
-        // Not an assertion — records the numbers that size the FOV->strength ramp
-        // and the periphery supersample. Run with `cargo test -- --nocapture`.
-        let vfov_deg = 70.0_f32;
-        let aspect = 16.0 / 9.0;
-        let vhalf = (vfov_deg * 0.5).to_radians();
-        let base_hhalf = (aspect * vhalf.tan()).atan();
-        eprintln!(
-            "vfov={vfov_deg}  aspect={aspect}  base hfov={:.1}",
-            2.0 * base_hhalf.to_degrees()
-        );
-        for &s in &STRENGTHS {
-            let fs = fov_scale(s);
-            let src_hhalf = (fs * base_hhalf.tan()).atan();
-            // peripheral compression: source-NDC span mapped into the outer 5% of
-            // the presented edge -> how many source texels pack into one edge pixel.
-            let outer = unwarp_x(1.0, s) - unwarp_x(0.95, s);
-            let inner = unwarp_x(0.05, s) - unwarp_x(0.0, s);
-            eprintln!(
-                "s={s:>3}  fov_scale={fs:.3}  src_hfov={:.1}  edge/center source-density={:.2}x",
-                2.0 * src_hhalf.to_degrees(),
-                outer / inner
             );
         }
     }

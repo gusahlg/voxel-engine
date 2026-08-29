@@ -79,11 +79,9 @@ fn create_rate_image(
         format: vk::Format::R8_UINT,
         usage: vk::ImageUsageFlags::STORAGE
             | vk::ImageUsageFlags::FRAGMENT_SHADING_RATE_ATTACHMENT_KHR,
-        mips: 1,
         layers: 1,
         aspect: vk::ImageAspectFlags::COLOR,
         samples: vk::SampleCountFlags::TYPE_1,
     };
     ImageResource::create(device, memory_props, &desc)
 }
-

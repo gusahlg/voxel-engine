@@ -10,11 +10,11 @@
 /// - `tris2d`:      triangle list, Vertex2D{pos px, uv, color}, no depth, alpha blend
 use ash::vk;
 use glam::Mat4;
-use std::io::Cursor;
 
 use crate::frame::SkyDesc;
 use crate::mesh::{DebugVertex, MeshVertex, Pass};
 use crate::vk::device::FragmentShadingRate;
+use crate::vk::pass;
 use crate::vk::vertex_input::{VertexInput, vertex_struct};
 
 pub const PUSH_BYTES_3D: u32 = size_of::<Mesh3dPush>() as u32;
@@ -333,15 +333,15 @@ impl Pipelines {
         let bindings_2d = [Vertex2D::binding()];
         let attributes_2d = Vertex2D::ATTRIBUTES;
 
-        let mesh_vert = create_shader_module(device, MESH3D_VERT);
-        let mesh_frag = create_shader_module(device, MESH3D_FRAG);
-        let debug_vert = create_shader_module(device, DEBUG_VERT);
-        let debug_frag = create_shader_module(device, DEBUG_FRAG);
-        let tri2d_vert = create_shader_module(device, TRIS2D_VERT);
-        let tri2d_frag = create_shader_module(device, TRIS2D_FRAG);
-        let tri2d_tex_frag = create_shader_module(device, TRIS2D_TEX_FRAG);
-        let sky_vert = create_shader_module(device, SKY_VERT);
-        let sky_frag = create_shader_module(device, SKY_FRAG);
+        let mesh_vert = pass::shader_module(device, MESH3D_VERT, "mesh3d vertex");
+        let mesh_frag = pass::shader_module(device, MESH3D_FRAG, "mesh3d fragment");
+        let debug_vert = pass::shader_module(device, DEBUG_VERT, "debug vertex");
+        let debug_frag = pass::shader_module(device, DEBUG_FRAG, "debug fragment");
+        let tri2d_vert = pass::shader_module(device, TRIS2D_VERT, "2d vertex");
+        let tri2d_frag = pass::shader_module(device, TRIS2D_FRAG, "2d fragment");
+        let tri2d_tex_frag = pass::shader_module(device, TRIS2D_TEX_FRAG, "textured 2d fragment");
+        let sky_vert = pass::shader_module(device, SKY_VERT, "sky vertex");
+        let sky_frag = pass::shader_module(device, SKY_FRAG, "sky fragment");
 
         let builder = PipelineBuilder {
             device,
@@ -390,7 +390,8 @@ impl Pipelines {
         );
         // Water absorption variant when dynamic_rendering_local_read available + single-sample.
         let absorb_ok = local_read && samples == vk::SampleCountFlags::TYPE_1;
-        let mesh3d_water_frag = absorb_ok.then(|| create_shader_module(device, MESH3D_WATER_FRAG));
+        let mesh3d_water_frag =
+            absorb_ok.then(|| pass::shader_module(device, MESH3D_WATER_FRAG, "water fragment"));
         let mesh3d_transparent_absorb = mesh3d_water_frag.map(|water_frag| {
             builder.build_depth_input(
                 mesh_vert,
@@ -510,8 +511,8 @@ impl Pipelines {
 
         // Tonemap: its own builder — writes the present format at single-sample
         // with no depth attachment; never VRS.
-        let tonemap_vert = create_shader_module(device, TONEMAP_VERT);
-        let tonemap_frag = create_shader_module(device, TONEMAP_FRAG);
+        let tonemap_vert = pass::shader_module(device, TONEMAP_VERT, "tonemap vertex");
+        let tonemap_frag = pass::shader_module(device, TONEMAP_FRAG, "tonemap fragment");
         let tonemap_builder = PipelineBuilder {
             device,
             cache,
@@ -890,48 +891,13 @@ fn create_vrs_compute(device: &ash::Device, cache: vk::PipelineCache) -> VrsComp
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
-    let set_layout = unsafe {
-        device
-            .create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default()
-                    .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
-                    .bindings(&bindings),
-                None,
-            )
-            .expect("Failed to create VRS set layout")
-    };
-
-    let push = [vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::COMPUTE)
-        .offset(0)
-        .size(size_of::<super::vrs::VrsPush>() as u32)];
-    let set_layouts = [set_layout];
-    let layout = unsafe {
-        device
-            .create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&set_layouts)
-                    .push_constant_ranges(&push),
-                None,
-            )
-            .expect("Failed to create VRS pipeline layout")
-    };
-
-    let module = create_shader_module(device, VRS_COMP);
-    let stage = vk::PipelineShaderStageCreateInfo::default()
-        .module(module)
-        .name(c"main")
-        .stage(vk::ShaderStageFlags::COMPUTE);
-    let info = vk::ComputePipelineCreateInfo::default()
-        .stage(stage)
-        .layout(layout);
-    let pipeline = unsafe {
-        device
-            .create_compute_pipelines(cache, &[info], None)
-            .map_err(|(_, err)| err)
-            .expect("Failed to create VRS compute pipeline")[0]
-    };
-    unsafe { device.destroy_shader_module(module, None) };
+    let (set_layout, layout) = pass::push_descriptor_layouts(
+        device,
+        &bindings,
+        size_of::<super::vrs::VrsPush>() as u32,
+        "vrs",
+    );
+    let pipeline = pass::compute_pipeline(device, cache, layout, VRS_COMP, "vrs");
 
     let depth_sampler = unsafe {
         device
@@ -952,15 +918,5 @@ fn create_vrs_compute(device: &ash::Device, cache: vk::PipelineCache) -> VrsComp
         layout,
         set_layout,
         depth_sampler,
-    }
-}
-
-fn create_shader_module(device: &ash::Device, bytes: &[u8]) -> vk::ShaderModule {
-    let code = ash::util::read_spv(&mut Cursor::new(bytes)).expect("Invalid embedded SPIR-V");
-    let info = vk::ShaderModuleCreateInfo::default().code(&code);
-    unsafe {
-        device
-            .create_shader_module(&info, None)
-            .expect("Failed to create shader module")
     }
 }

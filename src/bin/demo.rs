@@ -1,7 +1,8 @@
 /// Smoke test: packed-vertex mesh via typed API, 2×2 grid with offset-per-draw,
 /// flat floor, orbiting camera, debug overlay. Keys: F fullscreen, V vsync, M MSAA, Esc quit.
 use voxel_engine::{
-    Ao, Camera3D, Color, Config, Detail, Key, Light, MeshData, MeshVertex, Normal, Pass, SkyDesc, Vec3,
+    Ao, Camera3D, Color, Config, Detail, Key, Light, MeshData, MeshVertex, Normal, Pass, SkyDesc,
+    Vec3,
 };
 
 const CHUNK: u8 = 16;

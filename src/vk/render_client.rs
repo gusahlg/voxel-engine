@@ -279,11 +279,7 @@ impl RenderClient {
         self.upload(data, Some(placement))
     }
 
-    fn upload(
-        &mut self,
-        data: &MeshData,
-        placement: Option<MeshPlacement>,
-    ) -> Option<MeshHandle> {
+    fn upload(&mut self, data: &MeshData, placement: Option<MeshPlacement>) -> Option<MeshHandle> {
         let (mut meta, resident) =
             unsafe { build_mesh_resident(&self.device, &mut self.mesh_alloc, data) }?;
         if placement.is_some() {

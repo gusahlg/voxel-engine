@@ -280,21 +280,30 @@ fn copy_barrier(
     reads: vk::AccessFlags2,
     role: CopyBarrier,
 ) -> vk::BufferMemoryBarrier2<'static> {
-    let barrier = vk::BufferMemoryBarrier2::default().buffer(buffer).offset(offset).size(size);
+    let barrier = vk::BufferMemoryBarrier2::default()
+        .buffer(buffer)
+        .offset(offset)
+        .size(size);
     match role {
         CopyBarrier::Draw => barrier
             .src_stage_mask(vk::PipelineStageFlags2::COPY)
             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
             .dst_access_mask(reads),
-        CopyBarrier::Release { src_family, dst_family } => barrier
+        CopyBarrier::Release {
+            src_family,
+            dst_family,
+        } => barrier
             .src_stage_mask(vk::PipelineStageFlags2::COPY)
             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::NONE)
             .dst_access_mask(vk::AccessFlags2::NONE)
             .src_queue_family_index(src_family)
             .dst_queue_family_index(dst_family),
-        CopyBarrier::Acquire { src_family, dst_family } => barrier
+        CopyBarrier::Acquire {
+            src_family,
+            dst_family,
+        } => barrier
             .src_stage_mask(vk::PipelineStageFlags2::NONE)
             .src_access_mask(vk::AccessFlags2::NONE)
             .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
@@ -1010,8 +1019,13 @@ impl QuadIbo {
             device.cmd_copy_buffer(record_cmd, staging, buffer, &[region]);
 
             if !separate_queue {
-                let barrier =
-                    [copy_barrier(buffer, 0, size, vk::AccessFlags2::INDEX_READ, CopyBarrier::Draw)];
+                let barrier = [copy_barrier(
+                    buffer,
+                    0,
+                    size,
+                    vk::AccessFlags2::INDEX_READ,
+                    CopyBarrier::Draw,
+                )];
                 device.cmd_pipeline_barrier2(
                     record_cmd,
                     &vk::DependencyInfo::default().buffer_memory_barriers(&barrier),
@@ -1022,7 +1036,10 @@ impl QuadIbo {
                     0,
                     size,
                     vk::AccessFlags2::INDEX_READ,
-                    CopyBarrier::Release { src_family: lane.family(), dst_family: graphics_family },
+                    CopyBarrier::Release {
+                        src_family: lane.family(),
+                        dst_family: graphics_family,
+                    },
                 )];
                 device.cmd_pipeline_barrier2(
                     record_cmd,
@@ -1040,7 +1057,10 @@ impl QuadIbo {
                     0,
                     size,
                     vk::AccessFlags2::INDEX_READ,
-                    CopyBarrier::Acquire { src_family: lane.family(), dst_family: graphics_family },
+                    CopyBarrier::Acquire {
+                        src_family: lane.family(),
+                        dst_family: graphics_family,
+                    },
                 )];
                 unsafe {
                     device.cmd_pipeline_barrier2(
@@ -1299,8 +1319,13 @@ impl RecordTable {
         let dyn_bytes: &[u8] = bytemuck::cast_slice(&self.dyns);
         const ARENA: usize = std::mem::size_of::<u32>();
         let arena_len = (self.records.len() * ARENA) as u64;
-        let arena_word =
-            |s: usize| if mesh_res.is_arrived(s as u32) { dir.arena_word(s) } else { 0 };
+        let arena_word = |s: usize| {
+            if mesh_res.is_arrived(s as u32) {
+                dir.arena_word(s)
+            } else {
+                0
+            }
+        };
         unsafe {
             let grew = copy
                 .records
@@ -1391,10 +1416,7 @@ const _: () = {
 };
 
 /// Create mesh3d push-descriptor set layout.
-pub fn create_mesh3d_set_layout(
-    device: &ash::Device,
-    local_read: bool,
-) -> vk::DescriptorSetLayout {
+pub fn create_mesh3d_set_layout(device: &ash::Device, local_read: bool) -> vk::DescriptorSetLayout {
     let mut bindings = vec![
         vk::DescriptorSetLayoutBinding::default()
             .binding(0)

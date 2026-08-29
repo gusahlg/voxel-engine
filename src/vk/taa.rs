@@ -128,7 +128,6 @@ fn create_hdr_image(
         usage: vk::ImageUsageFlags::STORAGE
             | vk::ImageUsageFlags::SAMPLED
             | vk::ImageUsageFlags::TRANSFER_SRC,
-        mips: 1,
         layers: 1,
         aspect: vk::ImageAspectFlags::COLOR,
         samples: vk::SampleCountFlags::TYPE_1,

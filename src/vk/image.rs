@@ -1,32 +1,14 @@
-//! The one way to create a GPU image and manage its layout. Subsumes the
-//! duplicated create-image/allocate/bind/view boilerplate at each site and
-//! turns ad hoc inline barriers into a method that reads the prior state off
-//! the image itself instead of a caller-tracked variable.
-use std::ops::Range;
+//! Shared creation and layout tracking for single-mip GPU images.
 
 use ash::vk;
 
 use super::alloc::find_memory_type;
 
-/// Derives a level's dispatch dimensions from the image rather than
-/// re-counting them. Free function: testable without a device.
-fn mip_extent_of(base: vk::Extent2D, level: u32) -> vk::Extent2D {
-    vk::Extent2D {
-        width: (base.width >> level).max(1),
-        height: (base.height >> level).max(1),
-    }
-}
-
-/// What `ImageResource::create` builds: a single 2D(-array) image with one
-/// full-range view over `mips`×`layers`, device-local memory.
-///
-/// Adds `aspect` and `samples` fields: every real site needs an aspect mask
-/// for the view (COLOR vs DEPTH) and targets.rs varies sample count for MSAA.
+/// Description of a single-mip 2D image with one full-range view.
 pub(crate) struct ImageDesc {
     pub extent: vk::Extent2D,
     pub format: vk::Format,
     pub usage: vk::ImageUsageFlags,
-    pub mips: u32,
     pub layers: u32,
     pub aspect: vk::ImageAspectFlags,
     pub samples: vk::SampleCountFlags,
@@ -97,34 +79,13 @@ impl LayoutUse {
     }
 }
 
-/// The ONE way to create and transition an image; owns its layout so a
-/// barrier is `image.transition(device, cmd, to)`, never inline ceremony.
+/// A single-mip image whose current layout is tracked with the resource.
 pub(crate) struct ImageResource {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
-    /// One view per mip level for pyramid passes (read level n while writing n+1).
-    mip_views: Vec<vk::ImageView>,
-    /// Per-mip layout: pyramid reads n while writing n+1 simultaneously.
-    layouts: Vec<vk::ImageLayout>,
-    extent: vk::Extent2D,
+    layout: vk::ImageLayout,
     subresource: vk::ImageSubresourceRange,
-}
-
-/// Groups contiguous mip ranges by layout. One barrier per run; pure.
-fn layout_runs(
-    layouts: &[vk::ImageLayout],
-    levels: Range<u32>,
-) -> Vec<(Range<u32>, vk::ImageLayout)> {
-    let mut runs: Vec<(Range<u32>, vk::ImageLayout)> = Vec::new();
-    for level in levels {
-        let layout = layouts[level as usize];
-        match runs.last_mut() {
-            Some((run, l)) if *l == layout => run.end = level + 1,
-            _ => runs.push((level..level + 1, layout)),
-        }
-    }
-    runs
 }
 
 impl ImageResource {
@@ -141,7 +102,7 @@ impl ImageResource {
                 height: desc.extent.height,
                 depth: 1,
             })
-            .mip_levels(desc.mips)
+            .mip_levels(1)
             .array_layers(desc.layers)
             .samples(desc.samples)
             .tiling(vk::ImageTiling::OPTIMAL)
@@ -179,7 +140,7 @@ impl ImageResource {
         let subresource = vk::ImageSubresourceRange {
             aspect_mask: desc.aspect,
             base_mip_level: 0,
-            level_count: desc.mips,
+            level_count: 1,
             base_array_layer: 0,
             layer_count: desc.layers,
         };
@@ -188,63 +149,26 @@ impl ImageResource {
         } else {
             vk::ImageViewType::TYPE_2D
         };
-        let make_view = |range: vk::ImageSubresourceRange| unsafe {
+        let view = unsafe {
             device
                 .create_image_view(
                     &vk::ImageViewCreateInfo::default()
                         .image(image)
                         .view_type(view_type)
                         .format(desc.format)
-                        .subresource_range(range),
+                        .subresource_range(subresource),
                     None,
                 )
                 .expect("Failed to create image view")
         };
-        let view = make_view(subresource);
-        // Built unconditionally, including the single-mip case where it aliases
-        // `view`: an extra view object is far cheaper than making every caller
-        // branch on whether this image happens to have a chain.
-        let mip_views = (0..desc.mips)
-            .map(|level| {
-                make_view(vk::ImageSubresourceRange {
-                    base_mip_level: level,
-                    level_count: 1,
-                    ..subresource
-                })
-            })
-            .collect();
 
         ImageResource {
             image,
             memory,
             view,
-            mip_views,
-            layouts: vec![vk::ImageLayout::UNDEFINED; desc.mips as usize],
-            extent: desc.extent,
+            layout: vk::ImageLayout::UNDEFINED,
             subresource,
         }
-    }
-
-    pub(crate) fn mips(&self) -> u32 {
-        self.layouts.len() as u32
-    }
-
-    /// Single-level view for `level`. Panics out of range to catch Hi-Z issues early.
-    #[expect(
-        dead_code,
-        reason = "Hi-Z pyramid is the first consumer"
-    )]
-    pub(crate) fn mip_view(&self, level: u32) -> vk::ImageView {
-        self.mip_views[level as usize]
-    }
-
-    #[expect(
-        dead_code,
-        reason = "Hi-Z pyramid is the first consumer"
-    )]
-    pub(crate) fn mip_extent(&self, level: u32) -> vk::Extent2D {
-        assert!(level < self.mips(), "mip {level} out of range");
-        mip_extent_of(self.extent, level)
     }
 
     pub(crate) fn image(&self) -> vk::Image {
@@ -262,37 +186,7 @@ impl ImageResource {
         cmd: vk::CommandBuffer,
         to: LayoutUse,
     ) {
-        self.barrier(device, cmd, 0..self.mips(), to, false);
-    }
-
-    /// Transition one mip level independently (for pyramid reads and writes).
-    #[expect(
-        dead_code,
-        reason = "Hi-Z pyramid is the first consumer"
-    )]
-    pub(crate) fn transition_mip(
-        &mut self,
-        device: &ash::Device,
-        cmd: vk::CommandBuffer,
-        level: u32,
-        to: LayoutUse,
-    ) {
-        self.barrier(device, cmd, level..level + 1, to, false);
-    }
-
-    /// Like `transition_mip`, but hints that the old contents are dead.
-    #[expect(
-        dead_code,
-        reason = "Hi-Z pyramid is the first consumer"
-    )]
-    pub(crate) fn transition_mip_discard(
-        &mut self,
-        device: &ash::Device,
-        cmd: vk::CommandBuffer,
-        level: u32,
-        to: LayoutUse,
-    ) {
-        self.barrier(device, cmd, level..level + 1, to, true);
+        self.barrier(device, cmd, to, false);
     }
 
     /// Declares oldLayout = UNDEFINED for targets being fully overwritten
@@ -303,64 +197,49 @@ impl ImageResource {
         cmd: vk::CommandBuffer,
         to: LayoutUse,
     ) {
-        self.barrier(device, cmd, 0..self.mips(), to, true);
+        self.barrier(device, cmd, to, true);
     }
 
     fn barrier(
         &mut self,
         device: &ash::Device,
         cmd: vk::CommandBuffer,
-        levels: Range<u32>,
         to: LayoutUse,
         discard: bool,
     ) {
         let (new_layout, dst_stage, dst_access) = to.dst();
-        let barriers: Vec<_> = layout_runs(&self.layouts, levels.clone())
-            .into_iter()
-            .map(|(run, old_layout)| {
-                let (src_stage, src_access) = if old_layout == vk::ImageLayout::UNDEFINED {
-                    (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
-                } else {
-                    to.src_when_used()
-                };
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(src_stage)
-                    .src_access_mask(src_access)
-                    .dst_stage_mask(dst_stage)
-                    .dst_access_mask(dst_access)
-                    // The discard hint only forces the layout half; the
-                    // dependency above still names the real prior use.
-                    .old_layout(if discard {
-                        vk::ImageLayout::UNDEFINED
-                    } else {
-                        old_layout
-                    })
-                    .new_layout(new_layout)
-                    .image(self.image)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        base_mip_level: run.start,
-                        level_count: run.end - run.start,
-                        ..self.subresource
-                    })
+        let (src_stage, src_access) = if self.layout == vk::ImageLayout::UNDEFINED {
+            (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
+        } else {
+            to.src_when_used()
+        };
+        let barrier = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(src_stage)
+            .src_access_mask(src_access)
+            .dst_stage_mask(dst_stage)
+            .dst_access_mask(dst_access)
+            // The discard hint only forces the layout half; the dependency
+            // above still names the real prior use.
+            .old_layout(if discard {
+                vk::ImageLayout::UNDEFINED
+            } else {
+                self.layout
             })
-            .collect();
+            .new_layout(new_layout)
+            .image(self.image)
+            .subresource_range(self.subresource)];
         unsafe {
             device.cmd_pipeline_barrier2(
                 cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&barriers),
+                &vk::DependencyInfo::default().image_memory_barriers(&barrier),
             );
         }
-        for level in levels {
-            self.layouts[level as usize] = new_layout;
-        }
+        self.layout = new_layout;
     }
 
     pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
         unsafe {
             device.destroy_image_view(self.view, None);
-            for view in &self.mip_views {
-                device.destroy_image_view(*view, None);
-            }
             device.destroy_image(self.image, None);
             device.free_memory(self.memory, None);
         }
@@ -429,93 +308,5 @@ mod tests {
             layouts[1 - read_idx],
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
         );
-    }
-
-    const GENERAL: vk::ImageLayout = vk::ImageLayout::GENERAL;
-    const READ: vk::ImageLayout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-    const UNDEF: vk::ImageLayout = vk::ImageLayout::UNDEFINED;
-
-    /// Mip extents floor correctly, including non-power-of-two dimensions.
-    #[test]
-    fn mip_extents_follow_the_vulkan_floor_rule() {
-        let base = vk::Extent2D {
-            width: 1920,
-            height: 1080,
-        };
-        assert_eq!(mip_extent_of(base, 0), base);
-        assert_eq!(mip_extent_of(base, 1).width, 960);
-        assert_eq!(mip_extent_of(base, 4).height, 67);
-        // Minimum is 1×1 (never empty).
-        assert_eq!(
-            mip_extent_of(base, 20),
-            vk::Extent2D {
-                width: 1,
-                height: 1
-            }
-        );
-    }
-
-    /// Uniform layouts produce a single barrier run.
-    #[test]
-    fn uniform_layouts_group_into_a_single_run() {
-        assert_eq!(layout_runs(&[UNDEF], 0..1), vec![(0..1, UNDEF)]);
-        assert_eq!(layout_runs(&[READ; 6], 0..6), vec![(0..6, READ)]);
-    }
-
-    /// Diverged pyramids yield one run per distinct old layout.
-    #[test]
-    fn diverged_pyramid_groups_into_runs_per_old_layout() {
-        assert_eq!(
-            layout_runs(&[READ, READ, GENERAL, UNDEF, UNDEF], 0..5),
-            vec![(0..2, READ), (2..3, GENERAL), (3..5, UNDEF)]
-        );
-        // Sub-ranges report only their own levels.
-        assert_eq!(
-            layout_runs(&[READ, READ, GENERAL, UNDEF, UNDEF], 2..4),
-            vec![(2..3, GENERAL), (3..4, UNDEF)]
-        );
-    }
-
-    /// Equal but non-adjacent layouts stay separate (don't merge across gaps).
-    #[test]
-    fn equal_but_noncontiguous_layouts_stay_separate_runs() {
-        assert_eq!(
-            layout_runs(&[READ, GENERAL, READ], 0..3),
-            vec![(0..1, READ), (1..2, GENERAL), (2..3, READ)]
-        );
-    }
-
-    /// Pyramid transitions leave unmodified levels untouched.
-    #[test]
-    fn pyramid_transitions_leave_unnamed_mips_untouched() {
-        const LEVELS: usize = 5;
-        let mut layouts = [UNDEF; LEVELS];
-        layouts[0] = LayoutUse::ComputeStorageWrite.dst().0;
-        assert_eq!(layouts, [GENERAL, UNDEF, UNDEF, UNDEF, UNDEF]);
-
-        for n in 0..LEVELS - 1 {
-            // Publish n: RAW dependency waits on storage write, not just ordered reads.
-            assert_eq!(
-                LayoutUse::SampledAfterComputeWrite.src_when_used(),
-                (
-                    vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::SHADER_STORAGE_WRITE
-                )
-            );
-            layouts[n] = LayoutUse::SampledAfterComputeWrite.dst().0;
-            layouts[n + 1] = LayoutUse::ComputeStorageWrite.dst().0;
-
-            // Invariant: read and write levels have different layouts.
-            assert_eq!(layouts[n], READ);
-            assert_eq!(layouts[n + 1], GENERAL);
-            assert!(layouts[..n].iter().all(|&l| l == READ));
-            assert!(layouts[n + 2..].iter().all(|&l| l == UNDEF));
-        }
-
-        assert_eq!(layouts[LEVELS - 1], GENERAL);
-        layouts[LEVELS - 1] = LayoutUse::SampledAfterComputeWrite.dst().0;
-        assert!(layouts.iter().all(|&l| l == READ));
-        // Uniform layout collapses to a single barrier.
-        assert_eq!(layout_runs(&layouts, 0..LEVELS as u32), vec![(0..5, READ)]);
     }
 }

@@ -127,11 +127,26 @@ vertex_struct! {
 
 impl MeshVertex {
     /// Only constructor: AO and light mandatory (prevents silent defaults).
-    pub const fn new(pos: [u8; 3], normal: Normal, layer: u16, ao: Ao, light: Light, water: bool) -> Self {
+    pub const fn new(
+        pos: [u8; 3],
+        normal: Normal,
+        layer: u16,
+        ao: Ao,
+        light: Light,
+        water: bool,
+    ) -> Self {
         Self::pack(pos, normal, layer, ao.0, light.sky, light.block, water)
     }
 
-    const fn pack(pos: [u8; 3], normal: Normal, layer: u16, ao: u8, sky: u8, block: u8, water: bool) -> Self {
+    const fn pack(
+        pos: [u8; 3],
+        normal: Normal,
+        layer: u16,
+        ao: u8,
+        sky: u8,
+        block: u8,
+        water: bool,
+    ) -> Self {
         // Chunk-local coords must be 0..=16. The 5-bit field also holds
         // 17..=31, so an out-of-range coord stores silently at the wrong
         // position rather than corrupting a neighbor — caught in debug only.
@@ -506,7 +521,9 @@ mod tests {
 
     /// A quad wound `[0,1,2,0,2,3]` seen from outside, layer irrelevant.
     fn quad_for(normal: Normal) -> [MeshVertex; 4] {
-        std::array::from_fn(|i| MeshVertex::new([i as u8, 0, 0], normal, 0, Ao::NONE, Light::FULL, false))
+        std::array::from_fn(|i| {
+            MeshVertex::new([i as u8, 0, 0], normal, 0, Ao::NONE, Light::FULL, false)
+        })
     }
 
     #[test]

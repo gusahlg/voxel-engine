@@ -549,7 +549,10 @@ unsafe fn alloc_from_pool(
         }
     };
     let block = blocks[index].as_mut().expect("slot was just filled");
-    let offset = block.free_list.alloc(size, align).expect("fresh block fits");
+    let offset = block
+        .free_list
+        .alloc(size, align)
+        .expect("fresh block fits");
     Ok(make_allocation(block, index, offset, size, pool))
 }
 
@@ -723,20 +726,6 @@ fn pick_memory_type(
         return Some(i);
     }
     None
-}
-
-#[cfg(test)]
-impl Allocation {
-    pub(crate) fn for_test(buffer: vk::Buffer, offset: u64, size: u64) -> Self {
-        Allocation {
-            buffer,
-            offset,
-            size,
-            mapped: None,
-            block: 0,
-            pool: Pool::Device,
-        }
-    }
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use ash::vk;
 
 use super::alloc::find_memory_type;
 use super::buffers::{FRAMES_IN_FLIGHT, HostBuffer, RecordBuffers};
+use super::pass;
 use crate::camera::Frustum;
 use crate::mesh::Pass;
 
@@ -320,28 +321,7 @@ impl CullState {
                 )
                 .expect("create cull pipeline layout")
         };
-        let code = ash::util::read_spv(&mut std::io::Cursor::new(CULL_COMP))
-            .expect("cull.comp.spv is embedded and aligned");
-        let module = unsafe {
-            device
-                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
-                .expect("create cull shader module")
-        };
-        let info = vk::ComputePipelineCreateInfo::default()
-            .stage(
-                vk::PipelineShaderStageCreateInfo::default()
-                    .stage(vk::ShaderStageFlags::COMPUTE)
-                    .module(module)
-                    // slangc renames the entry point to "main" in the SPIR-V.
-                    .name(c"main"),
-            )
-            .layout(layout);
-        let pipeline = unsafe {
-            device
-                .create_compute_pipelines(cache, &[info], None)
-                .expect("create cull pipeline")[0]
-        };
-        unsafe { device.destroy_shader_module(module, None) };
+        let pipeline = pass::compute_pipeline(device, cache, layout, CULL_COMP, "cull");
         Self {
             set_layout,
             layout,

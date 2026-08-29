@@ -37,7 +37,10 @@ fn all_tracked_spirv_modules_pass_spirv_val() {
             ));
         }
     }
-    assert!(checked > 10, "expected the full module inventory, found {checked}");
+    assert!(
+        checked > 10,
+        "expected the full module inventory, found {checked}"
+    );
     assert!(
         failures.is_empty(),
         "invalid SPIR-V modules in the tracked inventory:\n{}",

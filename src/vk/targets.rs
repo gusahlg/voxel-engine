@@ -359,7 +359,6 @@ impl RenderTargets {
                     usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
                         | vk::ImageUsageFlags::SAMPLED
                         | vk::ImageUsageFlags::INPUT_ATTACHMENT,
-                    mips: 1,
                     layers: 1,
                     aspect: vk::ImageAspectFlags::DEPTH,
                     samples,
@@ -378,7 +377,6 @@ impl RenderTargets {
                         // MSAA resolve target for post-pass sampling.
                         usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
                             | vk::ImageUsageFlags::SAMPLED,
-                        mips: 1,
                         layers: 1,
                         aspect: vk::ImageAspectFlags::DEPTH,
                         samples: vk::SampleCountFlags::TYPE_1,
@@ -396,7 +394,6 @@ impl RenderTargets {
                     format: color_format,
                     usage: vk::ImageUsageFlags::COLOR_ATTACHMENT
                         | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
-                    mips: 1,
                     layers: 1,
                     aspect: vk::ImageAspectFlags::COLOR,
                     samples,
@@ -415,7 +412,6 @@ impl RenderTargets {
                     usage: vk::ImageUsageFlags::COLOR_ATTACHMENT
                         | vk::ImageUsageFlags::SAMPLED
                         | vk::ImageUsageFlags::TRANSFER_DST,
-                    mips: 1,
                     layers: 1,
                     aspect: vk::ImageAspectFlags::COLOR,
                     samples: vk::SampleCountFlags::TYPE_1,
@@ -452,9 +448,9 @@ impl RenderTargets {
     }
 
     /// The single-sample depth VRS/TAA/godrays sample: the MSAA resolve target
-    /// when multisampled, else the (already single-sample) `depth`. Both rest in
-    /// `DEPTH_ATTACHMENT_OPTIMAL` between passes, so consumers share one barrier
-    /// shape regardless of sample count.
+    /// when multisampled, else the (already single-sample) `depth`. The resolve
+    /// rests in `DEPTH_ATTACHMENT_OPTIMAL`; the single-sample image may instead
+    /// use `RENDERING_LOCAL_READ_KHR`, so consumers derive its barrier state.
     pub(crate) fn sampleable_depth(&self, slot: usize) -> &ImageResource {
         self.resolved_depth[slot]
             .as_ref()
