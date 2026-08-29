@@ -65,7 +65,10 @@ cargo test
 
 Shader changes should also be compiled with the pinned Slang toolchain and
 validated. Checked-in SPIR-V is a fallback generated from `shaders/`; do not
-edit it directly. Changes to generated shader constants belong in `build.rs`.
+edit it directly. Refresh it with
+`nix develop --command env VOXEL_ENGINE_REFRESH_SHADER_FALLBACKS=1 cargo check --locked`,
+review the generated diff, then run `cargo test --test shader_validation`.
+Changes to generated shader constants belong in `build.rs`.
 
 When the repository enables them, contributors must also pass `reuse lint`,
 `cargo deny check`, shader validation and reproducibility checks.

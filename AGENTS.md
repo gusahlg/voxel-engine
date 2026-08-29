@@ -2,16 +2,20 @@
 
 ## Project Structure & Module Organization
 
-This is a Rust 2024 Vulkan renderer experiment using `ash` and `winit`.
-Application entry is [src/main.rs](/home/gusahlg/repos/voxel-engine/src/main.rs), which creates the event loop and `App`. Vulkan code lives under `src/vk/`, with renderer state in `src/vk/renderer/`. Device selection and logical-device setup are in `src/vk/renderer/device/`, frame synchronization and command buffers in `src/vk/renderer/frame/`, and pipeline/shader helpers in `src/vk/renderer/rendering/`. Slang shader sources are in `shaders/`; compiled SPIR-V outputs are written to `shaders_spv/` by `build.rs`.
+This is a Rust 2024 Vulkan renderer library using `ash` and `winit`. The public
+API starts in `src/lib.rs`, the runnable example is `src/bin/demo.rs`, and Vulkan
+implementation modules live under `src/vk/`. Slang sources are in `shaders/`;
+`build.rs` compiles them into Cargo's output directory and uses `shaders_spv/`
+only as a checked-in fallback. Refresh that fallback explicitly as documented
+in the README.
 
 ## Build, Test, and Development Commands
 
 - `nix develop`: enter the intended Linux dev shell with Rust, Slang `slangc`, Vulkan loader/tools, Wayland, and X11 dependencies.
 - `cargo check`: type-check the project and run `build.rs`, including shader compilation.
-- `cargo build`: build the `vk_rust_renderer` binary.
-- `cargo run`: build and launch the renderer window locally.
-- `cargo test`: run unit/integration tests when present.
+- `cargo build`: build the library and demo.
+- `cargo run --bin demo`: build and launch the renderer window locally.
+- `cargo test`: run the host-side unit and integration tests.
 - `cargo fmt`: format Rust code before committing.
 - `vulkaninfo --summary`: verify that Vulkan is visible on the host when runtime initialization fails.
 
@@ -21,7 +25,11 @@ Use standard `rustfmt` formatting with 4-space indentation. Follow Rust naming c
 
 ## Testing Guidelines
 
-There are no tests in the current tree. Add focused unit tests beside Rust modules with `#[cfg(test)]` where logic is host-testable, and integration tests under `tests/` only when they do not require a display or GPU. For renderer behavior, at minimum run `cargo check` and, when hardware/display access is available, `cargo run`.
+Add focused unit tests beside Rust modules where logic is host-testable, and
+integration tests under `tests/` when they do not require a display or GPU. Run
+`cargo test --all-targets`; shader changes also require
+`cargo test --test shader_validation`. Exercise renderer changes with validation
+layers when Vulkan hardware and a display are available.
 
 ## Commit & Pull Request Guidelines
 

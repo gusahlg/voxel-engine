@@ -9,40 +9,14 @@ A small, fast Vulkan 1.3 voxel renderer in Rust (`ash` + `winit`), built as a
 library with a raylib-shaped polling API. Written to power
 [project_watt_cubed](../project_watt_cubed), usable by any voxel game.
 
-<!-- SPDX-SnippetBegin -->
-<!-- SPDX-SnippetCopyrightText: 2026 Project Watt Cubed contributors -->
-<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-
-```rust
-use voxel_engine::{run, Config, Camera3D, Color, Key, Vec3, WarpParams};
-
-fn main() {
-    voxel_engine::run(Config::default(), move |eng| {
-        if eng.is_key_pressed(Key::Escape) || eng.should_close() {
-            return false;
-        }
-        let cam = Camera3D { position: Vec3::new(0.0, 10.0, 20.0),
-                             target: Vec3::ZERO, up: Vec3::Y, fovy: 70.0,
-                             warp: WarpParams::IDENTITY };
-        let mut f = eng.begin_frame(Color::SKYBLUE);
-        {
-            let mut f3 = f.begin_3d(&cam);
-            f3.draw_cube(Vec3::ZERO, Vec3::splat(2.0), Color::RED);
-        }
-        f.draw_text("hello", 16, 16, 20, Color::RAYWHITE);
-        true
-    });
-}
-```
-
-<!-- SPDX-SnippetEnd -->
+See the maintained [demo](src/bin/demo.rs) for a complete API example.
 
 ## What it does
 
 - **Frame loop**: `run(config, |eng| ...)` — a per-frame callback with polled
   input (edge + held keys, drainable char queue, raw mouse deltas with cursor
   capture), delta time, and an optional frame cap. Winit 0.30 underneath.
-- **Meshes**: 16-byte unlit vertices (`pos f32x3 + color u8x4`), u32 indices.
+- **Meshes**: packed 8-byte world vertices, u32 indices.
   Uploads land in device-local memory suballocated from 64 MiB blocks (one
   `vkAllocateMemory` per block, not per mesh); on unified-memory GPUs (Apple
   Silicon) uploads are direct memcpys, elsewhere a staging copy recorded into
@@ -67,7 +41,9 @@ fn main() {
   V vsync, M MSAA cycle, Esc quit).
 - Shaders are Slang (`shaders/`), compiled by `build.rs` with `slangc` and
   embedded into the binary; checked-in SPIR-V under `shaders_spv/` is used as
-  a fallback when `slangc` is not installed.
+  a fallback when `slangc` is not installed. Ordinary builds never rewrite
+  these files. Refresh them with the pinned compiler via
+  `nix develop --command env VOXEL_ENGINE_REFRESH_SHADER_FALLBACKS=1 cargo check --locked`.
 - `nix develop` — dev shell with Rust, slangc, the Vulkan loader/tools and
   validation layers. `nix run` builds and runs the demo.
 - macOS: install MoltenVK + the Vulkan loader (`brew install molten-vk

@@ -1,5 +1,7 @@
 use std::{env, fs, path::Path, path::PathBuf, process::Command};
 
+const REFRESH_SHADER_FALLBACKS: &str = "VOXEL_ENGINE_REFRESH_SHADER_FALLBACKS";
+
 struct Shader<'a> {
     src: &'a str,
     stage: &'a str,
@@ -127,15 +129,33 @@ fn have_slangc() -> bool {
         .unwrap_or(false)
 }
 
+fn env_flag(name: &str) -> bool {
+    match env::var(name) {
+        Err(env::VarError::NotPresent) => false,
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => panic!("{name} must be 0 or 1, got {value:?}"),
+        Err(env::VarError::NotUnicode(_)) => panic!("{name} must be valid UTF-8 and either 0 or 1"),
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-changed=shaders_spv");
+    println!("cargo:rerun-if-env-changed={REFRESH_SHADER_FALLBACKS}");
+    println!("cargo:rerun-if-env-changed=VOXEL_BUILD_PROBE");
     // Emitting any rerun-if-changed replaces cargo's default "rerun if any
     // package file changed", so build.rs itself must be listed explicitly —
     // otherwise edits to the CONSTS table below would not regenerate outputs.
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let refresh_fallbacks = env_flag(REFRESH_SHADER_FALLBACKS);
+    let slangc = have_slangc();
+    assert!(
+        !refresh_fallbacks || slangc,
+        "{REFRESH_SHADER_FALLBACKS}=1 requires slangc"
+    );
 
     // Single-source the constants shared by Rust and Slang BEFORE compiling any
     // shader: common.slang `#include`s the generated .slang, so it must exist
@@ -143,14 +163,15 @@ fn main() {
     generate_shared_constants(&out_dir);
 
     // Checked-in fallback so the crate builds without a Slang toolchain
-    // (e.g. inside `nix build` sandboxes). Refreshed whenever slangc is around.
+    // (e.g. inside `nix build` sandboxes). Ordinary builds never rewrite these
+    // fallback artifacts: refresh them explicitly with the pinned toolchain.
     let fallback_dir = Path::new("shaders_spv");
-    fs::create_dir_all(fallback_dir).unwrap();
+    if refresh_fallbacks {
+        fs::create_dir_all(fallback_dir).expect("create shader fallback directory");
+    }
 
     // Ensure tunables use generated includes, not hand-written constants.
     lint_slang_constants();
-
-    let slangc = have_slangc();
 
     for shader in SHADERS {
         compile(slangc, &out_dir, fallback_dir, shader, &[]);
@@ -177,40 +198,65 @@ fn main() {
     // Substrate probe: compute shaders for BDA, QUAD, STORAGE, and occupancy tests.
     // Gated behind VOXEL_BUILD_PROBE to avoid requiring extended SPIR-V profile.
     if env::var("VOXEL_BUILD_PROBE").is_ok() {
-        compile_probe(slangc, &out_dir, fallback_dir);
+        compile_probe(slangc, &out_dir);
+    }
+
+    // Defer every source-tree write until all requested shaders have compiled,
+    // so a compiler failure cannot leave a half-refreshed fallback inventory.
+    if refresh_fallbacks {
+        for shader in SHADERS.iter().chain(std::iter::once(&mesh3d_water)) {
+            copy_if_changed(&out_dir.join(shader.dst), &fallback_dir.join(shader.dst));
+        }
     }
 }
 
 /// Compile probe shaders at higher SPIR-V profile for BDA and subgroup-quad ops.
-fn compile_probe(slangc: bool, out_dir: &Path, fallback_dir: &Path) {
+fn compile_probe(slangc: bool, out_dir: &Path) {
+    assert!(slangc, "VOXEL_BUILD_PROBE requires slangc");
     const PROBE_SHADERS: &[Shader] = &[
-        Shader { src: "shaders/probe_bda.comp.slang", stage: "compute", entry: "computeMain", dst: "probe_bda.comp.spv" },
-        Shader { src: "shaders/probe_quad.comp.slang", stage: "compute", entry: "computeMain", dst: "probe_quad.comp.spv" },
-        Shader { src: "shaders/probe_storage.comp.slang", stage: "compute", entry: "computeMain", dst: "probe_storage.comp.spv" },
-        Shader { src: "shaders/probe_occupancy.comp.slang", stage: "compute", entry: "computeMain", dst: "probe_occupancy.comp.spv" },
+        Shader {
+            src: "shaders/probe_bda.comp.slang",
+            stage: "compute",
+            entry: "computeMain",
+            dst: "probe_bda.comp.spv",
+        },
+        Shader {
+            src: "shaders/probe_quad.comp.slang",
+            stage: "compute",
+            entry: "computeMain",
+            dst: "probe_quad.comp.spv",
+        },
+        Shader {
+            src: "shaders/probe_storage.comp.slang",
+            stage: "compute",
+            entry: "computeMain",
+            dst: "probe_storage.comp.spv",
+        },
+        Shader {
+            src: "shaders/probe_occupancy.comp.slang",
+            stage: "compute",
+            entry: "computeMain",
+            dst: "probe_occupancy.comp.spv",
+        },
     ];
     for shader in PROBE_SHADERS {
         let out_path = out_dir.join(shader.dst);
-        let fallback_path = fallback_dir.join(shader.dst);
-        if !slangc {
-            assert!(
-                fallback_path.exists(),
-                "VOXEL_BUILD_PROBE set but slangc missing and no prebuilt {} — install Slang",
-                fallback_path.display()
-            );
-            fs::copy(&fallback_path, &out_path).unwrap();
-            continue;
-        }
         let output = Command::new("slangc")
             .args([
                 shader.src,
-                "-target", "spirv",
-                "-profile", "spirv_1_5",
-                "-entry", shader.entry,
-                "-stage", shader.stage,
+                "-target",
+                "spirv",
+                "-profile",
+                "spirv_1_5",
+                "-entry",
+                shader.entry,
+                "-stage",
+                shader.stage,
                 "-matrix-layout-column-major",
-                "-capability", "spvGroupNonUniformQuad",
-                "-capability", "spvPhysicalStorageBufferAddresses",
+                "-capability",
+                "spvGroupNonUniformQuad",
+                "-capability",
+                "spvPhysicalStorageBufferAddresses",
             ])
             .arg("-o")
             .arg(&out_path)
@@ -218,11 +264,16 @@ fn compile_probe(slangc: bool, out_dir: &Path, fallback_dir: &Path) {
             .expect("failed to run slangc for probe shader");
         if !output.status.success() {
             eprintln!("slangc failed while compiling probe {}", shader.src);
-            eprintln!("--- stdout ---\n{}", String::from_utf8_lossy(&output.stdout));
-            eprintln!("--- stderr ---\n{}", String::from_utf8_lossy(&output.stderr));
+            eprintln!(
+                "--- stdout ---\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            eprintln!(
+                "--- stderr ---\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             panic!("probe shader compilation failed");
         }
-        let _ = fs::copy(&out_path, &fallback_path);
     }
 }
 
@@ -361,8 +412,19 @@ fn compile(slangc: bool, out_dir: &Path, fallback_dir: &Path, shader: &Shader, d
         );
         panic!("shader compilation failed");
     }
+}
 
-    let _ = fs::copy(&out_path, &fallback_path);
+fn copy_if_changed(compiled: &Path, fallback: &Path) {
+    let fresh = fs::read(compiled)
+        .unwrap_or_else(|e| panic!("read compiled shader {}: {e}", compiled.display()));
+    match fs::read(fallback) {
+        Ok(existing) if existing == fresh => return,
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("read shader fallback {}: {e}", fallback.display()),
+    }
+    fs::write(fallback, fresh)
+        .unwrap_or_else(|e| panic!("write shader fallback {}: {e}", fallback.display()));
 }
 
 // Shared constants: single source of truth for Rust and Slang.
@@ -424,7 +486,6 @@ fn build_table() -> Vec<Def> {
         let i = k + 1;
         halton.push([radical_inverse(i, 2) - 0.5, radical_inverse(i, 3) - 0.5]);
     }
-
 
     // Autoexposure curve fitted in EV space (gentle log-linear response, no cliff).
     // Key anchors: exposure(day_luma)=1.0 (day image must match golden), exposure(cave_luma)=6.05.
