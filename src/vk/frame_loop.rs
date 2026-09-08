@@ -363,8 +363,14 @@ impl Renderer {
         unsafe {
             {
                 let _p = crate::profile::scope(crate::profile::Meter::Fence);
-                self.timeline
-                    .wait(device, self.slots[FrameSlot::new(slot)].render_value);
+                let value = self.slots[FrameSlot::new(slot)].render_value;
+                if self.vsync.current() {
+                    self.timeline.wait(device, value);
+                } else {
+                    const FENCE_SPIN_BUDGET: std::time::Duration =
+                        std::time::Duration::from_micros(200);
+                    self.timeline.wait_spin(device, value, FENCE_SPIN_BUDGET);
+                }
             }
             self.publish_vrs_mix(slot);
             self.publish_cull_stats(slot);
