@@ -162,6 +162,8 @@ impl Renderer {
             }
             // Shared shadow map is UNDEFINED after recreate: force a rewrite.
             self.shadow_cache.invalidate();
+            // LUT images are UNDEFINED after recreate.
+            self.sky_cloud.invalidate();
 
             if msaa_changed || format_changed {
                 self.pipelines.destroy(&self.device.device);

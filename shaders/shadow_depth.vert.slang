@@ -1,7 +1,7 @@
 // Depth-only shadow map occluder pass; reuses mesh3d vertex format and record layout.
 #include "common.slang"
 
-// Per-mesh record: mirrors mesh3d's MeshRecord exactly (std430, 64 bytes).
+// Per-mesh record: mirrors mesh3d's MeshRecord exactly (std430, 80 bytes).
 // Changing the struct stride breaks instance offset calculation.
 struct MeshRecord
 {
@@ -13,6 +13,8 @@ struct MeshRecord
     uint index_count;
     float3 aabb_max;
     int vertex_offset;
+    uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
+    uint _pad2;
 };
 
 [[vk::binding(0, 0)]]
@@ -53,7 +55,7 @@ float4 vertexMain(VertexInput input) : SV_Position
     float z = float((w0 >> 10) & 0x1F);
 
     MeshRecord rec = mesh_records[input.instance];
-    float scale = exp2(float(rec.detail_pass & 0xFu) - float(DETAIL_GPU_BIAS));
+    float scale = detail_scale(rec.detail_pass);
     float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
     float3 world = float3(x, y, z) * scale + offset;
 

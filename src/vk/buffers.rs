@@ -201,8 +201,8 @@ pub(crate) struct MeshMeta {
     pub aabb_min: Vec3,
     pub aabb_max: Vec3,
     /// Seven local (0-based) index boundaries into the shared quad IBO:
-    /// `bounds[dir]..bounds[dir+1]` is direction `dir`'s range (cumulative
-    /// `6*quads` in Normal order) and `bounds[0]..bounds[6]` the whole mesh.
+    /// `bounds[k]..bounds[k+1]` is upload-order face `k`'s range (cumulative
+    /// `6*quads`) and `bounds[0]..bounds[6]` the whole mesh.
     /// `bounds[0]` is always 0; always increasing (see [`build_mesh_resident`]).
     pub bounds: [u32; 7],
     /// First vertex (in vertices from block start); the command's `vertex_offset`.
@@ -250,6 +250,17 @@ impl MeshRecord {
             index_count: meta.bounds[6],
             aabb_max: meta.aabb_max.to_array(),
             vertex_offset: meta.vertex_offset,
+            face_quads: {
+                let mut packed = [0u32; 3];
+                for (k, slot) in packed.iter_mut().enumerate() {
+                    let q0 = (meta.bounds[k * 2 + 1] - meta.bounds[k * 2]) / 6;
+                    let q1 = (meta.bounds[k * 2 + 2] - meta.bounds[k * 2 + 1]) / 6;
+                    debug_assert!(q0 <= u32::from(u16::MAX) && q1 <= u32::from(u16::MAX));
+                    *slot = q0 | (q1 << 16);
+                }
+                packed
+            },
+            _pad2: 0,
         }
     }
 }
@@ -392,6 +403,11 @@ impl GpuResident {
     }
 }
 
+/// Upload order of the six [`crate::mesh::Normal`] buckets: +X,+Y,+Z,−X,−Y,−Z.
+/// An outside camera sees ≤3 of these, and same-sign buckets are adjacent, so
+/// the GPU cull merges them into ~1.75 contiguous runs per mesh instead of 3.
+pub(crate) const FACE_UPLOAD_ORDER: [usize; 6] = [0, 2, 4, 1, 3, 5];
+
 /// Allocates a device buffer for `data`, writes/stages its bytes, and returns
 /// the main-owned [`MeshMeta`] plus render-owned [`GpuResident`]. Main-thread
 /// only: touches the allocator + persistent mapping, never the timeline.
@@ -418,7 +434,8 @@ pub(crate) unsafe fn build_mesh_resident(
 
     let write_into = |dst: *mut u8| unsafe {
         let mut cursor = 0usize;
-        for bucket in &data.buckets {
+        for &dir in &FACE_UPLOAD_ORDER {
+            let bucket = &data.buckets[dir];
             debug_assert_eq!(bucket.len() % 6, 0, "each quad contributes 6 indices");
             for quad in bucket.chunks_exact(6) {
                 let b = quad[0];
@@ -476,13 +493,13 @@ pub(crate) unsafe fn build_mesh_resident(
     debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
     let vertex_offset = (alloc.offset / VERTEX_STRIDE) as i32;
 
-    // Local, 0-based index boundaries into the shared quad IBO: `bounds[dir]` is
-    // the cumulative `6*quads` before face `dir` (Normal order). The IBO's index
+    // Local, 0-based index boundaries into the shared quad IBO: `bounds[k]` is
+    // the cumulative `6*quads` before upload-order face `k`. The IBO's index
     // value at position `6j` is `4j`, and quad `j` sits at vertices `4j..4j+4`, so
     // adding the unchanged `vertex_offset` base reproduces the old vertex fetches.
     let mut bounds = [0u32; 7];
-    for dir in 0..6 {
-        bounds[dir + 1] = bounds[dir] + data.buckets[dir].len() as u32;
+    for (k, &dir) in FACE_UPLOAD_ORDER.iter().enumerate() {
+        bounds[k + 1] = bounds[k] + data.buckets[dir].len() as u32;
     }
     debug_assert_eq!(bounds[6], total_indices as u32);
 
@@ -1405,10 +1422,15 @@ pub struct MeshRecord {
     pub index_count: u32,
     pub aabb_max: [f32; 3],
     pub vertex_offset: i32,
+    /// Packed u16 quad counts for upload slots (0|1, 2|3, 4|5).
+    pub face_quads: [u32; 3],
+    pub _pad2: u32,
 }
 
 // Stride must match the vertex shaders exactly; layout drift corrupts every draw.
-const _: () = assert!(std::mem::size_of::<MeshRecord>() == 64);
+const _: () = assert!(std::mem::size_of::<MeshRecord>() == 80);
+const _: () = assert!(std::mem::offset_of!(MeshRecord, face_quads) == 64);
+const _: () = assert!(std::mem::offset_of!(MeshRecord, _pad2) == 76);
 
 /// Per-mesh dynamic style, patched on change.
 #[repr(C)]

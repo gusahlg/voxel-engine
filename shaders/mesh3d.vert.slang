@@ -11,7 +11,7 @@
 
 #include "common.slang"
 
-// Per-mesh placement record (std430, mirrors vk::buffers::MeshRecord).
+// Per-mesh placement record (std430, mirrors vk::buffers::MeshRecord, 80 bytes).
 struct MeshRecord
 {
     int3 block;       // world-space origin
@@ -22,6 +22,8 @@ struct MeshRecord
     uint index_count;
     float3 aabb_max;
     int vertex_offset;
+    uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
+    uint _pad2;
 };
 
 // Per-mesh dynamic style (std430, mirrors vk::buffers::DrawDyn).
@@ -111,9 +113,9 @@ VertexOutput vertexMain(VertexInput input)
     // Per-axis 2-bit two's-complement micro-offsets. Truth: mesh.rs
     // SHIFT_MICRO_{X,Y,Z}=11,13,15, MASK_MICRO=0x3 (raw 0,1,2,3 -> 0,+1,-2,-1).
     // The seam-overdraw anti-z-fight nudge; zero for ordinary vertices.
-    int mx = int((w1 >> 11) & 0x3); if (mx >= 2) mx -= 4;
-    int my = int((w1 >> 13) & 0x3); if (my >= 2) my -= 4;
-    int mz = int((w1 >> 15) & 0x3); if (mz >= 2) mz -= 4;
+    int mx = int(w1 << 19) >> 30;
+    int my = int(w1 << 17) >> 30;
+    int mz = int(w1 << 15) >> 30;
     float3 micro = float3(float(mx), float(my), float(mz)) * MICRO_STEP;
 
     // UV mapping: X face (z,y), Y face (x,z), Z face (x,y).
@@ -138,7 +140,7 @@ VertexOutput vertexMain(VertexInput input)
     MeshRecord rec = mesh_records[input.instance];
     DrawDyn style = draw_dyn[input.instance];
     uint detail = rec.detail_pass & 0xFu;
-    float scale = exp2(float(detail) - float(DETAIL_GPU_BIAS));
+    float scale = detail_scale(detail);
     // Camera-relative placement: block delta first, then fractional parts.
     float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
     float3 world = (float3(x, y, z) + micro) * scale + offset;
