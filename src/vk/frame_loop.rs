@@ -942,7 +942,12 @@ impl Renderer {
             && lists.sky.is_some()
             && let Some(scene) = &lists.scene
         {
-            self.record_sky_cloud_lut(cmd, slot, scene.frame_uniforms.anim[3]);
+            self.record_sky_cloud_lut(
+                cmd,
+                slot,
+                &scene.frame_uniforms,
+                self.pending_capture.is_some(),
+            );
         }
 
         // Bind the rate image classified at the end of this slot's previous

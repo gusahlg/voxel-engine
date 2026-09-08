@@ -37,6 +37,9 @@ static const float3 FACE_NORMAL[6] = {
     float3(0.0, 0.0, 1.0),  float3(0.0, 0.0, -1.0),
 };
 
+// 2^(bits-DETAIL_GPU_BIAS) from IEEE exponent bits: bits∈[0,15], bias 2 ⇒ exponent field 125..140, exact.
+float detail_scale(uint detail_pass) { return asfloat(((detail_pass & 0xFu) + (127u - DETAIL_GPU_BIAS)) << 23u); }
+
 // Blocklight (torch/candle) response curve. `x` is a
 // per-channel block-light level in [0,1] (`candle.rgb · level`); the curve lifts
 // it into an HDR glow near full brightness. Constants match CPU values exactly,

@@ -38,6 +38,10 @@ pub(crate) const SHADOW_GROUPS: usize = 2;
 pub(crate) const GROUPS: usize = CAMERA_GROUPS + SHADOW_GROUPS;
 /// Front-to-back buckets on camera groups only (shadows stay unbucketed).
 pub(crate) const BUCKETS: usize = crate::genconst::CULL_DISTANCE_BUCKETS as usize;
+/// Max contiguous face-runs the GPU cull emits per camera mesh. Per axis the
+/// camera is in {+, −, both}; upload order +X,+Y,+Z,−X,−Y,−Z keeps same-sign
+/// faces adjacent, so an outside camera sees ≤3 maximal contiguous runs.
+pub(crate) const MAX_FACE_RUNS: u32 = 3;
 /// Live-count lanes: [full-res Opaque, Cutout, LOD Opaque].
 const LANES: usize = CAMERA_GROUPS;
 /// Size of VkDrawIndexedIndirectCommand.
@@ -112,7 +116,8 @@ struct CullParamsGpu {
     cam_frac: [f32; 3],
     arena_count: u32,
     shadow_enabled: u32,
-    _pad: [u32; 3],
+    flags: u32,
+    _pad: [u32; 2],
 }
 // Padding ensures alignment matches shader layout.
 const _: () = assert!(size_of::<CullParamsGpu>() == 288);
@@ -123,6 +128,7 @@ const _: () = assert!(std::mem::offset_of!(CullParamsGpu, slot_count) == 252);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, cam_frac) == 256);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, arena_count) == 268);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, shadow_enabled) == 272);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, flags) == 276);
 
 /// Arena registry with live counts per (arena, lane).
 pub(crate) struct ArenaDirectory {
@@ -303,10 +309,11 @@ impl ArenaDirectory {
     /// allocation, and returns the total command count.
     ///
     /// Camera groups (Opaque, Cutout, OpaqueLod) emit K distance buckets per
-    /// arena, each sized to the full live count (worst case: every mesh lands
-    /// in one bucket). Shadow groups (Near, Far) are unbucketed and reuse the
-    /// full-res Opaque live count — a caster may land in both cascades.
-    fn partitions_into(&self, parts: &mut Vec<PartitionGpu>) -> u32 {
+    /// arena, each sized to `live * runs_per_mesh` (worst case: every mesh lands
+    /// in one bucket and emits that many face-runs). Shadow groups (Near, Far)
+    /// stay ×1 (whole-mesh cmd) and reuse the full-res Opaque live count — a
+    /// caster may land in both cascades.
+    fn partitions_into(&self, parts: &mut Vec<PartitionGpu>, runs_per_mesh: u32) -> u32 {
         let a = self.live.len();
         parts.clear();
         parts.reserve(partition_count(a));
@@ -314,7 +321,7 @@ impl ArenaDirectory {
         for group in Group::ALL {
             let lane = group as usize;
             for arena in 0..a {
-                let capacity = self.live[arena][lane];
+                let capacity = self.live[arena][lane] * runs_per_mesh;
                 for _bucket in 0..BUCKETS {
                     parts.push(PartitionGpu { offset, capacity });
                     offset += capacity;
@@ -335,7 +342,7 @@ impl ArenaDirectory {
     #[cfg(test)]
     fn partitions(&self) -> (Vec<PartitionGpu>, u32) {
         let mut parts = Vec::new();
-        let total = self.partitions_into(&mut parts);
+        let total = self.partitions_into(&mut parts, 1);
         (parts, total)
     }
 }
@@ -458,6 +465,9 @@ pub(crate) struct CullState {
     /// Recycled partition table when [`Self::prepare`] returns `None`, so a
     /// frame with nothing to cull does not drop last frame's allocation.
     spare_parts: Vec<PartitionGpu>,
+    /// Per-direction face-run culling. On by default; follows
+    /// [`crate::Engine::set_cull_faces`].
+    face_cull: bool,
 }
 
 /// Host-visible copy of the per-slot geometry histogram, fence-safe to read
@@ -557,7 +567,14 @@ impl CullState {
             }),
             stats: std::array::from_fn(|_| StatsReadback::new(device, memory_props)),
             spare_parts: Vec::new(),
+            face_cull: true,
         }
+    }
+
+    /// Applied between frames; [`Self::prepare`] snapshots the value so a
+    /// toggle cannot size partitions for one run count and advertise the other.
+    pub fn set_face_cull(&mut self, on: bool) {
+        self.face_cull = on;
     }
 
     /// Last completed histogram for `slot`: `[draws0, idx0, draws1, idx1, draws2, idx2]`.
@@ -599,7 +616,11 @@ impl CullState {
         if partitions.capacity() == 0 {
             partitions = std::mem::take(&mut self.spare_parts);
         }
-        let total = dir.partitions_into(&mut partitions);
+        // One snapshot for both partition capacity and CullParams.flags so a
+        // mid-frame toggle cannot size runs for one value and advertise the other.
+        let face_cull = self.face_cull;
+        let runs_per_mesh = if face_cull { MAX_FACE_RUNS } else { 1 };
+        let total = dir.partitions_into(&mut partitions, runs_per_mesh);
         if partitions.is_empty() || total == 0 {
             self.spare_parts = partitions;
             return None;
@@ -612,7 +633,8 @@ impl CullState {
             cam_frac: eye.frac,
             arena_count: dir.arena_count() as u32,
             shadow_enabled: shadow.is_some() as u32,
-            _pad: [0; 3],
+            flags: u32::from(face_cull),
+            _pad: [0; 2],
         };
         if let Some(frusta) = shadow {
             for (c, f) in frusta.iter().enumerate() {
@@ -1188,11 +1210,28 @@ mod tests {
         dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL);
         let mut parts = Vec::with_capacity(64);
         let ptr = parts.as_ptr();
-        let total = dir.partitions_into(&mut parts);
+        let total = dir.partitions_into(&mut parts, 1);
         assert_eq!(parts.as_ptr(), ptr);
         assert_eq!(parts.len(), partition_count(1));
         // K camera (opaque) slots + 2 unbucketed shadow slots.
         assert_eq!(total, BUCKETS as u32 + 2);
+    }
+
+    #[test]
+    fn partitions_scale_camera_capacity_by_runs_per_mesh() {
+        let mut dir = ArenaDirectory::new();
+        dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL);
+        let mut parts = Vec::new();
+        let total = dir.partitions_into(&mut parts, 3);
+        for bucket in 0..BUCKETS {
+            assert_eq!(
+                parts[camera_part(Group::Opaque as usize, 0, bucket, 1)].capacity,
+                3
+            );
+        }
+        assert_eq!(parts[shadow_part(0, 0, 1)].capacity, 1);
+        assert_eq!(parts[shadow_part(1, 0, 1)].capacity, 1);
+        assert_eq!(total, BUCKETS as u32 * 3 + 2);
     }
 
     #[test]

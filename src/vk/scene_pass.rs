@@ -145,6 +145,13 @@ impl<'a> RenderPass<'a> {
                 },
             };
             let offscreen_view = r.targets.offscreen[slot].view();
+            // Sky triangle covers every pixel left at reversed-Z far (depth 0).
+            // Debug-flat (TerrainKey) frames carry `lists.sky == None` and still clear.
+            let color_load = if lists.scene.is_some() && r.flags.sky && lists.sky.is_some() {
+                vk::AttachmentLoadOp::DONT_CARE
+            } else {
+                vk::AttachmentLoadOp::CLEAR
+            };
             let mut color_attachment = if let Some(msaa) = &r.targets.msaa {
                 vk::RenderingAttachmentInfo::default()
                     .image_view(msaa.view())
@@ -152,14 +159,14 @@ impl<'a> RenderPass<'a> {
                     .resolve_mode(vk::ResolveModeFlags::AVERAGE)
                     .resolve_image_view(offscreen_view)
                     .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .load_op(color_load)
                     .store_op(vk::AttachmentStoreOp::DONT_CARE)
             } else {
                 // Offscreen is color target; store contents for present copy.
                 vk::RenderingAttachmentInfo::default()
                     .image_view(offscreen_view)
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .load_op(color_load)
                     .store_op(vk::AttachmentStoreOp::STORE)
             };
             color_attachment = color_attachment.clear_value(clear_color);

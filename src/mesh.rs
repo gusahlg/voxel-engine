@@ -294,13 +294,12 @@ impl Pass {
 /// Six [`Normal`]-indexed index buckets share one vertex array; [`Self::quad`]
 /// routes each quad by its normal and emits correctly wound indices, so
 /// direction mis-sorting and winding bugs are unrepresentable at the call site.
-/// Upload concatenates the buckets in `Normal` order into one index blob and
-/// records the per-direction boundaries, which the renderer uses for optional
-/// six-way face culling. Reusable as scratch: [`Self::clear`] keeps capacity.
+/// Bucket order stays [`Normal`]; the renderer may permute at upload for GPU
+/// face-run culling. Reusable as scratch: [`Self::clear`] keeps capacity.
 pub struct MeshData {
     pub(crate) vertices: Vec<MeshVertex>,
-    /// Indices per face direction, indexed by `Normal as usize`. Concatenated
-    /// in that order at upload. Each entry references the shared `vertices`.
+    /// Indices per face direction, indexed by `Normal as usize`. Each entry
+    /// references the shared `vertices`.
     pub(crate) buckets: [Vec<u32>; 6],
     pub(crate) pass: Pass,
 }
@@ -354,8 +353,8 @@ impl MeshData {
         &self.vertices
     }
 
-    /// The six per-direction index buckets (concatenated in [`Normal`] order at
-    /// upload). `#[doc(hidden)]` — dependent-crate tests only, as [`Self::vertices`].
+    /// The six per-direction index buckets, indexed by [`Normal`].
+    /// `#[doc(hidden)]` — dependent-crate tests only, as [`Self::vertices`].
     #[doc(hidden)]
     pub fn buckets(&self) -> &[Vec<u32>; 6] {
         &self.buckets

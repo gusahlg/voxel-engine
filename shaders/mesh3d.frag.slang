@@ -220,7 +220,7 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     }
 #elif !defined(MESH3D_OPAQUE)
     // Blend module: mixed full-res / LOD draws share this path.
-    float scale = exp2(float((input.ids.x >> 20) & 0xFu) - float(DETAIL_GPU_BIAS));
+    float scale = detail_scale(input.ids.x >> 20);
     if (scale > 1.0 && pc.clip > 0.0) {
         bool inside_h = length(input.world.xz) < pc.clip;
         bool inside_v = pc.clip_v > 0.0 && abs(input.world.y) < pc.clip_v;
