@@ -392,6 +392,9 @@ impl RenderClient {
     // ---- settings (cached on main; getters read the cache) ----
 
     pub(crate) fn set_vsync(&mut self, on: bool) {
+        if self.vsync == on {
+            return;
+        }
         self.vsync = on;
         let _ = self.tx.send(RenderCmd::SetVsync(on));
     }
