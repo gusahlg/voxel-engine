@@ -19,8 +19,6 @@ pub(super) enum GpuPass {
     Cull,
     /// The cascaded shadow-map pass (stamped only on regenerating frames).
     ShadowMap,
-    /// The VRS classify dispatch (stamped only when it runs).
-    Vrs,
     /// Scene-pass begin: attachment transitions + `cmd_begin_rendering` clears.
     Clear,
     Opaque,
@@ -31,8 +29,11 @@ pub(super) enum GpuPass {
     Transparent,
     Overlay,
     /// End of the scene pass: `cmd_end_rendering` (where the MSAA color
-    /// resolve executes) and the offscreen finalize transitions.
+    /// resolve executes) and the offscreen/depth-rest finalize transitions.
     Resolve,
+    /// The VRS classify dispatch (end of frame, after depth rests; stamped
+    /// only when it runs).
+    Vrs,
     /// The TAA resolve compute (stamped only when it runs).
     Taa,
     /// Exposure metering reduce + finalize (stamped only when it runs).
@@ -47,7 +48,6 @@ impl GpuPass {
         GpuPass::Copies,
         GpuPass::Cull,
         GpuPass::ShadowMap,
-        GpuPass::Vrs,
         GpuPass::Clear,
         GpuPass::Opaque,
         GpuPass::Sky,
@@ -57,6 +57,7 @@ impl GpuPass {
         GpuPass::Transparent,
         GpuPass::Overlay,
         GpuPass::Resolve,
+        GpuPass::Vrs,
         GpuPass::Taa,
         GpuPass::Exposure,
         GpuPass::Bloom,
@@ -69,7 +70,6 @@ impl GpuPass {
             GpuPass::Copies => Meter::GpuCopies,
             GpuPass::Cull => Meter::GpuCull,
             GpuPass::ShadowMap => Meter::GpuShadowMap,
-            GpuPass::Vrs => Meter::GpuVrs,
             GpuPass::Clear => Meter::GpuClear,
             GpuPass::Opaque => Meter::GpuOpaque,
             GpuPass::Sky => Meter::GpuSky,
@@ -79,6 +79,7 @@ impl GpuPass {
             GpuPass::Transparent => Meter::GpuTransparent,
             GpuPass::Overlay => Meter::GpuOverlay,
             GpuPass::Resolve => Meter::GpuResolve,
+            GpuPass::Vrs => Meter::GpuVrs,
             GpuPass::Taa => Meter::GpuTaa,
             GpuPass::Exposure => Meter::GpuExposure,
             GpuPass::Bloom => Meter::GpuBloom,

@@ -44,27 +44,21 @@ impl<'a> RenderPass<'a> {
         let offscreen_image = r.targets.offscreen[slot].image();
         let profiling = crate::profile::is_enabled();
         unsafe {
-            // Generate the rate map first: it samples this slot's depth (leaving
-            // it in DEPTH_ATTACHMENT_OPTIMAL, ready for the pass below) and
-            // returns the only valid `RateAttachment`. Done before the color
-            // barriers so the compute dispatch overlaps nothing it depends on.
-            let rate = do_vrs.then(|| {
-                let scene = lists.scene.as_ref().expect("do_vrs implies a 3D scene");
-                let focal_px = 0.5 * extent.height as f32 / scene.fovy_tan_half.max(1e-4);
-                let d_threshold = crate::camera::Z_NEAR / focal_px;
-                let rate = r.record_vrs_generate(cmd, slot, d_threshold);
-                if profiling {
-                    r.gpu_timer.mark(device, cmd, slot, GpuPass::Vrs);
-                }
-                rate
-            });
+            // Bind last-use's rate image if this slot has already classified
+            // (`vrs_ready`). The classifier ran at the END of that previous use
+            // and left the image in GENERAL; the begin batch below transitions
+            // it to FRAGMENT_SHADING_RATE_ATTACHMENT. First use after
+            // create/recreate skips VRS (`vrs_ready` is false).
+            let rate = do_vrs.then(|| r.vrs_rate_attachment(slot));
 
-            // Transition attachments to render targets; old contents discarded.
-            // The VRS pass above transitions the sampled depth when `do_vrs` —
-            // under MSAA that is `resolved_depth`, so the MS `depth` attachment
-            // still needs its own transition here.
-            let mut image_barriers = [vk::ImageMemoryBarrier2::default(); 4];
+            // One vkCmdPipelineBarrier2 for every image the pass writes, plus
+            // the rate image when VRS is bound. Sampleable depth always begins
+            // from UNDEFINED (cleared every frame; see SAMPLEABLE_DEPTH_REST_LAYOUT).
+            let mut image_barriers = [vk::ImageMemoryBarrier2::default(); 5];
             let mut barrier_count = 0;
+            // Offscreen: src COLOR_ATTACHMENT_OUTPUT / NONE (discard).
+            // Dst COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE.
+            // Old UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
             image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                 .src_access_mask(vk::AccessFlags2::NONE)
@@ -75,31 +69,33 @@ impl<'a> RenderPass<'a> {
                 .image(offscreen_image)
                 .subresource_range(color_range());
             barrier_count += 1;
-            // MS depth needs a fresh-target transition unless the VRS pass
-            // already put THIS image there — which it only does single-sampled
-            // (under MSAA the VRS pass transitions `resolved_depth` instead).
-            if !do_vrs || r.targets.msaa.is_some() {
-                image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(
-                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    )
-                    .dst_access_mask(
-                        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                    )
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(r.depth_pass_layout())
-                    .image(r.targets.depth[slot].image())
-                    .subresource_range(depth_range());
-                barrier_count += 1;
-            }
-            // The single-sample resolve target: bring it to the attachment layout
-            // for the SAMPLE_ZERO resolve. When `do_vrs`, the VRS pass already
-            // restored it to DEPTH_ATTACHMENT_OPTIMAL after sampling.
-            if !do_vrs && let Some(resolved) = &r.targets.resolved_depth[slot] {
+            // Depth attachment (MS depth when multisampled, else the
+            // single-sample depth): src LATE_FRAGMENT_TESTS / NONE (discard).
+            // Dst EARLY|LATE_FRAGMENT_TESTS / DEPTH_STENCIL_ATTACHMENT_{READ,WRITE}.
+            // Old UNDEFINED → depth_pass_layout. Unconditional: VRS no longer
+            // round-trips this image, and contents are cleared anyway.
+            image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                )
+                .dst_access_mask(
+                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                )
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(r.depth_pass_layout())
+                .image(r.targets.depth[slot].image())
+                .subresource_range(depth_range());
+            barrier_count += 1;
+            // MSAA SAMPLE_ZERO resolve target: src COLOR_ATTACHMENT_OUTPUT / NONE
+            // (Vulkan runs depth resolves at color-output). Dst COLOR_ATTACHMENT_OUTPUT
+            // / COLOR_ATTACHMENT_WRITE. Old UNDEFINED → DEPTH_ATTACHMENT_OPTIMAL.
+            // The MS `depth` attachment above is never sampled; only this image
+            // rests in SAMPLEABLE_DEPTH_REST_LAYOUT after `end`.
+            if let Some(resolved) = &r.targets.resolved_depth[slot] {
                 image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .src_access_mask(vk::AccessFlags2::NONE)
@@ -112,6 +108,9 @@ impl<'a> RenderPass<'a> {
                 barrier_count += 1;
             }
             if let Some(msaa) = &r.targets.msaa {
+                // MSAA color: src COLOR_ATTACHMENT_OUTPUT / NONE (discard).
+                // Dst COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE.
+                // Old UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
                 image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .src_access_mask(vk::AccessFlags2::NONE)
@@ -121,6 +120,10 @@ impl<'a> RenderPass<'a> {
                     .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .image(msaa.image())
                     .subresource_range(color_range());
+                barrier_count += 1;
+            }
+            if do_vrs {
+                image_barriers[barrier_count] = r.vrs_rate_to_attachment_barrier(slot);
                 barrier_count += 1;
             }
             device.cmd_pipeline_barrier2(
@@ -163,7 +166,8 @@ impl<'a> RenderPass<'a> {
             let color_attachments = [color_attachment];
 
             // Reversed-Z: clear depth to 0.0, GREATER_OR_EQUAL test. Single-
-            // sampled: store the depth so a later cycle can classify it for VRS.
+            // sampled: store the depth so the end-of-frame classify (and
+            // TAA/godrays) can sample it after it rests in SAMPLEABLE_DEPTH_REST_LAYOUT.
             // MSAA: DONT_CARE the MS store — its single-sample SAMPLE_ZERO
             // resolve into `resolved_depth` is what feeds VRS/TAA/godrays.
             let depth_store = if r.targets.msaa.is_some() {
@@ -189,9 +193,8 @@ impl<'a> RenderPass<'a> {
                     .resolve_image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL);
             }
 
-            // `rate` (generated above) is the only source of a `RateAttachment`,
-            // so its image is guaranteed classified and in the shading-rate
-            // layout before it is bound here.
+            // `rate` is the previous classify of this slot, transitioned to
+            // the shading-rate layout in the begin batch above.
             let mut rate_attachment = rate.as_ref().map(|rate| {
                 vk::RenderingFragmentShadingRateAttachmentInfoKHR::default()
                     .image_view(rate.view)
@@ -741,44 +744,76 @@ impl<'a> RenderPass<'a> {
     /// `SHADER_READ_ONLY_OPTIMAL`, and returns the [`HdrReadable`] proof. The
     /// timeline orders later submits; this barrier owns layout and visibility.
     /// Use when no later pass writes the offscreen, so this pass owns the final
-    /// transition for tonemapping.
-    pub(super) unsafe fn end_sampled(self) -> HdrReadable {
+    /// transition for tonemapping. Sampleable depth always rests here (see
+    /// [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]); `classify_vrs` joins the rate
+    /// and history images into the same barrier.
+    pub(super) unsafe fn end_sampled(self, classify_vrs: bool) -> HdrReadable {
         let slot = self.slot;
-        unsafe { self.end(true) };
+        unsafe { self.end(true, classify_vrs) };
         HdrReadable::new(slot)
     }
 
-    /// Ends dynamic rendering WITHOUT the sampled transition: a later offscreen
-    /// writer (TAA resolve / exposure metering) runs after this, and one of them
-    /// owns the finalization instead (its barrier would otherwise race their
-    /// writes). Yields no proof — the deferred finalizer produces it.
-    pub(super) unsafe fn end_deferred(self) {
-        unsafe { self.end(false) };
+    /// Ends dynamic rendering WITHOUT the offscreen sampled transition: a later
+    /// offscreen writer (TAA resolve / exposure metering) runs after this, and
+    /// one of them owns the finalization instead (its barrier would otherwise
+    /// race their writes). Sampleable depth still rests in
+    /// [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]. Yields no proof — the deferred
+    /// finalizer produces it.
+    pub(super) unsafe fn end_deferred(self, classify_vrs: bool) {
+        unsafe { self.end(false, classify_vrs) };
     }
 
-    unsafe fn end(mut self, transition_offscreen: bool) {
+    unsafe fn end(mut self, transition_offscreen: bool, classify_vrs: bool) {
         let device = &self.r.device.device;
         let cmd = self.cmd;
         unsafe {
             device.cmd_end_rendering(cmd);
 
             self.ended = true;
-            if !transition_offscreen {
-                return;
+
+            // Mix fill (profiling only) must precede the barrier that makes it
+            // visible to the classifier. Joins as a CLEAR→COMPUTE memory barrier.
+            let mix_filled = classify_vrs && self.r.record_vrs_mix_fill(cmd, self.slot);
+
+            // One vkCmdPipelineBarrier2: offscreen (optional) + sampleable-depth
+            // rest + (if classifying) rate/history → GENERAL. No extra VRS
+            // pipeline barrier beyond the two the frame already has.
+            let mut images = [vk::ImageMemoryBarrier2::default(); 4];
+            let mut n = 0;
+            if transition_offscreen {
+                // Offscreen: src COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE
+                // (scene color, including the MSAA average resolve). Dst
+                // FRAGMENT_SHADER / SHADER_SAMPLED_READ (tonemap present-copy;
+                // bloom/exposure insert their own barriers when they run).
+                // Old COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
+                images[n] = vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image(self.offscreen_image)
+                    .subresource_range(color_range());
+                n += 1;
+            }
+            // Sampleable depth rest: see `sampleable_depth_rest_barrier`.
+            images[n] = self.r.sampleable_depth_rest_barrier(self.slot);
+            n += 1;
+            if classify_vrs {
+                images[n] = self.r.vrs_rate_to_general_barrier(self.slot);
+                n += 1;
+                images[n] = self.r.vrs_history_to_general_barrier(self.slot);
+                n += 1;
             }
 
-            let to_sampled = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image(self.offscreen_image)
-                .subresource_range(color_range())];
+            let mix_mem = [super::Renderer::vrs_mix_fill_memory_barrier()];
+            let mem: &[vk::MemoryBarrier2] = if mix_filled { &mix_mem } else { &[] };
             device.cmd_pipeline_barrier2(
                 cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
+                &vk::DependencyInfo::default()
+                    .memory_barriers(mem)
+                    .image_memory_barriers(&images[..n]),
             );
         }
     }

@@ -473,9 +473,9 @@ impl RenderTargets {
     }
 
     /// The single-sample depth VRS/TAA/godrays sample: the MSAA resolve target
-    /// when multisampled, else the (already single-sample) `depth`. The resolve
-    /// rests in `DEPTH_ATTACHMENT_OPTIMAL`; the single-sample image may instead
-    /// use `RENDERING_LOCAL_READ_KHR`, so consumers derive its barrier state.
+    /// when multisampled, else the (already single-sample) `depth`. After the
+    /// scene pass this image rests in [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`];
+    /// during the pass its write scope is [`super::sampleable_depth_attachment_state`].
     pub(crate) fn sampleable_depth(&self, slot: usize) -> &ImageResource {
         self.resolved_depth[slot]
             .as_ref()

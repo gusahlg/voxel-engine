@@ -260,7 +260,9 @@ impl TaaState {
 impl super::Renderer {
     /// Record TAA resolve (after HDR, before exposure). Outputs the stabilized HDR
     /// for exposure/tonemap to sample directly. One pre-dispatch barrier and one
-    /// post-dispatch barrier cover offscreen, depth, and both history images.
+    /// post-dispatch barrier cover offscreen and both history images. Depth
+    /// already rests in [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`] from
+    /// `RenderPass::end` and is sampled with no further transition.
     pub(crate) fn record_taa_pass(
         &mut self,
         cmd: vk::CommandBuffer,
@@ -269,10 +271,6 @@ impl super::Renderer {
         eye: DVec3,
         jitter_px: Vec2,
     ) {
-        // Captured before the &mut borrow below. Under MSAA the sampleable image
-        // is the resolve target, written at COLOR_ATTACHMENT_OUTPUT rather than
-        // by early/late depth tests.
-        let (depth_layout, depth_stage, depth_access) = self.sampleable_depth_attachment_state();
         let taa = &mut self.taa;
         let r = taa.read_idx;
         let w = 1 - r;
@@ -288,14 +286,19 @@ impl super::Renderer {
 
         let extent = taa.extent;
         let offscreen = &self.targets.offscreen[slot.index()];
-        // Depth-aware reprojection reads this frame's depth (same command buffer,
-        // ordered by barrier). Under MSAA that is the single-sample resolve of
-        // the geometry pass; single-sampled it is the depth buffer directly.
+        // Depth-aware reprojection reads this frame's depth (already in
+        // SAMPLEABLE_DEPTH_REST_LAYOUT from RenderPass::end). Under MSAA that
+        // is the single-sample resolve of the geometry pass; single-sampled it
+        // is the depth buffer directly.
         let depth = self.targets.sampleable_depth(slot.index());
         let device = &self.device.device;
         unsafe {
             let hist_r = taa.history[r].barrier_to(LayoutUse::ComputeSampledRead, false);
             let hist_w = taa.history[w].barrier_to(LayoutUse::ComputeStorageWrite, true);
+            // Offscreen: src COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE
+            // (end_deferred left it in COLOR_ATTACHMENT). Dst COMPUTE_SHADER /
+            // SHADER_SAMPLED_READ. Old COLOR_ATTACHMENT → SHADER_READ_ONLY.
+            // Depth is not in this batch: it already rests in SHADER_READ_ONLY.
             let pre = [
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -306,15 +309,6 @@ impl super::Renderer {
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .image(offscreen.image())
                     .subresource_range(super::color_range()),
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(depth_stage)
-                    .src_access_mask(depth_access)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .old_layout(depth_layout)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .image(depth.image())
-                    .subresource_range(super::depth_range()),
                 hist_r,
                 hist_w,
             ];
@@ -338,7 +332,7 @@ impl super::Renderer {
             let depth_info = [vk::DescriptorImageInfo::default()
                 .sampler(taa.compute.depth_sampler)
                 .image_view(depth.view())
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                .image_layout(super::SAMPLEABLE_DEPTH_REST_LAYOUT)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_binding(TAA_RESOLVE_CURRENT_BINDING)
@@ -388,22 +382,11 @@ impl super::Renderer {
                 1,
             );
 
-            let hist_pub = taa.history[w].barrier_to(LayoutUse::SampledAfterComputeWrite, false);
-            let post = [
-                hist_pub,
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .dst_stage_mask(depth_stage)
-                    .dst_access_mask(depth_access)
-                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .new_layout(depth_layout)
-                    .image(depth.image())
-                    .subresource_range(super::depth_range()),
-            ];
+            // History write → sampled for exposure/tonemap. Depth stays at rest.
+            let hist_pub = [taa.history[w].barrier_to(LayoutUse::SampledAfterComputeWrite, false)];
             device.cmd_pipeline_barrier2(
                 cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&post),
+                &vk::DependencyInfo::default().image_memory_barriers(&hist_pub),
             );
         }
 

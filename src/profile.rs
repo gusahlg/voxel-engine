@@ -289,19 +289,27 @@ pub enum Gauge {
     WorldSkins,
     UploadBytes,
     DrawsPacked,
+    DrawsFull,
+    DrawsLod,
+    TrisFull,
+    TrisLod,
     Vrs1x1,
     Vrs2x2,
     Vrs4x4,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 9] = [
+    const ALL: [Gauge; 13] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
         Gauge::WorldSkins,
         Gauge::UploadBytes,
         Gauge::DrawsPacked,
+        Gauge::DrawsFull,
+        Gauge::DrawsLod,
+        Gauge::TrisFull,
+        Gauge::TrisLod,
         Gauge::Vrs1x1,
         Gauge::Vrs2x2,
         Gauge::Vrs4x4,
@@ -316,6 +324,10 @@ impl Gauge {
             Gauge::WorldSkins => "skins",
             Gauge::UploadBytes => "upload.bytes",
             Gauge::DrawsPacked => "draws.packed",
+            Gauge::DrawsFull => "draws.full",
+            Gauge::DrawsLod => "draws.lod",
+            Gauge::TrisFull => "tris.full",
+            Gauge::TrisLod => "tris.lod",
             Gauge::Vrs1x1 => "vrs.1x1",
             Gauge::Vrs2x2 => "vrs.2x2",
             Gauge::Vrs4x4 => "vrs.4x4",
@@ -727,6 +739,13 @@ fn is_substage(m: Meter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gauge_ordinals_index_all_in_order() {
+        for (i, g) in Gauge::ALL.into_iter().enumerate() {
+            assert_eq!(g as usize, i, "{} is out of order in Gauge::ALL", g.label());
+        }
+    }
 
     #[test]
     fn meter_ordinals_index_all_in_order() {
