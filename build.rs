@@ -432,8 +432,8 @@ fn lint_slang_file(path: &Path, violations: &mut Vec<String>) {
         let after_type = trimmed
             .trim_start_matches("static const")
             .trim_start()
-            .splitn(2, char::is_whitespace)
-            .nth(1)
+            .split_once(char::is_whitespace)
+            .map(|x| x.1)
             .unwrap_or("");
         let name: String = after_type
             .trim_start()
@@ -441,7 +441,7 @@ fn lint_slang_file(path: &Path, violations: &mut Vec<String>) {
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
 
-        let rhs = stmt.splitn(2, '=').nth(1).unwrap_or("");
+        let rhs = stmt.split_once('=').map(|x| x.1).unwrap_or("");
         let has_numeric_literal = rhs.char_indices().any(|(idx, c)| {
             c.is_ascii_digit() && !rhs[..idx].ends_with(|p: char| p.is_alphanumeric() || p == '_')
         });

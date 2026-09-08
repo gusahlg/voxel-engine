@@ -338,8 +338,7 @@ impl ArenaDirectory {
 
 impl Group {
     /// Camera-group partition-table order (shadows are unbucketed after this).
-    pub(crate) const ALL: [Group; CAMERA_GROUPS] =
-        [Group::Opaque, Group::Cutout, Group::OpaqueLod];
+    pub(crate) const ALL: [Group; CAMERA_GROUPS] = [Group::Opaque, Group::Cutout, Group::OpaqueLod];
 }
 
 /// Get live-count lane for a (pass, lod) record (Blend returns None).
