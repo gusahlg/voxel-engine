@@ -6,6 +6,8 @@ use super::alloc::{find_memory_type, try_find_memory_type};
 use super::buffers::FRAMES_IN_FLIGHT;
 use super::device::FragmentShadingRate;
 use super::image::{ImageDesc, ImageResource};
+use super::{color_range, depth_range};
+use crate::skeleton::FrameSlot;
 
 const SLOTS: usize = FRAMES_IN_FLIGHT as usize;
 
@@ -281,6 +283,222 @@ fn create_mapped_buffer(
     };
     unsafe { std::ptr::write_bytes(mapped, 0, MIX_COUNT) };
     (buffer, memory, mapped)
+}
+
+impl super::Renderer {
+    /// Records the VRS classifier: samples this slot's depth (from two cycles
+    /// ago) and writes its rate image, leaving depth back in
+    /// `DEPTH_ATTACHMENT_OPTIMAL` for the geometry pass. Returns the attachment
+    /// the caller binds. Only called when `do_vrs`, so both `vrs` and
+    /// `vrs_compute` are present. `cmd` must be recording, outside a render pass.
+    pub(super) unsafe fn record_vrs_generate(
+        &self,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        d_threshold: f32,
+    ) -> RateAttachment {
+        let device = &self.device.device;
+        let vrs = self.targets.vrs.as_ref().expect("do_vrs implies vrs");
+        let compute = self
+            .pipelines
+            .vrs_compute
+            .as_ref()
+            .expect("do_vrs implies vrs_compute");
+        // MSAA: the classifier samples the single-sample resolve of this slot's
+        // depth from two cycles ago; single-sampled it is that depth directly.
+        let depth = self.targets.sampleable_depth(slot);
+        let (depth_layout, depth_stage, depth_access) = self.sampleable_depth_attachment_state();
+        let tiles = vrs.tiles();
+        let use_history = self.slots[FrameSlot::new(slot)].vrs_history;
+        let allow_4x4 = self
+            .device
+            .fragment_shading_rate
+            .as_ref()
+            .is_some_and(|f| f.allow_4x4(self.targets.samples));
+        let mut flags = 0u32;
+        if allow_4x4 {
+            flags |= FLAG_ALLOW_4X4;
+        }
+        if use_history {
+            flags |= FLAG_USE_HISTORY;
+        }
+        unsafe {
+            device.cmd_fill_buffer(cmd, vrs.mix_gpu(slot), 0, MIX_BYTES, 0);
+
+            let mut images = [
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(depth_stage)
+                    .src_access_mask(depth_access)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .old_layout(depth_layout)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image(depth.image())
+                    .subresource_range(depth_range()),
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(vrs.image(slot))
+                    .subresource_range(color_range()),
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(if use_history {
+                        vk::PipelineStageFlags2::COMPUTE_SHADER
+                    } else {
+                        vk::PipelineStageFlags2::NONE
+                    })
+                    .src_access_mask(if use_history {
+                        vk::AccessFlags2::SHADER_STORAGE_WRITE
+                    } else {
+                        vk::AccessFlags2::NONE
+                    })
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_STORAGE_READ
+                            | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    )
+                    .old_layout(if use_history {
+                        vk::ImageLayout::GENERAL
+                    } else {
+                        vk::ImageLayout::UNDEFINED
+                    })
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(vrs.history_image(slot))
+                    .subresource_range(color_range()),
+            ];
+            let fill_to_compute = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                )];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default()
+                    .memory_barriers(&fill_to_compute)
+                    .image_memory_barriers(&images),
+            );
+
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, compute.pipeline);
+            let depth_info = [vk::DescriptorImageInfo::default()
+                .sampler(compute.depth_sampler)
+                .image_view(depth.view())
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let rate_info = [vk::DescriptorImageInfo::default()
+                .image_view(vrs.view(slot))
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let history_info = [vk::DescriptorImageInfo::default()
+                .image_view(vrs.history_view(slot))
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let mix_info = [vk::DescriptorBufferInfo::default()
+                .buffer(vrs.mix_gpu(slot))
+                .offset(0)
+                .range(MIX_BYTES)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&depth_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(&rate_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(&history_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&mix_info),
+            ];
+            self.device.push_descriptor.cmd_push_descriptor_set(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                compute.layout,
+                0,
+                &writes,
+            );
+
+            let push = VrsPush {
+                d_threshold,
+                texel_w: vrs.texel_size.width,
+                texel_h: vrs.texel_size.height,
+                tiles_x: tiles.width,
+                tiles_y: tiles.height,
+                depth_w: self.render_extent.width,
+                depth_h: self.render_extent.height,
+                flags,
+            };
+            device.cmd_push_constants(
+                cmd,
+                compute.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&push),
+            );
+            device.cmd_dispatch(cmd, tiles.width.div_ceil(8), tiles.height.div_ceil(8), 1);
+
+            // rate → shading-rate attachment; depth → back to attachment layout;
+            // mix histogram → host-visible readback.
+            images[0] = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADING_RATE_ATTACHMENT_KHR)
+                .dst_access_mask(vk::AccessFlags2::FRAGMENT_SHADING_RATE_ATTACHMENT_READ_KHR)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR)
+                .image(vrs.image(slot))
+                .subresource_range(color_range());
+            images[1] = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .dst_stage_mask(depth_stage)
+                .dst_access_mask(depth_access)
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(depth_layout)
+                .image(depth.image())
+                .subresource_range(depth_range());
+            let mix_to_copy = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default()
+                    .memory_barriers(&mix_to_copy)
+                    .image_memory_barriers(&images[..2]),
+            );
+            device.cmd_copy_buffer(
+                cmd,
+                vrs.mix_gpu(slot),
+                vrs.mix_cpu(slot),
+                &[vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: MIX_BYTES,
+                }],
+            );
+            let copy_to_host = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&copy_to_host),
+            );
+        }
+
+        RateAttachment {
+            view: vrs.view(slot),
+            texel_size: vrs.texel_size,
+        }
+    }
 }
 
 #[cfg(test)]
