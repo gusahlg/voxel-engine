@@ -260,6 +260,7 @@ impl MeshRecord {
 /// field-by-field — the exact part a reviewer must get right — so the
 /// pairings live here once and a site states only its buffer range, its
 /// draw-side reads, and its role.
+#[derive(Clone, Copy)]
 enum CopyBarrier {
     /// Same queue: copy → vertex input, visible in this submission.
     Draw,
@@ -316,6 +317,55 @@ fn copy_barrier(
 /// The draw-side reads a mesh buffer feeds (interleaved vertices + indices).
 fn mesh_reads() -> vk::AccessFlags2 {
     vk::AccessFlags2::VERTEX_ATTRIBUTE_READ | vk::AccessFlags2::INDEX_READ
+}
+
+/// The stages at which uploaded mesh bytes (and the shared quad IBO) are
+/// first consumed: fixed-function vertex/index fetch in the shadow cascades
+/// and the scene passes (`VERTEX_INPUT` = `INDEX_INPUT | VERTEX_ATTRIBUTE_INPUT`
+/// in synchronization2). Nothing samples or pulls mesh bytes from a shader
+/// stage, so a cross-queue wait scoped here leaves cull, clears, the sky and
+/// post free to start before the transfer queue signals.
+pub(crate) const MESH_CONSUMER_STAGES: vk::PipelineStageFlags2 =
+    vk::PipelineStageFlags2::VERTEX_INPUT;
+
+/// One destination byte range written by a copy batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BufferRange {
+    buffer: vk::Buffer,
+    offset: u64,
+    size: u64,
+}
+
+/// Sorts by (buffer, offset) and merges ranges of the same buffer that touch
+/// or overlap, so a burst of meshes landing in one arena needs one barrier per
+/// contiguous run instead of one per mesh. Never widens past bytes the batch
+/// actually wrote: on the dedicated-family tier these ranges become
+/// ownership release/acquire pairs, and claiming bytes another live mesh in
+/// the same arena is being drawn from would hand their ownership around
+/// underneath those draws — wrong, not merely wasteful.
+fn coalesce_ranges(mut ranges: Vec<BufferRange>) -> Vec<BufferRange> {
+    use ash::vk::Handle;
+    ranges.sort_unstable_by_key(|r| (r.buffer.as_raw(), r.offset));
+    let mut merged: Vec<BufferRange> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        match merged.last_mut() {
+            Some(last) if last.buffer == r.buffer && last.offset + last.size >= r.offset => {
+                last.size = last.size.max(r.offset + r.size - last.offset);
+            }
+            _ => merged.push(r),
+        }
+    }
+    merged
+}
+
+/// The graphics-side half of a lane batch that has been submitted but not yet
+/// consumed: the timeline value it signals and, on the dedicated-family tier,
+/// the ownership-transfer ACQUIRE barriers over its destination ranges. Both
+/// are applied by the NEXT graphics submission — see the hazard analysis in
+/// [`MeshResidency::flush_copies`].
+struct DeferredArrival {
+    value: TimelineValue,
+    acquires: Vec<vk::BufferMemoryBarrier2<'static>>,
 }
 
 struct PendingCopy {
@@ -473,6 +523,9 @@ pub(crate) struct MeshResidency {
     live: usize,
     /// Slots with just-submitted copies, ready to expose in arena word.
     arrived_since_flush: Vec<u32>,
+    /// The last separate-queue batch's wait value + ACQUIRE barriers, owed
+    /// to the next graphics submission (see [`Self::flush_copies`]).
+    deferred: Option<DeferredArrival>,
 }
 
 impl MeshResidency {
@@ -485,6 +538,7 @@ impl MeshResidency {
             transfer_retire: RetireQueue::new(),
             live: 0,
             arrived_since_flush: Vec::new(),
+            deferred: None,
         }
     }
 
@@ -543,16 +597,45 @@ impl MeshResidency {
     /// first item is always serviced regardless of size, a forward-progress
     /// floor). A barrier cannot scope a cross-queue dependency, so only the
     /// `SameQueueFallback` tier gets an in-command-buffer barrier; separate-
-    /// queue copies order via the returned timeline value instead.
+    /// queue copies order via the lane's timeline instead.
     ///
-    /// Returns `Some(value)` when copies were submitted on the lane's own
-    /// queue: the caller's render submission must wait on the lane's
-    /// semaphore for `value` before touching the copied ranges. `graphics_cmd`
-    /// must always be a real, valid (reset-and-begun) command buffer — even
-    /// under a separate transfer queue, `DedicatedFamily` needs an ACQUIRE
-    /// barrier recorded into it, and the caller is responsible for submitting
-    /// `graphics_cmd` afterward (waiting on the returned value's semaphore
-    /// when `Some`).
+    /// Copies are issued as one `vkCmdCopyBuffer` per (staging block, arena)
+    /// pair and the barriers cover coalesced destination runs (see
+    /// [`coalesce_ranges`]), so a burst of N meshes costs O(arenas) commands.
+    ///
+    /// # Cross-queue hazard analysis (why the wait is deferred one frame)
+    ///
+    /// A batch submitted on the lane during frame N is never read by frame
+    /// N's own graphics submission:
+    /// - the GPU cull that emits mesh draws reads the arena word table, which
+    ///   [`RecordTable::flush`] wrote *before* this call with the slot still
+    ///   gated to 0 (`is_arrived` was false); [`Self::take_arrived`] then
+    ///   marks the slot dirty so the word is revealed in frame N+1's table;
+    /// - the CPU Blend walk is gated on `is_arrived` at the same point;
+    /// - the shared quad IBO is grown by [`QuadIbo::ensure`] *after* this call
+    ///   and, since a unified-memory upload can be drawn the same frame, keeps
+    ///   its own same-frame wait.
+    ///
+    /// So the earliest consumer is frame N+1's vertex/index fetch. Frame N's
+    /// submission therefore does not wait on the lane at all; the batch's
+    /// value (and, on `DedicatedFamily`, its ACQUIRE barriers, which must
+    /// execute after the release via that very semaphore wait) is stashed
+    /// and applied by [`Self::take_deferred_arrival`] on frame N+1's command
+    /// buffer, whose submission waits on the lane at
+    /// [`MESH_CONSUMER_STAGES`]. Later frames are covered too: a queue wait's
+    /// second scope includes every submission later in submission order. The
+    /// benefit: the graphics queue never idles on a copy that was enqueued
+    /// microseconds earlier, so a streaming burst no longer costs a frame
+    /// spike. Destination ranges are only ever reused after their previous
+    /// occupant's reads retired through the render timeline (the allocator
+    /// sees a range back only past `RetireQueue::collect`), so the copy's
+    /// write-after-read side needs no GPU-side ordering; the transfer queue
+    /// takes ownership of such a range without an acquire, which Vulkan
+    /// allows for `EXCLUSIVE` buffers at the cost of undefined prior
+    /// contents — every byte is overwritten by the copy.
+    ///
+    /// `graphics_cmd` must be a real, valid (reset-and-begun) command buffer:
+    /// the `SameQueueFallback` tier records its copies and barrier into it.
     pub unsafe fn flush_copies(
         &mut self,
         device: &ash::Device,
@@ -560,9 +643,9 @@ impl MeshResidency {
         graphics_cmd: vk::CommandBuffer,
         graphics_family: u32,
         render_done_at: TimelineValue,
-    ) -> Option<TimelineValue> {
+    ) {
         if self.pending.is_empty() {
-            return None;
+            return;
         }
         let _scope = crate::profile::scope(crate::profile::Meter::Upload);
 
@@ -591,66 +674,38 @@ impl MeshResidency {
         let record_cmd = lane_batch.as_ref().map_or(graphics_cmd, |b| b.cmd());
 
         let mut bytes = 0u64;
-        // Barrier handling depends on tier: same-queue scoped barrier,
-        // or release/acquire for ownership transfer.
-        let mut same_queue_barriers: Vec<vk::BufferMemoryBarrier2> = Vec::new();
-        let mut release_barriers: Vec<vk::BufferMemoryBarrier2> = Vec::new();
-        let mut acquire_barriers: Vec<vk::BufferMemoryBarrier2> = Vec::new();
+        // Regions grouped per (staging block, destination arena) pair; the
+        // destination ranges feed the coalesced barriers below.
+        let mut copies: Vec<(vk::Buffer, vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
+        let mut written: Vec<BufferRange> = Vec::with_capacity(batch.len());
         let mut copied_slots: Vec<u32> = Vec::with_capacity(batch.len());
-        // Stamp value depends on tier (render-Rev or lane-Rev).
         let mut staging: Vec<Allocation> = Vec::with_capacity(batch.len());
-        unsafe {
-            for slot in batch {
-                let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) else {
-                    continue;
-                };
-                let Some(copy) = res.copy.take() else {
-                    continue;
-                };
-                let region = vk::BufferCopy::default()
-                    .src_offset(copy.staging.offset)
-                    .dst_offset(copy.dst_offset)
-                    .size(copy.size);
-                device.cmd_copy_buffer(record_cmd, copy.staging.buffer, copy.dst_buffer, &[region]);
-                bytes += copy.size;
-                let (buffer, offset, size) = (copy.dst_buffer, copy.dst_offset, copy.size);
-                if !separate_queue {
-                    same_queue_barriers.push(copy_barrier(
-                        buffer,
-                        offset,
-                        size,
-                        mesh_reads(),
-                        CopyBarrier::Draw,
-                    ));
-                } else if needs_qfot {
-                    release_barriers.push(copy_barrier(
-                        buffer,
-                        offset,
-                        size,
-                        mesh_reads(),
-                        CopyBarrier::Release {
-                            src_family: lane.family(),
-                            dst_family: graphics_family,
-                        },
-                    ));
-                    acquire_barriers.push(copy_barrier(
-                        buffer,
-                        offset,
-                        size,
-                        mesh_reads(),
-                        CopyBarrier::Acquire {
-                            src_family: lane.family(),
-                            dst_family: graphics_family,
-                        },
-                    ));
-                }
-                // else: SecondQueueSameFamily — no queue-family ownership
-                // transfer (same family), and memory visibility is already
-                // guaranteed by the timeline semaphore signal/wait pair
-                // below; no barrier at all.
-                staging.push(copy.staging);
-                copied_slots.push(slot);
+        for slot in batch {
+            let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) else {
+                continue;
+            };
+            let Some(copy) = res.copy.take() else {
+                continue;
+            };
+            let region = vk::BufferCopy::default()
+                .src_offset(copy.staging.offset)
+                .dst_offset(copy.dst_offset)
+                .size(copy.size);
+            match copies
+                .iter_mut()
+                .find(|(src, dst, _)| *src == copy.staging.buffer && *dst == copy.dst_buffer)
+            {
+                Some((_, _, regions)) => regions.push(region),
+                None => copies.push((copy.staging.buffer, copy.dst_buffer, vec![region])),
             }
+            written.push(BufferRange {
+                buffer: copy.dst_buffer,
+                offset: copy.dst_offset,
+                size: copy.size,
+            });
+            bytes += copy.size;
+            staging.push(copy.staging);
+            copied_slots.push(slot);
         }
 
         if copied_slots.is_empty() {
@@ -659,41 +714,60 @@ impl MeshResidency {
             if let Some(lane_batch) = lane_batch {
                 unsafe { lane.discard(device, lane_batch) };
             }
-            return None;
+            return;
         }
         crate::profile::gauge(crate::profile::Gauge::UploadBytes, bytes);
 
-        if !release_barriers.is_empty() {
-            unsafe {
-                device.cmd_pipeline_barrier2(
-                    record_cmd,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&release_barriers),
-                );
+        unsafe {
+            for (src, dst, regions) in &copies {
+                device.cmd_copy_buffer(record_cmd, *src, *dst, regions);
             }
         }
+        let written = coalesce_ranges(written);
+        let barriers = |role: CopyBarrier| -> Vec<vk::BufferMemoryBarrier2<'static>> {
+            written
+                .iter()
+                .map(|r| copy_barrier(r.buffer, r.offset, r.size, mesh_reads(), role))
+                .collect()
+        };
 
         let arrived_at = if let Some(lane_batch) = lane_batch {
-            // Cross-queue: a timeline wait (folded into the caller's next
-            // graphics submission) orders graphics against these copies; an
-            // in-command-buffer barrier cannot scope a cross-queue
-            // dependency. `graphics_cmd` still gets the ACQUIRE half of the
-            // ownership-transfer pair when the tier needs one.
-            let value = unsafe { lane.submit(device, lane_batch) };
-            if !acquire_barriers.is_empty() {
+            // Cross-queue: the RELEASE half rides the lane batch on the
+            // dedicated-family tier; the ACQUIRE half and the semaphore wait
+            // are deferred to the next graphics submission (see the hazard
+            // analysis above). `SecondQueueSameFamily` needs neither: same
+            // family, and the timeline signal/wait pair covers visibility.
+            if needs_qfot {
+                let release = barriers(CopyBarrier::Release {
+                    src_family: lane.family(),
+                    dst_family: graphics_family,
+                });
                 unsafe {
                     device.cmd_pipeline_barrier2(
-                        graphics_cmd,
-                        &vk::DependencyInfo::default().buffer_memory_barriers(&acquire_barriers),
+                        record_cmd,
+                        &vk::DependencyInfo::default().buffer_memory_barriers(&release),
                     );
                 }
             }
+            let value = unsafe { lane.submit(device, lane_batch) };
+            let acquires = if needs_qfot {
+                barriers(CopyBarrier::Acquire {
+                    src_family: lane.family(),
+                    dst_family: graphics_family,
+                })
+            } else {
+                Vec::new()
+            };
+            self.defer_arrival(value, acquires);
             value
         } else {
-            // Same queue: barrier in graphics_cmd orders the copies.
+            // Same queue: the barrier in graphics_cmd orders the copies ahead
+            // of every later vertex fetch in submission order.
+            let draw = barriers(CopyBarrier::Draw);
             unsafe {
                 device.cmd_pipeline_barrier2(
                     record_cmd,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&same_queue_barriers),
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&draw),
                 );
             }
             render_done_at
@@ -713,12 +787,57 @@ impl MeshResidency {
                 self.arrived_since_flush.push(slot);
             }
         }
+    }
 
-        separate_queue.then_some(arrived_at)
+    /// Stashes a submitted lane batch's graphics-side half. Folds into any
+    /// batch still owed (two flushes between graphics submissions): the wait
+    /// value is the max, the acquire lists concatenate.
+    fn defer_arrival(
+        &mut self,
+        value: TimelineValue,
+        acquires: Vec<vk::BufferMemoryBarrier2<'static>>,
+    ) {
+        match &mut self.deferred {
+            Some(prev) => {
+                prev.value = prev.value.max(value);
+                prev.acquires.extend(acquires);
+            }
+            None => self.deferred = Some(DeferredArrival { value, acquires }),
+        }
+    }
+
+    /// Applies the graphics-side half owed by earlier separate-queue batches:
+    /// records their ownership-transfer ACQUIRE barriers (dedicated-family
+    /// tier; empty otherwise) into `graphics_cmd` and returns the lane value
+    /// the submission of `graphics_cmd` must wait on — at
+    /// [`MESH_CONSUMER_STAGES`], which is also the acquires' destination
+    /// stage, so the release→acquire ordering rides that same wait. Call
+    /// before any pass is recorded into `graphics_cmd`. `None` when nothing
+    /// is owed.
+    pub unsafe fn take_deferred_arrival(
+        &mut self,
+        device: &ash::Device,
+        graphics_cmd: vk::CommandBuffer,
+    ) -> Option<TimelineValue> {
+        let DeferredArrival { value, acquires } = self.deferred.take()?;
+        if !acquires.is_empty() {
+            unsafe {
+                device.cmd_pipeline_barrier2(
+                    graphics_cmd,
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&acquires),
+                );
+            }
+        }
+        Some(value)
     }
 
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// True when a separate-queue batch is owed a graphics wait + ACQUIRE.
+    pub fn has_deferred(&self) -> bool {
+        self.deferred.is_some()
     }
 
     pub fn has_garbage(&self) -> bool {
@@ -1581,6 +1700,51 @@ mod tests {
     use super::super::timeline::TimelineValue;
     use super::{HandleAllocator, IMM_MIN_CAPACITY, RetireQueue, shrink_capacity};
     use crate::mesh::MeshHandle;
+    use ash::vk;
+    use ash::vk::Handle;
+
+    #[test]
+    fn coalesce_merges_touching_runs_per_buffer_only() {
+        use super::{BufferRange, coalesce_ranges};
+        let a = vk::Buffer::from_raw(1);
+        let b = vk::Buffer::from_raw(2);
+        let r = |buffer, offset, size| BufferRange {
+            buffer,
+            offset,
+            size,
+        };
+        // Out-of-order input; [0,256) + [256,512) + [512,520) touch; [1024,..)
+        // is a separate run; buffer b's touching range must not merge into a.
+        let merged = coalesce_ranges(vec![
+            r(a, 512, 8),
+            r(a, 0, 256),
+            r(b, 520, 16),
+            r(a, 1024, 100),
+            r(a, 256, 256),
+        ]);
+        assert_eq!(merged, vec![r(a, 0, 520), r(a, 1024, 100), r(b, 520, 16)]);
+        // Overlap keeps the farthest end; a gap of one byte stays split.
+        let merged = coalesce_ranges(vec![r(a, 0, 100), r(a, 50, 100), r(a, 151, 1)]);
+        assert_eq!(merged, vec![r(a, 0, 150), r(a, 151, 1)]);
+        assert!(coalesce_ranges(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn deferred_arrival_folds_until_taken() {
+        use super::{DeferredArrival, MeshResidency};
+        let mut res = MeshResidency::new();
+        assert!(!res.has_deferred());
+        res.defer_arrival(TimelineValue::from_raw_for_test(3), vec![]);
+        res.defer_arrival(
+            TimelineValue::from_raw_for_test(2),
+            vec![vk::BufferMemoryBarrier2::default()],
+        );
+        assert!(res.has_deferred());
+        let DeferredArrival { value, acquires } = res.deferred.take().expect("owed");
+        assert_eq!(value, TimelineValue::from_raw_for_test(3));
+        assert_eq!(acquires.len(), 1);
+        assert!(!res.has_deferred());
+    }
 
     #[test]
     fn mesh_handle_option_has_niche() {

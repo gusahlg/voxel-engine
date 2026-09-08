@@ -119,24 +119,27 @@ impl RenderSubmit {
         self.value
     }
 
-    /// Submit with optional cross-queue dependency via `extra_wait`.
+    /// Submit with optional cross-queue dependency via `extra_wait`: the
+    /// semaphore, the value, and the stages that first consume what the other
+    /// queue produced (the wait's second synchronization scope). Pass
+    /// `ALL_COMMANDS` unless the consumer set is known exactly.
     pub unsafe fn submit(
         self,
         device: &ash::Device,
         queue: vk::Queue,
         timeline: &Timeline,
-        extra_wait: Option<(vk::Semaphore, TimelineValue)>,
+        extra_wait: Option<(vk::Semaphore, TimelineValue, vk::PipelineStageFlags2)>,
     ) -> RenderCompletion {
         let signal = [vk::SemaphoreSubmitInfo::default()
             .semaphore(timeline.sem)
             .value(self.value.raw())
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
         let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(self.cmd)];
-        let waits = extra_wait.map(|(sem, value)| {
+        let waits = extra_wait.map(|(sem, value, stages)| {
             [vk::SemaphoreSubmitInfo::default()
                 .semaphore(sem)
                 .value(value.raw())
-                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)]
+                .stage_mask(stages)]
         });
         let mut submit = vk::SubmitInfo2::default()
             .command_buffer_infos(&cmds)
