@@ -629,6 +629,12 @@ impl Renderer {
         if self.flags.taa != flags.taa {
             self.taa.invalidate_history();
         }
+        if self.flags.bloom && !flags.bloom {
+            // Next presented frame must re-clear the stale pyramid to black.
+            for chain in &mut self.targets.bloom {
+                chain.cleared = false;
+            }
+        }
         self.flags = flags;
     }
 
@@ -825,7 +831,7 @@ impl Renderer {
         }
         let (rs, hdr_readable) = {
             let _p = scope(Meter::Record);
-            self.record_render(&guard, lists, offsets)
+            self.record_render(&guard, lists, offsets, present_target.is_some())
         };
 
         {
@@ -1354,6 +1360,7 @@ impl Renderer {
         guard: &SlotGuard,
         lists: &DrawLists,
         offsets: ImmOffsets,
+        will_present: bool,
     ) -> (RenderSubmit, HdrReadable) {
         let slot = guard.0;
         let cmd = self.slots[FrameSlot::new(slot)].cmd;
@@ -1591,17 +1598,23 @@ impl Renderer {
         // `end`, so when either is active `end` must NOT transition (the barrier
         // would race their writes) — the deferred finalization below owns it
         // instead. With both disabled (the common path) `end` transitions.
+        //
+        // TAA keeps history every frame. Bloom and exposure metering feed only
+        // the tonemap present-copy, so they run solely on frames that will
+        // present (`decide_present` already ran; forced capture always presents).
         let taa = lists.scene.is_some() && self.flags.taa;
-        let exposure = lists.scene.is_some() && self.flags.exposure;
-        let deferred = taa || exposure;
+        let exposure_on = lists.scene.is_some() && self.flags.exposure;
+        let run_exposure = exposure_on && will_present;
+        let deferred = taa || run_exposure;
         // Overlay composited post-tonemap so warp/TAA don't affect the HUD.
         stamp(GpuPass::Overlay);
         // Finalize the offscreen to SHADER_READ_ONLY exactly once and obtain the
         // [`HdrReadable`] proof the tonemap present-copy requires. The branches
-        // are exhaustive and each ends with the offscreen sampled: (a) not
-        // deferred → the render pass transitions; (b) deferred + exposure →
-        // metering owns the transition; (c) deferred + !exposure (TAA-on,
-        // exposure-off) → TAA left COLOR_ATTACHMENT, so transition explicitly.
+        // are exhaustive and each ends with the offscreen sampled when a present
+        // will sample it: (a) not deferred → the render pass transitions (or we
+        // skip the transition on an unpresented frame); (b) deferred + exposure
+        // → metering owns the transition; (c) deferred + !exposure (TAA-on,
+        // exposure-off/skipped) → TAA already left its output sampled.
         // Producing the proof only inside these paths is what makes "nobody
         // finalized the layout" fail to compile at `present` rather than trip the
         // validation layer (the exact bug from the exposure-default-off change).
@@ -1615,8 +1628,8 @@ impl Renderer {
                 // TAA resolve runs AFTER the HDR resolve and BEFORE exposure, so
                 // exposure meters the stabilized image. It reads the current HDR +
                 // reprojected history, writes the resolved HDR back, and leaves it
-                // COLOR_ATTACHMENT for the exposure pass. Reprojection uses the
-                // un-jittered view-proj; a false `flags.taa` never reaches here.
+                // sampled for the exposure pass. Reprojection uses the un-jittered
+                // view-proj; a false `flags.taa` never reaches here.
                 if taa {
                     // `taa` is `lists.scene.is_some() && self.flags.taa` (above).
                     let scene = lists.scene.as_ref().expect("taa true implies a 3D scene");
@@ -1634,7 +1647,7 @@ impl Renderer {
                         };
                     }
                 }
-                if exposure {
+                if run_exposure {
                     // Reduce the frame HDR to per-tile mean log2-luma, publish
                     // the smoothed exposure, and finalize the HDR in SHADER_READ.
                     let readable = self.record_exposure_pass(cmd, FrameSlot::new(slot));
@@ -1649,7 +1662,7 @@ impl Renderer {
                     // TAA published its output as the frame HDR and already
                     // left it (and the offscreen) sampled: nothing to record.
                     HdrReadable::new(slot)
-                } else {
+                } else if will_present {
                     let readable = unsafe { self.transition_offscreen_to_sampled(cmd, slot) };
                     // The finalize barrier belongs to the resolve span.
                     if profiling {
@@ -1659,8 +1672,10 @@ impl Renderer {
                         };
                     }
                     readable
+                } else {
+                    HdrReadable::new(slot)
                 }
-            } else {
+            } else if will_present {
                 // Common path (TAA + exposure both off): the render pass finalizes.
                 let readable = unsafe { pass.end_sampled() };
                 // Close the resolve/finalize segment (MSAA resolve + transitions)
@@ -1672,13 +1687,20 @@ impl Renderer {
                     };
                 }
                 readable
+            } else {
+                // Unpresented, no later HDR writer: skip the sampled transition;
+                // the next begin discards the offscreen from UNDEFINED.
+                unsafe { pass.end_deferred() };
+                HdrReadable::new(slot)
             }
         };
         // Bloom: threshold + downsample the finalized HDR into this slot's
-        // mip chain; the tonemap present-copy composites it. Recorded here so the
-        // render→present semaphore makes the pyramid visible to the tonemap sample,
-        // exactly as it does for the offscreen. A pure function of this frame.
-        self.record_bloom_pass(cmd, FrameSlot::new(slot));
+        // mip chain; the tonemap present-copy composites it. Present-only — a
+        // dropped mailbox frame never samples the pyramid. Forced capture always
+        // presents, so it always gets a fresh chain.
+        if will_present {
+            self.record_bloom_pass(cmd, FrameSlot::new(slot));
+        }
         // Close the tail: without this stamp the bloom work recorded above
         // ends after the last boundary and never reaches the report. (The
         // tonemap/present copy is timed on the copy command buffer; see

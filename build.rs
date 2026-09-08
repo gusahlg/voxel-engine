@@ -711,7 +711,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "VARIANCE_GAMMA",
-            doc: "TAA neighbourhood variance-clamp width in std-devs: history is clamped to\nYCoCg mean +/- VARIANCE_GAMMA*stddev of the 3x3 current taps. Wider = steadier\n(less crawl) but more ghosting. Read by taa_resolve.comp.",
+            doc: "TAA neighbourhood variance-clamp width in std-devs: history is clamped to\nYCoCg mean +/- VARIANCE_GAMMA*stddev of the 5-tap cross current taps. Wider =\nsteadier (less crawl) but more ghosting. Read by taa_resolve.comp.",
             val: Val::Scalar(1.25),
         },
         Def {
@@ -765,6 +765,11 @@ fn build_table() -> Vec<Def> {
         Def {
             name: "EXPOSURE_TILE",
             doc: "Exposure metering tile edge in HDR texels. The CPU-side tile-grid dimensions\n(vk/exposure.rs) are ceil(hdr_dim / EXPOSURE_TILE) and must agree.",
+            val: Val::UInt(16),
+        },
+        Def {
+            name: "TAA_TILE",
+            doc: "TAA resolve workgroup edge in texels (groupshared tile + 1-pixel apron).\nCPU dispatch (vk/taa.rs) must divide by the same value.",
             val: Val::UInt(16),
         },
         Def {
@@ -859,6 +864,11 @@ fn build_table() -> Vec<Def> {
             name: "BLOOM_SPIRAL_LOD",
             doc: "Mip level the bloom spiral samples the (already downsampled) chain at — the\nwide soft blur comes from the pyramid; the spiral just spreads and de-aliases it.",
             val: Val::Scalar(2.0),
+        },
+        Def {
+            name: "BLOOM_MAX_MIPS",
+            doc: "Bloom pyramid mip cap. Tonemap samples only BLOOM_SPIRAL_LOD, so the chain\nstops at that level (base + LOD). CPU (vk/targets.rs) must agree.",
+            val: Val::UInt(3),
         },
         Def {
             name: "BLOOM_SPIRAL_RADIUS",

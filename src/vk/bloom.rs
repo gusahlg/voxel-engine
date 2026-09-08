@@ -14,9 +14,12 @@
 //! consumer, so nothing here is generalized into a reusable HDR-mip abstraction.
 //!
 //! Determinism: bloom is a pure function of this frame's HDR — no temporal state,
-//! no wall-clock. Recorded on the render command buffer right after the offscreen
-//! is finalized, so the render→present semaphore makes the pyramid visible to the
-//! tonemap sample exactly as it does for the offscreen itself.
+//! no wall-clock. Recorded on the render command buffer of presented frames only
+//! (tonemap never samples an unpresented pyramid), right after the offscreen is
+//! finalized, so the render→present semaphore makes the pyramid visible to the
+//! tonemap sample exactly as it does for the offscreen itself. The mip chain is
+//! capped at [`crate::genconst::BLOOM_MAX_MIPS`] (the LOD tonemap actually
+//! samples); bloom-off clears each slot's pyramid once, not every frame.
 
 use ash::vk;
 
@@ -137,13 +140,12 @@ impl BloomState {
 }
 
 impl super::Renderer {
-    pub(crate) fn record_bloom_pass(&self, cmd: vk::CommandBuffer, slot: FrameSlot) {
+    pub(crate) fn record_bloom_pass(&mut self, cmd: vk::CommandBuffer, slot: FrameSlot) {
         let device = &self.device.device;
         let bloom = &self.bloom;
-        let chain = &self.targets.bloom[slot.index()];
         let (hdr_image, hdr_view) = self.hdr_of(slot.index());
         let exposure = self.exposure.current().0;
-        let levels = chain.mip_views.len();
+        let levels = self.targets.bloom[slot.index()].mip_views.len();
 
         // All mip levels.
         let all_mips = vk::ImageSubresourceRange {
@@ -154,10 +156,15 @@ impl super::Renderer {
             layer_count: 1,
         };
 
-        // Lane off: clear the pyramid to black and hand it to the tonemap as-is —
-        // the composite `hdr += spill·…` then adds zero, a no-op with no shader or
-        // push-constant branch. Cheap enough to run unconditionally each frame.
+        // Lane off: clear the pyramid to black once and hand it to the tonemap
+        // as-is — the composite `hdr += spill·…` then adds zero, a no-op with no
+        // shader or push-constant branch. Subsequent frames reuse the black
+        // pyramid; toggling the lane back off invalidates `cleared`.
         if !self.flags.bloom {
+            let chain = &mut self.targets.bloom[slot.index()];
+            if chain.cleared {
+                return;
+            }
             unsafe {
                 let to_dst = [vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
@@ -192,8 +199,11 @@ impl super::Renderer {
                     &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
                 );
             }
+            chain.cleared = true;
             return;
         }
+        self.targets.bloom[slot.index()].cleared = false;
+        let chain = &self.targets.bloom[slot.index()];
 
         unsafe {
             // Transition HDR image for compute sampling.

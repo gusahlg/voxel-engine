@@ -72,8 +72,8 @@ static const float2 HALTON_23[16] = {
 static const float HISTORY_BLEND = 0.92f;
 
 // TAA neighbourhood variance-clamp width in std-devs: history is clamped to
-// YCoCg mean +/- VARIANCE_GAMMA*stddev of the 3x3 current taps. Wider = steadier
-// (less crawl) but more ghosting. Read by taa_resolve.comp.
+// YCoCg mean +/- VARIANCE_GAMMA*stddev of the 5-tap cross current taps. Wider =
+// steadier (less crawl) but more ghosting. Read by taa_resolve.comp.
 static const float VARIANCE_GAMMA = 1.25f;
 
 // Blocklight candle curve: candle = x*sqrt(x) + (CANDLE_HIGH_MUL*x)^CANDLE_HIGH_POW,
@@ -115,6 +115,10 @@ static const uint CULL_WORKGROUP = 64;
 // Exposure metering tile edge in HDR texels. The CPU-side tile-grid dimensions
 // (vk/exposure.rs) are ceil(hdr_dim / EXPOSURE_TILE) and must agree.
 static const uint EXPOSURE_TILE = 16;
+
+// TAA resolve workgroup edge in texels (groupshared tile + 1-pixel apron).
+// CPU dispatch (vk/taa.rs) must divide by the same value.
+static const uint TAA_TILE = 16;
 
 // Sun-disc soft rim (fade-to-zero edge) as a multiple of the sun angular radius.
 // Tighter rim keeps sun crisp against busier night sky. Complements brighter stars [4.2, 4.5, 5.2] and larger moon.
@@ -175,6 +179,10 @@ static const float BLOOM_SPIRAL_SAMPLES = 6.0f;
 // Mip level the bloom spiral samples the (already downsampled) chain at — the
 // wide soft blur comes from the pyramid; the spiral just spreads and de-aliases it.
 static const float BLOOM_SPIRAL_LOD = 2.0f;
+
+// Bloom pyramid mip cap. Tonemap samples only BLOOM_SPIRAL_LOD, so the chain
+// stops at that level (base + LOD). CPU (vk/targets.rs) must agree.
+static const uint BLOOM_MAX_MIPS = 3;
 
 // Bloom spiral radius in output uv (isotropic). Small — the mip chain already
 // carries the wide blur, so this only softens the seams between taps.

@@ -177,10 +177,14 @@ pub(crate) struct BloomChain {
     pub sample_view: vk::ImageView,
     pub mip_views: Vec<vk::ImageView>,
     pub mip_extents: Vec<vk::Extent2D>,
+    /// True once a bloom-off clear has left this pyramid black in
+    /// `SHADER_READ_ONLY`. Avoids re-clearing every frame.
+    pub cleared: bool,
 }
 
-/// Maximum mip levels; pyramid reaches 1x1 or BLOOM_MAX_MIPS, whichever is shorter.
-const BLOOM_MAX_MIPS: u32 = 6;
+/// Tonemap samples only `BLOOM_SPIRAL_LOD`, so the pyramid stops there.
+const BLOOM_MAX_MIPS: u32 = crate::genconst::BLOOM_MAX_MIPS;
+const _: () = assert!(BLOOM_MAX_MIPS == crate::genconst::BLOOM_SPIRAL_LOD as u32 + 1);
 
 impl BloomChain {
     fn new(
@@ -287,6 +291,7 @@ impl BloomChain {
             sample_view,
             mip_views,
             mip_extents,
+            cleared: false,
         }
     }
 

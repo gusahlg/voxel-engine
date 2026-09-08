@@ -9,23 +9,19 @@
 //! integrator and the resolved HDR that exposure meters and tonemap reads.
 //!
 //! This pass runs AFTER the main HDR resolve and BEFORE `record_exposure_pass`,
-//! so exposure meters the stabilized image.
+//! so exposure meters the stabilized image. TAA itself runs every frame (history
+//! must not freeze on mailbox drops); bloom/exposure are present-only.
 //!
 //! History is a single ping-pong integrator, independent of the 2FIF slots: each
 //! frame reads the image written last frame and writes the other. Persistent;
 //! recreated on resize with contents discarded (history reconverges).
 //!
-//! Reprojection is depth-aware: the current pixel is unprojected at its real depth
-//! through the current inverse view-proj and reprojected by the packed
-//! previous clip transform, so both rotation and translation reproject correctly.
-//! Single-sampled only (MSAA depth can't be sampled by this pass); the MSAA fallback
-//! is the old far-plane path, and disocclusions still fall to the neighbourhood clamp.
+//! Reprojection is depth-aware: the host f64-composes `prev * inv(cur)` into a
+//! single push-constant matrix (no per-slot UBO). Depth is point-sampled.
 
 use ash::vk;
-use glam::{DVec3, Mat4, Vec2};
+use glam::{DMat4, DVec3, Mat4, Vec2};
 
-use super::alloc::find_memory_type;
-use super::buffers::FRAMES_IN_FLIGHT;
 use super::image::{ImageDesc, ImageResource, LayoutUse};
 use super::targets::HDR_COLOR_FORMAT;
 use crate::rev::FrameSlot;
@@ -62,7 +58,6 @@ pub const TAA_HISTORY_FORMAT: ash::vk::Format = ash::vk::Format::R16G16B16A16_SF
 /// to verify temporal stability.
 pub const TAA_RESOLVE_CURRENT_BINDING: u32 = 0;
 pub const TAA_RESOLVE_HISTORY_BINDING: u32 = 1;
-pub const TAA_RESOLVE_REPROJ_BINDING: u32 = 2;
 
 /// Reprojection inputs. `prev` is clean (un-jittered) to avoid ghosting.
 pub struct Reprojection {
@@ -70,52 +65,44 @@ pub struct Reprojection {
     pub camera_delta: DVec3,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct ReprojectionGpu {
-    pub prev_view_proj: [[f32; 4]; 4],
-    /// xyz = camera delta, w unused.
-    pub camera_delta: [f32; 4],
+impl Reprojection {
+    /// Compose `prev * translate(-delta) * inverse(cur)` in f64, then narrow.
+    pub fn matrix(&self, cur: Mat4) -> Mat4 {
+        compose_reproj(self.prev.0, self.camera_delta, cur)
+    }
 }
 
-const _: () = assert!(size_of::<ReprojectionGpu>() == 80);
-
-impl Reprojection {
-    /// Compose the previous clip transform with the camera delta, then narrow to f32.
-    pub fn pack(&self) -> ReprojectionGpu {
-        let d = self.camera_delta.as_vec3();
-        let m = self.prev.0 * Mat4::from_translation(-d);
-        ReprojectionGpu {
-            prev_view_proj: m.to_cols_array_2d(),
-            camera_delta: [d.x, d.y, d.z, 0.0],
-        }
-    }
+fn compose_reproj(prev_vp: Mat4, camera_delta: DVec3, cur: Mat4) -> Mat4 {
+    let prev = prev_vp.as_dmat4() * DMat4::from_translation(-camera_delta);
+    (prev * cur.as_dmat4().inverse()).as_mat4()
 }
 
 const TAA_RESOLVE_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/taa_resolve.comp.spv"));
 
-/// Output storage-image binding (inputs 0/1/2 are fixed).
-const TAA_RESOLVE_OUTPUT_BINDING: u32 = 3;
+const TAA_RESOLVE_OUTPUT_BINDING: u32 = 2;
+const TAA_RESOLVE_DEPTH_BINDING: u32 = 3;
 
-/// Depth binding for depth-aware reprojection.
-const TAA_RESOLVE_DEPTH_BINDING: u32 = 4;
+const TAA_TILE: u32 = crate::genconst::TAA_TILE;
 
 /// History feedback weight from genconst; fraction of clamped history kept each frame.
 use crate::genconst::HISTORY_BLEND;
 
-/// Push constants for `taa_resolve.comp` (the inverse view-proj without jitter).
+/// Push constants for `taa_resolve.comp`. One f64-composed reprojection matrix;
+/// Vulkan min `maxPushConstantsSize` is 128 B.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct TaaPush {
-    inv_cur_view_proj: [[f32; 4]; 4],
+    reproj: [[f32; 4]; 4],
     dim: [u32; 2],
-    /// Raster jitter in pixels (samples depth at uv + jitter for clean center ray).
+    /// Raster jitter in pixels (point-sampled depth at the jittered pixel).
     jitter_px: [f32; 2],
     blend: f32,
     history_valid: u32,
-    /// 0 under MSAA (falls back to far-plane reprojection).
+    /// 0 under the far-plane fallback (no sampleable depth).
     depth_valid: u32,
 }
+
+const _: () = assert!(size_of::<TaaPush>() <= 128);
 
 fn create_hdr_image(
     device: &ash::Device,
@@ -135,79 +122,13 @@ fn create_hdr_image(
     ImageResource::create(device, memory_props, &desc)
 }
 
-/// One slot's host-visible reprojection UBO (`ReprojectionGpu`, 80 B). Per-slot
-/// so a 2FIF in-flight frame never reads a half-written buffer.
-struct ReprojUbo {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-    mapped: *mut ReprojectionGpu,
-}
-
-impl ReprojUbo {
-    fn new(device: &ash::Device, memory_props: &vk::PhysicalDeviceMemoryProperties) -> ReprojUbo {
-        let buffer = unsafe {
-            device
-                .create_buffer(
-                    &vk::BufferCreateInfo::default()
-                        .size(size_of::<ReprojectionGpu>() as u64)
-                        .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                    None,
-                )
-                .expect("create taa reproj ubo")
-        };
-        let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let memory = unsafe {
-            device
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(reqs.size)
-                        .memory_type_index(find_memory_type(
-                            memory_props,
-                            reqs.memory_type_bits,
-                            vk::MemoryPropertyFlags::HOST_VISIBLE
-                                | vk::MemoryPropertyFlags::HOST_COHERENT,
-                        )),
-                    None,
-                )
-                .expect("allocate taa reproj ubo memory")
-        };
-        unsafe {
-            device
-                .bind_buffer_memory(buffer, memory, 0)
-                .expect("bind taa reproj ubo memory");
-        }
-        let mapped = unsafe {
-            device
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                .expect("map taa reproj ubo") as *mut ReprojectionGpu
-        };
-        ReprojUbo {
-            buffer,
-            memory,
-            mapped,
-        }
-    }
-
-    fn write(&self, r: &ReprojectionGpu) {
-        unsafe { std::ptr::write(self.mapped, *r) };
-    }
-
-    unsafe fn destroy(&self, device: &ash::Device) {
-        unsafe {
-            device.unmap_memory(self.memory);
-            device.destroy_buffer(self.buffer, None);
-            device.free_memory(self.memory, None);
-        }
-    }
-}
-
-/// The resolve compute pipeline plus the sampler it reads current/history through.
+/// The resolve compute pipeline plus the samplers it reads current/history/depth through.
 struct TaaCompute {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     set_layout: vk::DescriptorSetLayout,
     sampler: vk::Sampler,
+    depth_sampler: vk::Sampler,
 }
 
 impl TaaCompute {
@@ -221,11 +142,6 @@ impl TaaCompute {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(TAA_RESOLVE_HISTORY_BINDING)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(TAA_RESOLVE_REPROJ_BINDING)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
@@ -243,12 +159,14 @@ impl TaaCompute {
             pass::push_descriptor_layouts(device, &bindings, size_of::<TaaPush>() as u32, "taa");
         let pipeline = pass::compute_pipeline(device, cache, layout, TAA_RESOLVE_COMP, "taa");
         let sampler = pass::linear_clamp_sampler(device, "taa");
+        let depth_sampler = pass::nearest_clamp_sampler(device, "taa depth");
 
         TaaCompute {
             pipeline,
             layout,
             set_layout,
             sampler,
+            depth_sampler,
         }
     }
 
@@ -258,6 +176,7 @@ impl TaaCompute {
             device.destroy_pipeline_layout(self.layout, None);
             device.destroy_descriptor_set_layout(self.set_layout, None);
             device.destroy_sampler(self.sampler, None);
+            device.destroy_sampler(self.depth_sampler, None);
         }
     }
 }
@@ -272,7 +191,6 @@ pub(crate) struct TaaState {
     /// Index of the image holding LAST frame's resolved output (this frame's
     /// history source); the other is written this frame, then becomes the source.
     read_idx: usize,
-    reproj: [ReprojUbo; FRAMES_IN_FLIGHT as usize],
     extent: vk::Extent2D,
     /// False until at least one frame has populated `read_idx` (and after a
     /// resize discards history): the shader then integrates from the current
@@ -294,7 +212,6 @@ impl TaaState {
             compute: TaaCompute::new(device, cache),
             history: std::array::from_fn(|_| create_hdr_image(device, memory_props, render_extent)),
             read_idx: 0,
-            reproj: std::array::from_fn(|_| ReprojUbo::new(device, memory_props)),
             extent: render_extent,
             valid: false,
             prev: None,
@@ -336,21 +253,14 @@ impl TaaState {
             for h in &self.history {
                 h.destroy(device);
             }
-            for u in &self.reproj {
-                u.destroy(device);
-            }
         }
     }
 }
 
-// SAFETY: the mapped UBO pointers are only dereferenced on the render thread
-// (this state lives inside the render-thread-owned `Renderer`); `Send` is needed
-// only because `Renderer` is constructed on and moved to that thread.
-unsafe impl Send for TaaState {}
-
 impl super::Renderer {
     /// Record TAA resolve (after HDR, before exposure). Outputs the stabilized HDR
-    /// for exposure/tonemap to sample directly.
+    /// for exposure/tonemap to sample directly. One pre-dispatch barrier and one
+    /// post-dispatch barrier cover offscreen, depth, and both history images.
     pub(crate) fn record_taa_pass(
         &mut self,
         cmd: vk::CommandBuffer,
@@ -367,19 +277,14 @@ impl super::Renderer {
         let r = taa.read_idx;
         let w = 1 - r;
 
-        let reproj_gpu = match taa.prev {
+        let reproj_mat = match taa.prev {
             Some((prev_vp, prev_eye)) => Reprojection {
                 prev: CleanViewProj(prev_vp),
                 camera_delta: prev_eye - eye,
             }
-            .pack(),
-            None => Reprojection {
-                prev: CleanViewProj(clean_view_proj),
-                camera_delta: DVec3::ZERO,
-            }
-            .pack(),
+            .matrix(clean_view_proj),
+            None => Mat4::IDENTITY,
         };
-        taa.reproj[slot.index()].write(&reproj_gpu);
 
         let extent = taa.extent;
         let offscreen = &self.targets.offscreen[slot.index()];
@@ -389,7 +294,9 @@ impl super::Renderer {
         let depth = self.targets.sampleable_depth(slot.index());
         let device = &self.device.device;
         unsafe {
-            let mut pre = vec![
+            let hist_r = taa.history[r].barrier_to(LayoutUse::ComputeSampledRead, false);
+            let hist_w = taa.history[w].barrier_to(LayoutUse::ComputeStorageWrite, true);
+            let pre = [
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -399,11 +306,6 @@ impl super::Renderer {
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .image(offscreen.image())
                     .subresource_range(super::color_range()),
-            ];
-            // Depth → shader-read. Under MSAA the producer is the render pass's
-            // SAMPLE_ZERO resolve at COLOR_ATTACHMENT_OUTPUT; single-sampled it
-            // is the ordinary depth attachment. Restore the matching scope below.
-            pre.push(
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(depth_stage)
                     .src_access_mask(depth_access)
@@ -413,13 +315,13 @@ impl super::Renderer {
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .image(depth.image())
                     .subresource_range(super::depth_range()),
-            );
+                hist_r,
+                hist_w,
+            ];
             device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&pre),
             );
-            taa.history[r].transition(device, cmd, LayoutUse::ComputeSampledRead);
-            taa.history[w].transition_discard(device, cmd, LayoutUse::ComputeStorageWrite);
 
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, taa.compute.pipeline);
             let cur_info = [vk::DescriptorImageInfo::default()
@@ -434,13 +336,9 @@ impl super::Renderer {
                 .image_view(taa.history[w].view())
                 .image_layout(vk::ImageLayout::GENERAL)];
             let depth_info = [vk::DescriptorImageInfo::default()
-                .sampler(taa.compute.sampler)
+                .sampler(taa.compute.depth_sampler)
                 .image_view(depth.view())
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let reproj_info = [vk::DescriptorBufferInfo::default()
-                .buffer(taa.reproj[slot.index()].buffer)
-                .offset(0)
-                .range(vk::WHOLE_SIZE)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_binding(TAA_RESOLVE_CURRENT_BINDING)
@@ -450,10 +348,6 @@ impl super::Renderer {
                     .dst_binding(TAA_RESOLVE_HISTORY_BINDING)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&hist_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_binding(TAA_RESOLVE_REPROJ_BINDING)
-                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                    .buffer_info(&reproj_info),
                 vk::WriteDescriptorSet::default()
                     .dst_binding(TAA_RESOLVE_OUTPUT_BINDING)
                     .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
@@ -472,7 +366,7 @@ impl super::Renderer {
             );
 
             let push = TaaPush {
-                inv_cur_view_proj: clean_view_proj.inverse().to_cols_array_2d(),
+                reproj: reproj_mat.to_cols_array_2d(),
                 dim: [extent.width, extent.height],
                 jitter_px: jitter_px.to_array(),
                 blend: HISTORY_BLEND,
@@ -487,19 +381,26 @@ impl super::Renderer {
                 0,
                 bytemuck::bytes_of(&push),
             );
-            device.cmd_dispatch(cmd, extent.width.div_ceil(8), extent.height.div_ceil(8), 1);
+            device.cmd_dispatch(
+                cmd,
+                extent.width.div_ceil(TAA_TILE),
+                extent.height.div_ceil(TAA_TILE),
+                1,
+            );
 
-            taa.history[w].transition(device, cmd, LayoutUse::SampledAfterComputeWrite);
-            // Depth back to its attachment layout for the next pass / godray read.
-            let post = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .dst_stage_mask(depth_stage)
-                .dst_access_mask(depth_access)
-                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .new_layout(depth_layout)
-                .image(depth.image())
-                .subresource_range(super::depth_range())];
+            let hist_pub = taa.history[w].barrier_to(LayoutUse::SampledAfterComputeWrite, false);
+            let post = [
+                hist_pub,
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .dst_stage_mask(depth_stage)
+                    .dst_access_mask(depth_access)
+                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .new_layout(depth_layout)
+                    .image(depth.image())
+                    .subresource_range(super::depth_range()),
+            ];
             device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&post),
@@ -517,10 +418,6 @@ impl super::Renderer {
 mod tests {
     use super::*;
 
-    // (An aspirational `taa_interferes_with_itself` test was removed here: it
-    // called a producer `manifest()` that never existed — TAA is not modelled
-    // as a scheduled producer, it runs inside the render thread.)
-
     /// Jitter sequence is centered and bounded (±0.5 px).
     #[test]
     fn jitter_sequence_centered_and_bounded() {
@@ -531,5 +428,40 @@ mod tests {
             sum += j;
         }
         assert!(sum.length() < 0.1 * TEMPORAL_SEQ_LEN as f32);
+    }
+
+    /// Same camera → identity reprojection (f64 compose, then narrow).
+    #[test]
+    fn compose_reproj_identity_when_camera_unmoved() {
+        let vp = Mat4::from_translation(glam::Vec3::new(10.0, 2.0, -4.0));
+        let eye = DVec3::new(10.0, 2.0, -4.0);
+        let m = compose_reproj(vp, DVec3::ZERO, vp);
+        let ident = Reprojection {
+            prev: CleanViewProj(vp),
+            camera_delta: eye - eye,
+        }
+        .matrix(vp);
+        let m_cols = m.to_cols_array_2d();
+        let ident_cols = ident.to_cols_array_2d();
+        for col in 0..4 {
+            for row in 0..4 {
+                let expected = if col == row { 1.0 } else { 0.0 };
+                assert!((m_cols[col][row] - expected).abs() < 1e-5);
+                assert!((ident_cols[col][row] - expected).abs() < 1e-5);
+            }
+        }
+    }
+
+    /// Identity prev/cur with a camera delta is a translation by -delta.
+    #[test]
+    fn compose_reproj_applies_camera_delta_as_translation() {
+        let cur = Mat4::IDENTITY;
+        let prev = Mat4::IDENTITY;
+        let delta = DVec3::new(1.0 + 1e-8, 0.0, 0.0);
+        let m = compose_reproj(prev, delta, cur);
+        // translate(-delta) on identity prev, times identity inv(cur) → translation -delta.
+        let t = m.w_axis;
+        assert!((t.x + delta.x as f32).abs() < 1e-6);
+        assert!(t.y.abs() < 1e-6 && t.z.abs() < 1e-6);
     }
 }
