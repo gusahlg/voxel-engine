@@ -5,9 +5,10 @@
 // SV_VulkanInstanceID (not SV_InstanceID) to read plain InstanceIndex.
 //
 // Shifts/masks mirror mesh.rs. UV derives from position and normal. Baked
-// sky/block amounts become RGB here (× frame light/candle) so the fragment
-// interpolates colours, not levels. Face index is packed — no float3 normal
-// varying; the fragment looks `FACE_NORMAL` up.
+// sky/block/AO levels interpolate as scalars; the fragment multiplies by
+// frame light/candle (uniform × interpolated scalar == interpolated product).
+// Face index is packed — no float3 normal varying; the fragment looks
+// `FACE_NORMAL` up.
 
 #include "common.slang"
 
@@ -59,17 +60,13 @@ struct VertexOutput
     [[vk::location(1)]]
     float3 world;
 
-    // rgb = frame.light.rgb * sky_amount; w = sky_amount (fallback / skip).
+    // x = sky_amount, y = block_amount, z = ao_factor.
     [[vk::location(2)]]
-    float4 sky;
-
-    // rgb = frame.candle.rgb * block_amount; a = AO factor.
-    [[vk::location(3)]]
-    float4 block_ao;
+    float3 light_lv;
 
     // x: layer[0:14] water[14] FLAT_COLOR[15] face[16:19] detail[20:24]
     // y: flat_rgba
-    [[vk::location(4)]]
+    [[vk::location(3)]]
     nointerpolation uint2 ids;
 };
 
@@ -155,8 +152,7 @@ VertexOutput vertexMain(VertexInput input)
     // Scale UV to maintain texel density across LOD levels.
     output.uv = uv * scale;
     output.world = world;
-    output.sky = float4(frame.light.rgb * sky_amount, sky_amount);
-    output.block_ao = float4(frame.candle.rgb * block_amount, ao_factor);
+    output.light_lv = float3(sky_amount, block_amount, ao_factor);
     output.ids = uint2(
         (layer & 0x3FFFu)
             | (water << 14)

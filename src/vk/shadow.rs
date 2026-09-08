@@ -124,6 +124,20 @@ impl ShadowCfg {
         splits: [64.0, 256.0],
     };
 
+    /// Fit the far cascade to full-res coverage (`DrawLists::lod_clip`).
+    /// `lod_clip <= 0` keeps [`Self::PROVISIONAL`]. Otherwise the far split is
+    /// `lod_clip` clamped into `[SHADOW_FAR_MIN_RADIUS, PROVISIONAL.splits[1]]`
+    /// (the min is itself min'd with the max so a clamp never panics).
+    pub fn for_coverage(lod_clip: f32) -> Self {
+        let mut cfg = Self::PROVISIONAL;
+        if lod_clip > 0.0 {
+            let hi = Self::PROVISIONAL.splits[1];
+            let lo = crate::genconst::SHADOW_FAR_MIN_RADIUS.min(hi);
+            cfg.splits[1] = lod_clip.clamp(lo, hi);
+        }
+        cfg
+    }
+
     fn texel_world_at(&self, radius: f32) -> f32 {
         2.0 * radius / self.resolution as f32
     }
@@ -717,17 +731,14 @@ mod tests {
     const SUN: DVec3 = DVec3::new(0.3, 0.8, 0.25);
 
     /// Project world point through cascade view-proj to NDC.
-    fn ndc(eye: DVec3, p: DVec3, c: Cascade) -> Vec3 {
-        let f = fit(eye, SUN, c, &ShadowCfg::PROVISIONAL);
+    fn ndc(eye: DVec3, p: DVec3, c: Cascade, cfg: &ShadowCfg) -> Vec3 {
+        let f = fit(eye, SUN, c, cfg);
         let rel = (p - eye).as_vec3();
         let clip = f.view_proj.0 * rel.extend(1.0);
         clip.truncate() / clip.w
     }
 
-    /// All points within selection distance must be covered by the map.
-    #[test]
-    fn every_selectable_fragment_is_covered() {
-        let cfg = ShadowCfg::PROVISIONAL;
+    fn assert_every_selectable_fragment_is_covered(cfg: &ShadowCfg) {
         let eye = DVec3::new(1000.0, 80.0, -2000.0);
         let dirs = [
             DVec3::X,
@@ -743,7 +754,7 @@ mod tests {
             let split = cfg.splits[c as usize] as f64;
             for d in dirs {
                 let p = eye + d.normalize() * split;
-                let n = ndc(eye, p, c);
+                let n = ndc(eye, p, c, cfg);
                 assert!(
                     n.x.abs() <= 1.0 && n.y.abs() <= 1.0,
                     "{c:?} {d:?}: lateral {n:?} outside footprint"
@@ -754,6 +765,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// All points within selection distance must be covered by the map.
+    #[test]
+    fn every_selectable_fragment_is_covered() {
+        assert_every_selectable_fragment_is_covered(&ShadowCfg::PROVISIONAL);
+        assert_every_selectable_fragment_is_covered(&ShadowCfg::for_coverage(192.0));
+    }
+
+    #[test]
+    fn for_coverage_zero_keeps_provisional_splits() {
+        assert_eq!(
+            ShadowCfg::for_coverage(0.0).splits,
+            ShadowCfg::PROVISIONAL.splits
+        );
+    }
+
+    #[test]
+    fn for_coverage_clamps_far_split_to_lod_clip() {
+        assert_eq!(ShadowCfg::for_coverage(192.0).splits[1], 192.0);
+        assert_eq!(
+            ShadowCfg::for_coverage(30.0).splits[1],
+            crate::genconst::SHADOW_FAR_MIN_RADIUS
+        );
     }
 
     /// The fit takes no camera orientation input, so the matrices are
@@ -787,7 +822,7 @@ mod tests {
         for c in [Cascade::Near, Cascade::Far] {
             let res = cfg.resolution as f32;
             let texel = |eye: DVec3| {
-                let n = ndc(eye, p, c);
+                let n = ndc(eye, p, c, &cfg);
                 Vec3::new((n.x * 0.5 + 0.5) * res, (n.y * 0.5 + 0.5) * res, 0.0)
             };
             let t0 = texel(eyes[0]);
@@ -814,7 +849,7 @@ mod tests {
         for c in [Cascade::Near, Cascade::Far] {
             let res = cfg.resolution as f32;
             let uv_texels = |eye: DVec3| {
-                let n = ndc(eye, p, c);
+                let n = ndc(eye, p, c, &cfg);
                 ((n.x * 0.5 + 0.5) * res, (n.y * 0.5 + 0.5) * res)
             };
             let (x0, y0) = uv_texels(eyes[0]);
@@ -863,7 +898,7 @@ mod tests {
         for c in [Cascade::Near, Cascade::Far] {
             let radius = cfg.splits[c as usize] as f64;
             let p = eye + toward_sun * (radius + PULLBACK as f64 * 0.95);
-            let n = ndc(eye, p, c);
+            let n = ndc(eye, p, c, &cfg);
             assert!(
                 (0.0..=1.0).contains(&n.z),
                 "{c:?}: tall occluder at {n:?} clipped"

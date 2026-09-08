@@ -42,4 +42,8 @@ struct FrameUniforms
     // Engine-derived. rgb = light.rgb * (0.5 + turbidity) (sky-halo tint×scale);
     // w = abs(2*day_night_mix - 1) (shadow_fallback day factor).
     float4 glow_day;
+    // Engine-derived. rgb = SHADOW_SKY_AMBIENT * lerp(light.rgb, zenith.rgb *
+    // luma709(light)/luma709(zenith), SHADOW_BOUNCE_TINT); light.rgb when zenith
+    // luma is 0. w reserved 0.
+    float4 shadow_bounce;
 };
