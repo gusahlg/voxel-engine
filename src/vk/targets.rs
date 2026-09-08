@@ -429,7 +429,7 @@ impl RenderTargets {
         });
 
         // Rate images exist whenever the device supports attachment FSR.
-        // `RenderFlags::vrs` (default on) is the runtime switch: off skips the
+        // `RenderFlags::vrs` (default off) is the runtime switch: off skips the
         // classify dispatch and the rate attachment, shading 1×1 everywhere.
         let vrs = fsr.map(|f| super::vrs::Vrs::new(device, &memory_props, f, extent));
 

@@ -753,7 +753,7 @@ impl Renderer {
         let profiling = crate::profile::is_enabled();
         if profiling {
             let mut passes = [0.0f64; GpuPass::COUNT];
-            if let Some(total) = unsafe {
+            if let Some((total, gap)) = unsafe {
                 self.gpu_timer
                     .read_into(&self.device.device, slot, &mut passes)
             } {
@@ -761,6 +761,9 @@ impl Renderer {
                     crate::profile::add_ms(pass.meter(), passes[pass as usize]);
                 }
                 crate::profile::gpu_frame_ms(total);
+                if let Some(gap) = gap {
+                    crate::profile::gpu_gap_ms(gap, total);
+                }
             }
         }
         // Begin render submission; this gets the timeline value to stamp mesh copies.

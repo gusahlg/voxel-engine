@@ -94,6 +94,11 @@ pub struct RenderFlags {
     /// fragment shading on distant/flat/sky tiles. Off skips both the classify
     /// dispatch and the rate attachment (full-rate shading everywhere). No-op
     /// when the device lacks attachment fragment shading rate.
+    ///
+    /// Default off: measured on an RTX 4060 at 1080p the classify pass plus
+    /// the shading-rate attachment cost more than the coarse shading saves
+    /// (3361 vs 5064 FPS). VRS pays off only at 4K-class render extents, so
+    /// it is opt-in.
     pub vrs: bool,
     /// Water surface animation (`anim` lane time). Off freezes the phase:
     /// water renders, tinted and reflective, but still — the cheapest frame
@@ -120,7 +125,7 @@ impl Default for RenderFlags {
             godrays: true,
             shadows: true,
             sky: true,
-            vrs: true,
+            vrs: false,
             water_anim: true,
             vignette: false,
             stars: true,

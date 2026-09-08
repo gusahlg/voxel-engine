@@ -20,6 +20,10 @@
 //!   RENDERED frame (the render thread may coalesce main-thread frames). The
 //!   tonemap present copy runs only on presented frames; its meter carries the
 //!   per-rendered-frame share, with the per-presented cost alongside.
+//!   `gap` is device time between the end of the previous render submit's last
+//!   stamp and this submit's first stamp: idle GPU plus submit/command-processor
+//!   overhead. It is not part of the gpu total; the header's `idle N%` is the
+//!   window average of `gap / (gap + gpu_frame)`.
 //! - Workers run in parallel off the critical path; their ms/frame is *offered
 //!   load* — if it exceeds the frame wall-time, the backlog grows and far
 //!   terrain lags behind the player.
@@ -108,6 +112,9 @@ pub enum Meter {
     /// The present copy (tonemap + godrays + warp + 2D overlay) — a separate
     /// submit that runs only on presented frames.
     GpuTonemap,
+    /// Device-time gap before this render submit: idle GPU plus submit /
+    /// command-processor overhead (`start(N) - end(N-1)` on the device clock).
+    GpuGap,
     // Tier::Workers — off-thread chunk jobs; the tile stages are sub-timings
     WorkGenerate,
     WorkMesh,
@@ -118,7 +125,7 @@ pub enum Meter {
 }
 
 impl Meter {
-    const ALL: [Meter; 50] = [
+    const ALL: [Meter; 51] = [
         Meter::NetEvents,
         Meter::Physics,
         Meter::StreamDrain,
@@ -163,6 +170,7 @@ impl Meter {
         Meter::GpuExposure,
         Meter::GpuBloom,
         Meter::GpuTonemap,
+        Meter::GpuGap,
         Meter::WorkGenerate,
         Meter::WorkMesh,
         Meter::WorkLight,
@@ -218,6 +226,7 @@ impl Meter {
             Meter::GpuExposure => "exposure",
             Meter::GpuBloom => "bloom",
             Meter::GpuTonemap => "tonemap",
+            Meter::GpuGap => "gap",
             Meter::WorkGenerate => "generate",
             Meter::WorkMesh => "mesh",
             Meter::WorkLight => "light",
@@ -267,7 +276,8 @@ impl Meter {
             | Meter::GpuTaa
             | Meter::GpuExposure
             | Meter::GpuBloom
-            | Meter::GpuTonemap => Tier::Gpu,
+            | Meter::GpuTonemap
+            | Meter::GpuGap => Tier::Gpu,
             Meter::WorkGenerate
             | Meter::WorkMesh
             | Meter::WorkLight
@@ -393,6 +403,8 @@ pub fn count(c: Counter) {
 /// thread's timestamp readback; drained by `report` for the p50/p95 header.
 /// Capped so a runaway window can never grow it unboundedly.
 static GPU_FRAMES: Mutex<Vec<f32>> = Mutex::new(Vec::new());
+/// Per-frame `gap / (gap + gpu_frame)` for the header's `idle N%`. Same cap.
+static GPU_IDLE_FRACS: Mutex<Vec<f32>> = Mutex::new(Vec::new());
 const GPU_FRAME_CAP: usize = 4096;
 
 /// Record one rendered frame's total GPU time (ms). Cheap no-op when off.
@@ -403,6 +415,27 @@ pub fn gpu_frame_ms(ms: f64) {
     let mut samples = GPU_FRAMES.lock().unwrap_or_else(|e| e.into_inner());
     if samples.len() < GPU_FRAME_CAP {
         samples.push(ms as f32);
+    }
+}
+
+/// Record the idle gap (ms) before this GPU frame. Also accumulates the
+/// windowed idle fraction `gap / (gap + gpu_frame)` for the header.
+/// Cheap no-op when profiling is off.
+pub fn gpu_gap_ms(gap_ms: f64, frame_ms: f64) {
+    if !enabled() || !gap_ms.is_finite() || gap_ms < 0.0 {
+        return;
+    }
+    add_ms(Meter::GpuGap, gap_ms);
+    if !frame_ms.is_finite() || frame_ms < 0.0 {
+        return;
+    }
+    let den = gap_ms + frame_ms;
+    if den <= 0.0 {
+        return;
+    }
+    let mut samples = GPU_IDLE_FRACS.lock().unwrap_or_else(|e| e.into_inner());
+    if samples.len() < GPU_FRAME_CAP {
+        samples.push((gap_ms / den) as f32);
     }
 }
 
@@ -574,6 +607,8 @@ fn report(frames: u64) {
         per_frame_count[m as usize] = c / f;
     }
     let mut gpu_frames = std::mem::take(&mut *GPU_FRAMES.lock().unwrap_or_else(|e| e.into_inner()));
+    let gpu_idle_fracs =
+        std::mem::take(&mut *GPU_IDLE_FRACS.lock().unwrap_or_else(|e| e.into_inner()));
 
     // Header: real frame period (hence fps) when we have a prior window mark,
     // plus the window's worst single frame — a stall that lasted only a few
@@ -617,6 +652,11 @@ fn report(frames: u64) {
         quantile(&mut gpu_frames, 0.95),
     ) {
         header.push_str(&format!(" (p50 {p50:.2} p95 {p95:.2})"));
+    }
+    if !gpu_idle_fracs.is_empty() {
+        let idle =
+            gpu_idle_fracs.iter().map(|x| f64::from(*x)).sum::<f64>() / gpu_idle_fracs.len() as f64;
+        header.push_str(&format!(" idle {:.0}%", idle * 100.0));
     }
     header.push_str(&format!(
         " work {:.2} | rendered {rendered} presented {presented}",
@@ -663,6 +703,15 @@ fn report(frames: u64) {
                 line.push_str(&format!(" ({:.2}/present)", ms_per_sample[m as usize]));
             }
         }
+        if tier == Tier::Gpu {
+            // Idle gap is GPU device time but not GPU *work*; keep it off the
+            // hottest-first pass list (and the gpu total) and pin it at the end.
+            line.push_str(&format!(
+                " {} {:.2}",
+                Meter::GpuGap.label(),
+                ms_per_frame[Meter::GpuGap as usize],
+            ));
+        }
         if tier == Tier::Workers {
             line.push_str(&format!(
                 " [tile.sample {:.2} tile.mesh {:.2} ms/job]",
@@ -708,8 +757,10 @@ fn report(frames: u64) {
     eprintln!("{sline}");
 }
 
-/// Tile sub-stage meters are reported inline in the workers line, not as their
-/// own tier entries (they double-count `tile`'s wall-time).
+/// Tile/record sub-stage meters are reported inline, not as their own tier
+/// entries (they double-count a parent). `GpuGap` is idle between submits —
+/// reported at the end of the gpu line and as `idle N%` in the header, never
+/// in the gpu total.
 fn is_substage(m: Meter) -> bool {
     matches!(
         m,
@@ -721,6 +772,7 @@ fn is_substage(m: Meter) -> bool {
             | Meter::RecImmediate
             | Meter::RecOverlay
             | Meter::RecTransitions
+            | Meter::GpuGap
     )
 }
 
