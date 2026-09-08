@@ -80,23 +80,31 @@ impl Renderer {
     /// swapchain attachment, using the present-format pipeline variants. Mirrors
     /// `RenderPass::record_2d` but for the post-tonemap pass; the caller has set a
     /// negative-height viewport so `tris2d.vert`'s pixel→NDC mapping is correct.
+    ///
+    /// `fused_overlay` selects the two-attachment overlay pipelines (empty
+    /// history write mask). That is only legal with `independentBlend`; the
+    /// caller must pass false and use a one-attachment rendering otherwise.
     unsafe fn record_overlay_present(
         &self,
         cmd: vk::CommandBuffer,
         slot: usize,
         overlay: OverlayPresent,
         extent: vk::Extent2D,
-        taa_fused: bool,
+        fused_overlay: bool,
     ) {
         let device = &self.device.device;
         let pixels_to_ndc = [2.0 / extent.width as f32, 2.0 / extent.height as f32];
-        let tris2d = if taa_fused {
-            self.pipelines.tris2d_present_taa
+        let tris2d = if fused_overlay {
+            self.pipelines
+                .tris2d_present_taa
+                .expect("two-attachment overlay pipelines exist when independentBlend is enabled")
         } else {
             self.pipelines.tris2d_present
         };
-        let tris2d_tex = if taa_fused {
-            self.pipelines.tris2d_tex_present_taa
+        let tris2d_tex = if fused_overlay {
+            self.pipelines
+                .tris2d_tex_present_taa
+                .expect("two-attachment overlay pipelines exist when independentBlend is enabled")
         } else {
             self.pipelines.tris2d_tex_present
         };
@@ -192,10 +200,13 @@ impl Renderer {
         let vignette = if self.flags.vignette { 1.0 } else { 0.0 };
         let tonemap_push = warp_map.push(exposure, vignette);
         // TAA-off: one-attachment pipeline, history omitted. TAA-on: two
-        // attachments (swapchain + write-history); overlay uses matching
-        // 2-attachment variants with attachment 1 write-mask empty so the HUD
-        // never lands in history.
+        // attachments (swapchain + write-history). Overlay joins that
+        // rendering only when independentBlend is enabled (attachment 1
+        // write-mask empty so the HUD never lands in history). Without it,
+        // overlay is a second one-attachment rendering after a
+        // COLOR_ATTACHMENT_OUTPUT write→read|write barrier.
         let taa_fused = taa.is_some();
+        let independent_blend = self.device.independent_blend;
         let taa_push = taa.as_ref().map(|t| self.tonemap_taa_push(t, tonemap_push));
         let hist_write_view = taa_fused.then(|| self.taa.write_view());
         let hist_read_view = taa_fused.then(|| self.taa.read_view());
@@ -415,6 +426,49 @@ impl Renderer {
             // the offscreen scene pass). Post-tonemap on BOTH paths: wide-FOV so the
             // warp never bends the HUD, rectilinear so the TAA resolve never reprojects
             // it. Uses a GL-style negative-height viewport, matching tris2d.vert.
+            //
+            // independentBlend: overlay stays in the fused two-attachment scope.
+            // Without it: end that scope after the tonemap triangle, then a second
+            // one-attachment rendering (LOAD) using the single-attachment overlay
+            // pipelines. Consecutive dynamic-rendering instances that write the
+            // same colour attachment are NOT ordered by an implicit
+            // COLOR_ATTACHMENT_OUTPUT WAW (unlike render-pass subpasses); blend
+            // LOAD also reads the attachment, so this is a write→read|write
+            // barrier on the swapchain. Same layout, no extra image transition.
+            let fused_overlay = taa_fused && independent_blend;
+            if taa_fused && !independent_blend {
+                device.cmd_end_rendering(self.copy_cmd);
+                let overlay_sync = [vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(
+                        vk::AccessFlags2::COLOR_ATTACHMENT_READ
+                            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                    )
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image(swap_image)
+                    .subresource_range(color_range())];
+                device.cmd_pipeline_barrier2(
+                    self.copy_cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&overlay_sync),
+                );
+                let overlay_att = vk::RenderingAttachmentInfo::default()
+                    .image_view(swap_view)
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::LOAD)
+                    .store_op(vk::AttachmentStoreOp::STORE);
+                let overlay_color = [overlay_att];
+                let overlay_info = vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent,
+                    })
+                    .layer_count(1)
+                    .color_attachments(&overlay_color);
+                device.cmd_begin_rendering(self.copy_cmd, &overlay_info);
+            }
             device.cmd_set_viewport(
                 self.copy_cmd,
                 0,
@@ -427,7 +481,7 @@ impl Renderer {
                     max_depth: 1.0,
                 }],
             );
-            self.record_overlay_present(self.copy_cmd, slot, overlay, extent, taa_fused);
+            self.record_overlay_present(self.copy_cmd, slot, overlay, extent, fused_overlay);
             device.cmd_end_rendering(self.copy_cmd);
 
             // Publish write-history to SHADER_READ (next present's read). Folded

@@ -210,8 +210,11 @@ pub struct Pipelines {
     /// Overlay variants with a second (history) color attachment, write-mask
     /// empty on attachment 1, so they can draw in the same rendering as the
     /// fused tonemap. Attachment 1 is not written: HUD stays out of history.
-    pub tris2d_present_taa: vk::Pipeline,
-    pub tris2d_tex_present_taa: vk::Pipeline,
+    /// `Some` only when `independentBlend` is enabled (distinct per-attachment
+    /// blend states). Without it the present path draws overlay in a second
+    /// one-attachment rendering using `tris2d_present` / `tris2d_tex_present`.
+    pub tris2d_present_taa: Option<vk::Pipeline>,
+    pub tris2d_tex_present_taa: Option<vk::Pipeline>,
     /// `Some` exactly when attachment VRS is enabled (`fsr.is_some()`).
     pub vrs_compute: Option<VrsCompute>,
 }
@@ -229,6 +232,7 @@ impl Pipelines {
         mesh3d_set_layout: vk::DescriptorSetLayout,
         fsr: Option<&FragmentShadingRate>,
         local_read: bool,
+        independent_blend: bool,
     ) -> Self {
         // 3D set 0: binding 0 = offsets SSBO (vertex), binding 1 = texture
         // array (fragment) — one push set (Vulkan allows at most one per
@@ -668,14 +672,6 @@ impl Pipelines {
                 depth_bias: None,
             },
         );
-        let overlay_taa_builder = PipelineBuilder {
-            second_color: Some((
-                super::taa::TAA_HISTORY_FORMAT,
-                vk::ColorComponentFlags::empty(),
-            )),
-            ..tonemap_builder
-        };
-
         // Overlay variants at present format / single-sample (same modules, layout,
         // and blend as tris2d/tris2d_tex) for the post-tonemap swapchain draw.
         let overlay_2d_config = || PipelineConfig {
@@ -702,22 +698,38 @@ impl Pipelines {
             layout_2d,
             overlay_2d_config(),
         );
-        let tris2d_present_taa = overlay_taa_builder.build(
-            tri2d_vert,
-            tri2d_frag,
-            &bindings_2d,
-            attributes_2d,
-            layout_2d,
-            overlay_2d_config(),
-        );
-        let tris2d_tex_present_taa = overlay_taa_builder.build(
-            tri2d_vert,
-            tri2d_tex_frag,
-            &bindings_2d,
-            attributes_2d,
-            layout_2d,
-            overlay_2d_config(),
-        );
+        // Distinct blend states (att0 alpha-blend, att1 empty write mask) are
+        // legal only with independentBlend. Without it these pipelines are
+        // omitted and present.rs draws overlay in a second one-attachment scope.
+        let (tris2d_present_taa, tris2d_tex_present_taa) = if independent_blend {
+            let overlay_taa_builder = PipelineBuilder {
+                second_color: Some((
+                    super::taa::TAA_HISTORY_FORMAT,
+                    vk::ColorComponentFlags::empty(),
+                )),
+                ..tonemap_builder
+            };
+            (
+                Some(overlay_taa_builder.build(
+                    tri2d_vert,
+                    tri2d_frag,
+                    &bindings_2d,
+                    attributes_2d,
+                    layout_2d,
+                    overlay_2d_config(),
+                )),
+                Some(overlay_taa_builder.build(
+                    tri2d_vert,
+                    tri2d_tex_frag,
+                    &bindings_2d,
+                    attributes_2d,
+                    layout_2d,
+                    overlay_2d_config(),
+                )),
+            )
+        } else {
+            (None, None)
+        };
 
         unsafe {
             device.destroy_shader_module(tonemap_vert, None);
@@ -816,8 +828,12 @@ impl Pipelines {
             device.destroy_pipeline(self.tris2d_tex, None);
             device.destroy_pipeline(self.tris2d_present, None);
             device.destroy_pipeline(self.tris2d_tex_present, None);
-            device.destroy_pipeline(self.tris2d_present_taa, None);
-            device.destroy_pipeline(self.tris2d_tex_present_taa, None);
+            if let Some(p) = self.tris2d_present_taa {
+                device.destroy_pipeline(p, None);
+            }
+            if let Some(p) = self.tris2d_tex_present_taa {
+                device.destroy_pipeline(p, None);
+            }
             device.destroy_pipeline(self.sky, None);
             device.destroy_pipeline(self.tonemap, None);
             device.destroy_pipeline(self.tonemap_taa, None);
@@ -857,7 +873,8 @@ struct PipelineBuilder<'a> {
     fsr_enabled: bool,
     /// Optional second color attachment (fused TAA history). The write mask
     /// is RGBA for the tonemap write, empty for overlay variants that must
-    /// match the 2-attachment rendering without touching history.
+    /// match the 2-attachment rendering without touching history. Overlay
+    /// variants with a distinct empty mask require `independentBlend`.
     second_color: Option<(vk::Format, vk::ColorComponentFlags)>,
 }
 

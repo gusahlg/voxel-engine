@@ -327,6 +327,7 @@ impl Renderer {
             mesh3d_set_layout,
             device.fragment_shading_rate.as_ref(),
             device.dynamic_rendering_local_read,
+            device.independent_blend,
         );
 
         // Per-slot command buffers plus one extra for the present copy.

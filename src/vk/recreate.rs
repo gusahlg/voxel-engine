@@ -178,6 +178,7 @@ impl Renderer {
                     self.mesh3d_set_layout,
                     self.device.fragment_shading_rate.as_ref(),
                     self.device.dynamic_rendering_local_read,
+                    self.device.independent_blend,
                 );
             }
 
