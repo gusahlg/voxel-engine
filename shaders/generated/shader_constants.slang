@@ -65,15 +65,15 @@ static const float2 HALTON_23[16] = {
 };
 
 // TAA history feedback weight: fraction of the (reprojected, variance-clamped)
-// history kept each frame. Higher = steadier but slower to react. Read by vk/taa.rs.
-// Reduced 0.95→0.92: animated water waves and clouds demand faster per-frame
-// reactivity. 0.92 (~8% new sample) reduces ghosting while maintaining temporal
-// coherence. Range [0.85–0.98].
+// history kept each present. Higher = steadier but slower to react. Read by vk/taa.rs
+// and pushed into the fused tonemap. Reduced 0.95→0.92: animated water waves and
+// clouds demand faster per-frame reactivity. 0.92 (~8% new sample) reduces ghosting
+// while maintaining temporal coherence. Range [0.85–0.98].
 static const float HISTORY_BLEND = 0.92f;
 
 // TAA neighbourhood variance-clamp width in std-devs: history is clamped to
 // YCoCg mean +/- VARIANCE_GAMMA*stddev of the 5-tap cross current taps. Wider =
-// steadier (less crawl) but more ghosting. Read by taa_resolve.comp.
+// steadier (less crawl) but more ghosting. Read by tonemap.frag (TAA_FUSED).
 static const float VARIANCE_GAMMA = 1.25f;
 
 // Blocklight candle curve: candle = x*sqrt(x) + (CANDLE_HIGH_MUL*x)^CANDLE_HIGH_POW,
@@ -153,8 +153,8 @@ static const float CULL_BUCKET_SPLIT_2 = 256.0f;
 // (vk/exposure.rs) are ceil(hdr_dim / EXPOSURE_TILE) and must agree.
 static const uint EXPOSURE_TILE = 16;
 
-// TAA resolve workgroup edge in texels (groupshared tile + 1-pixel apron).
-// CPU dispatch (vk/taa.rs) must divide by the same value.
+// Retired TAA compute workgroup edge; the resolve now runs in the present-time
+// tonemap fragment (no groupshared tile). Kept so generated constants stay stable.
 static const uint TAA_TILE = 16;
 
 // Sun-disc soft rim (fade-to-zero edge) as a multiple of the sun angular radius.

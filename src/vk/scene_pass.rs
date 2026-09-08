@@ -179,9 +179,9 @@ impl<'a> RenderPass<'a> {
 
             // Reversed-Z: clear depth to 0.0, GREATER_OR_EQUAL test. Single-
             // sampled: store the depth so the end-of-frame classify (and
-            // TAA/spill-godrays) can sample it after it rests in SAMPLEABLE_DEPTH_REST_LAYOUT.
+            // spill-godrays / present TAA) can sample it after it rests in SAMPLEABLE_DEPTH_REST_LAYOUT.
             // MSAA: DONT_CARE the MS store — its single-sample SAMPLE_ZERO
-            // resolve into `resolved_depth` is what feeds VRS/TAA/spill.
+            // resolve into `resolved_depth` is what feeds VRS/spill/present TAA.
             let depth_store = if r.targets.msaa.is_some() {
                 vk::AttachmentStoreOp::DONT_CARE
             } else {
@@ -772,11 +772,10 @@ impl<'a> RenderPass<'a> {
     }
 
     /// Ends dynamic rendering WITHOUT the offscreen sampled transition: a later
-    /// offscreen writer (TAA resolve / exposure metering) runs after this, and
-    /// one of them owns the finalization instead (its barrier would otherwise
-    /// race their writes). Sampleable depth still rests in
-    /// [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]. Yields no proof — the deferred
-    /// finalizer produces it.
+    /// offscreen writer (exposure metering) runs after this and owns the
+    /// finalization instead (its barrier would otherwise race the write).
+    /// Sampleable depth still rests in [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`].
+    /// Yields no proof — the deferred finalizer produces it.
     pub(super) unsafe fn end_deferred(self, classify_vrs: bool) {
         unsafe { self.end(false, classify_vrs) };
     }

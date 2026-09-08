@@ -101,8 +101,6 @@ struct SlotState {
     vrs_ready: bool,
     /// History image holds a raw classification from a previous VRS dispatch.
     vrs_history: bool,
-    /// Which image holds the final HDR (offscreen or TAA history).
-    hdr_source: HdrSource,
 }
 
 /// Minimap texture edge length in texels.
@@ -354,7 +352,6 @@ impl Renderer {
             indirect: HostBuffer::new(vk::BufferUsageFlags::INDIRECT_BUFFER),
             vrs_ready: false,
             vrs_history: false,
-            hdr_source: HdrSource::Offscreen,
         }));
 
         let present_semaphores = create_present_semaphores(&device.device, swapchain.images.len());
@@ -379,7 +376,7 @@ impl Renderer {
             render_extent,
             pipeline_cache,
         );
-        let taa = taa::TaaState::new(&device.device, &memory_props, render_extent, pipeline_cache);
+        let taa = taa::TaaState::new(&device.device, &memory_props, swapchain.extent);
         let bloom = bloom::BloomState::new(&device.device, &memory_props, pipeline_cache);
         let sky_cloud = sky::SkyCloudState::new(&device.device, pipeline_cache);
 
@@ -948,13 +945,14 @@ fn depth_range() -> vk::ImageSubresourceRange {
 /// resolve target when multisampled, else the depth image) from the scene-pass
 /// write scope ([`sampleable_depth_attachment_state`]) to this layout in the
 /// same `vkCmdPipelineBarrier2` as the offscreen HDR finalize, with dst stage
-/// `COMPUTE_SHADER` and access `SHADER_SAMPLED_READ`. From then on it RESTS
-/// here: TAA, the quarter-res spill pass (godray sampler), and the VRS
-/// classifier all sample it with no further transition. The present copy does
-/// not read depth. The next scene pass of this slot begins the image from
-/// `UNDEFINED` (contents are cleared every frame, so the discard is free). The
-/// multisampled `depth` attachment is unchanged: it still begins from
-/// UNDEFINED and is never sampled.
+/// `COMPUTE_SHADER | FRAGMENT_SHADER` and access `SHADER_SAMPLED_READ`. From
+/// then on it RESTS here: the quarter-res spill pass (godray sampler) and the
+/// VRS classifier sample it in the same submit with no further transition; the
+/// present-time fused TAA tonemap samples it in the later copy submit (the
+/// render timeline wait covers that fragment shader). The next scene pass of
+/// this slot begins the image from `UNDEFINED` (contents are cleared every
+/// frame, so the discard is free). The multisampled `depth` attachment is
+/// unchanged: it still begins from UNDEFINED and is never sampled.
 pub(super) const SAMPLEABLE_DEPTH_REST_LAYOUT: vk::ImageLayout =
     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 
@@ -981,15 +979,6 @@ fn sampleable_depth_attachment_state(
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         )
     }
-}
-
-/// See `SlotState::hdr_source`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum HdrSource {
-    /// The scene render's offscreen target (TAA off).
-    Offscreen,
-    /// The TAA history image at this index (TAA on: the resolve output).
-    TaaHistory(usize),
 }
 
 #[cfg(test)]

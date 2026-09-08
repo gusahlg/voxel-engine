@@ -34,7 +34,9 @@ pub(super) enum GpuPass {
     /// The VRS classify dispatch (end of frame, after depth rests; stamped
     /// only when it runs).
     Vrs,
-    /// The TAA resolve compute (stamped only when it runs).
+    /// Retired TAA compute stamp. Resolve is fused into the present-time
+    /// tonemap (`GpuTonemap`); this variant is never marked and reports 0 so
+    /// `GpuPass` ordinals stay stable.
     Taa,
     /// Exposure metering reduce + finalize (stamped only when it runs).
     Exposure,

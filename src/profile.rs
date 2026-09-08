@@ -104,16 +104,17 @@ pub enum Meter {
     /// End of the scene pass: `cmd_end_rendering` (the MSAA color resolve lands
     /// here) and the offscreen finalize transitions.
     GpuResolve,
-    /// TAA resolve compute.
+    /// Retired TAA compute resolve. Fused into [`Meter::GpuTonemap`] at present
+    /// time; left in the enum so ordinals stay stable (reports 0).
     GpuTaa,
     /// Exposure metering reduce + finalize.
     GpuExposure,
     /// The bloom chain + quarter-res spill (bloom composite + godrays) — the
     /// render-command tail.
     GpuBloom,
-    /// The present copy (tonemap + warp + 2D overlay) — a separate submit that
-    /// runs only on presented frames. Bloom composite and godrays now live in
-    /// the bloom span's spill dispatch.
+    /// The present copy (tonemap + fused TAA + warp + 2D overlay) — a separate
+    /// submit that runs only on presented frames. Bloom composite and godrays
+    /// live in the bloom span's spill dispatch.
     GpuTonemap,
     /// Device-time gap before this render submit: idle GPU plus submit /
     /// command-processor overhead (`start(N) - end(N-1)` on the device clock).

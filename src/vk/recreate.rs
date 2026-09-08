@@ -146,9 +146,9 @@ impl Renderer {
                 .get_physical_device_memory_properties(self.device.physical);
             self.exposure
                 .recreate(&self.device.device, &memory_props, self.render_extent);
-            // History is extent-sized; recreate discards it (reconverges).
+            // History is swapchain-sized; recreate discards it (reconverges).
             self.taa
-                .recreate(&self.device.device, &memory_props, self.render_extent);
+                .recreate(&self.device.device, &memory_props, self.swapchain.extent);
 
             // Offscreen images recreated; clear copy tracking.
             self.clear_copy();

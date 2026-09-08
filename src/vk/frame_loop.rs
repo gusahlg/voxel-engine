@@ -17,8 +17,7 @@ use super::scene_pass::RenderPass;
 use super::shadow;
 use super::timeline::{RenderSubmit, acquire_next_image};
 use super::{
-    Env, HdrSource, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, color_range, depth_range,
-    sampleable_depth_attachment_state,
+    Env, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, depth_range, sampleable_depth_attachment_state,
 };
 
 /// Token returned by `acquire_slot` proving the slot is safe to render into
@@ -275,6 +274,16 @@ impl Renderer {
                 d2_tex_offset: offsets.d2_tex,
                 d2_tex_count: lists.tex_verts_2d.len() as u32,
             };
+            let taa =
+                lists
+                    .scene
+                    .as_ref()
+                    .filter(|_| self.flags.taa)
+                    .map(|s| super::taa::TaaPresent {
+                        view_proj: s.view_proj,
+                        eye: s.eye,
+                        jitter: s.jitter.0,
+                    });
             self.present(
                 slot,
                 present_target,
@@ -282,6 +291,7 @@ impl Renderer {
                 overlay,
                 hdr_readable,
                 spill_live,
+                taa,
             );
         }
         if self.vsync.current() {
@@ -344,14 +354,17 @@ impl Renderer {
     ///
     /// Src is the attachment-write scope (depth tests, or COLOR_ATTACHMENT_OUTPUT
     /// for the MSAA SAMPLE_ZERO resolve). Dst covers every consumer that samples
-    /// it without a further transition: VRS compute, TAA compute, and the
-    /// quarter-res spill compute (godrays).
+    /// it without a further transition: VRS compute, the quarter-res spill
+    /// compute (godrays), and the present-time tonemap fragment (fused TAA).
+    /// The present copy is a later submit that waits on the render timeline.
     pub(super) fn sampleable_depth_rest_barrier(&self, slot: usize) -> vk::ImageMemoryBarrier2<'_> {
         let (src_layout, src_stage, src_access) = self.sampleable_depth_attachment_state();
         vk::ImageMemoryBarrier2::default()
             .src_stage_mask(src_stage)
             .src_access_mask(src_access)
-            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .dst_stage_mask(
+                vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            )
             .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
             .old_layout(src_layout)
             .new_layout(SAMPLEABLE_DEPTH_REST_LAYOUT)
@@ -1018,10 +1031,6 @@ impl Renderer {
                 unsafe { self.gpu_timer.mark(device, cmd, slot, p) };
             }
         };
-        // A fresh scene render makes the offscreen the frame's HDR again; the
-        // TAA pass overrides this if it runs (set before `begin` borrows self
-        // shared for the whole pass).
-        self.slots[FrameSlot::new(slot)].hdr_source = HdrSource::Offscreen;
         let pass = {
             let _g = crate::profile::scope(crate::profile::Meter::RecTransitions);
             unsafe { RenderPass::begin(self, cmd, slot, lists, offsets, do_vrs) }
@@ -1073,94 +1082,41 @@ impl Renderer {
         }
         // The offscreen HDR must reach SHADER_READ_ONLY before the tonemap
         // present copy samples it. `end` performs that COLOR_ATTACHMENT→
-        // SHADER_READ barrier UNLESS a later offscreen writer runs after it: the
-        // TAA resolve and exposure metering both write the offscreen *after*
-        // `end`, so when either is active `end` must NOT transition (the barrier
-        // would race their writes) — the deferred finalization below owns it
-        // instead. With both disabled (the common path) `end` transitions.
-        //
-        // TAA keeps history every frame. Bloom and exposure metering feed only
-        // the tonemap present-copy, so they run solely on frames that will
-        // present (`decide_present` already ran; forced capture always presents).
-        let taa = lists.scene.is_some() && self.flags.taa;
-        let exposure_on = lists.scene.is_some() && self.flags.exposure;
-        let run_exposure = exposure_on && will_present;
-        let deferred = taa || run_exposure;
+        // SHADER_READ barrier UNLESS a later offscreen writer runs after it:
+        // exposure metering writes after `end` (it owns the finalize). TAA no
+        // longer writes the offscreen — it resolves in the present-time tonemap
+        // — so TAA-on is the same finalize path as TAA-off. Bloom and exposure
+        // metering feed only the tonemap present-copy, so they run solely on
+        // frames that will present (`decide_present` already ran; forced capture
+        // always presents).
+        let run_exposure = lists.scene.is_some() && self.flags.exposure && will_present;
         // Overlay composited post-tonemap so warp/TAA don't affect the HUD.
         stamp(GpuPass::Overlay);
         // Finalize the offscreen to SHADER_READ_ONLY exactly once and obtain the
         // [`HdrReadable`] proof the tonemap present-copy requires. The branches
-        // are exhaustive and each ends with the offscreen sampled when a present
-        // will sample it: (a) not deferred → the render pass transitions (or we
-        // skip the transition on an unpresented frame); (b) deferred + exposure
-        // → metering owns the transition; (c) deferred + !exposure (TAA-on,
-        // exposure-off/skipped) → TAA already left its output sampled.
-        // Producing the proof only inside these paths is what makes "nobody
-        // finalized the layout" fail to compile at `present` rather than trip the
-        // validation layer (the exact bug from the exposure-default-off change).
+        // are exhaustive: (a) exposure on + presenting → metering owns the
+        // transition; (b) presenting without exposure → the render pass
+        // finalizes; (c) unpresented → skip the sampled transition.
         let readable: HdrReadable = {
             let _g = crate::profile::scope(crate::profile::Meter::RecTransitions);
-            if deferred {
+            if run_exposure {
                 unsafe { pass.end_deferred(classify_vrs) };
-                // Close the end-rendering/MSAA-resolve span before the deferred
-                // writers, so TAA and exposure report apart from it.
                 stamp(GpuPass::Resolve);
                 self.finish_vrs_classify(cmd, slot, classify_vrs, lists);
-                // TAA resolve runs AFTER the HDR resolve and BEFORE exposure, so
-                // exposure meters the stabilized image. It reads the current HDR +
-                // reprojected history, writes the resolved HDR back, and leaves it
-                // sampled for the exposure pass. Reprojection uses the un-jittered
-                // view-proj; a false `flags.taa` never reaches here.
-                if taa {
-                    // `taa` is `lists.scene.is_some() && self.flags.taa` (above).
-                    let scene = lists.scene.as_ref().expect("taa true implies a 3D scene");
-                    self.record_taa_pass(
-                        cmd,
-                        FrameSlot::new(slot),
-                        scene.view_proj,
-                        scene.eye,
-                        scene.jitter.0,
-                    );
-                    if profiling {
-                        unsafe {
-                            self.gpu_timer
-                                .mark(&self.device.device, cmd, slot, GpuPass::Taa)
-                        };
-                    }
+                // Reduce the (jittered, unresolved) frame HDR to per-tile mean
+                // log2-luma, publish the smoothed exposure, and finalize the HDR
+                // in SHADER_READ. Metering the unresolved image is acceptable:
+                // it is spatial and low-frequency.
+                let readable = self.record_exposure_pass(cmd, FrameSlot::new(slot));
+                if profiling {
+                    unsafe {
+                        self.gpu_timer
+                            .mark(&self.device.device, cmd, slot, GpuPass::Exposure)
+                    };
                 }
-                if run_exposure {
-                    // Reduce the frame HDR to per-tile mean log2-luma, publish
-                    // the smoothed exposure, and finalize the HDR in SHADER_READ.
-                    let readable = self.record_exposure_pass(cmd, FrameSlot::new(slot));
-                    if profiling {
-                        unsafe {
-                            self.gpu_timer
-                                .mark(&self.device.device, cmd, slot, GpuPass::Exposure)
-                        };
-                    }
-                    readable
-                } else if self.slots[FrameSlot::new(slot)].hdr_source != HdrSource::Offscreen {
-                    // TAA published its output as the frame HDR and already
-                    // left it (and the offscreen) sampled: nothing to record.
-                    HdrReadable::new(slot)
-                } else if will_present {
-                    let readable = unsafe { self.transition_offscreen_to_sampled(cmd, slot) };
-                    // The finalize barrier belongs to the resolve span.
-                    if profiling {
-                        unsafe {
-                            self.gpu_timer
-                                .mark(&self.device.device, cmd, slot, GpuPass::Resolve)
-                        };
-                    }
-                    readable
-                } else {
-                    HdrReadable::new(slot)
-                }
+                readable
             } else if will_present {
-                // Common path (TAA + exposure both off): the render pass finalizes.
                 let readable = unsafe { pass.end_sampled(classify_vrs) };
-                // Close the resolve/finalize segment (MSAA resolve + transitions)
-                // before bloom records, so the report splits them.
                 if profiling {
                     unsafe {
                         self.gpu_timer
@@ -1207,15 +1163,14 @@ impl Renderer {
         (rs, readable)
     }
 
-    /// The image+view holding slot `slot`'s FINAL HDR (see `hdr_source`).
+    /// The image+view holding slot `slot`'s HDR offscreen. TAA no longer
+    /// rewrites this; the present-time tonemap resolves into a swapchain-sized
+    /// history instead.
     pub(super) fn hdr_of(&self, slot: usize) -> (vk::Image, vk::ImageView) {
-        match self.slots[FrameSlot::new(slot)].hdr_source {
-            HdrSource::Offscreen => (
-                self.targets.offscreen[slot].image(),
-                self.targets.offscreen[slot].view(),
-            ),
-            HdrSource::TaaHistory(i) => self.taa.history_image(i),
-        }
+        (
+            self.targets.offscreen[slot].image(),
+            self.targets.offscreen[slot].view(),
+        )
     }
 
     /// End-of-frame classify: this slot's just-written depth, for the next use
@@ -1248,34 +1203,6 @@ impl Renderer {
         }
         self.slots[FrameSlot::new(slot)].vrs_ready = true;
         self.slots[FrameSlot::new(slot)].vrs_history = true;
-    }
-
-    /// Transitions slot `slot`'s offscreen HDR from `COLOR_ATTACHMENT_OPTIMAL` to
-    /// `SHADER_READ_ONLY_OPTIMAL` for the tonemap present-copy, minting the
-    /// [`HdrReadable`] proof. Used on the TAA-on/exposure-off path, where the TAA
-    /// resolve left the offscreen in `COLOR_ATTACHMENT` and no metering pass owns
-    /// the transition.
-    unsafe fn transition_offscreen_to_sampled(
-        &self,
-        cmd: vk::CommandBuffer,
-        slot: usize,
-    ) -> HdrReadable {
-        let to_sampled = [vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image(self.targets.offscreen[slot].image())
-            .subresource_range(color_range())];
-        unsafe {
-            self.device.device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
-            );
-        }
-        HdrReadable::new(slot)
     }
 
     /// Submits the recorded command buffer and advances the timeline. Waits

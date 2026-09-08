@@ -15,29 +15,32 @@ pub(crate) struct ImageDesc {
 }
 
 /// A destination this image is being transitioned TO. Variants are the
-/// distinct (layout, stage, access) triples actually used at the two sites
-/// wired through `transition` (minimap upload, TAA history ping-pong) — not
-/// a speculative catalogue of every Vulkan layout use.
+/// distinct (layout, stage, access) triples actually used at the sites
+/// wired through `transition` (minimap upload, sky LUT, TAA history ping-pong)
+/// — not a speculative catalogue of every Vulkan layout use.
 pub(crate) enum LayoutUse {
     /// Upload target (minimap): copy destination.
     TransferDst,
     /// Sampled by the fragment shader right after a transfer write (minimap:
     /// RAW, waits on the copy's TRANSFER_WRITE).
     FragmentSampledAfterTransfer,
-    /// Sampled by compute; the prior use was itself a sampled read or the
-    /// image is fresh (TAA history read side: order-only, nothing to wait on
-    /// since the write that produced it was already made visible on entry).
-    ComputeSampledRead,
-    /// Written by compute as storage; same order-only prior-use as above
-    /// (TAA history write side).
+    /// Written by compute as storage; order-only prior-use (sky-cloud LUT
+    /// write side).
     ComputeStorageWrite,
-    /// Sampled by compute+fragment right after a compute storage write (TAA
-    /// history publish: RAW, waits on SHADER_STORAGE_WRITE).
+    /// Sampled by compute+fragment right after a compute storage write
+    /// (sky-cloud LUT publish: RAW, waits on SHADER_STORAGE_WRITE).
     SampledAfterComputeWrite,
     /// Color-clear destination (`vkCmdClearColorImage`; sky-cloud LUT skip).
     TransferClear,
     /// Sampled by the fragment shader right after a color clear (LUT skip path).
     FragmentSampledAfterClear,
+    /// Written as a color attachment (fused TAA history). Prior use is a
+    /// fragment sampled read (last present's history) or UNDEFINED.
+    ColorAttachmentWrite,
+    /// Sampled by the fragment shader. Used to (a) publish a just-written TAA
+    /// history (src color-attachment write) and (b) promote a fresh UNDEFINED
+    /// history to SHADER_READ so the first present's unused read side is valid.
+    FragmentSampled,
 }
 
 impl LayoutUse {
@@ -48,11 +51,6 @@ impl LayoutUse {
             LayoutUse::FragmentSampledAfterTransfer => (
                 L::SHADER_READ_ONLY_OPTIMAL,
                 S::FRAGMENT_SHADER,
-                A::SHADER_SAMPLED_READ,
-            ),
-            LayoutUse::ComputeSampledRead => (
-                L::SHADER_READ_ONLY_OPTIMAL,
-                S::COMPUTE_SHADER,
                 A::SHADER_SAMPLED_READ,
             ),
             LayoutUse::ComputeStorageWrite => {
@@ -69,6 +67,16 @@ impl LayoutUse {
                 S::FRAGMENT_SHADER,
                 A::SHADER_SAMPLED_READ,
             ),
+            LayoutUse::ColorAttachmentWrite => (
+                L::COLOR_ATTACHMENT_OPTIMAL,
+                S::COLOR_ATTACHMENT_OUTPUT,
+                A::COLOR_ATTACHMENT_WRITE,
+            ),
+            LayoutUse::FragmentSampled => (
+                L::SHADER_READ_ONLY_OPTIMAL,
+                S::FRAGMENT_SHADER,
+                A::SHADER_SAMPLED_READ,
+            ),
         }
     }
 
@@ -81,12 +89,12 @@ impl LayoutUse {
         match self {
             LayoutUse::TransferDst => (S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ),
             LayoutUse::FragmentSampledAfterTransfer => (S::COPY, A::TRANSFER_WRITE),
-            LayoutUse::ComputeSampledRead | LayoutUse::ComputeStorageWrite => {
-                (S::COMPUTE_SHADER | S::FRAGMENT_SHADER, A::NONE)
-            }
+            LayoutUse::ComputeStorageWrite => (S::COMPUTE_SHADER | S::FRAGMENT_SHADER, A::NONE),
             LayoutUse::SampledAfterComputeWrite => (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE),
             LayoutUse::TransferClear => (S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ),
             LayoutUse::FragmentSampledAfterClear => (S::CLEAR, A::TRANSFER_WRITE),
+            LayoutUse::ColorAttachmentWrite => (S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ),
+            LayoutUse::FragmentSampled => (S::COLOR_ATTACHMENT_OUTPUT, A::COLOR_ATTACHMENT_WRITE),
         }
     }
 }
@@ -189,6 +197,10 @@ impl ImageResource {
 
     pub(crate) fn view(&self) -> vk::ImageView {
         self.view
+    }
+
+    pub(crate) fn layout(&self) -> vk::ImageLayout {
+        self.layout
     }
 
     pub(crate) fn subresource_range(&self) -> vk::ImageSubresourceRange {
@@ -300,7 +312,7 @@ mod tests {
             )
         );
         assert_eq!(
-            LayoutUse::ComputeSampledRead.src_when_used(),
+            LayoutUse::ComputeStorageWrite.src_when_used(),
             (
                 vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
                 vk::AccessFlags2::NONE
@@ -327,6 +339,20 @@ mod tests {
                 vk::AccessFlags2::TRANSFER_WRITE
             )
         );
+        assert_eq!(
+            LayoutUse::ColorAttachmentWrite.src_when_used(),
+            (
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ
+            )
+        );
+        assert_eq!(
+            LayoutUse::FragmentSampled.src_when_used(),
+            (
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+            )
+        );
     }
 
     /// Ping-pong states stay within covered layout transitions.
@@ -338,15 +364,11 @@ mod tests {
             let r = read_idx;
             let w = 1 - r;
             assert_eq!(
-                LayoutUse::ComputeSampledRead.dst().0,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                LayoutUse::ColorAttachmentWrite.dst().0,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
             );
-            assert_eq!(
-                LayoutUse::ComputeStorageWrite.dst().0,
-                vk::ImageLayout::GENERAL
-            );
-            layouts[r] = LayoutUse::ComputeSampledRead.dst().0;
-            layouts[w] = LayoutUse::SampledAfterComputeWrite.dst().0;
+            layouts[r] = LayoutUse::FragmentSampled.dst().0;
+            layouts[w] = LayoutUse::FragmentSampled.dst().0;
             read_idx = w;
         }
         assert_eq!(layouts[read_idx], vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
