@@ -13,12 +13,13 @@
 //!   cursor is locked/hidden.
 
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use winit::event::{DeviceEvent, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 /// Physical keyboard keys the engine exposes (raylib-style names).
+#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Key {
     A,
@@ -89,12 +90,68 @@ pub enum Key {
     F6,
 }
 
+impl Key {
+    /// One past the last discriminant. Keep tied to the last variant so the
+    /// compile-time capacity check below tracks the enum.
+    const COUNT: u32 = Self::F6 as u32 + 1;
+
+    const fn bit(self) -> u32 {
+        self as u32
+    }
+}
+
+const _: () = assert!(Key::COUNT <= 128);
+
 /// Mouse buttons the engine exposes. Other buttons are ignored.
+#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum MouseButton {
     Left,
     Right,
     Middle,
+}
+
+impl MouseButton {
+    const COUNT: u32 = Self::Middle as u32 + 1;
+
+    const fn bit(self) -> u32 {
+        self as u32
+    }
+}
+
+const _: () = assert!(MouseButton::COUNT <= u8::BITS);
+
+/// 128-bit set of `Key` discriminants. Two `u64`s cover the whole enum.
+struct KeyBits([u64; 2]);
+
+impl KeyBits {
+    const EMPTY: Self = Self([0; 2]);
+
+    #[inline]
+    fn insert(&mut self, key: Key) {
+        let bit = key.bit();
+        debug_assert!(bit < 128, "Key discriminant {bit} exceeds KeyBits capacity");
+        self.0[(bit as usize) / 64] |= 1u64 << (bit % 64);
+    }
+
+    #[inline]
+    fn remove(&mut self, key: Key) {
+        let bit = key.bit();
+        debug_assert!(bit < 128, "Key discriminant {bit} exceeds KeyBits capacity");
+        self.0[(bit as usize) / 64] &= !(1u64 << (bit % 64));
+    }
+
+    #[inline]
+    fn contains(&self, key: Key) -> bool {
+        let bit = key.bit();
+        debug_assert!(bit < 128, "Key discriminant {bit} exceeds KeyBits capacity");
+        self.0[(bit as usize) / 64] & (1u64 << (bit % 64)) != 0
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        *self = Self::EMPTY;
+    }
 }
 
 /// Polled input state for one window.
@@ -103,10 +160,10 @@ pub enum MouseButton {
 /// `get_char_pressed(&self)` can drain it through a shared reference
 /// (matching raylib's `GetCharPressed`), which makes this type `!Sync`.
 pub struct InputState {
-    keys_down: HashSet<Key>,
-    keys_pressed: HashSet<Key>,
-    mouse_down: HashSet<MouseButton>,
-    mouse_pressed: HashSet<MouseButton>,
+    keys_down: KeyBits,
+    keys_pressed: KeyBits,
+    mouse_down: u8,
+    mouse_pressed: u8,
     mouse_delta: (f64, f64),
     /// Vertical scroll accumulated since `begin_frame`, in line units (a mouse
     /// notch is ~1.0; pixel-delta devices are normalised to the same scale).
@@ -117,10 +174,10 @@ pub struct InputState {
 impl InputState {
     pub fn new() -> Self {
         Self {
-            keys_down: HashSet::new(),
-            keys_pressed: HashSet::new(),
-            mouse_down: HashSet::new(),
-            mouse_pressed: HashSet::new(),
+            keys_down: KeyBits::EMPTY,
+            keys_pressed: KeyBits::EMPTY,
+            mouse_down: 0,
+            mouse_pressed: 0,
             mouse_delta: (0.0, 0.0),
             scroll_delta: 0.0,
             chars: RefCell::new(VecDeque::new()),
@@ -132,7 +189,7 @@ impl InputState {
     /// resets its char queue every poll). Held-key state persists.
     pub fn begin_frame(&mut self) {
         self.keys_pressed.clear();
-        self.mouse_pressed.clear();
+        self.mouse_pressed = 0;
         self.mouse_delta = (0.0, 0.0);
         self.scroll_delta = 0.0;
         self.chars.borrow_mut().clear();
@@ -187,13 +244,13 @@ impl InputState {
     }
 
     pub fn is_key_down(&self, k: Key) -> bool {
-        self.keys_down.contains(&k)
+        self.keys_down.contains(k)
     }
 
     /// True only on the frame the key transitioned to pressed. Stable within
     /// a frame: every call site sees the same answer.
     pub fn is_key_pressed(&self, k: Key) -> bool {
-        self.keys_pressed.contains(&k)
+        self.keys_pressed.contains(k)
     }
 
     /// Pops the next typed character (FIFO), or `None` when drained.
@@ -213,11 +270,11 @@ impl InputState {
     }
 
     pub fn is_mouse_button_pressed(&self, b: MouseButton) -> bool {
-        self.mouse_pressed.contains(&b)
+        self.mouse_pressed & (1u8 << b.bit()) != 0
     }
 
     pub fn is_mouse_button_down(&self, b: MouseButton) -> bool {
-        self.mouse_down.contains(&b)
+        self.mouse_down & (1u8 << b.bit()) != 0
     }
 
     // ---- internal event handlers (unit-testable; winit events can't be
@@ -232,7 +289,7 @@ impl InputState {
             // Repeats touch neither set: the key is already held and a
             // repeat is not a new press edge.
         } else {
-            self.keys_down.remove(&key);
+            self.keys_down.remove(key);
         }
     }
 
@@ -246,11 +303,12 @@ impl InputState {
     }
 
     fn mouse_button_event(&mut self, b: MouseButton, pressed: bool) {
+        let mask = 1u8 << b.bit();
         if pressed {
-            self.mouse_down.insert(b);
-            self.mouse_pressed.insert(b);
+            self.mouse_down |= mask;
+            self.mouse_pressed |= mask;
         } else {
-            self.mouse_down.remove(&b);
+            self.mouse_down &= !mask;
         }
     }
 
@@ -263,7 +321,7 @@ impl InputState {
     /// the window can no longer see their release events.
     fn focus_lost(&mut self) {
         self.keys_down.clear();
-        self.mouse_down.clear();
+        self.mouse_down = 0;
     }
 }
 
@@ -444,5 +502,59 @@ mod tests {
 
         input.mouse_button_event(MouseButton::Right, false);
         assert!(!input.is_mouse_button_down(MouseButton::Right));
+    }
+
+    #[test]
+    fn last_key_variant_down_pressed_release() {
+        let mut input = InputState::new();
+        input.begin_frame();
+        input.key_event(Key::F6, true, false);
+        assert!(input.is_key_pressed(Key::F6));
+        assert!(input.is_key_down(Key::F6));
+        // A low-index key must stay untouched (F6 lives in the second word).
+        assert!(!input.is_key_down(Key::A));
+        assert!(!input.is_key_pressed(Key::A));
+
+        input.begin_frame();
+        assert!(!input.is_key_pressed(Key::F6), "edge must clear next frame");
+        assert!(input.is_key_down(Key::F6), "held state must persist");
+
+        input.key_event(Key::F6, false, false);
+        assert!(!input.is_key_down(Key::F6));
+        assert!(!input.is_key_pressed(Key::F6));
+    }
+
+    #[test]
+    fn all_three_mouse_buttons_at_once() {
+        let mut input = InputState::new();
+        input.begin_frame();
+        input.mouse_button_event(MouseButton::Left, true);
+        input.mouse_button_event(MouseButton::Right, true);
+        input.mouse_button_event(MouseButton::Middle, true);
+
+        assert!(input.is_mouse_button_pressed(MouseButton::Left));
+        assert!(input.is_mouse_button_pressed(MouseButton::Right));
+        assert!(input.is_mouse_button_pressed(MouseButton::Middle));
+        assert!(input.is_mouse_button_down(MouseButton::Left));
+        assert!(input.is_mouse_button_down(MouseButton::Right));
+        assert!(input.is_mouse_button_down(MouseButton::Middle));
+
+        input.begin_frame();
+        assert!(!input.is_mouse_button_pressed(MouseButton::Left));
+        assert!(!input.is_mouse_button_pressed(MouseButton::Right));
+        assert!(!input.is_mouse_button_pressed(MouseButton::Middle));
+        assert!(input.is_mouse_button_down(MouseButton::Left));
+        assert!(input.is_mouse_button_down(MouseButton::Right));
+        assert!(input.is_mouse_button_down(MouseButton::Middle));
+
+        input.mouse_button_event(MouseButton::Right, false);
+        assert!(input.is_mouse_button_down(MouseButton::Left));
+        assert!(!input.is_mouse_button_down(MouseButton::Right));
+        assert!(input.is_mouse_button_down(MouseButton::Middle));
+
+        input.mouse_button_event(MouseButton::Left, false);
+        input.mouse_button_event(MouseButton::Middle, false);
+        assert!(!input.is_mouse_button_down(MouseButton::Left));
+        assert!(!input.is_mouse_button_down(MouseButton::Middle));
     }
 }
