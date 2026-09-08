@@ -41,7 +41,10 @@ use crate::frame::Scene3D;
 use crate::mesh::Pass;
 use crate::skeleton::{FrameSlot, PerSlot};
 use block_textures::BlockTextures;
-use buffers::{DrawIndexedIndirect, FRAMES_IN_FLIGHT, GpuResident, HostBuffer, MeshResidency};
+use buffers::{
+    DrawIndexedIndirect, FRAMES_IN_FLIGHT, GpuResident, HostBuffer, MESH_CONSUMER_STAGES,
+    MeshResidency,
+};
 use device::Device;
 use instance::InstanceBundle;
 use minimap::MinimapTexture;
@@ -298,7 +301,8 @@ pub(crate) struct Renderer {
     timeline: Timeline,
     /// Transfer queue for staging copies.
     transfer_lane: TransferLane,
-    /// Highest transfer-lane value submitted this frame.
+    /// Transfer-lane value this graphics submission waits on: last frame's
+    /// deferred mesh copies and/or this frame's quad-IBO grow.
     pending_transfer_wait: Option<TimelineValue>,
     /// Last present copy timeline value.
     last_copy_value: TimelineValue,
@@ -1385,7 +1389,11 @@ impl Renderer {
                 self.gpu_timer.begin(device, cmd, slot);
             }
 
-            self.pending_transfer_wait = self.mesh_res.flush_copies(
+            // Last frame's separate-queue copies: this submission is the first
+            // that can draw them (see `MeshResidency::flush_copies`). This
+            // frame's copies are flushed next and deferred one frame.
+            let deferred = self.mesh_res.take_deferred_arrival(device, cmd);
+            self.mesh_res.flush_copies(
                 device,
                 &mut self.transfer_lane,
                 cmd,
@@ -1400,10 +1408,10 @@ impl Renderer {
             // never early).
             let arrived = self.mesh_res.take_arrived();
             self.records.mark_arrived(&arrived);
-            // Grow the shared quad IBO (if a bigger mesh arrived) before any draw
-            // indexes it; ordered either by its own barrier (same-queue tiers)
-            // or the lane wait folded into `pending_transfer_wait` below —
-            // exactly like the mesh staging copies above.
+            // Grow the shared quad IBO (if a bigger mesh arrived) before any
+            // draw indexes it. Unified-memory uploads can draw the same frame,
+            // so this copy keeps a same-frame wait (same-queue barrier, or the
+            // lane wait folded into `pending_transfer_wait` below).
             let quad_wait = self.quad_ibo.ensure(
                 &self.instance.instance,
                 device,
@@ -1413,7 +1421,7 @@ impl Renderer {
                 self.device.graphics_family,
                 done_at,
             );
-            self.pending_transfer_wait = match (self.pending_transfer_wait, quad_wait) {
+            self.pending_transfer_wait = match (deferred, quad_wait) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (a, b) => a.or(b),
             };
@@ -1858,15 +1866,18 @@ impl Renderer {
     }
 
     /// Submits the recorded command buffer and advances the timeline. Waits
-    /// on the transfer lane's semaphore too when this frame's `flush_copies`/
-    /// `quad_ibo.ensure` submitted on a separate queue — a cross-queue
-    /// dependency needs a semaphore wait; the in-command-buffer barrier used
-    /// otherwise only orders work within one queue.
+    /// on the transfer lane at [`MESH_CONSUMER_STAGES`] when last frame's
+    /// deferred mesh copies and/or this frame's `quad_ibo.ensure` submitted
+    /// on a separate queue — a cross-queue dependency needs a semaphore wait;
+    /// the in-command-buffer barrier used otherwise only orders work within
+    /// one queue. The wait is vertex/index fetch (including the shadow
+    /// cascades), not `ALL_COMMANDS`, so cull/clears/sky/post can overlap
+    /// the copy.
     fn submit_render(&mut self, rs: RenderSubmit, slot: usize) {
         let extra_wait = self
             .pending_transfer_wait
             .take()
-            .map(|value| (self.transfer_lane.semaphore(), value));
+            .map(|value| (self.transfer_lane.semaphore(), value, MESH_CONSUMER_STAGES));
         let completion = unsafe {
             rs.submit(
                 &self.device.device,
@@ -2421,12 +2432,15 @@ impl Renderer {
             self.timeline.wait(device, self.timeline.last_reserved());
             self.copy_slot = None;
 
-            if self.mesh_res.has_pending() {
+            let had_pending = self.mesh_res.has_pending();
+            if had_pending || self.mesh_res.has_deferred() {
                 // Reuse slot 0's command buffer. Always real and valid: even
                 // under a separate transfer queue, the `DedicatedFamily` tier
                 // needs a real graphics-side command buffer to record its
                 // ownership-transfer ACQUIRE barrier into (see
-                // `MeshResidency::flush_copies`).
+                // `MeshResidency::flush_copies`). Take the deferred arrival
+                // after this flush so idle reclaim waits out this batch too
+                // (live frames take *before* flush, one frame later).
                 let cmd = self.slots[FrameSlot::new(0)].cmd;
                 device
                     .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
@@ -2436,13 +2450,16 @@ impl Renderer {
                 device
                     .begin_command_buffer(cmd, &begin)
                     .expect("begin command buffer failed");
-                let transfer_wait = self.mesh_res.flush_copies(
-                    device,
-                    &mut self.transfer_lane,
-                    cmd,
-                    self.device.graphics_family,
-                    self.last_render_value,
-                );
+                if had_pending {
+                    self.mesh_res.flush_copies(
+                        device,
+                        &mut self.transfer_lane,
+                        cmd,
+                        self.device.graphics_family,
+                        self.last_render_value,
+                    );
+                }
+                let transfer_wait = self.mesh_res.take_deferred_arrival(device, cmd);
                 device
                     .end_command_buffer(cmd)
                     .expect("end command buffer failed");
@@ -2451,7 +2468,7 @@ impl Renderer {
                     [vk::SemaphoreSubmitInfo::default()
                         .semaphore(self.transfer_lane.semaphore())
                         .value(value.raw())
-                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)]
+                        .stage_mask(MESH_CONSUMER_STAGES)]
                 });
                 let mut submit = vk::SubmitInfo2::default().command_buffer_infos(&cmd_info);
                 if let Some(wait_info) = &wait_info {
