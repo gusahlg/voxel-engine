@@ -146,7 +146,10 @@ impl Renderer {
                 .get_physical_device_memory_properties(self.device.physical);
             self.exposure
                 .recreate(&self.device.device, &memory_props, self.render_extent);
-            // History is swapchain-sized; recreate discards it (reconverges).
+            // History is swapchain-sized. Recreate rebuilds the images only
+            // when that extent changed; a render-scale-only apply still
+            // invalidates temporal state (new reconstruction kernel / sample
+            // grid must not mix with the previous present's history).
             self.taa
                 .recreate(&self.device.device, &memory_props, self.swapchain.extent);
 

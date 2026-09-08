@@ -72,7 +72,7 @@ static const float2 HALTON_23[16] = {
 static const float HISTORY_BLEND = 0.92f;
 
 // TAA neighbourhood variance-clamp width in std-devs: history is clamped to
-// YCoCg mean +/- VARIANCE_GAMMA*stddev of the 5-tap cross current taps. Wider =
+// YCoCg mean +/- VARIANCE_GAMMA*stddev of the unweighted 3x3 current taps. Wider =
 // steadier (less crawl) but more ghosting. Read by tonemap.frag (TAA_FUSED).
 static const float VARIANCE_GAMMA = 1.25f;
 

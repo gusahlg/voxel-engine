@@ -184,9 +184,10 @@ impl Renderer {
 
         let swap_image = self.swapchain.images[image_index as usize];
         let swap_view = self.swapchain.image_views[image_index as usize];
-        // Exposure applied before the tonemap curve. Render scale is handled by the
-        // tonemap sampler (it reads the HDR image bilinearly at window size), so
-        // there is no separate copy/blit path anymore. The same pass also applies
+        // Exposure applied before the tonemap curve. Render scale is handled in
+        // this pass: TAA-off bilinear-samples HDR at window size; TAA-on
+        // reconstructs a swapchain-res image from a 3×3 of render texels (TAAU).
+        // There is no separate copy/blit path. The same pass also applies
         // the wide-FOV periphery remap: `warp_map` carries the coefficients, and an
         // identity (rectilinear) map pushes `s = 0` so the frag stays a no-op.
         // Metering off pins exposure at 1.0 structurally (the set_flags reset
