@@ -78,6 +78,8 @@ pub struct Device {
     pub draw_indirect_first_instance: bool,
     /// Required for GPU-driven culling; kept as field for single-source enable.
     pub draw_indirect_count: bool,
+    /// Compute-stage subgroup BASIC+BALLOT: cull uses wave-aggregated atomics.
+    pub cull_wave_atomics: bool,
     pub timestamp_period_ns: f32,
     pub timestamps_supported: bool,
     pub max_image_array_layers: u32,
@@ -283,6 +285,21 @@ impl Device {
             .dynamic_rendering_local_read
             .then(|| khr::dynamic_rendering_local_read::Device::new(instance, &device));
 
+        let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut subgroup_props = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
+        unsafe { instance.get_physical_device_properties2(best.physical, &mut subgroup_props) };
+        let cull_wave_atomics = subgroup
+            .supported_stages
+            .contains(vk::ShaderStageFlags::COMPUTE)
+            && subgroup
+                .supported_operations
+                .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::BALLOT);
+        if cull_wave_atomics {
+            log::info!("cull: wave-aggregated atomics (compute subgroup ballot)");
+        } else {
+            log::info!("cull: per-thread atomics (no compute subgroup ballot)");
+        }
+
         Self {
             physical: best.physical,
             device,
@@ -304,6 +321,7 @@ impl Device {
             multi_draw_indirect: best.multi_draw_indirect,
             draw_indirect_first_instance: best.draw_indirect_first_instance,
             draw_indirect_count: best.draw_indirect_count,
+            cull_wave_atomics,
             timestamp_period_ns: best.properties.limits.timestamp_period,
             timestamps_supported: best.properties.limits.timestamp_compute_and_graphics == vk::TRUE,
             max_image_array_layers: best.properties.limits.max_image_array_layers,

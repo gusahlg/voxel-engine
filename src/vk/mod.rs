@@ -96,8 +96,6 @@ struct SlotState {
     vrs_ready: bool,
     /// History image holds a raw classification from a previous VRS dispatch.
     vrs_history: bool,
-    /// Shadow map cleared to all-lit; gates shadow pass skip.
-    shadow_lit_ready: bool,
     /// Which image holds the final HDR (offscreen or TAA history).
     hdr_source: HdrSource,
 }
@@ -178,6 +176,25 @@ fn jittered_clip(clean: glam::Mat4, jitter_px: glam::Vec2, extent: vk::Extent2D)
 }
 
 /// Get frame's sun direction, defaulting to up if absent.
+/// Shadow-map content key: sun/eye-snap/occluders plus hashed avatar casters.
+fn shadow_key(
+    eye: glam::DVec3,
+    sun: glam::DVec3,
+    occluders: u64,
+    lists: &DrawLists,
+) -> shadow::ShadowKey {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    bytemuck::cast_slice::<_, u8>(&lists.cube_verts).hash(&mut h);
+    shadow::ShadowKey::of(
+        eye,
+        sun,
+        occluders,
+        h.finish(),
+        &crate::skeleton::ShadowCfg::PROVISIONAL,
+    )
+}
+
 fn sun_dir(lists: &DrawLists) -> glam::DVec3 {
     lists
         .scene
@@ -448,7 +465,6 @@ impl Renderer {
             indirect: HostBuffer::new(vk::BufferUsageFlags::INDIRECT_BUFFER),
             vrs_ready: false,
             vrs_history: false,
-            shadow_lit_ready: false,
             hdr_source: HdrSource::Offscreen,
         }));
 
@@ -496,7 +512,7 @@ impl Renderer {
             exposure: exposure.shared(),
         };
 
-        let cull = cull::CullState::new(&device.device, pipeline_cache);
+        let cull = cull::CullState::new(&device.device, pipeline_cache, device.cull_wave_atomics);
         // GPU-driven emission: opaque/cutout/shadow draws are always emitted
         // by the cull dispatch, so the device must support drawIndirectCount.
         // Device selection enforces this; this assert makes mis-selection fail
@@ -1163,25 +1179,38 @@ impl Renderer {
             )
         };
 
-        // The cull dispatch owns the shadow set, so these cascade frusta feed
-        // its params.
-        let shadow_frusta = lists
-            .scene
-            .as_ref()
-            .filter(|_| self.flags.shadows)
-            .map(|scene| {
-                let cfg = crate::skeleton::ShadowCfg::PROVISIONAL;
+        // Cull emits shadow casters only when the shared map will actually be
+        // rewritten this frame. A cache hit skips cascade `fit()` and sets
+        // `shadow_enabled = 0` so invisible slots bail before the AABB load.
+        let cfg = crate::skeleton::ShadowCfg::PROVISIONAL;
+        let shadow_frusta = lists.scene.as_ref().and_then(|scene| {
+            if self.flags.shadows {
+                let key = shadow_key(
+                    scene.eye,
+                    sun_dir(lists),
+                    self.records.occluder_rev(),
+                    lists,
+                );
+                if !self.shadow_cache.prepare(Some((key, &cfg))) {
+                    return None;
+                }
                 let sun = sun_dir(lists);
-                [
-                    crate::skeleton::Cascade::Near,
-                    crate::skeleton::Cascade::Far,
-                ]
-                .map(|c| {
-                    crate::camera::Frustum::from_view_proj(
-                        &shadow::fit(scene.eye, sun, c, &cfg).view_proj.0,
-                    )
-                })
-            });
+                Some(
+                    [
+                        crate::skeleton::Cascade::Near,
+                        crate::skeleton::Cascade::Far,
+                    ]
+                    .map(|c| {
+                        crate::camera::Frustum::from_view_proj(
+                            &shadow::fit(scene.eye, sun, c, &cfg).view_proj.0,
+                        )
+                    }),
+                )
+            } else {
+                self.shadow_cache.prepare(None);
+                None
+            }
+        });
 
         // GPU cull prep: the persistent visibility mask IS the dispatch's
         // visibility input, grown to cover every live slot (zero = hidden).
@@ -1448,53 +1477,26 @@ impl Renderer {
             }
         }
 
-        // Cascaded shadows: fit both cascades around this frame's frustum,
-        // publish the binding-3 uniforms the receiver samples, and render the
-        // occluders into the shadow map BEFORE the color pass (it leaves the map
-        // in SHADER_READ_ONLY_OPTIMAL for mesh3d.frag's PCF). The mesh pass always
-        // samples binding 4, so this must run whenever a 3D scene exists.
+        // Cascaded shadows: on a miss, fit both cascades, publish binding-3
+        // uniforms, and render occluders into the *shared* map before the color
+        // pass (it leaves the map in SHADER_READ_ONLY_OPTIMAL for mesh3d.frag).
+        // Hits skip the producer (and skip `fit()`); the slot UBO is filled from
+        // the cached block so sampling matches the resident depth.
         if let Some(scene) = &lists.scene {
-            // With shadows disabled the map holds a constant fully-lit clear and
-            // its cascade UBO a constant (SHADOW_LIMIT=∞) block, so once this
-            // slot has primed both there is nothing left to re-record: skip the
-            // per-frame clears + barriers (the bulk of the off-path cost). Any
-            // shadowed frame re-runs the pass and re-arms every slot.
             let cfg = crate::skeleton::ShadowCfg::PROVISIONAL;
             let sun = sun_dir(lists);
-            // Off: the map holds a constant fully-lit clear; prime each slot once
-            // then skip forever (unchanged fast path). The cached generation is
-            // meaningless while off, so re-render both slots on re-enable.
-            // On: additionally gate the re-render on the dirty cache — regenerate
-            // only when the sun/eye-snap/occluders actually shifted the depth.
-            // Avatar boxes cast into the shadow map; hash their geometry so the
-            // cache regenerates on any motion (and stays cached when still).
-            // Only the shadowed path consumes the hash, so only it pays for it.
             let caster_verts = lists.cube_verts.len() as u32;
-            let render = if self.flags.shadows {
-                let casters = {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::hash::DefaultHasher::new();
-                    bytemuck::cast_slice::<_, u8>(&lists.cube_verts).hash(&mut h);
-                    h.finish()
-                };
-                let key = shadow::ShadowKey::of(
-                    scene.eye,
-                    sun,
-                    self.records.occluder_rev(),
-                    casters,
-                    &cfg,
-                );
-                self.shadow_cache.take_render(slot, key, &cfg)
-            } else {
-                self.shadow_cache.invalidate();
-                !self.slots[FrameSlot::new(slot)].shadow_lit_ready
-            };
+            let render = self.shadow_cache.pending_rebuild();
             if render {
                 let _g = crate::profile::scope(crate::profile::Meter::RecShadow);
-                // Write the UBO only on a regenerating frame so the receiver's
-                // sampled cascade matrices always match the depth actually in the
-                // (possibly cached-from-an-earlier-frame) image.
+                // WAR: the other FIF slot may still be sampling the shared map.
+                // Hits skip this wait (concurrent SHADER_READ_ONLY is legal).
+                unsafe {
+                    self.timeline
+                        .wait(&self.device.device, self.last_render_value);
+                }
                 let cu = self.shadow_uniforms(scene.eye, sun, &cfg);
+                self.shadow_cache.store_uniforms(cu);
                 self.shadow.write_uniforms(slot, &cu);
                 self.record_shadow_pass(cmd, slot, scene.eye, sun, &cfg, caster_verts);
                 if profiling {
@@ -1503,7 +1505,12 @@ impl Renderer {
                             .mark(&self.device.device, cmd, slot, GpuPass::ShadowMap)
                     };
                 }
-                self.slots[FrameSlot::new(slot)].shadow_lit_ready = !self.flags.shadows;
+                if !self.flags.shadows {
+                    self.shadow_cache.mark_lit_ready();
+                }
+            } else if let Some(cu) = self.shadow_cache.uniforms() {
+                // Hit: copy cached matrices into this slot's UBO, no `fit()`.
+                self.shadow.write_uniforms(slot, cu);
             }
         }
 
@@ -2658,15 +2665,12 @@ impl Renderer {
             // Offscreen images recreated; clear copy tracking.
             self.clear_copy();
             // Depth images recreated (layout UNDEFINED): VRS must re-prime.
-            // Shadow map recreated (layout UNDEFINED): re-prime the lit clear.
             for slot in 0..FRAMES_IN_FLIGHT as usize {
                 let s = &mut self.slots[FrameSlot::new(slot)];
                 s.vrs_ready = false;
                 s.vrs_history = false;
-                s.shadow_lit_ready = false;
             }
-            // Shadow images are UNDEFINED after recreate: force both slots to
-            // re-render rather than sample a stale/garbage cached depth.
+            // Shared shadow map is UNDEFINED after recreate: force a rewrite.
             self.shadow_cache.invalidate();
 
             if msaa_changed || format_changed {
@@ -2971,8 +2975,8 @@ impl<'a> RenderPass<'a> {
             r.block_textures.view,
             r.ubo_ring.buffer(FrameSlot::new(self.slot)),
             r.shadow.ubo(self.slot),
-            r.targets.shadow[FrameSlot::new(self.slot)].sampler,
-            r.targets.shadow[FrameSlot::new(self.slot)].sample_view,
+            r.targets.shadow.sampler,
+            r.targets.shadow.sample_view,
         );
         self.mesh_desc_bound.set(true);
     }
@@ -3142,9 +3146,9 @@ impl<'a> RenderPass<'a> {
     }
 
     /// GPU-culled variant of [`record_mesh_indirect`](Self::record_mesh_indirect):
-    /// one `vkCmdDrawIndexedIndirectCount` per non-empty (pass, arena)
-    /// partition, consuming the commands the cull dispatch emitted earlier in
-    /// this command buffer. Never called for Blend (CPU-sorted path).
+    /// one `vkCmdDrawIndexedIndirectCount` per non-empty (pass, arena, bucket)
+    /// partition, near-to-far, consuming the commands the cull dispatch emitted
+    /// earlier in this command buffer. Never called for Blend (CPU-sorted path).
     unsafe fn record_mesh_indirect_count(&self, pass: Pass) {
         let Some(frame) = &self.r.cull_frame else {
             return; // nothing live to draw
@@ -3154,8 +3158,9 @@ impl<'a> RenderPass<'a> {
             Pass::Cutout => 1,
             Pass::Blend => unreachable!("Blend stays on the CPU path"),
         };
-        let base = group * frame.arena_count;
-        if frame.partitions[base..base + frame.arena_count]
+        let span = frame.arena_count * cull::BUCKETS;
+        let base = group * span;
+        if frame.partitions[base..base + span]
             .iter()
             .all(|p| p.capacity == 0)
         {
@@ -3176,8 +3181,11 @@ impl<'a> RenderPass<'a> {
                 .expect("live records imply the quad IBO is allocated");
             device.cmd_bind_index_buffer(self.cmd, quad_ibo, 0, vk::IndexType::UINT32);
             for arena in 0..frame.arena_count {
-                let part = frame.partitions[base + arena];
-                if part.capacity == 0 {
+                let first = cull::camera_part(group, arena, 0, frame.arena_count);
+                if frame.partitions[first..first + cull::BUCKETS]
+                    .iter()
+                    .all(|p| p.capacity == 0)
+                {
                     continue;
                 }
                 device.cmd_bind_vertex_buffers(
@@ -3186,15 +3194,22 @@ impl<'a> RenderPass<'a> {
                     &[self.r.arena_dir.arena_buffer(arena)],
                     &[0],
                 );
-                device.cmd_draw_indexed_indirect_count(
-                    self.cmd,
-                    frame.commands,
-                    u64::from(part.offset) * cull::CMD_STRIDE,
-                    frame.counts,
-                    ((base + arena) * 4) as u64,
-                    part.capacity,
-                    cull::CMD_STRIDE as u32,
-                );
+                for bucket in 0..cull::BUCKETS {
+                    let idx = first + bucket;
+                    let part = frame.partitions[idx];
+                    if part.capacity == 0 {
+                        continue;
+                    }
+                    device.cmd_draw_indexed_indirect_count(
+                        self.cmd,
+                        frame.commands,
+                        u64::from(part.offset) * cull::CMD_STRIDE,
+                        frame.counts,
+                        (idx * 4) as u64,
+                        part.capacity,
+                        cull::CMD_STRIDE as u32,
+                    );
+                }
             }
         }
     }

@@ -151,10 +151,11 @@ const MESH3D_WATER: Shader = Shader {
     dst: "mesh3d_water.frag.spv",
 };
 
-/// One compile unit: a shader plus its `-D` defines.
+/// One compile unit: a shader plus its `-D` defines and extra slangc args.
 struct Job<'a> {
     shader: &'a Shader<'a>,
     defines: &'a [&'a str],
+    extra_args: &'a [&'a str],
 }
 
 /// The shader toolchain found on PATH. `None` when `slangc` is missing, in
@@ -235,13 +236,19 @@ fn main() {
         .map(|shader| Job {
             shader,
             defines: &[],
+            extra_args: &[],
         })
         .collect();
     jobs.push(Job {
         shader: &MESH3D_WATER,
         defines: &["-DWATER_DEPTH_ABSORPTION"],
+        extra_args: &[],
     });
     compile_all(toolchain.as_ref(), &out_dir, fallback_dir, &jobs);
+    // Wave-aggregated InterlockedAdd variant of the cull shader. Not in SHADERS:
+    // shaders_spv/ keeps the plain-atomic module (no subgroup caps) as the
+    // no-slangc fallback; this file lives only in OUT_DIR.
+    compile_cull_wave(toolchain.as_ref(), &out_dir);
 
     // Substrate probe: compute shaders for BDA, QUAD, STORAGE, and occupancy tests.
     // Gated behind VOXEL_BUILD_PROBE to avoid requiring extended SPIR-V profile.
@@ -458,7 +465,7 @@ fn compile_all(toolchain: Option<&Toolchain>, out_dir: &Path, fallback_dir: &Pat
     );
 }
 
-fn slangc_args(shader: &Shader, defines: &[&str]) -> Vec<String> {
+fn slangc_args(shader: &Shader, defines: &[&str], extra_args: &[&str]) -> Vec<String> {
     let mut args = vec![
         shader.src.to_owned(),
         "-target".into(),
@@ -473,6 +480,7 @@ fn slangc_args(shader: &Shader, defines: &[&str]) -> Vec<String> {
         SLANG_OPT_LEVEL.into(),
     ];
     args.extend(defines.iter().map(|d| (*d).to_owned()));
+    args.extend(extra_args.iter().map(|a| (*a).to_owned()));
     args
 }
 
@@ -538,6 +546,36 @@ fn fingerprint(toolchain: &Toolchain, args: &[String], src: &Path) -> String {
     format!("{hash:016x}")
 }
 
+/// Wave-aggregated InterlockedAdd variant of the cull shader. Without slangc,
+/// clone the plain module so `include_bytes!` still resolves; the runtime then
+/// picks the plain pipeline because wave ops are absent. Lives only in OUT_DIR
+/// (shaders_spv/ keeps the no-subgroup fallback).
+fn compile_cull_wave(toolchain: Option<&Toolchain>, out_dir: &Path) {
+    const CULL_WAVE: Shader = Shader {
+        src: "shaders/cull.comp.slang",
+        stage: "compute",
+        entry: "computeMain",
+        dst: "cull_wave.comp.spv",
+    };
+    if toolchain.is_some() {
+        compile_all(
+            toolchain,
+            out_dir,
+            Path::new("shaders_spv"),
+            &[Job {
+                shader: &CULL_WAVE,
+                defines: &["-DUSE_WAVE_ATOMICS"],
+                extra_args: &["-capability", "subgroup_basic_ballot"],
+            }],
+        );
+        return;
+    }
+    let plain = out_dir.join("cull.comp.spv");
+    let wave = out_dir.join(CULL_WAVE.dst);
+    fs::copy(&plain, &wave)
+        .unwrap_or_else(|e| panic!("copy plain cull module to {}: {e}", wave.display()));
+}
+
 fn compile(
     toolchain: Option<&Toolchain>,
     out_dir: &Path,
@@ -564,7 +602,7 @@ fn compile(
         return Ok(());
     };
 
-    let args = slangc_args(shader, job.defines);
+    let args = slangc_args(shader, job.defines, job.extra_args);
     let fingerprint = fingerprint(toolchain, &args, Path::new(shader.src));
     if out_path.exists() && fs::read_to_string(&stamp_path).is_ok_and(|s| s == fingerprint) {
         return Ok(());
@@ -761,6 +799,26 @@ fn build_table() -> Vec<Def> {
             name: "CULL_WORKGROUP",
             doc: "GPU cull dispatch workgroup width (one thread per mesh slot). The CPU-side\ndispatch partition math (vk/cull.rs) must divide by the same value.",
             val: Val::UInt(64),
+        },
+        Def {
+            name: "CULL_DISTANCE_BUCKETS",
+            doc: "Front-to-back approximate-order buckets per camera (pass, arena) partition.\nShadow groups stay unbucketed. CPU partition math and the cull shader must agree.",
+            val: Val::UInt(4),
+        },
+        Def {
+            name: "CULL_BUCKET_SPLIT_0",
+            doc: "Camera-distance edge (metres from AABB centre) between cull buckets 0 and 1.\nBucket 0 is nearest; record_mesh_indirect_count draws 0..K-1 near-to-far.",
+            val: Val::Scalar(16.0),
+        },
+        Def {
+            name: "CULL_BUCKET_SPLIT_1",
+            doc: "Camera-distance edge (metres) between cull buckets 1 and 2.",
+            val: Val::Scalar(64.0),
+        },
+        Def {
+            name: "CULL_BUCKET_SPLIT_2",
+            doc: "Camera-distance edge (metres) between cull buckets 2 and 3 (farthest).",
+            val: Val::Scalar(256.0),
         },
         Def {
             name: "EXPOSURE_TILE",

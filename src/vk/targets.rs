@@ -331,8 +331,9 @@ pub struct RenderTargets {
     /// images, history, and mix readback. `RenderFlags::vrs` decides whether
     /// a frame actually classifies and binds the rate attachment.
     pub(crate) vrs: Option<super::vrs::Vrs>,
-    /// Cascaded shadow map, per-slot: avoid frame overlap glitches with type-safe indexing.
-    pub(crate) shadow: crate::skeleton::PerSlot<ShadowMap>,
+    /// Shared cascaded shadow map (both FIF slots sample the same image).
+    /// Regenerated once per `ShadowKey`; see `shadow.rs` hazard analysis.
+    pub(crate) shadow: ShadowMap,
     /// Per-slot bloom mip chain. Extent-dependent, so recreated with the
     /// rest of the targets on resize.
     pub(crate) bloom: [BloomChain; FRAMES_IN_FLIGHT as usize],
@@ -429,9 +430,7 @@ impl RenderTargets {
         // classify dispatch and the rate attachment, shading 1×1 everywhere.
         let vrs = fsr.map(|f| super::vrs::Vrs::new(device, &memory_props, f, extent));
 
-        let shadow = crate::skeleton::PerSlot::new(std::array::from_fn(|_| {
-            ShadowMap::new(device, &memory_props)
-        }));
+        let shadow = ShadowMap::new(device, &memory_props);
 
         let bloom = std::array::from_fn(|_| BloomChain::new(device, &memory_props, extent));
 
@@ -476,9 +475,7 @@ impl RenderTargets {
             if let Some(vrs) = &mut self.vrs {
                 vrs.destroy(device);
             }
-            for shadow in self.shadow.iter() {
-                shadow.destroy(device);
-            }
+            self.shadow.destroy(device);
             for chain in &self.bloom {
                 chain.destroy(device);
             }
