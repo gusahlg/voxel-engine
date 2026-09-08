@@ -64,6 +64,16 @@ pub(crate) struct ArenaDirectory {
     refs: Vec<u32>,
     /// Slot placement (arena, pass, gen) for free decrement.
     slots: Vec<Option<(u32, Pass, NonZeroU32)>>,
+    /// The registered Blend slots (unordered). The CPU Blend re-source walks
+    /// exactly this set, so its cost scales with the transparent meshes, not
+    /// with the whole slot table.
+    blend: Vec<u32>,
+    /// Position + 1 of a slot in `blend` (0 = not a Blend slot); O(1) removal.
+    blend_pos: Vec<u32>,
+    /// One past the highest registered slot: the cull dispatch and its
+    /// visibility mask stop here rather than at the table's high-water mark
+    /// when the tail has been freed.
+    live_end: u32,
 }
 
 impl ArenaDirectory {
@@ -73,6 +83,9 @@ impl ArenaDirectory {
             live: Vec::new(),
             refs: Vec::new(),
             slots: Vec::new(),
+            blend: Vec::new(),
+            blend_pos: Vec::new(),
+            live_end: 0,
         }
     }
 
@@ -113,7 +126,40 @@ impl ArenaDirectory {
             self.slots.resize(n, None);
         }
         self.slots[slot as usize] = Some((arena, pass, generation));
+        self.set_blend(slot, pass == Pass::Blend);
+        self.live_end = self.live_end.max(slot + 1);
         arena
+    }
+
+    /// Adds `slot` to (or removes it from) the Blend set; idempotent either way.
+    fn set_blend(&mut self, slot: u32, on: bool) {
+        let i = slot as usize;
+        if self.blend_pos.len() <= i {
+            self.blend_pos.resize(i + 1, 0);
+        }
+        let pos = self.blend_pos[i];
+        if on && pos == 0 {
+            self.blend.push(slot);
+            self.blend_pos[i] = self.blend.len() as u32;
+        } else if !on && pos != 0 {
+            let at = (pos - 1) as usize;
+            self.blend.swap_remove(at);
+            self.blend_pos[i] = 0;
+            if let Some(&moved) = self.blend.get(at) {
+                self.blend_pos[moved as usize] = pos;
+            }
+        }
+    }
+
+    /// The registered Blend slots, in no particular order.
+    pub fn blend_slots(&self) -> &[u32] {
+        &self.blend
+    }
+
+    /// One past the highest registered slot (0 when nothing is registered):
+    /// every slot at or beyond it has a dead arena word.
+    pub fn live_end(&self) -> u32 {
+        self.live_end
     }
 
     /// Register a free with generation check.
@@ -131,6 +177,15 @@ impl ArenaDirectory {
         self.refs[arena as usize] -= 1;
         if let Some(lane) = group_lane(pass) {
             self.live[arena as usize][lane] -= 1;
+        }
+        self.set_blend(slot, false);
+        if slot + 1 == self.live_end {
+            // The tail died: retreat to the next registered slot. Amortised
+            // O(1) — each dead slot is stepped over once per retreat.
+            self.live_end = self.slots[..slot as usize]
+                .iter()
+                .rposition(Option::is_some)
+                .map_or(0, |i| i as u32 + 1);
         }
     }
 
@@ -151,10 +206,12 @@ impl ArenaDirectory {
         self.buffers.len()
     }
 
-    /// Get group-major partition table (group, arena pairs).
-    fn partitions(&self) -> (Vec<PartitionGpu>, u32) {
+    /// Fills `parts` with the group-major partition table (group, arena
+    /// pairs), reusing its allocation, and returns the total command count.
+    fn partitions_into(&self, parts: &mut Vec<PartitionGpu>) -> u32 {
         let a = self.live.len();
-        let mut parts = Vec::with_capacity(GROUPS * a);
+        parts.clear();
+        parts.reserve(GROUPS * a);
         let mut offset = 0u32;
         for group in 0..GROUPS {
             // Shadow (group 2) reuses Opaque lane (group 0).
@@ -165,7 +222,15 @@ impl ArenaDirectory {
                 offset += capacity;
             }
         }
-        (parts, offset)
+        offset
+    }
+
+    /// Get group-major partition table (group, arena pairs).
+    #[cfg(test)]
+    fn partitions(&self) -> (Vec<PartitionGpu>, u32) {
+        let mut parts = Vec::new();
+        let total = self.partitions_into(&mut parts);
+        (parts, total)
     }
 }
 
@@ -277,6 +342,9 @@ pub(crate) struct CullState {
     visible: [HostBuffer; SLOTS],
     commands: [DeviceBuffer; SLOTS],
     counts: [DeviceBuffer; SLOTS],
+    /// Recycled partition table when [`Self::prepare`] returns `None`, so a
+    /// frame with nothing to cull does not drop last frame's allocation.
+    spare_parts: Vec<PartitionGpu>,
 }
 
 impl CullState {
@@ -341,10 +409,15 @@ impl CullState {
                         | vk::BufferUsageFlags::TRANSFER_DST,
                 )
             }),
+            spare_parts: Vec::new(),
         }
     }
 
     /// Prepare buffers and params for cull dispatch. Safe after fence is waited.
+    ///
+    /// `slot_count` bounds the dispatch (the caller trims it to the directory's
+    /// live end); `visible` must cover it. `partitions` is last frame's table
+    /// handed back for reuse (its contents are discarded).
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn prepare(
         &mut self,
@@ -354,20 +427,28 @@ impl CullState {
         physical: vk::PhysicalDevice,
         dir: &ArenaDirectory,
         records: RecordBuffers,
+        slot_count: u32,
         camera: &Frustum,
         shadow: Option<&[Frustum; 2]>,
         eye: super::pipeline::EyeSplit,
         visible: &[u32],
+        mut partitions: Vec<PartitionGpu>,
     ) -> Option<CullFrame> {
-        let (partitions, total) = dir.partitions();
+        debug_assert!(slot_count <= records.slots, "slot_count exceeds the table");
+        debug_assert!(visible.len() >= slot_count.div_ceil(32) as usize);
+        if partitions.capacity() == 0 {
+            partitions = std::mem::take(&mut self.spare_parts);
+        }
+        let total = dir.partitions_into(&mut partitions);
         if partitions.is_empty() || total == 0 {
+            self.spare_parts = partitions;
             return None;
         }
         let mut params = CullParamsGpu {
             cam_planes: camera.planes().map(|p| p.to_array()),
             shadow_planes: [[0.0; 4]; 10],
             cam_block: eye.block,
-            slot_count: records.slots,
+            slot_count,
             cam_frac: eye.frac,
             arena_count: dir.arena_count() as u32,
             shadow_enabled: shadow.is_some() as u32,
@@ -405,7 +486,7 @@ impl CullState {
             counts: self.counts[slot].bound()?,
             partitions,
             arena_count: dir.arena_count(),
-            slot_count: records.slots,
+            slot_count,
         })
     }
 
@@ -682,6 +763,72 @@ mod tests {
         let (parts, total) = dir.partitions();
         assert_eq!(parts[1].capacity, 1, "Cutout slot must still be live");
         assert_eq!(total, 1, "stale free must not have drained the reused slot");
+    }
+
+    #[test]
+    fn blend_set_tracks_uploads_and_frees_only_for_blend_slots() {
+        let mut dir = ArenaDirectory::new();
+        assert!(dir.blend_slots().is_empty());
+        dir.note_upload(3, G1, buf(1), Pass::Blend);
+        dir.note_upload(7, G1, buf(1), Pass::Opaque);
+        dir.note_upload(9, G1, buf(2), Pass::Blend);
+        dir.note_upload(12, G1, buf(2), Pass::Blend);
+        let mut got = dir.blend_slots().to_vec();
+        got.sort_unstable();
+        assert_eq!(got, [3, 9, 12]);
+        // Removing from the middle (swap_remove) keeps the moved slot findable.
+        dir.note_free(9, G1);
+        let mut got = dir.blend_slots().to_vec();
+        got.sort_unstable();
+        assert_eq!(got, [3, 12]);
+        dir.note_free(12, G1);
+        assert_eq!(dir.blend_slots(), [3]);
+        // A stale free never touches the set; a real one drains it.
+        dir.note_free(3, genr(2));
+        assert_eq!(dir.blend_slots(), [3]);
+        dir.note_free(3, G1);
+        assert!(dir.blend_slots().is_empty());
+        // Re-registering a drained slot as Blend re-adds it exactly once.
+        dir.note_upload(3, genr(2), buf(1), Pass::Blend);
+        dir.note_upload(3, genr(2), buf(1), Pass::Blend);
+        assert_eq!(dir.blend_slots(), [3]);
+        // Re-registering it as Opaque (without a free in between) removes it.
+        dir.note_upload(3, genr(3), buf(1), Pass::Opaque);
+        assert!(dir.blend_slots().is_empty());
+    }
+
+    #[test]
+    fn partitions_into_reuses_the_callers_allocation() {
+        let mut dir = ArenaDirectory::new();
+        dir.note_upload(0, G1, buf(1), Pass::Opaque);
+        let mut parts = Vec::with_capacity(64);
+        let ptr = parts.as_ptr();
+        let total = dir.partitions_into(&mut parts);
+        assert_eq!(parts.as_ptr(), ptr);
+        assert_eq!(parts.len(), GROUPS);
+        assert_eq!(total, 2); // opaque + shadow lane
+    }
+
+    #[test]
+    fn live_end_follows_the_highest_registered_slot() {
+        let mut dir = ArenaDirectory::new();
+        assert_eq!(dir.live_end(), 0);
+        dir.note_upload(4, G1, buf(1), Pass::Opaque);
+        assert_eq!(dir.live_end(), 5);
+        dir.note_upload(40, G1, buf(1), Pass::Blend);
+        dir.note_upload(20, G1, buf(1), Pass::Cutout);
+        assert_eq!(dir.live_end(), 41);
+        // Freeing below the top leaves it; freeing the top retreats past the
+        // dead gap to the next registered slot.
+        dir.note_free(20, G1);
+        assert_eq!(dir.live_end(), 41);
+        dir.note_free(40, G1);
+        assert_eq!(dir.live_end(), 5);
+        // A stale free of the top is ignored.
+        dir.note_free(4, genr(2));
+        assert_eq!(dir.live_end(), 5);
+        dir.note_free(4, G1);
+        assert_eq!(dir.live_end(), 0);
     }
 
     #[test]

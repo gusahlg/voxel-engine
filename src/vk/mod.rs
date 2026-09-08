@@ -931,6 +931,14 @@ impl Renderer {
         unsafe {
             self.timeline
                 .wait(device, self.slots[FrameSlot::new(slot)].render_value);
+            // Nothing retired (the steady state): skip the two counter reads
+            // and the queue drains, which would find nothing to reclaim.
+            if !self.mesh_res.has_garbage()
+                && self.retired_textures.is_empty()
+                && !self.quad_ibo.has_garbage()
+            {
+                return;
+            }
             let current = self.timeline.counter(device);
             // Retired allocations return to the main-owned allocator freelist;
             // staging-block shrink happens main-side after it reclaims them.
@@ -1144,11 +1152,20 @@ impl Renderer {
 
         // GPU cull prep: the persistent visibility mask IS the dispatch's
         // visibility input, grown to cover every live slot (zero = hidden).
+        // The dispatch (and the mask it reads) stops at the directory's live
+        // end, not the table length: a freed tail is all dead words.
+        // Last frame's partition table is handed back so its allocation is
+        // reused rather than rebuilt from scratch every frame.
+        let recycled = self
+            .cull_frame
+            .take()
+            .map_or_else(Vec::new, |f| f.partitions);
         self.cull_frame = if let Some(scene) = &lists.scene {
             let camera = crate::camera::Frustum::from_view_proj(&scene.view_proj);
             let eye = pipeline::EyeSplit::of(scene.eye);
             if let Some(records) = self.record_buffers {
-                let need = records.slots.div_ceil(32) as usize;
+                let slot_count = records.slots.min(self.arena_dir.live_end());
+                let need = slot_count.div_ceil(32) as usize;
                 if self.visible_mask.len() < need {
                     self.visible_mask.resize(need, 0);
                 }
@@ -1160,10 +1177,12 @@ impl Renderer {
                         self.device.physical,
                         &self.arena_dir,
                         records,
+                        slot_count,
                         &camera,
                         shadow_frusta.as_ref(),
                         eye,
-                        &self.visible_mask,
+                        &self.visible_mask[..need],
+                        recycled,
                     )
                 }
             } else {
@@ -1174,11 +1193,12 @@ impl Renderer {
         };
 
         // CPU Blend re-source: walk the resident, visible, Blend-pass records.
+        // The directory's Blend set is exactly that candidate list, so this is
+        // O(transparent meshes), never a sweep of the whole slot table.
         if let Some(scene) = &lists.scene {
             let camera = crate::camera::Frustum::from_view_proj(&scene.view_proj);
             let eye = pipeline::EyeSplit::of(scene.eye);
-            let slot_count = self.record_buffers.map_or(0, |r| r.slots);
-            for s in 0..slot_count {
+            for &s in self.arena_dir.blend_slots() {
                 // Arena word (0 = not resident) is the arena index + 1, giving
                 // the vertex buffer without a residency-handle lookup. Gated
                 // on `is_arrived` too: a budget-deferred copy is registered in
@@ -1202,9 +1222,11 @@ impl Renderer {
                 let Some(rec) = self.records.record(s) else {
                     continue;
                 };
-                if rec.pass() != Pass::Blend {
-                    continue;
-                }
+                debug_assert_eq!(
+                    rec.pass(),
+                    Pass::Blend,
+                    "Blend set holds a non-Blend record"
+                );
                 // Camera-relative placement reconstructed exactly as the vertex
                 // shader does (integer block minus camera block, then the
                 // fractional remainder), so the CPU sort/cull agrees with the GPU
@@ -1264,9 +1286,9 @@ impl Renderer {
             }
         }
         // The fingerprint exists only so VRS can tell whether a slot's stored
-        // depth still matches the scene it will classify; with VRS off nothing
-        // reads it, so skip the per-frame hash.
-        self.scene_fingerprint = if self.targets.vrs.is_some() {
+        // depth still matches the scene it will classify; with VRS off (the
+        // flag or the rate images) nothing reads it, so skip the per-frame hash.
+        self.scene_fingerprint = if self.flags.vrs && self.targets.vrs.is_some() {
             scene_fingerprint(lists, &self.draw_scratch, &self.visible_mask)
         } else {
             0
@@ -1409,14 +1431,15 @@ impl Renderer {
             // only when the sun/eye-snap/occluders actually shifted the depth.
             // Avatar boxes cast into the shadow map; hash their geometry so the
             // cache regenerates on any motion (and stays cached when still).
+            // Only the shadowed path consumes the hash, so only it pays for it.
             let caster_verts = lists.cube_verts.len() as u32;
-            let casters = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::hash::DefaultHasher::new();
-                bytemuck::cast_slice::<_, u8>(&lists.cube_verts).hash(&mut h);
-                h.finish()
-            };
             let render = if self.flags.shadows {
+                let casters = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::hash::DefaultHasher::new();
+                    bytemuck::cast_slice::<_, u8>(&lists.cube_verts).hash(&mut h);
+                    h.finish()
+                };
                 let key = shadow::ShadowKey::of(
                     scene.eye,
                     sun,

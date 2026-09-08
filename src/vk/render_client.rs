@@ -23,7 +23,7 @@ use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
-use super::alloc::{Allocation, GpuAllocator};
+use super::alloc::{Allocation, DEVICE_SHRINK_SETTLE_TICKS, GpuAllocator};
 use super::buffers::{
     DrawDyn, FRAMES_IN_FLIGHT, GpuResident, MeshHandles, MeshRecord, PlacementState,
     build_mesh_resident,
@@ -141,14 +141,60 @@ pub(crate) struct DeviceLeftovers {
     pub device: Device,
 }
 
+/// Recording snapshots in circulation. GPU frames-in-flight is
+/// [`FRAMES_IN_FLIGHT`] (2); the extra box means [`RenderClient::take_frame`]
+/// rarely parks waiting for the render thread to recycle one.
+const FRAME_POOL_SIZE: usize = FRAMES_IN_FLIGHT as usize + 1;
+
+/// Pooled [`DrawLists`] boxes plus the most recently completed snapshot, used
+/// so a blocking capture can re-present the last scene without cloning it
+/// every frame. Boxes match [`RenderCmd::Frame`] so a pop is a pointer move.
+#[allow(clippy::vec_box)]
+struct FramePool {
+    idle: Vec<Box<DrawLists>>,
+    last_drawn: Option<Box<DrawLists>>,
+    in_flight: u32,
+}
+
+impl FramePool {
+    fn with_boxes(n: usize) -> Self {
+        Self {
+            idle: (0..n).map(|_| Box::new(DrawLists::new())).collect(),
+            last_drawn: None,
+            in_flight: 0,
+        }
+    }
+
+    fn pop_idle(&mut self) -> Option<Box<DrawLists>> {
+        self.idle.pop()
+    }
+
+    fn note_submit(&mut self) {
+        self.in_flight += 1;
+    }
+
+    fn on_returned(&mut self, b: Box<DrawLists>) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if let Some(prev) = self.last_drawn.replace(b) {
+            self.idle.push(prev);
+        }
+    }
+}
+
 /// The main-thread half. Facade signatures match the old `Renderer` methods so
 /// `Engine` and every app caller are untouched.
 pub(crate) struct RenderClient {
     tx: SyncSender<RenderCmd>,
     ret_rx: Receiver<RenderReturn>,
-    /// Idle snapshots to record into (cap = FRAMES_IN_FLIGHT); blocking to pop
-    /// one IS the present-pacing that replaced the old spin `pace()`.
-    frame_pool: Vec<Box<DrawLists>>,
+    /// Idle snapshots to record into plus the last completed scene.
+    frames: FramePool,
+    /// Empty box reused by the submit-first handoff so that path does not
+    /// allocate a fresh [`DrawLists`] when the idle pool is empty.
+    spare: Option<Box<DrawLists>>,
+    /// Remaining [`GpuAllocator::shrink_device`] ticks after a free. Armed at
+    /// [`DEVICE_SHRINK_SETTLE_TICKS`] so empty device blocks can settle without
+    /// scanning every frame that did not free anything.
+    shrink_ticks: u32,
     mesh_ids: MeshHandles,
     /// Main's copy of the visibility mask and changed words (delta batching).
     visible: Vec<u32>,
@@ -231,14 +277,13 @@ impl RenderClient {
             log::info!("Unified memory detected: mesh uploads bypass staging");
         }
         let msaa = clamp_msaa(config.msaa, reply.caps.max_msaa);
-        let frame_pool = (0..FRAMES_IN_FLIGHT)
-            .map(|_| Box::new(DrawLists::new()))
-            .collect();
 
         let client = RenderClient {
             tx: cmd_tx,
             ret_rx,
-            frame_pool,
+            frames: FramePool::with_boxes(FRAME_POOL_SIZE),
+            spare: None,
+            shrink_ticks: 0,
             mesh_ids: MeshHandles::new(),
             visible: Vec::new(),
             visible_dirty: std::collections::BTreeSet::new(),
@@ -392,6 +437,9 @@ impl RenderClient {
     // ---- settings (cached on main; getters read the cache) ----
 
     pub(crate) fn set_vsync(&mut self, on: bool) {
+        if self.vsync == on {
+            return;
+        }
         self.vsync = on;
         let _ = self.tx.send(RenderCmd::SetVsync(on));
     }
@@ -464,33 +512,95 @@ impl RenderClient {
 
     // ---- frame handoff / present pacing ----
 
-    /// Drains render→main returns each cycle: recycled frame buffers back to the
-    /// pool, freed allocations back to the allocator freelist.
-    pub(crate) fn drain_returns(&mut self) {
-        while let Ok(r) = self.ret_rx.try_recv() {
-            match r {
-                RenderReturn::Frame(b) => self.frame_pool.push(b),
-                RenderReturn::FreeAlloc(a) => unsafe { self.mesh_alloc.free(a) },
+    fn handle_return(&mut self, r: RenderReturn) {
+        match r {
+            RenderReturn::Frame(b) => self.frames.on_returned(b),
+            RenderReturn::FreeAlloc(a) => {
+                unsafe {
+                    self.mesh_alloc.free(a);
+                    self.mesh_alloc.shrink_staging(&self.device);
+                }
+                self.shrink_ticks = DEVICE_SHRINK_SETTLE_TICKS;
             }
         }
+    }
+
+    fn shrink_device_if_due(&mut self) {
+        if self.shrink_ticks == 0 {
+            return;
+        }
         unsafe {
-            self.mesh_alloc.shrink_staging(&self.device);
             self.mesh_alloc.shrink_device(&self.device);
+        }
+        self.shrink_ticks -= 1;
+    }
+
+    /// Drains render→main returns each cycle: recycled frame buffers back to the
+    /// pool, freed allocations back to the allocator freelist. Allocator shrink
+    /// scans run only after a free (and for the device-block settle window).
+    pub(crate) fn drain_returns(&mut self) {
+        while let Ok(r) = self.ret_rx.try_recv() {
+            self.handle_return(r);
+        }
+        self.shrink_device_if_due();
+    }
+
+    /// Non-blocking pop of an idle recording snapshot.
+    pub(crate) fn pop_idle_frame(&mut self) -> Option<Box<DrawLists>> {
+        self.frames.pop_idle()
+    }
+
+    /// Empty box used only as a swap slot so the caller can submit before a
+    /// blocking [`Self::take_frame`].
+    pub(crate) fn take_placeholder(&mut self) -> Box<DrawLists> {
+        self.spare
+            .take()
+            .unwrap_or_else(|| Box::new(DrawLists::new()))
+    }
+
+    pub(crate) fn stash_placeholder(&mut self, b: Box<DrawLists>) {
+        if self.spare.is_none() {
+            self.spare = Some(b);
         }
     }
 
     /// Pops an idle snapshot to record into; blocks on the return channel when
     /// the pool is empty. That block IS the present-pacing (the render thread
-    /// returns a buffer only after it has consumed one).
+    /// returns a buffer only after it has consumed one). Never takes
+    /// [`FramePool::last_drawn`]: that box still holds the last completed
+    /// scene for [`Self::wait_last_drawn`].
     pub(crate) fn take_frame(&mut self) -> Box<DrawLists> {
-        if let Some(b) = self.frame_pool.pop() {
-            return b;
-        }
         loop {
+            if let Some(b) = self.frames.pop_idle() {
+                return b;
+            }
+            if self.frames.in_flight == 0 {
+                // Nothing in flight to wait for. Allocate rather than steal
+                // `last_drawn` (the blocking capture path needs that snapshot).
+                return Box::new(DrawLists::new());
+            }
             match self.ret_rx.recv() {
-                Ok(RenderReturn::Frame(b)) => return b,
-                Ok(RenderReturn::FreeAlloc(a)) => unsafe { self.mesh_alloc.free(a) },
+                Ok(r) => self.handle_return(r),
                 // Render thread gone: unblock with a throwaway (shutdown path).
+                Err(_) => return Box::new(DrawLists::new()),
+            }
+        }
+    }
+
+    /// Waits until every submitted snapshot has returned and yields the most
+    /// recently completed one (data still intact — it is reset only when
+    /// reused for recording). Used by the blocking capture path.
+    pub(crate) fn wait_last_drawn(&mut self) -> Box<DrawLists> {
+        loop {
+            if self.frames.in_flight == 0 {
+                return self
+                    .frames
+                    .last_drawn
+                    .take()
+                    .unwrap_or_else(|| Box::new(DrawLists::new()));
+            }
+            match self.ret_rx.recv() {
+                Ok(r) => self.handle_return(r),
                 Err(_) => return Box::new(DrawLists::new()),
             }
         }
@@ -499,7 +609,9 @@ impl RenderClient {
     /// Submits a recorded snapshot to the render thread.
     pub(crate) fn submit_frame(&mut self, lists: Box<DrawLists>) {
         self.flush_visible();
-        let _ = self.tx.send(RenderCmd::Frame(lists));
+        if self.tx.send(RenderCmd::Frame(lists)).is_ok() {
+            self.frames.note_submit();
+        }
     }
 
     /// Stops the render thread and destroys the device/instance/surface in the
@@ -586,4 +698,30 @@ fn render_loop(
     }
     // Sender dropped without a Shutdown (main gone): tear down anyway.
     renderer.teardown()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FRAME_POOL_SIZE, FRAMES_IN_FLIGHT, FramePool};
+
+    #[test]
+    fn frame_pool_is_one_ahead_of_gpu_slots() {
+        assert_eq!(FRAME_POOL_SIZE, FRAMES_IN_FLIGHT as usize + 1);
+        assert_eq!(FRAME_POOL_SIZE, 3);
+    }
+
+    #[test]
+    fn returned_frames_keep_the_latest_and_park_the_previous_in_idle() {
+        let mut p = FramePool::with_boxes(0);
+        p.note_submit();
+        p.note_submit();
+        p.on_returned(Box::new(super::DrawLists::new()));
+        p.on_returned(Box::new(super::DrawLists::new()));
+        assert_eq!(p.in_flight, 0);
+        assert!(p.last_drawn.is_some());
+        assert_eq!(p.idle.len(), 1);
+        assert!(p.pop_idle().is_some());
+        assert!(p.pop_idle().is_none());
+        assert!(p.last_drawn.take().is_some());
+    }
 }
