@@ -68,12 +68,18 @@ pub struct CascadeUniformsGpu {
     pub splits_fade: [f32; 4],
     /// x = blur_texels, y = slope_bias, z = dist_bias, w = texel_world(near).
     pub bias: [f32; 4],
+    /// Per-cascade receiver constants the PCF used to derive per fragment:
+    /// x = texel_world, y = ndc_per_metre (light-space depth per world metre),
+    /// z = PCF grid spread in map-UV units, w = reversed-Z reference slack
+    /// (`texel_world * ndc_per_metre`).
+    pub texel: [[f32; 4]; 2],
 }
 
 pub const CASCADE_UNIFORMS_BINDING: u32 = 3;
 
-const _: () = assert!(size_of::<CascadeUniformsGpu>() == 160);
+const _: () = assert!(size_of::<CascadeUniformsGpu>() == 192);
 const _: () = assert!(std::mem::offset_of!(CascadeUniformsGpu, splits_fade) == 128);
+const _: () = assert!(std::mem::offset_of!(CascadeUniformsGpu, texel) == 160);
 
 const SHADOW_DEPTH_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow_depth.vert.spv"));
 
@@ -377,6 +383,21 @@ pub(crate) fn fit(eye: DVec3, sun: DVec3, c: Cascade, cfg: &ShadowCfg) -> Cascad
     }
 }
 
+/// The receiver-side per-cascade constants (`CascadeUniformsGpu::texel`),
+/// derived once here instead of per fragment: the light-space depth scale is
+/// row 2 of the (orthographic) view-proj, and the 3x3 PCF grid spread is
+/// `blur_texels * 0.7071` texels (grid corner ~= the blur radius) in UV units.
+fn receiver_lanes(fit: &CascadeFit, cfg: &ShadowCfg) -> [f32; 4] {
+    let ndc_per_metre = fit.view_proj.0.row(2).truncate().length();
+    let spread_uv = cfg.blur_texels * std::f32::consts::FRAC_1_SQRT_2 / cfg.resolution as f32;
+    [
+        fit.texel_world,
+        ndc_per_metre,
+        spread_uv,
+        fit.texel_world * ndc_per_metre,
+    ]
+}
+
 impl Renderer {
     pub(crate) fn shadow_uniforms(
         &self,
@@ -404,6 +425,7 @@ impl Renderer {
                 cfg.dist_bias,
                 near.texel_world,
             ],
+            texel: [receiver_lanes(near, cfg), receiver_lanes(far, cfg)],
         }
     }
 
@@ -586,7 +608,7 @@ impl Renderer {
             .bound()
             .expect("live records imply the quad IBO is allocated");
         unsafe { device.cmd_bind_index_buffer(cmd, quad_ibo, 0, vk::IndexType::UINT32) };
-        let base = 2 * frame.arena_count;
+        let base = cull::Group::Shadow as usize * frame.arena_count;
         for arena in 0..frame.arena_count {
             let part = frame.partitions[base + arena];
             if part.capacity == 0 {
@@ -725,6 +747,31 @@ mod tests {
                     "{c:?}: far-coordinate translation broke the grid by {d}"
                 );
             }
+        }
+    }
+
+    /// The hoisted receiver lanes must equal what mesh3d.frag used to derive
+    /// per fragment from the matrix: texel_world = 2 / (RES * |row0|) and
+    /// ndc_per_metre = |row2|, with the ref slack their product.
+    #[test]
+    fn receiver_lanes_match_matrix_derivation() {
+        let cfg = ShadowCfg::PROVISIONAL;
+        let eye = DVec3::new(123.4, 56.0, -789.0);
+        for c in [Cascade::Near, Cascade::Far] {
+            let f = fit(eye, SUN, c, &cfg);
+            let [texel_world, ndc_per_metre, spread_uv, slack] = receiver_lanes(&f, &cfg);
+            let m = f.view_proj.0;
+            let from_matrix = 2.0 / (cfg.resolution as f32 * m.row(0).truncate().length());
+            assert!(
+                (texel_world - from_matrix).abs() < 1e-6 * from_matrix,
+                "{c:?}: texel_world {texel_world} vs matrix {from_matrix}"
+            );
+            let depth_scale = m.row(2).truncate().length();
+            assert!((ndc_per_metre - depth_scale).abs() < 1e-7);
+            assert!((slack - texel_world * ndc_per_metre).abs() < 1e-9);
+            // Spread: blur_texels * 1/√2 texels, expressed in UV units.
+            let expect = cfg.blur_texels * std::f32::consts::FRAC_1_SQRT_2 / cfg.resolution as f32;
+            assert!((spread_uv - expect).abs() < 1e-7, "{spread_uv} vs {expect}");
         }
     }
 

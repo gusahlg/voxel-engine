@@ -102,7 +102,15 @@ vertex_struct! {
 }
 
 const MESH3D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d.vert.spv"));
+/// Full mesh3d.frag module (water/absorb branch + LOD-slab `discard`): the
+/// Blend pipelines only.
 const MESH3D_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d.frag.spv"));
+/// Full-res opaque variant: no water code and no `discard`, so the driver
+/// keeps early depth writes on for every opaque terrain fragment.
+const MESH3D_OPAQUE_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_opaque.frag.spv"));
+/// Coarse-LOD opaque variant: the slab-clip `discard`, no cascade sampling.
+const MESH3D_LOD_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_lod.frag.spv"));
 /// Shader variant with depth input attachment for water absorption; built
 /// when dynamic_rendering_local_read is available and MSAA is off.
 const MESH3D_WATER_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_water.frag.spv"));
@@ -133,9 +141,14 @@ pub struct Pipelines {
     /// Push-constant-only (view_proj) layout for immediate debug geometry.
     pub layout_debug: vk::PipelineLayout,
     pub layout_2d: vk::PipelineLayout,
+    /// Full-res opaque terrain (`cull::Group::Opaque`): the no-`discard`
+    /// fragment variant, depth read/write, cull back.
     pub mesh3d: vk::Pipeline,
-    /// Same vertex/fragment modules and `layout_3d` as `mesh3d`, but alpha
-    /// blends and reads (never writes) depth. Selected for [`Pass::Blend`].
+    /// Coarse-LOD opaque terrain (`cull::Group::OpaqueLod`): same state as
+    /// `mesh3d` with the slab-clip `discard` fragment variant.
+    pub mesh3d_lod: vk::Pipeline,
+    /// The full fragment module with `layout_3d`, alpha blended, reads (never
+    /// writes) depth. Selected for [`Pass::Blend`].
     pub mesh3d_transparent: vk::Pipeline,
     /// Water-absorption variant when dynamic_rendering_local_read is available and MSAA is off;
     /// fallback to mesh3d_transparent otherwise.
@@ -335,6 +348,9 @@ impl Pipelines {
 
         let mesh_vert = pass::shader_module(device, MESH3D_VERT, "mesh3d vertex");
         let mesh_frag = pass::shader_module(device, MESH3D_FRAG, "mesh3d fragment");
+        let mesh_opaque_frag =
+            pass::shader_module(device, MESH3D_OPAQUE_FRAG, "mesh3d opaque fragment");
+        let mesh_lod_frag = pass::shader_module(device, MESH3D_LOD_FRAG, "mesh3d lod fragment");
         let debug_vert = pass::shader_module(device, DEBUG_VERT, "debug vertex");
         let debug_frag = pass::shader_module(device, DEBUG_FRAG, "debug fragment");
         let tri2d_vert = pass::shader_module(device, TRIS2D_VERT, "2d vertex");
@@ -353,20 +369,29 @@ impl Pipelines {
         };
 
         // Depth: reversed-Z, so GREATER_OR_EQUAL and clear to 0.0.
+        let opaque_config = || PipelineConfig {
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            depth: DepthMode::ReadWrite,
+            cull: vk::CullModeFlags::BACK,
+            blend: false,
+            vrs: true,
+            depth_bias: None,
+        };
         let mesh3d = builder.build(
             mesh_vert,
-            mesh_frag,
+            mesh_opaque_frag,
             &bindings_3d,
             attributes_3d,
             layout_3d,
-            PipelineConfig {
-                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                depth: DepthMode::ReadWrite,
-                cull: vk::CullModeFlags::BACK,
-                blend: false,
-                vrs: true,
-                depth_bias: None,
-            },
+            opaque_config(),
+        );
+        let mesh3d_lod = builder.build(
+            mesh_vert,
+            mesh_lod_frag,
+            &bindings_3d,
+            attributes_3d,
+            layout_3d,
+            opaque_config(),
         );
         // Blend world geometry: same modules/layout, alpha blend, depth read-only
         // (all opaque wrote depth first; blend tests but never writes). Double-sided
@@ -569,6 +594,8 @@ impl Pipelines {
             device.destroy_shader_module(tonemap_frag, None);
             device.destroy_shader_module(mesh_vert, None);
             device.destroy_shader_module(mesh_frag, None);
+            device.destroy_shader_module(mesh_opaque_frag, None);
+            device.destroy_shader_module(mesh_lod_frag, None);
             if let Some(m) = mesh3d_water_frag {
                 device.destroy_shader_module(m, None);
             }
@@ -589,6 +616,7 @@ impl Pipelines {
             layout_debug,
             layout_2d,
             mesh3d,
+            mesh3d_lod,
             mesh3d_transparent,
             mesh3d_transparent_absorb,
             debug_tris,
@@ -609,12 +637,14 @@ impl Pipelines {
     }
 
     /// The 3D pipeline for a mesh's draw pass. Exhaustive so a new [`Pass`]
-    /// variant forces a matching pipeline here.
+    /// variant forces a matching pipeline here. Opaque means the FULL-RES
+    /// partition; the coarse-LOD partition binds [`Self::mesh3d_lod`].
     pub fn pipeline_for(&self, pass: Pass) -> vk::Pipeline {
         match pass {
             Pass::Opaque => self.mesh3d,
-            // Reserved: shares the opaque pipeline (depth write, cull back) until a
-            // `discard` frag variant lands. Sound because nothing emits Cutout yet.
+            // Reserved: shares the opaque pipeline (depth write, cull back) until an
+            // alpha-test `discard` frag variant lands (it must NOT reuse the
+            // no-discard opaque module then). Sound because nothing emits Cutout yet.
             Pass::Cutout => self.mesh3d,
             Pass::Blend => self.blend_pipeline(),
         }
@@ -636,6 +666,7 @@ impl Pipelines {
                 device.destroy_sampler(v.depth_sampler, None);
             }
             device.destroy_pipeline(self.mesh3d, None);
+            device.destroy_pipeline(self.mesh3d_lod, None);
             device.destroy_pipeline(self.mesh3d_transparent, None);
             if let Some(p) = self.mesh3d_transparent_absorb {
                 device.destroy_pipeline(p, None);
@@ -918,5 +949,57 @@ fn create_vrs_compute(device: &ash::Device, cache: vk::PipelineCache) -> VrsComp
         layout,
         set_layout,
         depth_sampler,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Scan a SPIR-V module for an opcode (low 16 bits of each instruction word).
+    fn spirv_has_opcode(bytes: &[u8], opcode: u32) -> bool {
+        assert!(bytes.len() >= 20 && bytes.len().is_multiple_of(4));
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(words[0], 0x0723_0203, "missing SPIR-V magic");
+        let mut i = 5usize;
+        while i < words.len() {
+            let wc = (words[i] >> 16) as usize;
+            let op = words[i] & 0xffff;
+            if wc == 0 || i + wc > words.len() {
+                break;
+            }
+            if op == opcode {
+                return true;
+            }
+            i += wc;
+        }
+        false
+    }
+
+    const OP_KILL: u32 = 252;
+    const OP_DEMOTE: u32 = 5380;
+
+    #[test]
+    fn opaque_frag_has_no_discard() {
+        assert!(
+            !spirv_has_opcode(super::MESH3D_OPAQUE_FRAG, OP_KILL)
+                && !spirv_has_opcode(super::MESH3D_OPAQUE_FRAG, OP_DEMOTE),
+            "MESH3D_OPAQUE must not OpKill/OpDemote (early depth write)"
+        );
+    }
+
+    #[test]
+    fn lod_and_blend_frags_keep_slab_discard() {
+        assert!(
+            spirv_has_opcode(super::MESH3D_LOD_FRAG, OP_KILL)
+                || spirv_has_opcode(super::MESH3D_LOD_FRAG, OP_DEMOTE),
+            "MESH3D_LOD must keep the slab-clip discard"
+        );
+        assert!(
+            spirv_has_opcode(super::MESH3D_FRAG, OP_KILL)
+                || spirv_has_opcode(super::MESH3D_FRAG, OP_DEMOTE),
+            "Blend mesh3d.frag must keep the slab-clip discard"
+        );
     }
 }

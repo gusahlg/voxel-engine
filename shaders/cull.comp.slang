@@ -1,5 +1,7 @@
 // Emit indirect draw commands per frustum test: one thread per mesh slot.
-// Partition by (pass, arena); camera uses passes 0/1, shadow uses pass 2.
+// Partition by (group, arena) — groups mirror vk::cull::Group: 0 full-res
+// Opaque, 1 Cutout, 2 Shadow casters, 3 coarse-LOD Opaque (scale > 1, the
+// only camera draws that pay for the slab-clip `discard`).
 
 #include "common.slang"
 
@@ -126,7 +128,11 @@ void computeMain(uint3 id: SV_DispatchThreadID)
     for (int p = 0; p < 5; p++)
         in_frustum = in_frustum && !outside_plane(params.cam_planes[p], mn, mx);
     if (cam_visible && in_frustum)
-        emit(pass * params.arena_count + arena, cmd);
+    {
+        // Camera group: the pass index, except coarse-LOD opaque → group 3.
+        uint group = (pass == 0u && scale > 1.0) ? 3u : pass;
+        emit(group * params.arena_count + arena, cmd);
+    }
 
     // Shadow casters: full-res opaque only. Coarse LOD excluded (harsh self-shadows).
     if (pass == 0u && scale <= 1.0 && params.shadow_enabled != 0u)

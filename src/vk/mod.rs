@@ -651,10 +651,23 @@ impl Renderer {
     ) {
         // Grow the shared quad IBO to index this mesh before its draws record.
         self.quad_ibo.require(quads);
-        self.arena_dir
-            .note_upload(slot, generation, resident.buffer(), record.pass());
+        self.arena_dir.note_upload(
+            slot,
+            generation,
+            resident.buffer(),
+            record.pass(),
+            record.detail_scale() > 1.0,
+        );
         self.mesh_res.apply_upload(slot, generation, resident);
         self.records.install(slot, record);
+    }
+
+    /// Replaces a mover's recomposed record, keeping the cull lane counts in
+    /// step should its detail (LOD lane) have changed.
+    pub(crate) fn apply_set_record(&mut self, slot: u32, record: buffers::MeshRecord) {
+        self.arena_dir
+            .note_record(slot, record.pass(), record.detail_scale() > 1.0);
+        self.records.set_record(slot, record);
     }
 
     /// Set one word of the visibility mask.
@@ -2915,19 +2928,32 @@ impl<'a> RenderPass<'a> {
     }
 
     /// GPU-culled variant of [`record_mesh_indirect`](Self::record_mesh_indirect):
-    /// one `vkCmdDrawIndexedIndirectCount` per non-empty (pass, arena)
+    /// one `vkCmdDrawIndexedIndirectCount` per non-empty (group, arena)
     /// partition, consuming the commands the cull dispatch emitted earlier in
-    /// this command buffer. Never called for Blend (CPU-sorted path).
+    /// this command buffer. Never called for Blend (CPU-sorted path). Opaque
+    /// draws its full-res partition (no-`discard` pipeline) first, then the
+    /// coarse-LOD partition (slab-clip pipeline) — near before far, so the
+    /// LOD skirt behind full-res terrain is mostly depth-rejected.
     unsafe fn record_mesh_indirect_count(&self, pass: Pass) {
+        let groups: &[(cull::Group, vk::Pipeline)] = match pass {
+            Pass::Opaque => &[
+                (cull::Group::Opaque, self.r.pipelines.mesh3d),
+                (cull::Group::OpaqueLod, self.r.pipelines.mesh3d_lod),
+            ],
+            Pass::Cutout => &[(cull::Group::Cutout, self.r.mesh_pipeline_for(pass))],
+            Pass::Blend => unreachable!("Blend stays on the CPU path"),
+        };
+        for &(group, pipeline) in groups {
+            unsafe { self.record_group_indirect_count(group, pipeline) };
+        }
+    }
+
+    /// Draws every non-empty arena partition of one cull group with `pipeline`.
+    unsafe fn record_group_indirect_count(&self, group: cull::Group, pipeline: vk::Pipeline) {
         let Some(frame) = &self.r.cull_frame else {
             return; // nothing live to draw
         };
-        let group = match pass {
-            Pass::Opaque => 0usize,
-            Pass::Cutout => 1,
-            Pass::Blend => unreachable!("Blend stays on the CPU path"),
-        };
-        let base = group * frame.arena_count;
+        let base = group as usize * frame.arena_count;
         if frame.partitions[base..base + frame.arena_count]
             .iter()
             .all(|p| p.capacity == 0)
@@ -2937,11 +2963,7 @@ impl<'a> RenderPass<'a> {
         unsafe { self.bind_mesh3d_state() };
         let device = &self.r.device.device;
         unsafe {
-            device.cmd_bind_pipeline(
-                self.cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.r.mesh_pipeline_for(pass),
-            );
+            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             let quad_ibo = self
                 .r
                 .quad_ibo

@@ -1,8 +1,18 @@
 // mesh3d.frag.slang — textured voxel shading. Lights from per-frame UBO with
 // cascaded shadow attenuation. Fog == sky. Opaque and transparent pipelines.
+//
+// Variants (build.rs `-D`):
+//   (none)                       full module: water/absorb branch + LOD-slab
+//                                `discard`; the Blend pipelines.
+//   MESH3D_OPAQUE                full-res opaque: no water code and NO `discard`
+//                                (no OpKill ⇒ early depth write stays enabled).
+//   MESH3D_OPAQUE + MESH3D_LOD   coarse-LOD opaque (scale > 1): keeps the slab
+//                                clip `discard`, never samples the cascades.
 
 #include "common.slang"
+#ifndef MESH3D_OPAQUE
 #include "water.slang"
+#endif
 
 struct FragmentInput
 {
@@ -12,28 +22,20 @@ struct FragmentInput
     float2 uv;
 
     [[vk::location(1)]]
-    nointerpolation uint layer;
-
-    [[vk::location(2)]]
     float3 world; // camera-relative (camera at origin)
 
+    // rgb = light.rgb * sky_amount (vertex); w = sky_amount
+    [[vk::location(2)]]
+    float4 sky;
+
+    // rgb = candle.rgb * block_amount (vertex); a = AO
     [[vk::location(3)]]
-    nointerpolation float3 nrm;
+    float4 block_ao;
 
+    // x: layer[0:14] water[14] FLAT_COLOR[15] face[16:19] detail[20:24]
+    // y: flat_rgba
     [[vk::location(4)]]
-    float3 lightparams; // x ao, y sky_amount(=visible_sky), z block_amount
-
-    [[vk::location(5)]]
-    nointerpolation uint water; // liquid material bit → animated water shading
-
-    [[vk::location(6)]]
-    nointerpolation float scale; // LOD level cell size
-
-    // Per-draw style: flat-color mode and RGBA.
-    [[vk::location(7)]]
-    nointerpolation uint mode;
-    [[vk::location(8)]]
-    nointerpolation uint flat_rgba;
+    nointerpolation uint2 ids;
 };
 
 // View-proj and LOD slab clip extents.
@@ -63,6 +65,11 @@ struct CascadeUniforms
     float4x4 view_proj[2]; // per-cascade light-space clip transform (CLEAN)
     float4 splits_fade;    // x,y split distances; z fade_band; w SHADOW_LIMIT
     float4 bias;           // x blur_texels, y slope_bias, z dist_bias, w texel_world(near)
+    // Per-cascade receiver constants, hoisted off the fragment (vk/shadow.rs
+    // derives them from the same fit): x texel_world, y ndc_per_metre (light
+    // depth per world metre), z PCF tap spread in map UV units, w reversed-Z
+    // reference slack (= texel_world * ndc_per_metre).
+    float4 texel[2];
 };
 
 [[vk::binding(3, 0)]]
@@ -87,124 +94,187 @@ SubpassInput opaqueDepthInput;
 static const float WATER_Z_NEAR = Z_NEAR;
 #endif
 
-// 3x3 PCF shadow sampling; returns lit fraction [0,1].
-// Outside cascade footprint returns 1.0 (caller fades to fallback).
-float shadow_map_term(float3 world, float3 N, float3 L, uint c)
+// PCF tap count: 4 = Castaño's optimized 4-tap/16-texel [1 2 1]² tent, 9 = the
+// fixed 3x3 grid at the configured blur spread. Both are fixed-pattern (no
+// per-pixel dither: that quantized every penumbra to quarters at a random
+// phase and read as salt-and-pepper stipple with TAA off).
+#ifndef PCF_TAPS
+#define PCF_TAPS 4
+#endif
+
+// Map term assumed for a face turned away from the light (N·L <= 0), where the
+// taps are skipped. 1.0 = lit: with the receiver's normal-offset bias at its
+// 4-texel clamp, the map already reads such faces as lit almost everywhere
+// (the offset point clears the face's own block), so this matches the shipped
+// look; the omni wrap keeps them at 75% direct either way.
+#ifndef BACKFACE_LIT
+#define BACKFACE_LIT 1.0
+#endif
+
+// One hardware-bilinear comparison tap of cascade `c`.
+float pcf_tap(float2 uv, uint c, float ref)
 {
-    // Single source of truth: derive per-cascade scale directly from the light matrix.
-    float4x4 vp = cascade.view_proj[c];
-    float texel_world = 2.0 / (SHADOW_RESOLUTION * length(vp[0].xyz));
-    float ndc_per_metre = length(vp[2].xyz);
+    return shadowMap.SampleCmpLevelZero(float3(uv, float(c)), ref);
+}
+
+// PCF shadow sampling; returns lit fraction [0,1]. `ndl` is the unflipped
+// clamp(N·sun) the normal-offset bias scales by.
+// Outside cascade footprint returns 1.0 (caller fades to fallback).
+float shadow_map_term(float3 world, float3 N, float ndl, uint c)
+{
+    float4 t = cascade.texel[c];
 
     // Normal-offset bias (depth-range independent) to avoid acne without floating shadows.
-    float ndl = clamp(dot(N, L), 0.0, 1.0);
     float tan_theta = sqrt(1.0 - ndl * ndl) / max(ndl, 0.1);
     float offset_texels = cascade.bias.y + cascade.bias.z * min(tan_theta, 4.0);
-    float3 pos = world + N * (texel_world * offset_texels);
+    float3 pos = world + N * (t.x * offset_texels);
 
-    float4 clip = mul(vp, float4(pos, 1.0));
-    float3 ndc = clip.xyz / clip.w;
+    // Orthographic light: clip.w == 1, so clip IS ndc (no divide).
+    float3 ndc = mul(cascade.view_proj[c], float4(pos, 1.0)).xyz;
     if (any(abs(ndc.xy) > 1.0))
         return 1.0;
     // No Y-flip: viewport is y-down. A flip would mirror shadows as the camera turns.
     float2 uv = ndc.xy * 0.5 + 0.5;
 
     // Reversed-Z: positive slack biases toward lit (kills acne).
-    float ref = ndc.z + texel_world * ndc_per_metre;
+    float ref = ndc.z + t.w;
 
-    // Map size is a compile-time truth (SHADOW_RESOLUTION, asserted against
-    // vk/targets.rs), so no per-fragment GetDimensions query.
-    float2 texel = float2(1.0 / SHADOW_RESOLUTION, 1.0 / SHADOW_RESOLUTION);
-
-    // Fixed 3x3 PCF at the configured blur spread. The old rotated 4-tap rode
-    // a per-pixel dither angle, which quantized every penumbra to quarters at
-    // a random phase — reading as loud salt-and-pepper stipple on the ground
-    // (no TAA runs by default to integrate it away). Nine fixed taps cost
-    // five more SampleCmp and resolve to smooth ninths with zero noise.
-    float spread = cascade.bias.x * 0.7071; // grid corner ~= old blur radius
-    float2 taps[9] = {
-        float2(0.0, 0.0),
-        float2(spread, 0.0), float2(-spread, 0.0),
-        float2(0.0, spread), float2(0.0, -spread),
-        float2(spread, spread), float2(spread, -spread),
-        float2(-spread, spread), float2(-spread, -spread),
-    };
-
-    float lit = 0.0;
-    for (int i = 0; i < 9; i++)
-        lit += shadowMap.SampleCmpLevelZero(float3(uv + taps[i] * texel, float(c)), ref);
+#if PCF_TAPS == 9
+    // Fixed 3x3 grid at the blur spread (uv units, hoisted); force-unrolled.
+    float d = t.z;
+    float lit = pcf_tap(uv, c, ref)
+              + pcf_tap(uv + float2(d, 0.0), c, ref)
+              + pcf_tap(uv + float2(-d, 0.0), c, ref)
+              + pcf_tap(uv + float2(0.0, d), c, ref)
+              + pcf_tap(uv + float2(0.0, -d), c, ref)
+              + pcf_tap(uv + float2(d, d), c, ref)
+              + pcf_tap(uv + float2(d, -d), c, ref)
+              + pcf_tap(uv + float2(-d, d), c, ref)
+              + pcf_tap(uv + float2(-d, -d), c, ref);
     return lit * (1.0 / 9.0);
+#else
+    // Four bilinear taps placed and weighted so their 2x2 footprints resolve
+    // to an exact [1 2 1]⊗[1 2 1] tent over 16 texels (the classic optimized
+    // PCF): 4x4-texel footprint, smooth for any sub-texel phase, 4 SampleCmp.
+    // Map size is a compile-time truth (SHADOW_RESOLUTION, asserted against
+    // vk/targets.rs), so no per-fragment GetDimensions query. Tap math is
+    // explicit (force-unrolled; the 4 offsets depend on the sub-texel phase).
+    const float inv = 1.0 / SHADOW_RESOLUTION;
+    float2 st = uv * SHADOW_RESOLUTION + 0.5;
+    float2 base = floor(st);
+    float2 f = st - base;
+    base = (base - 0.5) * inv;
+    float2 uw = float2(3.0 - 2.0 * f.x, 1.0 + 2.0 * f.x);
+    float2 vw = float2(3.0 - 2.0 * f.y, 1.0 + 2.0 * f.y);
+    float2 u = float2((2.0 - f.x) / uw.x - 1.0, f.x / uw.y + 1.0) * inv;
+    float2 v = float2((2.0 - f.y) / vw.x - 1.0, f.y / vw.y + 1.0) * inv;
+    float lit = uw.x * vw.x * pcf_tap(base + float2(u.x, v.x), c, ref)
+              + uw.y * vw.x * pcf_tap(base + float2(u.y, v.x), c, ref)
+              + uw.x * vw.y * pcf_tap(base + float2(u.x, v.y), c, ref)
+              + uw.y * vw.y * pcf_tap(base + float2(u.y, v.y), c, ref);
+    return lit * (1.0 / 16.0);
+#endif
 }
 
 // Sun shadow factor [0,1]: the near/far cascade PCF blended into the far-field
 // `shadow_fallback` across the `fade_band` at `SHADOW_LIMIT`, so the
-// chunk→tile handoff shows no shading step.
-float sun_shadow(float3 world, float3 N, float3 L, float dist, float visible_sky)
+// chunk→tile handoff shows no shading step. `raw_ndl` = N·sun (unflipped);
+// `ndl` = the day/night-flipped N·L the direct term is shaped by.
+float sun_shadow(float3 world, float3 N, float raw_ndl, float ndl, float dist, float visible_sky)
 {
     float fallback = shadow_fallback(frame, visible_sky);
     float limit = cascade.splits_fade.w;
     float band = cascade.splits_fade.z;
     float fade = smoothstep(limit - band, limit, dist);
     // Fully past the fade the map term is multiplied out entirely — skip the
-    // 4-tap PCF. Every fragment beyond SHADOW_LIMIT lands here (all far-LOD
+    // PCF. Every fragment beyond SHADOW_LIMIT lands here (all far-LOD
     // terrain by construction), and the branch is spatially coherent.
     if (fade >= 1.0)
         return fallback;
+    // A face turned away from the light source (N·L <= 0 after the day/night
+    // flip) cannot receive direct light: skip the taps and treat the map as
+    // BACKFACE_LIT (see the golden notes in vk/shadow.rs).
+    if (ndl <= 0.0)
+        return lerp(BACKFACE_LIT, fallback, fade);
     uint c = dist < cascade.splits_fade.x ? 0u : 1u;
-    float map = shadow_map_term(world, N, L, c);
+    float map = shadow_map_term(world, N, clamp(raw_ndl, 0.0, 1.0), c);
     return lerp(map, fallback, fade);
 }
 
 [shader("fragment")]
 float4 fragmentMain(FragmentInput input) : SV_Target
 {
-    // Discard LOD tiles inside the full-res slab extent.
-    if (input.scale > 1.0 && pc.clip > 0.0) {
+#if defined(MESH3D_LOD)
+    // Coarse-LOD partition is scale > 1 by construction; skip the scale test.
+    if (pc.clip > 0.0) {
         bool inside_h = length(input.world.xz) < pc.clip;
         bool inside_v = pc.clip_v > 0.0 && abs(input.world.y) < pc.clip_v;
         if (inside_h && inside_v)
             discard;
     }
+#elif !defined(MESH3D_OPAQUE)
+    // Blend module: mixed full-res / LOD draws share this path.
+    float scale = exp2(float((input.ids.x >> 20) & 0xFu) - float(DETAIL_GPU_BIAS));
+    if (scale > 1.0 && pc.clip > 0.0) {
+        bool inside_h = length(input.world.xz) < pc.clip;
+        bool inside_v = pc.clip_v > 0.0 && abs(input.world.y) < pc.clip_v;
+        if (inside_h && inside_v)
+            discard;
+    }
+#endif
 
     // Debug-flat (TerrainKey): output the flat key colour for every covered
     // fragment; depth still writes so the sky-hole detector sees real coverage.
+    // A uniform branch, never a discard.
     if (frame.extras.w > 0.5) {
         return float4(srgb_to_linear(frame.extras.rgb), 1.0);
     }
+
+    uint packed = input.ids.x;
+    uint layer = packed & 0x3FFFu;
+    uint face = (packed >> 16) & 7u;
 
     // Base albedo: flat far material or texture-sampled.
     // block texture. Only the albedo changes — light_eval/fog stay identical.
     float3 base;
     float alpha;
-    if ((input.mode & 1u) != 0u) { // FLAT_COLOR
-        uint c = input.flat_rgba;
+    if ((packed & (1u << 15)) != 0u) { // FLAT_COLOR
+        uint c = input.ids.y;
         float3 srgb = float3(c & 0xFFu, (c >> 8) & 0xFFu, (c >> 16) & 0xFFu) / 255.0;
         base = srgb_to_linear(srgb); // match the sRGB-view texture path
         alpha = 1.0;                 // coarse far material is opaque
     } else {
         // Texture sampled through an sRGB view, so tex.rgb is already linear.
-        float4 tex = blockTex.Sample(float3(input.uv, float(input.layer)));
+        float4 tex = blockTex.Sample(float3(input.uv, float(layer)));
         base = tex.rgb;
         alpha = tex.a;
     }
 
-    float ao = input.lightparams.x;
-    float sky_amount = input.lightparams.y;
-    float block_amount = input.lightparams.z;
-
+    float sky_amount = input.sky.w;
+    float ao = input.block_ao.a;
+    float3 N = FACE_NORMAL[face];
     float dist = length(input.world);
-    float3 N = normalize(input.nrm);
-    float3 sun = normalize(frame.sun_dir_elev.xyz);
-    float raw_ndl = dot(N, sun);           // signed, unclamped
+    float raw_ndl = dot(N, frame.sun_dir_elev.xyz);
 
     // Omnidirectional wrap: day/night cycle flips lit hemisphere to moon side.
-    float ndl = lerp(-raw_ndl, raw_ndl, frame.light.w);
+    // lerp(-r, r, mix) = r * (2*mix - 1).
+    float ndl = raw_ndl * (frame.light.w * 2.0 - 1.0);
     float omni = ((ndl + 1.0) * 0.25) + 0.75;
 
     // Coarse LOD excluded from cascade (self-shadowing); use sky-based fallback.
-    float shadow = input.scale > 1.0
+    // With sky_amount == 0 (caves) the whole skylight term below is zero, so
+    // the shadow value is moot: skip the cascade taps there too.
+#if defined(MESH3D_LOD)
+    float shadow = shadow_fallback(frame, sky_amount);
+#elif defined(MESH3D_OPAQUE)
+    float shadow = sky_amount > 0.0
+        ? sun_shadow(input.world, N, raw_ndl, ndl, dist, sky_amount)
+        : 0.0;
+#else
+    float shadow = scale > 1.0 || sky_amount <= 0.0
         ? shadow_fallback(frame, sky_amount)
-        : sun_shadow(input.world, N, sun, dist, sky_amount);
+        : sun_shadow(input.world, N, raw_ndl, ndl, dist, sky_amount);
+#endif
 
     // Skylight (sun-tinted, shadow-attenuated, omni-shaped) and pre-curve
     // blocklight, folded by the shared evaluator with the candle curve + omni
@@ -215,8 +285,8 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // near-black. Fully lit surfaces are untouched (shadow*omni >= the floor),
     // and caves stay dark (the whole term still scales by sky_amount).
     float lit = max(shadow * omni, SHADOW_SKY_AMBIENT);
-    float3 sky = frame.light.rgb * (sky_amount * lit);
-    float3 block = frame.candle.rgb * block_amount;
+    float3 sky = input.sky.rgb * lit;
+    float3 block = input.block_ao.rgb;
     float3 rgb = base * light_eval(sky, block, ao, frame);
 
     // Water fragments (transparent pass) replace the flat blend with animated
@@ -225,7 +295,8 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // so opaque geometry never takes this branch. LOD-section water never sets
     // the bit (it meshes as an opaque solid — see world/section/mesh.rs), so only
     // full-res chunk water reaches here.
-    if (input.water != 0u) {
+#ifndef MESH3D_OPAQUE
+    if (((packed >> 14) & 1u) != 0u) {
 #ifdef WATER_DEPTH_ABSORPTION
         // True depth-difference absorption: opaque forward distance behind the
         // water (input attachment) minus this fragment's own forward distance,
@@ -242,10 +313,14 @@ float4 fragmentMain(FragmentInput input) : SV_Target
         rgb = w.rgb;
         alpha = w.a;
     }
+#endif
 
-    // Fog: fade toward sky radiance along the view ray.
-    float3 fog_color = sky_radiance(normalize(input.world), frame);
-    float fog = 1.0 - exp(-dist * frame.horizon.w); // horizon.w = fog density
-    rgb = lerp(rgb, fog_color, fog);
+    // Fog: fade toward sky radiance along the view ray. Uniform-density gate:
+    // horizon.w == 0 (fog off / RenderFlags::fog) skips the sky eval and lerp.
+    if (frame.horizon.w > 0.0) {
+        float3 fog_color = sky_radiance(normalize(input.world), frame);
+        float fog = 1.0 - exp(-dist * frame.horizon.w); // horizon.w = fog density
+        rgb = lerp(rgb, fog_color, fog);
+    }
     return float4(rgb, alpha);
 }

@@ -4,7 +4,10 @@
 //
 // SV_VulkanInstanceID (not SV_InstanceID) to read plain InstanceIndex.
 //
-// Shifts/masks mirror mesh.rs. UV and shade derive from position and normal.
+// Shifts/masks mirror mesh.rs. UV derives from position and normal. Baked
+// sky/block amounts become RGB here (× frame light/candle) so the fragment
+// interpolates colours, not levels. Face index is packed — no float3 normal
+// varying; the fragment looks `FACE_NORMAL` up.
 
 #include "common.slang"
 
@@ -31,6 +34,9 @@ struct DrawDyn
 [[vk::binding(0, 0)]]
 StructuredBuffer<MeshRecord> mesh_records;
 
+[[vk::binding(2, 0)]]
+ConstantBuffer<FrameUniforms> frame;
+
 [[vk::binding(6, 0)]]
 StructuredBuffer<DrawDyn> draw_dyn;
 
@@ -49,34 +55,22 @@ struct VertexOutput
     [[vk::location(0)]]
     float2 uv;
 
-    [[vk::location(1)]]
-    nointerpolation uint layer;
-
     // Camera-relative world position for fog distance and shadow projection.
-    [[vk::location(2)]]
+    [[vk::location(1)]]
     float3 world;
 
-    // Face normal for shadow slope bias.
+    // rgb = frame.light.rgb * sky_amount; w = sky_amount (fallback / skip).
+    [[vk::location(2)]]
+    float4 sky;
+
+    // rgb = frame.candle.rgb * block_amount; a = AO factor.
     [[vk::location(3)]]
-    nointerpolation float3 nrm;
+    float4 block_ao;
 
-    // Lighting: x = AO, y = skylight, z = blocklight (all normalized).
+    // x: layer[0:14] water[14] FLAT_COLOR[15] face[16:19] detail[20:24]
+    // y: flat_rgba
     [[vk::location(4)]]
-    float3 lightparams;
-
-    // Water material bit; selects animated water shading in transparent path.
-    [[vk::location(5)]]
-    nointerpolation uint water;
-
-    // LOD scale from detail_pass.
-    [[vk::location(6)]]
-    nointerpolation float scale;
-
-    // Per-draw style: flat-color mode and RGBA.
-    [[vk::location(7)]]
-    nointerpolation uint mode;
-    [[vk::location(8)]]
-    nointerpolation uint flat_rgba;
+    nointerpolation uint2 ids;
 };
 
 struct PushConstants
@@ -140,18 +134,11 @@ VertexOutput vertexMain(VertexInput input)
     float sky_amount = float(sky) / 15.0;
     float block_amount = float(block) / 15.0;
 
-    // Face normal for the receiver's slope bias (matches the `normal` index).
-    static const float3 FACE_NORMAL[6] = {
-        float3(1.0, 0.0, 0.0),  float3(-1.0, 0.0, 0.0),
-        float3(0.0, 1.0, 0.0),  float3(0.0, -1.0, 0.0),
-        float3(0.0, 0.0, 1.0),  float3(0.0, 0.0, -1.0),
-    };
-    float3 N = FACE_NORMAL[normal];
-
     // Micro-offset is added in LOCAL space so it scales with the draw (2^k LOD).
     MeshRecord rec = mesh_records[input.instance];
     DrawDyn style = draw_dyn[input.instance];
-    float scale = exp2(float(rec.detail_pass & 0xFu) - float(DETAIL_GPU_BIAS));
+    uint detail = rec.detail_pass & 0xFu;
+    float scale = exp2(float(detail) - float(DETAIL_GPU_BIAS));
     // Camera-relative placement: block delta first, then fractional parts.
     float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
     float3 world = (float3(x, y, z) + micro) * scale + offset;
@@ -167,13 +154,15 @@ VertexOutput vertexMain(VertexInput input)
         output.position.z *= 1.0 - scale / 4096.0;
     // Scale UV to maintain texel density across LOD levels.
     output.uv = uv * scale;
-    output.layer = layer;
     output.world = world;
-    output.nrm = N;
-    output.lightparams = float3(ao_factor, sky_amount, block_amount);
-    output.water = water;
-    output.scale = scale;
-    output.mode = style.mode;
-    output.flat_rgba = style.flat_rgba;
+    output.sky = float4(frame.light.rgb * sky_amount, sky_amount);
+    output.block_ao = float4(frame.candle.rgb * block_amount, ao_factor);
+    output.ids = uint2(
+        (layer & 0x3FFFu)
+            | (water << 14)
+            | ((style.mode & 1u) << 15)
+            | ((normal & 7u) << 16)
+            | (detail << 20),
+        style.flat_rgba);
     return output;
 }

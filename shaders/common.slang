@@ -28,6 +28,15 @@ float luma709(float3 c)
     return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
 
+// Cube-face unit normals indexed by the packed-vertex `normal` field
+// (mesh.rs: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z). Shared so the fragment looks
+// the face up instead of interpolating a float3 varying.
+static const float3 FACE_NORMAL[6] = {
+    float3(1.0, 0.0, 0.0),  float3(-1.0, 0.0, 0.0),
+    float3(0.0, 1.0, 0.0),  float3(0.0, -1.0, 0.0),
+    float3(0.0, 0.0, 1.0),  float3(0.0, 0.0, -1.0),
+};
+
 // Blocklight (torch/candle) response curve. `x` is a
 // per-channel block-light level in [0,1] (`candle.rgb · level`); the curve lifts
 // it into an HDR glow near full brightness. Constants match CPU values exactly,
@@ -38,34 +47,18 @@ float3 candle_curve(float3 x)
     return min(x * sqrt(x) + hi, float3(CANDLE_CLAMP));
 }
 
-// Omni ambient floor colour: the zenith tint re-scaled to `candle.w` luma
-// (`ambient_floor`, composed by the game's `FrameSnapshot`), so shadowed faces
-// and caves never read pure black yet keep the sky's hue.
-float3 ambient_floor_color(FrameUniforms frame)
-{
-    float floor = frame.candle.w;
-    float zl = luma709(frame.zenith.rgb);
-    return zl > 1e-6 ? frame.zenith.rgb * (floor / zl) : float3(floor);
-}
-
 // Analytic sky radiance along `ray` — THE sky formula, single source of truth
 // for the sky background, the distance fog (fog == sky evaluated at the
 // fragment), and water reflection: an elevation gradient between the horizon
 // and zenith anchors, plus a turbidity-scaled sun halo. `ray.y` below the
-// horizon clamps to the horizon colour. (The CPU `Atmosphere::radiance_rgb`
-// drifted from this formula and is scheduled for deletion; do not treat it
-// as a mirror.)
+// horizon clamps to the horizon colour. Halo exponent and tint×scale are
+// hoisted to `ambient_glow.w` / `glow_day.rgb` (CPU, once per frame).
 float3 sky_radiance(float3 ray, FrameUniforms frame)
 {
     float up = clamp(ray.y, 0.0, 1.0);
     float3 base = lerp(frame.horizon.rgb, frame.zenith.rgb, sqrt(up));
-    float3 sun = normalize(frame.sun_dir_elev.xyz);
-    float c = max(dot(ray, sun), 0.0);
-    // Halo widens as the sun drops: low exponent at/below the horizon (wide golden-hour
-    // halo), tightening to the noon look above GLOW_EDGE1. sun_dir_elev.w = elevation [-1,1].
-    float glow_pow = lerp(GLOW_POW_SUNSET, GLOW_POW_DAY,
-                          smoothstep(GLOW_EDGE0, GLOW_EDGE1, frame.sun_dir_elev.w));
-    float3 glow = frame.light.rgb * (pow(c, glow_pow) * (0.5 + frame.zenith.w)); // zenith.w = turbidity
+    float c = max(dot(ray, frame.sun_dir_elev.xyz), 0.0);
+    float3 glow = frame.glow_day.rgb * pow(c, frame.ambient_glow.w);
     return base + glow;
 }
 
@@ -86,19 +79,19 @@ float3 sun_disc(float3 ray, float3 sun_dir, float3 tint, float radius)
 // attenuated AND omni-shaped by the caller — the directional N·L wrap folds into
 // this direct term), `block` = linear blocklight colour
 // pre-curve, `ao` the ambient-occlusion factor [0,1]. Folds in the candle curve
-// and the omni ambient floor from `frame`. The ambient floor + AO stay global
-// (omni-directional); only `sky` carries the directional shaping.
+// and the hoisted omni ambient floor (`ambient_glow.rgb`). The ambient floor +
+// AO stay global (omni-directional); only `sky` carries the directional shaping.
 float3 light_eval(float3 sky, float3 block, float ao, FrameUniforms frame)
 {
-    float3 diffuse = max(ambient_floor_color(frame) + sky, candle_curve(block));
+    float3 diffuse = max(frame.ambient_glow.rgb + sky, candle_curve(block));
     return diffuse * ao;
 }
 
 // Far-field shadow fallback beyond shadow-map cascades. Uses baked sky-visibility
-// term; scaled by |day_night·2−1| so strength varies with sun position.
+// term; day factor is `glow_day.w` = |2·day_night_mix − 1|, hoisted on the CPU.
 float shadow_fallback(FrameUniforms frame, float visible_sky)
 {
-    return pow(visible_sky, SHADOW_FALLBACK_POW) * abs(frame.light.w * 2.0 - 1.0);
+    return pow(visible_sky, SHADOW_FALLBACK_POW) * frame.glow_day.w;
 }
 
 #endif // VOXEL_COMMON_SLANG

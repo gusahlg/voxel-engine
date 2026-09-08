@@ -558,7 +558,7 @@ fn render_loop(
                 RenderCmd::FreeMesh { slot, generation } => {
                     renderer.apply_free_mesh(slot, generation)
                 }
-                RenderCmd::SetRecord { slot, record } => renderer.records.set_record(slot, record),
+                RenderCmd::SetRecord { slot, record } => renderer.apply_set_record(slot, record),
                 RenderCmd::SetVisible { word, bits } => renderer.set_visible_word(word, bits),
                 RenderCmd::SetDrawDyn { slot, dyn_lane } => {
                     renderer.records.set_dyn(slot, dyn_lane)
