@@ -98,6 +98,7 @@ fn gate_uniforms(f: &crate::engine::RenderFlags, mut u: FrameUniformsGpu) -> Fra
         // Zero the stars gain; sky.frag skips the starfield evaluation.
         u.extras[0] = 0.0;
     }
+    u.prepare_derived();
     u
 }
 
@@ -708,18 +709,23 @@ mod tests {
     use super::*;
 
     /// The stars gain rides `extras.x`; the flag gate must zero exactly that
-    /// channel and leave the rest of the lane (debug-flat scratch) alone.
+    /// channel. `extras.yz` are engine-derived glow terms (filled by
+    /// `prepare_derived`); `w` stays reserved zero.
     #[test]
     fn stars_gate_zeroes_extras_x() {
         let mut u = FrameUniformsGpu::full_bright();
         u.extras = [1.0, 0.0, 0.0, 0.0];
         let on = gate_uniforms(&crate::engine::RenderFlags::default(), u);
-        assert_eq!(on.extras, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(on.extras[0], 1.0);
+        assert!((on.extras[1] - crate::genconst::GLOW_POW_DAY).abs() < 1e-5);
+        assert!((on.extras[2] - 0.5).abs() < 1e-5);
+        assert_eq!(on.extras[3], 0.0);
         let flags = crate::engine::RenderFlags {
             stars: false,
             ..Default::default()
         };
         let off = gate_uniforms(&flags, u);
-        assert_eq!(off.extras, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(off.extras[0], 0.0);
+        assert!((off.extras[1] - crate::genconst::GLOW_POW_DAY).abs() < 1e-5);
     }
 }

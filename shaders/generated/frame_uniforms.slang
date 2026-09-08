@@ -9,7 +9,8 @@
 // Per-frame uniform block. Mirrors voxel_engine::skeleton::FrameUniformsGpu.
 struct FrameUniforms
 {
-    // xyz = sun direction (normalized), w = sun elevation (radians).
+    // xyz = sun direction (unit, engine-normalized in prepare_derived),
+    // w = sun elevation (game: sun_dir.y in [-1,1]; drives the glow_pow lerp).
     float4 sun_dir_elev;
     // rgb = direct light color (linear), w = day_night_mix.
     float4 light;
@@ -23,8 +24,9 @@ struct FrameUniforms
     // in pixels (informational; jitter is applied via the matrix — zero until enabled).
     float4 exposure_dither;
     // x = stars gain (1 = night starfield renders, 0 = skipped — the
-    // `RenderFlags::stars` gate). yzw reserved (always zero); repurposing a
-    // channel bumps FRAME_UNIFORMS_VERSION.
+    // `RenderFlags::stars` gate). y = glow_pow, z = glow_scale (0.5+turbidity):
+    // engine-derived sky_radiance terms, filled by FrameUniformsGpu::prepare_derived.
+    // w reserved (always zero).
     float4 extras;
     // x = anim_time = world-time seconds mod ANIM_PERIOD; yz = fract(camera_world.xz
     // / ANIM_PERIOD); w = camera world-y (metres, bounded ⇒ no wrap) for the cloud

@@ -20,7 +20,8 @@ use crate::vk::vertex_input::{VertexInput, vertex_struct};
 pub const PUSH_BYTES_3D: u32 = size_of::<Mesh3dPush>() as u32;
 pub const PUSH_BYTES_DEBUG: u32 = size_of::<DebugPush>() as u32;
 pub const PUSH_BYTES_2D: u32 = size_of::<[f32; 2]>() as u32; // pixels_to_ndc
-pub const PUSH_BYTES_SKY: u32 = size_of::<SkyParams>() as u32; // inv_view_proj + sun geom + tint
+pub const PUSH_BYTES_SKY: u32 = size_of::<SkyParams>() as u32; // inv_view_proj + disc cosines
+const _: () = assert!(size_of::<SkyParams>() <= 128);
 // exposure + wide-FOV remap coefficients (s, atan_s); see camera::WarpPush.
 pub const PUSH_BYTES_TONEMAP: u32 = size_of::<crate::camera::WarpPush>() as u32;
 
@@ -69,13 +70,15 @@ pub struct DebugPush {
     pub view_proj: Mat4,
 }
 
-/// Sky push constant: inverse view-proj, sun direction and radius, tint color.
+/// Sky push constant: inverse view-proj, unit sun dir, disc tint, precomputed
+/// sun/moon cone cosines (the per-pixel `cos(radius·SUN_DISC_*)` hoist).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SkyParams {
     inv_view_proj: Mat4,
     sun: [f32; 4],
     sun_tint: [f32; 4],
+    moon: [f32; 4],
 }
 
 impl SkyParams {
@@ -84,10 +87,18 @@ impl SkyParams {
         // sun_tint is ALREADY linear (LinearRgb, non-quantising boundary) — no
         // /255 decode: the disc composites in linear light shader-side.
         let [tr, tg, tb] = desc.sun_tint.0;
+        let r = desc.sun_angular_radius;
+        let moon_r = r * crate::genconst::MOON_RADIUS_SCALE;
         Self {
             inv_view_proj,
-            sun: [s.x, s.y, s.z, desc.sun_angular_radius],
-            sun_tint: [tr, tg, tb, 0.0],
+            sun: [s.x, s.y, s.z, (r * crate::genconst::SUN_DISC_CORE).cos()],
+            sun_tint: [tr, tg, tb, (r * crate::genconst::SUN_DISC_RIM).cos()],
+            moon: [
+                (moon_r * crate::genconst::SUN_DISC_CORE).cos(),
+                (moon_r * crate::genconst::SUN_DISC_RIM).cos(),
+                0.0,
+                0.0,
+            ],
         }
     }
 }
@@ -154,11 +165,14 @@ pub struct Pipelines {
     pub tris2d_present: vk::Pipeline,
     pub tris2d_tex_present: vk::Pipeline,
     /// Vertex-less fullscreen background pass: geometry push constant + set 0
-    /// binding 2 (the shared per-frame `FrameUniforms`). Depth-tests
-    /// (read-only) at the reversed-Z far plane so it shades only pixels the
-    /// terrain left uncovered.
+    /// binding 0 (cloud LUT) and binding 1 (the shared per-frame `FrameUniforms`).
+    /// Depth-tests (read-only) at the reversed-Z far plane so it shades only
+    /// pixels the terrain left uncovered.
     pub sky: vk::Pipeline,
     pub layout_sky: vk::PipelineLayout,
+    pub sky_set_layout: vk::DescriptorSetLayout,
+    /// Linear-clamp sampler pushed with the octahedral cloud LUT.
+    pub sky_lut_sampler: vk::Sampler,
     /// Fullscreen AgX tonemap: samples the HDR offscreen (set 0 push descriptor,
     /// `tonemap_set_layout`) and writes the LDR swapchain image.
     pub tonemap: vk::Pipeline,
@@ -216,16 +230,37 @@ impl Pipelines {
                 .expect("Failed to create debug pipeline layout")
         };
 
-        // Sky layout: geometry push constant across both stages, plus set 0 =
-        // the SAME `mesh3d_set_layout` the mesh passes use, so the sky
-        // fragment reads the per-frame `FrameUniforms` at binding 2 — one UBO,
-        // one descriptor-set-layout, no second definition. The sky shader only
-        // touches binding 2; the other bindings stay unwritten for this pass.
+        // Sky layout: fragment push constant (inv VP + disc cosines) plus set 0
+        // binding 0 = cloud LUT, binding 1 = FrameUniforms. Dedicated rather than
+        // sharing mesh3d_set_layout: the LUT is a sampled image the mesh pass
+        // never touches.
         let push_sky = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(PUSH_BYTES_SKY)];
-        let set_layouts_sky = [mesh3d_set_layout];
+        let sky_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let sky_set_layout = unsafe {
+            device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+                        .bindings(&sky_bindings),
+                    None,
+                )
+                .expect("Failed to create sky set layout")
+        };
+        let set_layouts_sky = [sky_set_layout];
         let layout_sky_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts_sky)
             .push_constant_ranges(&push_sky);
@@ -234,6 +269,7 @@ impl Pipelines {
                 .create_pipeline_layout(&layout_sky_info, None)
                 .expect("Failed to create sky pipeline layout")
         };
+        let sky_lut_sampler = pass::linear_clamp_sampler(device, "sky cloud LUT");
 
         let push_2d = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
@@ -600,6 +636,8 @@ impl Pipelines {
             tris2d_tex_present,
             sky,
             layout_sky,
+            sky_set_layout,
+            sky_lut_sampler,
             tonemap,
             layout_tonemap,
             tonemap_set_layout,
@@ -653,6 +691,8 @@ impl Pipelines {
             device.destroy_pipeline_layout(self.layout_debug, None);
             device.destroy_pipeline_layout(self.layout_2d, None);
             device.destroy_pipeline_layout(self.layout_sky, None);
+            device.destroy_descriptor_set_layout(self.sky_set_layout, None);
+            device.destroy_sampler(self.sky_lut_sampler, None);
             device.destroy_pipeline_layout(self.layout_tonemap, None);
             device.destroy_descriptor_set_layout(self.tonemap_set_layout, None);
             device.destroy_sampler(self.tonemap_sampler, None);

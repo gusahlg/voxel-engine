@@ -20,6 +20,7 @@ pub(crate) mod pass;
 pub(crate) mod pipeline;
 pub(crate) mod render_client;
 pub(crate) mod shadow;
+pub(crate) mod sky;
 pub(crate) mod swapchain;
 pub(crate) mod taa;
 pub(crate) mod targets;
@@ -279,6 +280,8 @@ pub(crate) struct Renderer {
     exposure: exposure::ExposureState,
     /// Bloom pipelines.
     bloom: bloom::BloomState,
+    /// Cloud-LUT compute pipeline.
+    sky_cloud: sky::SkyCloudState,
     /// TAA state.
     taa: taa::TaaState,
 
@@ -497,6 +500,7 @@ impl Renderer {
         );
         let taa = taa::TaaState::new(&device.device, &memory_props, render_extent, pipeline_cache);
         let bloom = bloom::BloomState::new(&device.device, pipeline_cache);
+        let sky_cloud = sky::SkyCloudState::new(&device.device, pipeline_cache);
 
         let gpu_timer = GpuTimer::new(
             &device.device,
@@ -557,6 +561,7 @@ impl Renderer {
             shadow,
             exposure,
             bloom,
+            sky_cloud,
             taa,
             draw_scratch: Vec::new(),
             flags,
@@ -802,6 +807,7 @@ impl Renderer {
                 .as_ref()
                 .map(|s| s.frame_uniforms)
                 .unwrap_or_else(crate::skeleton::FrameUniformsGpu::full_bright);
+            u.prepare_derived();
             // Debug-flat: claim the `extras` lane as [r, g, b, enabled] —
             // sRGB-encoded key channels + an enable flag. mesh3d.frag linearises rgb
             // (as it does every CPU colour) and outputs it flat while depth writes.
@@ -1439,6 +1445,15 @@ impl Renderer {
                 self.record_shadow_pass(cmd, slot, scene.eye, sun, &cfg, caster_verts);
                 self.slots[FrameSlot::new(slot)].shadow_lit_ready = !self.flags.shadows;
             }
+        }
+
+        // Cloud LUT: march (or zero) before the scene pass so the sky fragment
+        // has a sampled image. Skipped when there is no sky.
+        if self.flags.sky
+            && lists.sky.is_some()
+            && let Some(scene) = &lists.scene
+        {
+            self.record_sky_cloud_lut(cmd, slot, scene.frame_uniforms.anim[3]);
         }
 
         // VRS generation needs a validly-written, single-sampled depth image to
@@ -3109,8 +3124,8 @@ impl<'a> RenderPass<'a> {
         }
     }
 
-    /// The procedural sky background pass (sky pipeline: geometry push constant
-    /// + the shared per-frame `FrameUniforms` at set 0 binding 2, no vertex
+    /// The procedural sky background pass (sky pipeline: fragment push constant,
+    /// FrameUniforms at set 0 binding 1, cloud LUT at binding 0, no vertex
     /// buffer). A single fullscreen triangle at the reversed-Z far plane; the
     /// read-only depth test rejects it wherever terrain wrote closer depth, so
     /// it shades only background pixels. Skipped unless the frame set a sky
@@ -3136,24 +3151,30 @@ impl<'a> RenderPass<'a> {
             device.cmd_push_constants(
                 cmd,
                 self.r.pipelines.layout_sky,
-                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                vk::ShaderStageFlags::FRAGMENT,
                 0,
                 bytemuck::bytes_of(&params),
             );
-            // Push ONLY binding 2 (the per-frame UBO): the sky fragment reads its
-            // colours from the same linear `FrameUniforms` the terrain fog does
-            // Reuses the mesh layout. The layout's other bindings (offsets SSBO, textures,
-            // shadow map) are unused by this pass, so they stay unwritten — valid
-            // for a push-descriptor set when the shader never accesses them.
+            let lut = &self.r.targets.sky_cloud[self.slot];
+            let lut_infos = [vk::DescriptorImageInfo::default()
+                .sampler(self.r.pipelines.sky_lut_sampler)
+                .image_view(lut.view())
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let ubo = self.r.ubo_ring.buffer(FrameSlot::new(self.slot));
             let ubo_infos = [vk::DescriptorBufferInfo::default()
                 .buffer(ubo)
                 .offset(0)
                 .range(vk::WHOLE_SIZE)];
-            let writes = [vk::WriteDescriptorSet::default()
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(&ubo_infos)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&lut_infos),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&ubo_infos),
+            ];
             self.r.device.push_descriptor.cmd_push_descriptor_set(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -3238,6 +3259,7 @@ impl Renderer {
             self.shadow.destroy(device);
             self.exposure.destroy(device);
             self.bloom.destroy(device);
+            self.sky_cloud.destroy(device);
             self.taa.destroy(device);
             self.block_textures.destroy(device);
             self.retired_textures
