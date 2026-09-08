@@ -98,3 +98,21 @@ pub(crate) fn linear_clamp_sampler(device: &ash::Device, label: &str) -> vk::Sam
             .unwrap_or_else(|e| panic!("create {label} sampler: {e:?}"))
     }
 }
+
+/// Nearest-filter, clamp-to-edge sampler — point depth fetches (TAA reprojection)
+/// must not interpolate reversed-Z.
+pub(crate) fn nearest_clamp_sampler(device: &ash::Device, label: &str) -> vk::Sampler {
+    unsafe {
+        device
+            .create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::NEAREST)
+                    .min_filter(vk::Filter::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("create {label} sampler: {e:?}"))
+    }
+}

@@ -191,6 +191,8 @@ impl ImageResource {
 
     /// Declares oldLayout = UNDEFINED for targets being fully overwritten
     /// (but dependency still uses real prior state). Waits for prior reads before discarding.
+    /// TAA batches via [`Self::barrier_to`]; kept for single-image discard transitions.
+    #[allow(dead_code)]
     pub(crate) fn transition_discard(
         &mut self,
         device: &ash::Device,
@@ -200,20 +202,22 @@ impl ImageResource {
         self.barrier(device, cmd, to, true);
     }
 
-    fn barrier(
+    /// Layout barrier for `to` (and the discard hint). Tracks the new layout so
+    /// callers can batch several images into one `cmd_pipeline_barrier2`.
+    /// `'static` because `p_next` is null — ash's lifetime only exists for the
+    /// pNext chain, not the image handle.
+    pub(crate) fn barrier_to(
         &mut self,
-        device: &ash::Device,
-        cmd: vk::CommandBuffer,
         to: LayoutUse,
         discard: bool,
-    ) {
+    ) -> vk::ImageMemoryBarrier2<'static> {
         let (new_layout, dst_stage, dst_access) = to.dst();
         let (src_stage, src_access) = if self.layout == vk::ImageLayout::UNDEFINED {
             (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
         } else {
             to.src_when_used()
         };
-        let barrier = [vk::ImageMemoryBarrier2::default()
+        let barrier = vk::ImageMemoryBarrier2::default()
             .src_stage_mask(src_stage)
             .src_access_mask(src_access)
             .dst_stage_mask(dst_stage)
@@ -227,14 +231,26 @@ impl ImageResource {
             })
             .new_layout(new_layout)
             .image(self.image)
-            .subresource_range(self.subresource)];
+            .subresource_range(self.subresource);
+        self.layout = new_layout;
+        // SAFETY: `p_next` is null; ash's lifetime only tracks the pNext chain.
+        unsafe { std::mem::transmute(barrier) }
+    }
+
+    fn barrier(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        to: LayoutUse,
+        discard: bool,
+    ) {
+        let barrier = [self.barrier_to(to, discard)];
         unsafe {
             device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&barrier),
             );
         }
-        self.layout = new_layout;
     }
 
     pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
