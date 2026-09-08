@@ -77,7 +77,6 @@ pub(super) fn jittered_clip(
     t * clean
 }
 
-/// Get frame's sun direction, defaulting to up if absent.
 /// Shadow-map content key: sun/eye-snap/occluders plus hashed avatar casters.
 fn shadow_key(
     eye: glam::DVec3,
@@ -85,18 +84,16 @@ fn shadow_key(
     occluders: u64,
     lists: &DrawLists,
 ) -> shadow::ShadowKey {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::hash::DefaultHasher::new();
-    bytemuck::cast_slice::<_, u8>(&lists.cube_verts).hash(&mut h);
     shadow::ShadowKey::of(
         eye,
         sun,
         occluders,
-        h.finish(),
+        shadow::hash_casters(bytemuck::cast_slice(&lists.cube_verts)),
         &crate::skeleton::ShadowCfg::PROVISIONAL,
     )
 }
 
+/// Get frame's sun direction, defaulting to up if absent.
 fn sun_dir(lists: &DrawLists) -> glam::DVec3 {
     lists
         .scene
@@ -146,6 +143,28 @@ impl Renderer {
         use crate::profile::{Meter, scope};
         crate::profile::count(crate::profile::Counter::Rendered);
 
+        let sun = sun_dir(lists);
+        let camera_eye = lists.scene.as_ref().map(|scene| {
+            (
+                crate::camera::Frustum::from_view_proj(&scene.view_proj),
+                pipeline::EyeSplit::of(scene.eye),
+            )
+        });
+
+        // CPU Blend re-source: persistent render-thread state that cannot change
+        // until the next command drain. Hoisted above the slot fence so it
+        // overlaps the previous frame's GPU work.
+        {
+            let _p = scope(Meter::Pack);
+            if let Some((camera, eye)) = &camera_eye {
+                self.prepare_blend_draws(lists, camera, *eye);
+            } else {
+                self.draw_scratch.clear();
+                self.draw_commands.clear();
+                self.draw_runs.clear();
+            }
+        }
+
         // Timed inside: the slot fence wait (wait tier) apart from the reclaim.
         self.wait_slot_and_reclaim(slot);
 
@@ -160,8 +179,8 @@ impl Renderer {
 
         let offsets = {
             let _p = scope(Meter::Pack);
-            let offsets = self.write_immediates(slot, lists);
-            self.prepare_mesh_draws(slot, lists);
+            let offsets = self.write_immediates(slot, lists, present_target.is_some());
+            self.prepare_mesh_draws(slot, lists, sun, camera_eye.as_ref());
             offsets
         };
 
@@ -524,7 +543,17 @@ impl Renderer {
     }
 
     /// Packs frame immediates (cubes, lines, 2D) into host buffer and returns offsets.
-    fn write_immediates(&mut self, slot: usize, lists: &DrawLists) -> ImmOffsets {
+    ///
+    /// 2D verts (`d2` / `d2_tex`) are read solely by the present overlay
+    /// (`present.rs::record_overlay_present`). Skip those two writes when this
+    /// frame will not present; a forced capture always presents. Offset math and
+    /// `imm.maintain(total)` stay identical so the buffer layout is stable.
+    fn write_immediates(
+        &mut self,
+        slot: usize,
+        lists: &DrawLists,
+        will_present: bool,
+    ) -> ImmOffsets {
         let cube_bytes: &[u8] = bytemuck::cast_slice(&lists.cube_verts);
         let line_bytes: &[u8] = bytemuck::cast_slice(&lists.line_verts);
         let shadow_bytes: &[u8] = bytemuck::cast_slice(&lists.shadow_verts);
@@ -547,8 +576,10 @@ impl Renderer {
                 imm.write(0, cube_bytes);
                 imm.write(line, line_bytes);
                 imm.write(shadow, shadow_bytes);
-                imm.write(d2, d2_bytes);
-                imm.write(d2_tex, d2_tex_bytes);
+                if will_present {
+                    imm.write(d2, d2_bytes);
+                    imm.write(d2_tex, d2_tex_bytes);
+                }
             }
         }
         ImmOffsets {
@@ -559,30 +590,132 @@ impl Renderer {
         }
     }
 
-    /// Prepares this frame's two draw sources from the persistent state.
+    /// CPU Blend re-source: transparency needs exact far→near ordering the GPU
+    /// cull does not provide, so Blend is the ONE pass still resolved CPU-side.
+    /// Sourced from the same persistent records, arena directory, and
+    /// `visible_mask` — not a per-frame draw list — by iterating resident,
+    /// visible Blend-pass slots, frustum-culling, sorting by distance, and
+    /// emitting whole-mesh indirect commands (`first_instance = slot` so
+    /// placement/style come from the record/dyn SSBOs).
     ///
-    /// - GPU cull (opaque/cutout/shadow): exact partitions from the arena live
-    ///   counts, params (camera + cascade frusta, eye split), and the persistent
-    ///   `visible_mask` as the dispatch's visibility input. The mask carries what
-    ///   only the app knows (LOD selection, quadrant masks, occlusion): a
-    ///   resident-but-hidden slot must not draw just because its record is live.
-    ///   The cull shader frustum-tests every visible slot and appends
-    ///   `first_instance = slot` commands the graphics side draws indirect-count.
-    ///
-    /// - CPU Blend re-source: transparency needs exact far→near ordering the GPU
-    ///   cull does not provide, so Blend is the ONE pass still resolved CPU-side.
-    ///   It is sourced from the SAME persistent state — records + arena directory
-    ///   + `visible_mask`, NOT a per-frame draw list — by iterating the resident,
-    ///   visible, Blend-pass slots, frustum-culling, sorting by distance, and
-    ///   emitting whole-mesh indirect commands (also `first_instance = slot`, so
-    ///   placement/style come from the record/dyn SSBOs, never rebuilt per frame).
-    fn prepare_mesh_draws(&mut self, slot: usize, lists: &DrawLists) {
+    /// Safe to run before the slot fence: everything it reads is render-thread
+    /// state that cannot change until the next command drain (reclaim frees
+    /// only already-retired allocations). The indirect buffer write stays in
+    /// [`Self::prepare_mesh_draws`] after the wait.
+    fn prepare_blend_draws(
+        &mut self,
+        lists: &DrawLists,
+        camera: &crate::camera::Frustum,
+        eye: pipeline::EyeSplit,
+    ) {
         use ash::vk::Handle;
 
         self.draw_scratch.clear();
         self.draw_commands.clear();
         self.draw_runs.clear();
 
+        // Walk the resident, visible, Blend-pass records. The directory's Blend
+        // set is exactly that candidate list, so this is O(transparent meshes),
+        // never a sweep of the whole slot table.
+        let Some(scene) = &lists.scene else {
+            return;
+        };
+        for &s in self.arena_dir.blend_slots() {
+            // Arena word (0 = not resident) is the arena index + 1, giving
+            // the vertex buffer without a residency-handle lookup. Gated
+            // on `is_arrived` too: a budget-deferred copy is registered in
+            // `arena_dir` (capacity/ref-count bookkeeping happens at
+            // upload) before its bytes actually land — reading it here
+            // early would source the CPU Blend draw from uninitialized
+            // arena memory, same hazard `RecordTable::flush` guards for
+            // the GPU cull path.
+            let arena = self.arena_dir.arena_word(s as usize);
+            if arena == 0 || !self.mesh_res.is_arrived(s) {
+                continue;
+            }
+            // The same persistent mask the GPU cull reads.
+            let visible = self
+                .visible_mask
+                .get((s >> 5) as usize)
+                .is_some_and(|w| w & (1 << (s & 31)) != 0);
+            if !visible {
+                continue;
+            }
+            let Some(rec) = self.records.record(s) else {
+                continue;
+            };
+            debug_assert_eq!(
+                rec.pass(),
+                Pass::Blend,
+                "Blend set holds a non-Blend record"
+            );
+            // Camera-relative placement reconstructed exactly as the vertex
+            // shader does (integer block minus camera block, then the
+            // fractional remainder), so the CPU sort/cull agrees with the GPU
+            // draw. `detail_scale` decodes the BIASED detail field — never
+            // decode `detail_pass` here by hand (it carries a to_gpu_bits offset).
+            let scale = rec.detail_scale();
+            let offset = glam::Vec3::new(
+                (rec.block[0] - eye.block[0]) as f32 - eye.frac[0] + rec.local_off[0],
+                (rec.block[1] - eye.block[1]) as f32 - eye.frac[1] + rec.local_off[1],
+                (rec.block[2] - eye.block[2]) as f32 - eye.frac[2] + rec.local_off[2],
+            );
+            let amin = glam::Vec3::from(rec.aabb_min);
+            let amax = glam::Vec3::from(rec.aabb_max);
+            if !camera.intersects_aabb(amin * scale + offset, amax * scale + offset) {
+                continue;
+            }
+            let center = offset + (amin + amax) * 0.5 * scale;
+            let dist2 = (center - scene.cam_pos).length_squared();
+            self.draw_scratch.push(DrawEntry {
+                buffer: self.arena_dir.arena_buffer((arena - 1) as usize),
+                pass: Pass::Blend,
+                first: 0,
+                count: rec.index_count,
+                vertex_offset: rec.vertex_offset,
+                slot: s,
+                dist2,
+            });
+        }
+        // Blend far→near for correct back-to-front alpha compositing.
+        self.draw_scratch.sort_unstable_by(|a, b| {
+            b.dist2
+                .total_cmp(&a.dist2)
+                // Deterministic tiebreak; keeps equidistant same-arena draws batched.
+                .then_with(|| a.buffer.as_raw().cmp(&b.buffer.as_raw()))
+        });
+
+        for entry in &self.draw_scratch {
+            let command_index = self.draw_commands.len() as u32;
+            self.draw_commands.push(DrawIndexedIndirect {
+                index_count: entry.count,
+                instance_count: 1,
+                first_index: entry.first,
+                vertex_offset: entry.vertex_offset,
+                first_instance: entry.slot,
+            });
+            match self.draw_runs.last_mut() {
+                Some(run) if run.buffer == entry.buffer && run.pass == entry.pass => run.count += 1,
+                _ => self.draw_runs.push(DrawRun {
+                    buffer: entry.buffer,
+                    pass: entry.pass,
+                    first: command_index,
+                    count: 1,
+                }),
+            }
+        }
+    }
+
+    /// GPU-cull prep, shadow fits, and the Blend indirect write. Runs after the
+    /// slot fence: flush and HostBuffer maintains must not race the previous
+    /// use of this slot. `camera`/`eye` were computed before the wait.
+    fn prepare_mesh_draws(
+        &mut self,
+        slot: usize,
+        lists: &DrawLists,
+        sun: glam::DVec3,
+        camera_eye: Option<&(crate::camera::Frustum, pipeline::EyeSplit)>,
+    ) {
         // Flush record/dyn patches into this slot's copies (post-fence, same
         // discipline as the HostBuffer maintains below).
         self.record_buffers = unsafe {
@@ -601,32 +734,23 @@ impl Renderer {
         // `shadow_enabled = 0` so invisible slots bail before the AABB load.
         let cfg = crate::skeleton::ShadowCfg::PROVISIONAL;
         let shadow_frusta = lists.scene.as_ref().and_then(|scene| {
-            if self.flags.shadows {
-                let key = shadow_key(
-                    scene.eye,
-                    sun_dir(lists),
-                    self.records.occluder_rev(),
-                    lists,
-                );
-                if !self.shadow_cache.prepare(Some((key, &cfg))) {
-                    return None;
-                }
-                let sun = sun_dir(lists);
-                Some(
-                    [
-                        crate::skeleton::Cascade::Near,
-                        crate::skeleton::Cascade::Far,
-                    ]
-                    .map(|c| {
-                        crate::camera::Frustum::from_view_proj(
-                            &shadow::fit(scene.eye, sun, c, &cfg).view_proj.0,
-                        )
-                    }),
-                )
+            let rebuild = if self.flags.shadows {
+                let key = shadow_key(scene.eye, sun, self.records.occluder_rev(), lists);
+                self.shadow_cache.prepare(Some((key, &cfg)))
             } else {
-                self.shadow_cache.prepare(None);
-                None
+                self.shadow_cache.prepare(None)
+            };
+            if !rebuild {
+                return None;
             }
+            let fits = shadow::PerCascade::new(
+                shadow::CASCADES.map(|c| shadow::fit(scene.eye, sun, c, &cfg)),
+            );
+            self.shadow_cache.store_fits(fits);
+            self.flags.shadows.then(|| {
+                shadow::CASCADES
+                    .map(|c| crate::camera::Frustum::from_view_proj(&fits[c].view_proj.0))
+            })
         });
 
         // GPU cull prep: the persistent visibility mask IS the dispatch's
@@ -639,9 +763,7 @@ impl Renderer {
             .cull_frame
             .take()
             .map_or_else(Vec::new, |f| f.partitions);
-        self.cull_frame = if let Some(scene) = &lists.scene {
-            let camera = crate::camera::Frustum::from_view_proj(&scene.view_proj);
-            let eye = pipeline::EyeSplit::of(scene.eye);
+        self.cull_frame = if let Some((camera, eye)) = camera_eye {
             if let Some(records) = self.record_buffers {
                 let slot_count = records.slots.min(self.arena_dir.live_end());
                 let need = slot_count.div_ceil(32) as usize;
@@ -657,9 +779,9 @@ impl Renderer {
                         &self.arena_dir,
                         records,
                         slot_count,
-                        &camera,
+                        camera,
                         shadow_frusta.as_ref(),
-                        eye,
+                        *eye,
                         &self.visible_mask[..need],
                         recycled,
                     )
@@ -671,99 +793,6 @@ impl Renderer {
             None
         };
 
-        // CPU Blend re-source: walk the resident, visible, Blend-pass records.
-        // The directory's Blend set is exactly that candidate list, so this is
-        // O(transparent meshes), never a sweep of the whole slot table.
-        if let Some(scene) = &lists.scene {
-            let camera = crate::camera::Frustum::from_view_proj(&scene.view_proj);
-            let eye = pipeline::EyeSplit::of(scene.eye);
-            for &s in self.arena_dir.blend_slots() {
-                // Arena word (0 = not resident) is the arena index + 1, giving
-                // the vertex buffer without a residency-handle lookup. Gated
-                // on `is_arrived` too: a budget-deferred copy is registered in
-                // `arena_dir` (capacity/ref-count bookkeeping happens at
-                // upload) before its bytes actually land — reading it here
-                // early would source the CPU Blend draw from uninitialized
-                // arena memory, same hazard `RecordTable::flush` guards for
-                // the GPU cull path.
-                let arena = self.arena_dir.arena_word(s as usize);
-                if arena == 0 || !self.mesh_res.is_arrived(s) {
-                    continue;
-                }
-                // The same persistent mask the GPU cull reads.
-                let visible = self
-                    .visible_mask
-                    .get((s >> 5) as usize)
-                    .is_some_and(|w| w & (1 << (s & 31)) != 0);
-                if !visible {
-                    continue;
-                }
-                let Some(rec) = self.records.record(s) else {
-                    continue;
-                };
-                debug_assert_eq!(
-                    rec.pass(),
-                    Pass::Blend,
-                    "Blend set holds a non-Blend record"
-                );
-                // Camera-relative placement reconstructed exactly as the vertex
-                // shader does (integer block minus camera block, then the
-                // fractional remainder), so the CPU sort/cull agrees with the GPU
-                // draw. `detail_scale` decodes the BIASED detail field — never
-                // decode `detail_pass` here by hand (it carries a to_gpu_bits offset).
-                let scale = rec.detail_scale();
-                let offset = glam::Vec3::new(
-                    (rec.block[0] - eye.block[0]) as f32 - eye.frac[0] + rec.local_off[0],
-                    (rec.block[1] - eye.block[1]) as f32 - eye.frac[1] + rec.local_off[1],
-                    (rec.block[2] - eye.block[2]) as f32 - eye.frac[2] + rec.local_off[2],
-                );
-                let amin = glam::Vec3::from(rec.aabb_min);
-                let amax = glam::Vec3::from(rec.aabb_max);
-                if !camera.intersects_aabb(amin * scale + offset, amax * scale + offset) {
-                    continue;
-                }
-                let center = offset + (amin + amax) * 0.5 * scale;
-                let dist2 = (center - scene.cam_pos).length_squared();
-                self.draw_scratch.push(DrawEntry {
-                    buffer: self.arena_dir.arena_buffer((arena - 1) as usize),
-                    pass: Pass::Blend,
-                    first: 0,
-                    count: rec.index_count,
-                    vertex_offset: rec.vertex_offset,
-                    slot: s,
-                    dist2,
-                });
-            }
-            // Blend far→near for correct back-to-front alpha compositing.
-            self.draw_scratch.sort_unstable_by(|a, b| {
-                b.dist2
-                    .total_cmp(&a.dist2)
-                    // Deterministic tiebreak; keeps equidistant same-arena draws batched.
-                    .then_with(|| a.buffer.as_raw().cmp(&b.buffer.as_raw()))
-            });
-
-            for entry in &self.draw_scratch {
-                let command_index = self.draw_commands.len() as u32;
-                self.draw_commands.push(DrawIndexedIndirect {
-                    index_count: entry.count,
-                    instance_count: 1,
-                    first_index: entry.first,
-                    vertex_offset: entry.vertex_offset,
-                    first_instance: entry.slot,
-                });
-                match self.draw_runs.last_mut() {
-                    Some(run) if run.buffer == entry.buffer && run.pass == entry.pass => {
-                        run.count += 1
-                    }
-                    _ => self.draw_runs.push(DrawRun {
-                        buffer: entry.buffer,
-                        pass: entry.pass,
-                        first: command_index,
-                        count: 1,
-                    }),
-                }
-            }
-        }
         let indirect_bytes: &[u8] = bytemuck::cast_slice(&self.draw_commands);
         unsafe {
             let indirect = &mut self.slots[FrameSlot::new(slot)].indirect;
@@ -820,7 +849,11 @@ impl Renderer {
                 .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
                 .expect("command buffer reset failed");
             device
-                .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
+                .begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
                 .expect("begin command buffer failed");
             // Start timing before the staged copies so the whole buffer is
             // attributed (the `Copies` stamp closes this first span).
@@ -880,7 +913,7 @@ impl Renderer {
             && let Some(frame) = &self.cull_frame
             && let Some(records) = self.record_buffers
         {
-            let _g = crate::profile::scope(crate::profile::Meter::Pack);
+            let _g = crate::profile::scope(crate::profile::Meter::RecCull);
             unsafe {
                 self.cull.record(
                     &self.device.device,
@@ -901,28 +934,31 @@ impl Renderer {
             self.cull.clear_stats_cpu(slot);
         }
 
-        // Cascaded shadows: on a miss, fit both cascades, publish binding-3
-        // uniforms, and render occluders into the *shared* map before the color
-        // pass (it leaves the map in SHADER_READ_ONLY_OPTIMAL for mesh3d.frag).
-        // Hits skip the producer (and skip `fit()`); the slot UBO is filled from
-        // the cached block so sampling matches the resident depth.
+        // Cascaded shadows: on a miss, `prepare_mesh_draws` already fitted both
+        // cascades; publish binding-3 uniforms and render occluders into the
+        // *shared* map before the color pass (it leaves the map in
+        // SHADER_READ_ONLY_OPTIMAL for mesh3d.frag). Hits skip the producer
+        // (and skip `fit()`); the slot UBO is filled from the cached block so
+        // sampling matches the resident depth.
         if let Some(scene) = &lists.scene {
             let cfg = crate::skeleton::ShadowCfg::PROVISIONAL;
-            let sun = sun_dir(lists);
             let caster_verts = lists.cube_verts.len() as u32;
             let render = self.shadow_cache.pending_rebuild();
             if render {
                 let _g = crate::profile::scope(crate::profile::Meter::RecShadow);
-                // WAR: the other FIF slot may still be sampling the shared map.
-                // Hits skip this wait (concurrent SHADER_READ_ONLY is legal).
-                unsafe {
-                    self.timeline
-                        .wait(&self.device.device, self.last_render_value);
-                }
-                let cu = self.shadow_uniforms(scene.eye, sun, &cfg);
+                // Previous frame's sampling of the shared map is ordered on the
+                // GPU by the entry barrier of `record_shadow_pass`, whose first
+                // synchronization scope covers every command earlier in
+                // submission order on the graphics queue. `shadow.write_uniforms`
+                // is per-slot and fence-waited, so no CPU-visible memory is shared.
+                let fits = self
+                    .shadow_cache
+                    .fits()
+                    .expect("pending rebuild stores fits in prepare_mesh_draws");
+                let cu = self.shadow_uniforms(&fits, &cfg);
                 self.shadow_cache.store_uniforms(cu);
                 self.shadow.write_uniforms(slot, &cu);
-                self.record_shadow_pass(cmd, slot, scene.eye, sun, &cfg, caster_verts);
+                self.record_shadow_pass(cmd, slot, &fits, scene.eye, &cfg, caster_verts);
                 if profiling {
                     unsafe {
                         self.gpu_timer

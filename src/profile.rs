@@ -61,6 +61,7 @@ pub enum Meter {
     // Substages (like the tile ones) — excluded from the submit tier total and
     // printed in brackets after it, so they never double-count `Record`.
     RecShadow,
+    RecCull,
     RecMesh,
     RecSky,
     RecImmediate,
@@ -125,7 +126,7 @@ pub enum Meter {
 }
 
 impl Meter {
-    const ALL: [Meter; 51] = [
+    const ALL: [Meter; 52] = [
         Meter::NetEvents,
         Meter::Physics,
         Meter::StreamDrain,
@@ -141,6 +142,7 @@ impl Meter {
         Meter::Pack,
         Meter::Record,
         Meter::RecShadow,
+        Meter::RecCull,
         Meter::RecMesh,
         Meter::RecSky,
         Meter::RecImmediate,
@@ -197,6 +199,7 @@ impl Meter {
             Meter::Pack => "pack",
             Meter::Record => "record",
             Meter::RecShadow => "rec.shadow",
+            Meter::RecCull => "rec.cull",
             Meter::RecMesh => "rec.mesh",
             Meter::RecSky => "rec.sky",
             Meter::RecImmediate => "rec.imm",
@@ -251,6 +254,7 @@ impl Meter {
             | Meter::Pack
             | Meter::Record
             | Meter::RecShadow
+            | Meter::RecCull
             | Meter::RecMesh
             | Meter::RecSky
             | Meter::RecImmediate
@@ -737,6 +741,7 @@ fn report(frames: u64) {
             // `record` number goes without double-counting it.
             let rec = sorted(vec![
                 Meter::RecShadow,
+                Meter::RecCull,
                 Meter::RecMesh,
                 Meter::RecSky,
                 Meter::RecImmediate,
@@ -779,6 +784,7 @@ fn is_substage(m: Meter) -> bool {
         Meter::TileSample
             | Meter::TileMesh
             | Meter::RecShadow
+            | Meter::RecCull
             | Meter::RecMesh
             | Meter::RecSky
             | Meter::RecImmediate

@@ -16,9 +16,11 @@
 //!
 //! - **WAR (write after other-slot sample).** Frame N samples the map in
 //!   `FRAGMENT_SHADER`. Frame N+1, on a miss, rewrites it as a depth
-//!   attachment. Before that write, the producer host-waits the previous
-//!   render's timeline value (`last_render_value`, the other FIF slot). Cache
-//!   hits skip the wait: concurrent `SHADER_READ_ONLY` sampling is legal.
+//!   attachment. The producer's first barrier (src `FRAGMENT_SHADER` /
+//!   `SHADER_SAMPLED_READ` → depth write, old layout `UNDEFINED`) covers every
+//!   command earlier in submission order on the graphics queue, so the rewrite
+//!   is ordered on the GPU after every earlier-submitted sample. Cache hits
+//!   skip the producer: concurrent `SHADER_READ_ONLY` sampling is legal.
 //! - **RAW (sample after this-slot write).** Same command buffer: the producer
 //!   already barriers `DEPTH_ATTACHMENT` → `SHADER_READ_ONLY` before the color
 //!   pass samples.
@@ -34,7 +36,7 @@
 //! Alternative considered: keep per-slot images and regenerate-only-this-slot.
 //! That still redraws the same key twice (once per slot as each is reused)
 //! unless the other slot samples this slot's image, which reintroduces the
-//! same WAR and needs the same timeline wait. One shared image is simpler.
+//! same WAR and needs the same GPU barrier. One shared image is simpler.
 
 use ash::vk;
 use glam::{DVec3, Mat4};
@@ -55,15 +57,16 @@ pub enum Cascade {
     Far,
 }
 
-pub struct PerCascade<T>([T; 2]);
+#[derive(Clone, Copy)]
+pub struct PerCascade<T: Copy>([T; 2]);
 
-impl<T> PerCascade<T> {
+impl<T: Copy> PerCascade<T> {
     pub fn new(pair: [T; 2]) -> Self {
         PerCascade(pair)
     }
 }
 
-impl<T> std::ops::Index<Cascade> for PerCascade<T> {
+impl<T: Copy> std::ops::Index<Cascade> for PerCascade<T> {
     type Output = T;
     fn index(&self, c: Cascade) -> &T {
         &self.0[c as usize]
@@ -112,7 +115,7 @@ const _: () = assert!(std::mem::offset_of!(CascadeUniformsGpu, texel) == 160);
 const SHADOW_DEPTH_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow_depth.vert.spv"));
 
 /// The two cascades in render/index order, so callers never spell `as usize`.
-const CASCADES: [Cascade; SHADOW_CASCADES as usize] = [Cascade::Near, Cascade::Far];
+pub(crate) const CASCADES: [Cascade; SHADOW_CASCADES as usize] = [Cascade::Near, Cascade::Far];
 
 impl ShadowCfg {
     pub const PROVISIONAL: Self = Self {
@@ -199,6 +202,8 @@ pub(crate) struct ShadowCache {
     /// Cascade UBO matching `key` (and the shadows-off lit-clear). Copied into
     /// the recording slot's UBO on a hit so that path skips `fit()`.
     uniforms: Option<CascadeUniformsGpu>,
+    /// Cascade fits computed once on a rebuild; consumed by uniforms + recording.
+    fits: Option<PerCascade<CascadeFit>>,
     /// Shared map holds the fully-lit shadows-off clear.
     lit_ready: bool,
     /// Producer must rewrite the shared map this frame.
@@ -210,6 +215,7 @@ impl ShadowCache {
         Self {
             key: None,
             uniforms: None,
+            fits: None,
             lit_ready: false,
             pending_rebuild: true,
         }
@@ -219,6 +225,7 @@ impl ShadowCache {
     pub(crate) fn invalidate(&mut self) {
         self.key = None;
         self.uniforms = None;
+        self.fits = None;
         self.lit_ready = false;
         self.pending_rebuild = true;
     }
@@ -235,6 +242,7 @@ impl ShadowCache {
                 if rebuild {
                     self.key = Some(cur);
                     self.uniforms = None;
+                    self.fits = None;
                 }
                 self.lit_ready = false;
                 self.pending_rebuild = rebuild;
@@ -245,6 +253,7 @@ impl ShadowCache {
                 self.pending_rebuild = !self.lit_ready;
                 if self.pending_rebuild {
                     self.uniforms = None;
+                    self.fits = None;
                 }
                 self.pending_rebuild
             }
@@ -257,6 +266,14 @@ impl ShadowCache {
 
     pub(crate) fn store_uniforms(&mut self, u: CascadeUniformsGpu) {
         self.uniforms = Some(u);
+    }
+
+    pub(crate) fn store_fits(&mut self, fits: PerCascade<CascadeFit>) {
+        self.fits = Some(fits);
+    }
+
+    pub(crate) fn fits(&self) -> Option<PerCascade<CascadeFit>> {
+        self.fits
     }
 
     pub(crate) fn uniforms(&self) -> Option<&CascadeUniformsGpu> {
@@ -476,44 +493,69 @@ fn receiver_lanes(fit: &CascadeFit, cfg: &ShadowCfg) -> [f32; 4] {
     ]
 }
 
+/// Receiver UBO from precomputed cascade fits. `shadow_limit` is the far split
+/// when shadows are on, `f32::MAX` when off (PCF early-outs as fully lit).
+pub(crate) fn cascade_uniforms(
+    fits: &PerCascade<CascadeFit>,
+    cfg: &ShadowCfg,
+    shadows_on: bool,
+) -> CascadeUniformsGpu {
+    let near = &fits[Cascade::Near];
+    let far = &fits[Cascade::Far];
+    let shadow_limit = if shadows_on { cfg.splits[1] } else { f32::MAX };
+    CascadeUniformsGpu {
+        view_proj: [
+            near.view_proj.0.to_cols_array_2d(),
+            far.view_proj.0.to_cols_array_2d(),
+        ],
+        splits_fade: [near.split, far.split, cfg.fade_band, shadow_limit],
+        bias: [
+            cfg.blur_texels,
+            cfg.slope_bias,
+            cfg.dist_bias,
+            near.texel_world,
+        ],
+        texel: [receiver_lanes(near, cfg), receiver_lanes(far, cfg)],
+    }
+}
+
+/// FxHash-style content hash of immediate caster bytes (avatar boxes).
+/// Seed is the length; each 8-byte LE word (then the tail) is mixed with
+/// rotate-xor-mul. Cheaper than SipHash and sufficient as a dirty key.
+pub(crate) fn hash_casters(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h = bytes.len() as u64;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in chunks.by_ref() {
+        let w = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8)"));
+        h = (h.rotate_left(5) ^ w).wrapping_mul(K);
+    }
+    let rem = chunks.remainder();
+    if !rem.is_empty() {
+        let mut tail = [0u8; 8];
+        tail[..rem.len()].copy_from_slice(rem);
+        let w = u64::from_le_bytes(tail);
+        h = (h.rotate_left(5) ^ w).wrapping_mul(K);
+    }
+    h
+}
+
 impl Renderer {
     pub(crate) fn shadow_uniforms(
         &self,
-        eye: DVec3,
-        sun: DVec3,
+        fits: &PerCascade<CascadeFit>,
         cfg: &ShadowCfg,
     ) -> CascadeUniformsGpu {
-        let fits = PerCascade::new(CASCADES.map(|c| fit(eye, sun, c, cfg)));
-        let near = &fits[Cascade::Near];
-        let far = &fits[Cascade::Far];
-        let shadow_limit = if self.flags.shadows {
-            cfg.splits[1]
-        } else {
-            f32::MAX
-        };
-        CascadeUniformsGpu {
-            view_proj: [
-                near.view_proj.0.to_cols_array_2d(),
-                far.view_proj.0.to_cols_array_2d(),
-            ],
-            splits_fade: [near.split, far.split, cfg.fade_band, shadow_limit],
-            bias: [
-                cfg.blur_texels,
-                cfg.slope_bias,
-                cfg.dist_bias,
-                near.texel_world,
-            ],
-            texel: [receiver_lanes(near, cfg), receiver_lanes(far, cfg)],
-        }
+        cascade_uniforms(fits, cfg, self.flags.shadows)
     }
 
     pub(crate) fn record_shadow_pass(
         &self,
         cmd: vk::CommandBuffer,
         slot: usize,
+        fits: &PerCascade<CascadeFit>,
         eye: DVec3,
-        sun: DVec3,
-        cfg: &ShadowCfg,
+        _cfg: &ShadowCfg,
         caster_verts: u32,
     ) {
         let device = &self.device.device;
@@ -589,7 +631,7 @@ impl Renderer {
             }
 
             for c in CASCADES {
-                let f = fit(eye, sun, c, cfg);
+                let f = fits[c];
                 let depth_attachment = vk::RenderingAttachmentInfo::default()
                     .image_view(shadow.layer_views[c as usize])
                     .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
@@ -902,6 +944,56 @@ mod tests {
             !cache.prepare(Some((b, &cfg))),
             "second slot samples the shared image"
         );
+    }
+
+    #[test]
+    fn cascade_uniforms_match_previous_formula() {
+        let cfg = ShadowCfg::PROVISIONAL;
+        let eye = DVec3::new(123.4, 56.0, -789.0);
+        let fits = PerCascade::new(CASCADES.map(|c| fit(eye, SUN, c, &cfg)));
+        let near = &fits[Cascade::Near];
+        let far = &fits[Cascade::Far];
+
+        let on = cascade_uniforms(&fits, &cfg, true);
+        assert_eq!(on.view_proj[0], near.view_proj.0.to_cols_array_2d());
+        assert_eq!(on.view_proj[1], far.view_proj.0.to_cols_array_2d());
+        assert_eq!(
+            on.splits_fade,
+            [near.split, far.split, cfg.fade_band, cfg.splits[1]]
+        );
+        assert_eq!(
+            on.bias,
+            [
+                cfg.blur_texels,
+                cfg.slope_bias,
+                cfg.dist_bias,
+                near.texel_world
+            ]
+        );
+        assert_eq!(
+            on.texel,
+            [receiver_lanes(near, &cfg), receiver_lanes(far, &cfg)]
+        );
+
+        let off = cascade_uniforms(&fits, &cfg, false);
+        assert_eq!(off.splits_fade[3], f32::MAX);
+        assert_eq!(off.view_proj, on.view_proj);
+        assert_eq!(&off.splits_fade[..3], &on.splits_fade[..3]);
+        assert_eq!(off.bias, on.bias);
+        assert_eq!(off.texel, on.texel);
+    }
+
+    #[test]
+    fn hash_casters_is_deterministic_and_sensitive() {
+        let a = b"hello world!!!!";
+        assert_eq!(hash_casters(a), hash_casters(a));
+        assert_ne!(hash_casters(b""), hash_casters(b"x"));
+        let mut flipped = a.to_vec();
+        flipped[3] ^= 1;
+        assert_ne!(hash_casters(a), hash_casters(&flipped));
+        // 8-byte aligned and a one-byte tail both mix.
+        assert_ne!(hash_casters(&[0; 8]), hash_casters(&[0; 9]));
+        assert_ne!(hash_casters(&[1; 8]), hash_casters(&[1; 7]));
     }
 
     #[test]
