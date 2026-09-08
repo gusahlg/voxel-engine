@@ -83,3 +83,42 @@ impl Color {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, Pod, Zeroable)]
 pub struct LinearRgb(pub [f32; 3]);
+
+#[cfg(test)]
+mod tonemap_sigmoid {
+    /// Original 3-`pow` curve: `c = 1.4 x; y = c / (c^2.5+1)^0.4; y^1.15`.
+    fn pow_form(x: f32) -> f32 {
+        if x <= 0.0 {
+            return 0.0;
+        }
+        let c = 1.4 * x;
+        let y = c / (c.powf(2.5) + 1.0).powf(0.4);
+        y.powf(1.15)
+    }
+
+    /// Shader rewrite: 2 log2 + 2 exp2 / channel, same algebra.
+    fn exp2_form(x: f32) -> f32 {
+        if x <= 0.0 {
+            return 0.0;
+        }
+        let c = 1.4 * x;
+        let logc = c.log2();
+        let t = logc - 0.4 * ((2.5 * logc).exp2() + 1.0).log2();
+        (1.15 * t).exp2()
+    }
+
+    #[test]
+    fn exp2_form_matches_pow_form() {
+        for x in [0.0, 1e-6, 0.01, 0.1, 0.5, 1.0, 2.0, 8.0, 32.0] {
+            let a = pow_form(x);
+            let b = exp2_form(x);
+            let eps = 2e-5 * a.max(1.0);
+            assert!(
+                (a - b).abs() <= eps,
+                "x={x}: pow {a} vs exp2 {b} (eps {eps})"
+            );
+        }
+        assert_eq!(exp2_form(-1.0), 0.0);
+        assert_eq!(pow_form(0.0), 0.0);
+    }
+}

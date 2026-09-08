@@ -380,7 +380,7 @@ impl Renderer {
             pipeline_cache,
         );
         let taa = taa::TaaState::new(&device.device, &memory_props, render_extent, pipeline_cache);
-        let bloom = bloom::BloomState::new(&device.device, pipeline_cache);
+        let bloom = bloom::BloomState::new(&device.device, &memory_props, pipeline_cache);
         let sky_cloud = sky::SkyCloudState::new(&device.device, pipeline_cache);
 
         let gpu_timer = GpuTimer::new(
@@ -947,13 +947,14 @@ fn depth_range() -> vk::ImageSubresourceRange {
 /// Contract: [`scene_pass::RenderPass::end`] transitions that image (the MSAA
 /// resolve target when multisampled, else the depth image) from the scene-pass
 /// write scope ([`sampleable_depth_attachment_state`]) to this layout in the
-/// same `vkCmdPipelineBarrier2` as the offscreen HDR finalize, with dst stages
-/// `COMPUTE_SHADER | FRAGMENT_SHADER` and access `SHADER_SAMPLED_READ`. From
-/// then on it RESTS here: TAA, the tonemap present copy (godray sampler), and
-/// the VRS classifier all sample it with no further transition. The next scene
-/// pass of this slot begins the image from `UNDEFINED` (contents are cleared
-/// every frame, so the discard is free). The multisampled `depth` attachment
-/// is unchanged: it still begins from UNDEFINED and is never sampled.
+/// same `vkCmdPipelineBarrier2` as the offscreen HDR finalize, with dst stage
+/// `COMPUTE_SHADER` and access `SHADER_SAMPLED_READ`. From then on it RESTS
+/// here: TAA, the quarter-res spill pass (godray sampler), and the VRS
+/// classifier all sample it with no further transition. The present copy does
+/// not read depth. The next scene pass of this slot begins the image from
+/// `UNDEFINED` (contents are cleared every frame, so the discard is free). The
+/// multisampled `depth` attachment is unchanged: it still begins from
+/// UNDEFINED and is never sampled.
 pub(super) const SAMPLEABLE_DEPTH_REST_LAYOUT: vk::ImageLayout =
     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 

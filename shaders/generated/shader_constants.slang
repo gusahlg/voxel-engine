@@ -217,13 +217,21 @@ static const float BLOOM_SPIRAL_SAMPLES = 6.0f;
 // wide soft blur comes from the pyramid; the spiral just spreads and de-aliases it.
 static const float BLOOM_SPIRAL_LOD = 2.0f;
 
-// Bloom pyramid mip cap. Tonemap samples only BLOOM_SPIRAL_LOD, so the chain
-// stops at that level (base + LOD). CPU (vk/targets.rs) must agree.
+// Bloom pyramid mip cap. The spill pass samples only BLOOM_SPIRAL_LOD, so the
+// chain stops at that level (base + LOD). CPU (vk/targets.rs) must agree.
 static const uint BLOOM_MAX_MIPS = 3;
 
 // Bloom spiral radius in output uv (isotropic). Small — the mip chain already
 // carries the wide blur, so this only softens the seams between taps.
 static const float BLOOM_SPIRAL_RADIUS = 0.08f;
+
+// Spill image is 1/SPILL_FACTOR of the render extent on each axis (quarter-res
+// at 4). CPU image create (vk/targets.rs) and the spill dispatch must agree.
+static const uint SPILL_FACTOR = 4;
+
+// Spill compute workgroup edge. CPU dispatch divides the spill extent by this;
+// the shader's [numthreads] uses the same value.
+static const uint SPILL_WG = 8;
 
 // March taps from each pixel toward the sun's screen position. Low (4); a
 // fixed half-step start-offset centres the first sample.
@@ -233,7 +241,7 @@ static const float GODRAY_SAMPLES = 4.0f;
 // Sunward falloff exponent. Higher tightens rays around sun.
 static const float GODRAY_GLOW_EXP = 6.0f;
 
-// Godray veil composite weight before tonemap sigmoid (after bloom).
+// Godray veil composite weight in the quarter-res spill (before tonemap sigmoid).
 static const float GODRAY_STRENGTH = 0.6f;
 
 // Max march length AND sunward falloff radius, in output uv (does double duty:

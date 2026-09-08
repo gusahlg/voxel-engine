@@ -28,6 +28,18 @@ float luma709(float3 c)
     return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
 
+// Remap output x-coord to source uv, compressing wide periphery. Horizontal only.
+// Shared by the quarter-res spill pass (source uv for bloom/depth taps) and the
+// tonemap HDR sample; tonemap then reads the spill at the UNwarped output uv.
+float2 warpSampleUv(float2 uv, float s, float atan_s)
+{
+    if (s <= 0.0)
+        return uv;
+    float px = uv.x * 2.0 - 1.0;
+    float qx = tan(px * atan_s) / s;
+    return float2(qx * 0.5 + 0.5, uv.y);
+}
+
 // Cube-face unit normals indexed by the packed-vertex `normal` field
 // (mesh.rs: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z). Shared so the fragment looks
 // the face up instead of interpolating a float3 varying.

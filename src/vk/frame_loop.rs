@@ -94,6 +94,28 @@ fn shadow_key(
     )
 }
 
+/// Project the sun to presented uv for the spill-pass godray march.
+fn project_godray(r: &Renderer, lists: &DrawLists) -> crate::camera::Godray {
+    match lists.scene.as_ref() {
+        Some(scene) => {
+            let u = scene.frame_uniforms;
+            crate::camera::Godray::project(
+                r.flags.godrays,
+                glam::Vec3::new(u.sun_dir_elev[0], u.sun_dir_elev[1], u.sun_dir_elev[2]),
+                [u.light[0], u.light[1], u.light[2]],
+                &scene.camera,
+                r.size.width as f32,
+                r.size.height as f32,
+                [
+                    scene.jitter.0.x / r.render_extent.width as f32,
+                    scene.jitter.0.y / r.render_extent.height as f32,
+                ],
+            )
+        }
+        None => crate::camera::Godray::OFF,
+    }
+}
+
 /// Get frame's sun direction, defaulting to up if absent.
 fn sun_dir(lists: &DrawLists) -> glam::DVec3 {
     lists
@@ -214,9 +236,28 @@ impl Renderer {
             }
             self.ubo_ring.write(FrameSlot::new(slot), &u);
         }
+        let warp_map = lists
+            .scene
+            .as_ref()
+            .map_or(crate::camera::WarpMap::Identity, |s| s.warp_map);
+        // Project the sun to presented uv for the spill-pass godray march.
+        // Computed here (not in the copy submit) so it rides the same camera +
+        // frame-uniform snapshot the scene was drawn from — and so the bloom
+        // chain (same submit as the spill dispatch) sees the same values.
+        // `project` returns a strength-0 no-op when godrays are off, the sun
+        // is behind the camera, or there is no 3D camera this frame.
+        let godray = project_godray(self, lists);
+        let spill_live = self.flags.bloom || godray.strength > 0.0;
         let (rs, hdr_readable) = {
             let _p = scope(Meter::Record);
-            self.record_render(&guard, lists, offsets, present_target.is_some())
+            self.record_render(
+                &guard,
+                lists,
+                offsets,
+                present_target.is_some(),
+                warp_map,
+                godray,
+            )
         };
 
         {
@@ -234,48 +275,13 @@ impl Renderer {
                 d2_tex_offset: offsets.d2_tex,
                 d2_tex_count: lists.tex_verts_2d.len() as u32,
             };
-            // Project the sun to presented uv for the tonemap godray march.
-            // Computed here (not in the copy submit) so it rides the same camera +
-            // frame-uniform snapshot the scene was drawn from. `project` returns a
-            // strength-0 no-op when godrays are off, the sun is behind the camera,
-            // or there is no 3D camera this frame.
-            let godray = match lists.scene.as_ref() {
-                Some(scene) => {
-                    let cam = scene.camera;
-                    let u = scene.frame_uniforms;
-                    let (sun_dir, tint) = (
-                        glam::Vec3::new(u.sun_dir_elev[0], u.sun_dir_elev[1], u.sun_dir_elev[2]),
-                        [u.light[0], u.light[1], u.light[2]],
-                    );
-                    crate::camera::Godray::project(
-                        // The tonemap shader samples single-sample depth; under
-                        // MSAA that is the resolve target (`sampleable_depth`), so
-                        // godrays are gated only on the feature flag now.
-                        self.flags.godrays,
-                        sun_dir,
-                        tint,
-                        &cam,
-                        self.size.width as f32,
-                        self.size.height as f32,
-                        [
-                            scene.jitter.0.x / self.render_extent.width as f32,
-                            scene.jitter.0.y / self.render_extent.height as f32,
-                        ],
-                    )
-                }
-                None => crate::camera::Godray::OFF,
-            };
-            let warp_map = lists
-                .scene
-                .as_ref()
-                .map_or(crate::camera::WarpMap::Identity, |s| s.warp_map);
             self.present(
                 slot,
                 present_target,
                 warp_map,
                 overlay,
                 hdr_readable,
-                godray,
+                spill_live,
             );
         }
         if self.vsync.current() {
@@ -339,15 +345,13 @@ impl Renderer {
     /// Src is the attachment-write scope (depth tests, or COLOR_ATTACHMENT_OUTPUT
     /// for the MSAA SAMPLE_ZERO resolve). Dst covers every consumer that samples
     /// it without a further transition: VRS compute, TAA compute, and the
-    /// tonemap present-copy fragment (godrays).
+    /// quarter-res spill compute (godrays).
     pub(super) fn sampleable_depth_rest_barrier(&self, slot: usize) -> vk::ImageMemoryBarrier2<'_> {
         let (src_layout, src_stage, src_access) = self.sampleable_depth_attachment_state();
         vk::ImageMemoryBarrier2::default()
             .src_stage_mask(src_stage)
             .src_access_mask(src_access)
-            .dst_stage_mask(
-                vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            )
+            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
             .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
             .old_layout(src_layout)
             .new_layout(SAMPLEABLE_DEPTH_REST_LAYOUT)
@@ -828,6 +832,8 @@ impl Renderer {
         lists: &DrawLists,
         offsets: ImmOffsets,
         will_present: bool,
+        warp_map: crate::camera::WarpMap,
+        godray: crate::camera::Godray,
     ) -> (RenderSubmit, HdrReadable) {
         let slot = guard.0;
         let cmd = self.slots[FrameSlot::new(slot)].cmd;
@@ -1173,15 +1179,16 @@ impl Renderer {
                 HdrReadable::new(slot)
             }
         };
-        // Bloom: threshold + downsample the finalized HDR into this slot's
-        // mip chain; the tonemap present-copy composites it. Present-only — a
-        // dropped mailbox frame never samples the pyramid. Forced capture always
-        // presents, so it always gets a fresh chain.
+        // Bloom pyramid + quarter-res spill (bloom composite + godrays). The
+        // tonemap present-copy takes one bilinear tap of the spill. Present-only
+        // — a dropped mailbox frame never samples either image. Forced capture
+        // always presents, so it always gets a fresh chain. The GPU timer's
+        // `Bloom` span covers this whole tail (pyramid + spill).
         if will_present {
-            self.record_bloom_pass(cmd, FrameSlot::new(slot));
+            self.record_bloom_pass(cmd, FrameSlot::new(slot), warp_map, godray);
         }
-        // Close the tail: without this stamp the bloom work recorded above
-        // ends after the last boundary and never reaches the report. (The
+        // Close the tail: without this stamp the bloom/spill work recorded
+        // above ends after the last boundary and never reaches the report. (The
         // tonemap/present copy is timed on the copy command buffer; see
         // `submit_present_copy`.)
         if profiling {

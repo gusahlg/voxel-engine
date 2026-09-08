@@ -1,7 +1,7 @@
 // bloom.comp.slang — HDR bloom threshold + downsample pyramid.
 //
-// Two entry points; the pyramid is capped at BLOOM_MAX_MIPS (tonemap samples
-// only BLOOM_SPIRAL_LOD, so threshold + that many-minus-one downsamples):
+// Two entry points; the pyramid is capped at BLOOM_MAX_MIPS (the spill pass
+// samples only BLOOM_SPIRAL_LOD, so threshold + that many-minus-one downsamples):
 //   * threshold: bilinear-downsamples the full-res HDR offscreen to the half-res
 //     mip 0 and keeps only the bright spill via a smoothstep soft knee on exposed
 //     luma. One bilinear tap doubles as the 2×2 average.

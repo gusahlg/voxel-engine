@@ -28,6 +28,15 @@ const _: () = assert!(crate::genconst::SHADOW_RESOLUTION == SHADOW_RESOLUTION as
 /// Exactly two cascades (mirrors `skeleton::Cascade`), so exactly two layers.
 pub const SHADOW_CASCADES: u32 = 2;
 
+/// Quarter-res spill extent (1/`SPILL_FACTOR` of the render extent, floored to 1).
+pub(crate) fn spill_extent(render: vk::Extent2D) -> vk::Extent2D {
+    let f = crate::genconst::SPILL_FACTOR;
+    vk::Extent2D {
+        width: render.width.div_ceil(f).max(1),
+        height: render.height.div_ceil(f).max(1),
+    }
+}
+
 /// The cascaded shadow map: one D32 image with two array layers (one per
 /// [`crate::skeleton::Cascade`]), each `SHADOW_RESOLUTION²`. `layer_views` are
 /// per-cascade single-layer depth attachments the producer renders into;
@@ -170,7 +179,7 @@ impl ShadowMap {
 }
 
 /// Bloom mip chain (half-res HDR pyramid): compute threshold and downsample
-/// passes feed the tonemap composite. Per-slot to avoid races between frames.
+/// passes feed the quarter-res spill composite. Per-slot to avoid races between frames.
 pub(crate) struct BloomChain {
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
@@ -182,7 +191,7 @@ pub(crate) struct BloomChain {
     pub cleared: bool,
 }
 
-/// Tonemap samples only `BLOOM_SPIRAL_LOD`, so the pyramid stops there.
+/// The spill pass samples only `BLOOM_SPIRAL_LOD`, so the pyramid stops there.
 const BLOOM_MAX_MIPS: u32 = crate::genconst::BLOOM_MAX_MIPS;
 const _: () = assert!(BLOOM_MAX_MIPS == crate::genconst::BLOOM_SPIRAL_LOD as u32 + 1);
 
@@ -213,7 +222,7 @@ impl BloomChain {
 
         // RGBA16F is a mandatory storage-image + sampled + linear-filter format,
         // so the pyramid needs no capability query. STORAGE for the compute
-        // read/write, SAMPLED for the tonemap composite.
+        // read/write, SAMPLED for the spill-pass composite.
         let image = unsafe {
             device
                 .create_image(
@@ -230,8 +239,8 @@ impl BloomChain {
                         .samples(vk::SampleCountFlags::TYPE_1)
                         .tiling(vk::ImageTiling::OPTIMAL)
                         // TRANSFER_DST: when the bloom lane is off, the pass clears
-                        // this to black instead of generating it, so the tonemap
-                        // composite is a no-op with no shader/push-constant branch.
+                        // this to black instead of generating it, so the spill
+                        // bloom term is a no-op with no extra descriptor branch.
                         .usage(
                             vk::ImageUsageFlags::STORAGE
                                 | vk::ImageUsageFlags::SAMPLED
@@ -337,6 +346,11 @@ pub struct RenderTargets {
     /// Per-slot bloom mip chain. Extent-dependent, so recreated with the
     /// rest of the targets on resize.
     pub(crate) bloom: [BloomChain; FRAMES_IN_FLIGHT as usize],
+    /// Per-slot quarter-res RGBA16F spill (bloom composite + godrays). Written
+    /// by compute on presented frames, sampled by the tonemap fragment. Recreated
+    /// with the targets; new images begin UNDEFINED. One image per FIF slot so
+    /// the in-flight present copy of the other slot can still sample its own.
+    pub(crate) spill: [ImageResource; FRAMES_IN_FLIGHT as usize],
     /// Per-slot octahedral cloud LUT (RGBA16F). Size is a genconst, independent
     /// of the swapchain; still owned here so resize tears it down with everything else.
     pub(crate) sky_cloud: [ImageResource; FRAMES_IN_FLIGHT as usize],
@@ -436,6 +450,22 @@ impl RenderTargets {
         let shadow = ShadowMap::new(device, &memory_props);
 
         let bloom = std::array::from_fn(|_| BloomChain::new(device, &memory_props, extent));
+        let spill_extent = spill_extent(extent);
+        let spill = std::array::from_fn(|_| {
+            ImageResource::create(
+                device,
+                &memory_props,
+                &ImageDesc {
+                    extent: spill_extent,
+                    format: HDR_COLOR_FORMAT,
+                    // STORAGE: spill compute write. SAMPLED: tonemap bilinear tap.
+                    usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+                    layers: 1,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                },
+            )
+        });
         let lut = crate::genconst::SKY_CLOUD_LUT_SIZE;
         let sky_cloud = std::array::from_fn(|_| {
             ImageResource::create(
@@ -468,11 +498,12 @@ impl RenderTargets {
             vrs,
             shadow,
             bloom,
+            spill,
             sky_cloud,
         }
     }
 
-    /// The single-sample depth VRS/TAA/godrays sample: the MSAA resolve target
+    /// The single-sample depth VRS/TAA/spill-godrays sample: the MSAA resolve target
     /// when multisampled, else the (already single-sample) `depth`. After the
     /// scene pass this image rests in [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`];
     /// during the pass its write scope is [`super::sampleable_depth_attachment_state`].
@@ -502,6 +533,9 @@ impl RenderTargets {
             self.shadow.destroy(device);
             for chain in &self.bloom {
                 chain.destroy(device);
+            }
+            for spill in &self.spill {
+                spill.destroy(device);
             }
             for lut in &self.sky_cloud {
                 lut.destroy(device);

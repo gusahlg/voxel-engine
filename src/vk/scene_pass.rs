@@ -179,9 +179,9 @@ impl<'a> RenderPass<'a> {
 
             // Reversed-Z: clear depth to 0.0, GREATER_OR_EQUAL test. Single-
             // sampled: store the depth so the end-of-frame classify (and
-            // TAA/godrays) can sample it after it rests in SAMPLEABLE_DEPTH_REST_LAYOUT.
+            // TAA/spill-godrays) can sample it after it rests in SAMPLEABLE_DEPTH_REST_LAYOUT.
             // MSAA: DONT_CARE the MS store — its single-sample SAMPLE_ZERO
-            // resolve into `resolved_depth` is what feeds VRS/TAA/godrays.
+            // resolve into `resolved_depth` is what feeds VRS/TAA/spill.
             let depth_store = if r.targets.msaa.is_some() {
                 vk::AttachmentStoreOp::DONT_CARE
             } else {

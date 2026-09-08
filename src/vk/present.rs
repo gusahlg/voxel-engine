@@ -10,7 +10,7 @@ use super::alloc;
 use super::image_upload;
 use super::render_client::Capture;
 use super::timeline::{RenderCompletion, queue_present};
-use super::{Env, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, color_range};
+use super::{Env, Renderer, color_range};
 
 /// Witness that HDR image is ready for present.
 #[must_use = "the offscreen HDR must be finalized to SHADER_READ before present"]
@@ -58,12 +58,12 @@ impl Renderer {
         warp_map: crate::camera::WarpMap,
         overlay: OverlayPresent,
         hdr_readable: HdrReadable,
-        godray: crate::camera::Godray,
+        spill_live: bool,
     ) {
         // The proof must be for the slot we are about to sample.
         debug_assert_eq!(hdr_readable.slot, slot, "HdrReadable slot mismatch");
         if let Some(image_index) = present_target {
-            unsafe { self.submit_present_copy(slot, image_index, warp_map, overlay, godray) };
+            unsafe { self.submit_present_copy(slot, image_index, warp_map, overlay, spill_live) };
             self.last_present = std::time::Instant::now();
         }
     }
@@ -148,12 +148,14 @@ impl Renderer {
         image_index: u32,
         warp_map: crate::camera::WarpMap,
         overlay: OverlayPresent,
-        godray: crate::camera::Godray,
+        spill_live: bool,
     ) {
         // A pending capture piggybacks on this copy: after the tonemap draw,
         // the swapchain image is read back into `readback` instead of going
-        // straight to PRESENT. Allocate the host buffer before borrowing
-        // `device` so the read-back path adds no &mut-self conflicts below.
+        // straight to PRESENT. The quarter-res spill is an intermediate the
+        // tonemap samples — never a capture source. Allocate the host buffer
+        // before borrowing `device` so the read-back path adds no &mut-self
+        // conflicts below.
         let capture = self.pending_capture.take();
         let extent = self.swapchain.extent;
         let readback = capture.as_ref().map(|_| unsafe {
@@ -177,7 +179,7 @@ impl Renderer {
             crate::skeleton::Exposure::DEFAULT.0
         };
         let vignette = if self.flags.vignette { 1.0 } else { 0.0 };
-        let tonemap_push = warp_map.push(exposure, godray, vignette);
+        let tonemap_push = warp_map.push(exposure, vignette);
         unsafe {
             device
                 .reset_command_buffer(self.copy_cmd, vk::CommandBufferResetFlags::empty())
@@ -211,13 +213,6 @@ impl Renderer {
                 self.copy_cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&to_color),
             );
-
-            // Sampleable depth already rests in SAMPLEABLE_DEPTH_REST_LAYOUT
-            // from RenderPass::end; the render→present semaphore is the
-            // execution dependency. Under MSAA this is the single-sample
-            // resolve target; the MS `depth` is never touched here. Always
-            // bound: the tonemap layout declares the depth sampler even when
-            // godrays are off (strength 0).
 
             let color_attachment = [vk::RenderingAttachmentInfo::default()
                 .image_view(swap_view)
@@ -271,30 +266,24 @@ impl Renderer {
                 self.pipelines.tonemap_sampler,
                 hdr_view,
             );
-            // Binding 1: the bloom pyramid (built in the render submit, made
-            // visible here by the render→present semaphore) with its mip-filtered
-            // composite sampler, for the golden-spiral spill in tonemap.frag.
-            let bloom_info = [vk::DescriptorImageInfo::default()
-                .sampler(self.bloom.composite_sampler())
-                .image_view(self.targets.bloom[slot].sample_view)
+            // Binding 1: quarter-res spill (bloom composite + godrays), built
+            // in the render submit and made visible here by the render→present
+            // semaphore. When bloom and godrays are both off the spill dispatch
+            // is skipped and this is a 1×1 black image (tonemap stays a single
+            // HDR fetch plus a cached 1×1 add of zero).
+            let spill_view = if spill_live {
+                self.targets.spill[slot].view()
+            } else {
+                self.bloom.black_view()
+            };
+            let spill_info = [vk::DescriptorImageInfo::default()
+                .sampler(self.pipelines.tonemap_sampler)
+                .image_view(spill_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            // Binding 2: single-sample scene depth for the godray sky mask —
-            // the MSAA resolve target when multisampled, the depth buffer else.
-            let depth_view = self.targets.sampleable_depth(slot).view();
-            let depth_info = [vk::DescriptorImageInfo::default()
-                .sampler(self.pipelines.tonemap_depth_sampler)
-                .image_view(depth_view)
-                .image_layout(SAMPLEABLE_DEPTH_REST_LAYOUT)];
-            let post_writes = [
-                vk::WriteDescriptorSet::default()
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&bloom_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_binding(2)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&depth_info),
-            ];
+            let post_writes = [vk::WriteDescriptorSet::default()
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&spill_info)];
             self.device.push_descriptor.cmd_push_descriptor_set(
                 self.copy_cmd,
                 vk::PipelineBindPoint::GRAPHICS,

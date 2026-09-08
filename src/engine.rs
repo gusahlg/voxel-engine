@@ -81,10 +81,12 @@ pub struct RenderFlags {
     pub sunlight: bool,
     /// Auto-exposure metering; off pins exposure at 1.0.
     pub exposure: bool,
-    /// HDR bloom (threshold + downsample compute → tonemap composite). Off skips
-    /// the dispatch and clears the bloom target so the tonemap add is a no-op.
+    /// HDR bloom (threshold + downsample compute → quarter-res spill). Off skips
+    /// the pyramid dispatch and clears the bloom target so the spill bloom term
+    /// is zero; with godrays also off the spill dispatch is skipped entirely.
     pub bloom: bool,
-    /// Screen-space godrays: volumetric sun rays in tonemap. Off disables them.
+    /// Screen-space godrays: volumetric sun rays in the quarter-res spill pass.
+    /// Off zeroes that term; with bloom also off the spill dispatch is skipped.
     pub godrays: bool,
     /// Cascade occluder draws + far-field fallback; off is fully lit.
     pub shadows: bool,
