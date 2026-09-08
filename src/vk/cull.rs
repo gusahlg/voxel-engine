@@ -1,6 +1,7 @@
 //! GPU draw-command emission: cull compute shader + indirect-count.
 //! One dispatch per frame frustum-tests each mesh and appends commands
-//! per-(pass, arena) partition. Blend uses CPU path; immediates untouched.
+//! per-(pass, arena, distance-bucket) for camera groups and per-(cascade, arena)
+//! for shadows. Blend uses CPU path; immediates untouched.
 
 use std::num::NonZeroU32;
 
@@ -13,13 +14,55 @@ use crate::camera::Frustum;
 use crate::mesh::Pass;
 
 const SLOTS: usize = FRAMES_IN_FLIGHT as usize;
-/// Number of emission groups (Opaque, Cutout, Shadow).
-pub(crate) const GROUPS: usize = 3;
+/// Emission groups: Opaque, Cutout, ShadowNear, ShadowFar.
+pub(crate) const GROUPS: usize = 4;
+pub(crate) const CAMERA_GROUPS: usize = 2;
+pub(crate) const SHADOW_GROUPS: usize = 2;
+/// Front-to-back buckets on camera groups only (shadows stay unbucketed).
+pub(crate) const BUCKETS: usize = crate::genconst::CULL_DISTANCE_BUCKETS as usize;
 /// Size of VkDrawIndexedIndirectCommand.
 pub(crate) const CMD_STRIDE: u64 = 20;
 const WORKGROUP: u32 = crate::genconst::CULL_WORKGROUP;
 
 static CULL_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cull.comp.spv"));
+static CULL_COMP_WAVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cull_wave.comp.spv"));
+
+const _: () = assert!(crate::genconst::CULL_DISTANCE_BUCKETS == 4);
+const _: () = assert!(GROUPS == CAMERA_GROUPS + SHADOW_GROUPS);
+
+/// Camera-distance bucket of an AABB centre, matching `cull.comp.slang`.
+#[cfg(test)]
+fn distance_bucket(dist: f32) -> u32 {
+    let mut b = 0u32;
+    if dist >= crate::genconst::CULL_BUCKET_SPLIT_0 {
+        b = 1;
+    }
+    if dist >= crate::genconst::CULL_BUCKET_SPLIT_1 {
+        b = 2;
+    }
+    if dist >= crate::genconst::CULL_BUCKET_SPLIT_2 {
+        b = 3;
+    }
+    b.min(crate::genconst::CULL_DISTANCE_BUCKETS - 1)
+}
+
+/// Partition index for a camera (pass, arena, bucket) triple.
+pub(crate) fn camera_part(group: usize, arena: usize, bucket: usize, arena_count: usize) -> usize {
+    debug_assert!(group < CAMERA_GROUPS);
+    debug_assert!(bucket < BUCKETS);
+    (group * arena_count + arena) * BUCKETS + bucket
+}
+
+/// Partition index for a shadow (cascade, arena) pair. Cascades are unbucketed.
+pub(crate) fn shadow_part(cascade: usize, arena: usize, arena_count: usize) -> usize {
+    debug_assert!(cascade < SHADOW_GROUPS);
+    CAMERA_GROUPS * arena_count * BUCKETS + cascade * arena_count + arena
+}
+
+/// Partition table length for `arena_count` live arena rows.
+pub(crate) fn partition_count(arena_count: usize) -> usize {
+    arena_count * (CAMERA_GROUPS * BUCKETS + SHADOW_GROUPS)
+}
 
 /// GPU Partition struct.
 #[repr(C)]
@@ -151,16 +194,28 @@ impl ArenaDirectory {
         self.buffers.len()
     }
 
-    /// Get group-major partition table (group, arena pairs).
+    /// Group-major partition table.
+    ///
+    /// Camera groups (Opaque, Cutout) emit K distance buckets per arena, each
+    /// sized to the full live count (worst case: every mesh lands in one
+    /// bucket). Shadow groups (Near, Far) are unbucketed and reuse the Opaque
+    /// live count — a caster may land in both cascades.
     fn partitions(&self) -> (Vec<PartitionGpu>, u32) {
         let a = self.live.len();
-        let mut parts = Vec::with_capacity(GROUPS * a);
+        let mut parts = Vec::with_capacity(partition_count(a));
         let mut offset = 0u32;
-        for group in 0..GROUPS {
-            // Shadow (group 2) reuses Opaque lane (group 0).
-            let lane = if group == 2 { 0 } else { group };
+        for group in 0..CAMERA_GROUPS {
             for arena in 0..a {
-                let capacity = self.live[arena][lane];
+                let capacity = self.live[arena][group];
+                for _bucket in 0..BUCKETS {
+                    parts.push(PartitionGpu { offset, capacity });
+                    offset += capacity;
+                }
+            }
+        }
+        for _cascade in 0..SHADOW_GROUPS {
+            for arena in 0..a {
+                let capacity = self.live[arena][0];
                 parts.push(PartitionGpu { offset, capacity });
                 offset += capacity;
             }
@@ -280,7 +335,7 @@ pub(crate) struct CullState {
 }
 
 impl CullState {
-    pub fn new(device: &ash::Device, cache: vk::PipelineCache) -> Self {
+    pub fn new(device: &ash::Device, cache: vk::PipelineCache, wave_atomics: bool) -> Self {
         // Bindings match cull.comp.slang.
         let storage = |binding: u32| {
             vk::DescriptorSetLayoutBinding::default()
@@ -321,7 +376,18 @@ impl CullState {
                 )
                 .expect("create cull pipeline layout")
         };
-        let pipeline = pass::compute_pipeline(device, cache, layout, CULL_COMP, "cull");
+        let bytes = if wave_atomics {
+            CULL_COMP_WAVE
+        } else {
+            CULL_COMP
+        };
+        let pipeline = pass::compute_pipeline(
+            device,
+            cache,
+            layout,
+            bytes,
+            if wave_atomics { "cull-wave" } else { "cull" },
+        );
         Self {
             set_layout,
             layout,
@@ -540,30 +606,39 @@ mod tests {
         assert_eq!(arena, 0);
         assert_eq!(dir.arena_count(), 1);
         let (parts, total) = dir.partitions();
-        // GROUPS * arenas = 3 * 1 partitions: [Opaque(a0), Cutout(a0), Shadow(a0)].
-        assert_eq!(parts.len(), GROUPS);
+        // 2 camera groups * K buckets + 2 shadow groups, one arena.
+        assert_eq!(parts.len(), partition_count(1));
+        for bucket in 0..BUCKETS {
+            assert_eq!(
+                parts[camera_part(0, 0, bucket, 1)],
+                PartitionGpu {
+                    offset: bucket as u32,
+                    capacity: 1
+                }
+            );
+            assert_eq!(
+                parts[camera_part(1, 0, bucket, 1)].capacity,
+                0,
+                "cutout buckets stay empty"
+            );
+        }
+        // Shadow Near/Far reuse Opaque's live count, unbucketed.
         assert_eq!(
-            parts[0],
+            parts[shadow_part(0, 0, 1)],
             PartitionGpu {
-                offset: 0,
+                offset: BUCKETS as u32,
                 capacity: 1
             }
-        ); // Opaque
+        );
         assert_eq!(
-            parts[1],
+            parts[shadow_part(1, 0, 1)],
             PartitionGpu {
-                offset: 1,
-                capacity: 0
-            }
-        ); // Cutout
-        assert_eq!(
-            parts[2],
-            PartitionGpu {
-                offset: 1,
+                offset: BUCKETS as u32 + 1,
                 capacity: 1
             }
-        ); // Shadow reuses Opaque's count
-        assert_eq!(total, 2);
+        );
+        // K camera slots + 2 shadow slots.
+        assert_eq!(total, BUCKETS as u32 + 2);
     }
 
     #[test]
@@ -585,51 +660,29 @@ mod tests {
         dir.note_upload(2, G1, buf(2), Pass::Cutout); // arena 1: 1 cutout
         assert_eq!(dir.arena_count(), 2);
         let (parts, total) = dir.partitions();
-        // Group-major: [Opaque(a0), Opaque(a1), Cutout(a0), Cutout(a1), Shadow(a0), Shadow(a1)].
-        assert_eq!(parts.len(), GROUPS * 2);
-        assert_eq!(
-            parts[0],
-            PartitionGpu {
-                offset: 0,
-                capacity: 2
-            }
-        ); // Opaque a0
-        assert_eq!(
-            parts[1],
-            PartitionGpu {
-                offset: 2,
-                capacity: 0
-            }
-        ); // Opaque a1
-        assert_eq!(
-            parts[2],
-            PartitionGpu {
-                offset: 2,
-                capacity: 0
-            }
-        ); // Cutout a0
-        assert_eq!(
-            parts[3],
-            PartitionGpu {
-                offset: 2,
-                capacity: 1
-            }
-        ); // Cutout a1
-        assert_eq!(
-            parts[4],
-            PartitionGpu {
-                offset: 3,
-                capacity: 2
-            }
-        ); // Shadow a0 (= Opaque a0)
-        assert_eq!(
-            parts[5],
-            PartitionGpu {
-                offset: 5,
-                capacity: 0
-            }
-        ); // Shadow a1 (= Opaque a1)
-        assert_eq!(total, 5);
+        assert_eq!(parts.len(), partition_count(2));
+        // Opaque a0: K buckets, each capacity 2, offsets 0,2,4,6.
+        for bucket in 0..BUCKETS {
+            let p = parts[camera_part(0, 0, bucket, 2)];
+            assert_eq!(p.capacity, 2);
+            assert_eq!(p.offset, (bucket * 2) as u32);
+        }
+        // Opaque a1: empty.
+        for bucket in 0..BUCKETS {
+            assert_eq!(parts[camera_part(0, 1, bucket, 2)].capacity, 0);
+        }
+        // Cutout a0 empty, a1 capacity 1 across K buckets.
+        for bucket in 0..BUCKETS {
+            assert_eq!(parts[camera_part(1, 0, bucket, 2)].capacity, 0);
+            assert_eq!(parts[camera_part(1, 1, bucket, 2)].capacity, 1);
+        }
+        // Shadows unbucketed, reuse Opaque live counts (a0=2, a1=0).
+        assert_eq!(parts[shadow_part(0, 0, 2)].capacity, 2);
+        assert_eq!(parts[shadow_part(0, 1, 2)].capacity, 0);
+        assert_eq!(parts[shadow_part(1, 0, 2)].capacity, 2);
+        assert_eq!(parts[shadow_part(1, 1, 2)].capacity, 0);
+        // Opaque: K*2, Cutout: K*1, ShadowNear: 2, ShadowFar: 2.
+        assert_eq!(total, (BUCKETS * 2 + BUCKETS + 2 + 2) as u32);
     }
 
     #[test]
@@ -639,8 +692,9 @@ mod tests {
         dir.note_upload(1, G1, buf(1), Pass::Opaque);
         dir.note_free(0, G1);
         let (parts, total) = dir.partitions();
-        assert_eq!(parts[0].capacity, 1);
-        assert_eq!(total, 2); // shadow lane still sized off the pre-free arena count math
+        assert_eq!(parts[camera_part(0, 0, 0, 1)].capacity, 1);
+        // K camera slots + 2 shadow slots, each sized off the remaining live count.
+        assert_eq!(total, BUCKETS as u32 + 2);
     }
 
     #[test]
@@ -665,8 +719,8 @@ mod tests {
         assert_eq!(arena, 0);
         assert_eq!(dir.arena_count(), 1);
         let (parts, _) = dir.partitions();
-        assert_eq!(parts[0].capacity, 1); // Opaque
-        assert_eq!(parts[1].capacity, 1); // Cutout
+        assert_eq!(parts[camera_part(0, 0, 0, 1)].capacity, 1); // Opaque
+        assert_eq!(parts[camera_part(1, 0, 0, 1)].capacity, 1); // Cutout
     }
 
     #[test]
@@ -680,8 +734,15 @@ mod tests {
         dir.note_upload(0, genr(2), buf(2), Pass::Cutout); // reused, new generation
         dir.note_free(0, genr(1)); // stale duplicate: must be ignored
         let (parts, total) = dir.partitions();
-        assert_eq!(parts[1].capacity, 1, "Cutout slot must still be live");
-        assert_eq!(total, 1, "stale free must not have drained the reused slot");
+        assert_eq!(
+            parts[camera_part(1, 0, 0, 1)].capacity,
+            1,
+            "Cutout slot must still be live"
+        );
+        assert_eq!(
+            total, BUCKETS as u32,
+            "stale free must not have drained the reused slot"
+        );
     }
 
     #[test]
@@ -689,5 +750,46 @@ mod tests {
         assert_eq!(group_lane(Pass::Opaque), Some(0));
         assert_eq!(group_lane(Pass::Cutout), Some(1));
         assert_eq!(group_lane(Pass::Blend), None);
+    }
+
+    #[test]
+    fn distance_bucket_splits_match_genconst_edges() {
+        assert_eq!(distance_bucket(0.0), 0);
+        assert_eq!(
+            distance_bucket(crate::genconst::CULL_BUCKET_SPLIT_0 - 0.01),
+            0
+        );
+        assert_eq!(distance_bucket(crate::genconst::CULL_BUCKET_SPLIT_0), 1);
+        assert_eq!(
+            distance_bucket(crate::genconst::CULL_BUCKET_SPLIT_1 - 0.01),
+            1
+        );
+        assert_eq!(distance_bucket(crate::genconst::CULL_BUCKET_SPLIT_1), 2);
+        assert_eq!(
+            distance_bucket(crate::genconst::CULL_BUCKET_SPLIT_2 - 0.01),
+            2
+        );
+        assert_eq!(distance_bucket(crate::genconst::CULL_BUCKET_SPLIT_2), 3);
+        assert_eq!(distance_bucket(1.0e6), 3);
+    }
+
+    #[test]
+    fn camera_buckets_are_k_wide_shadows_are_unbucketed() {
+        let mut dir = ArenaDirectory::new();
+        dir.note_upload(0, G1, buf(1), Pass::Opaque);
+        let (parts, _) = dir.partitions();
+        assert_eq!(GROUPS, 4, "Opaque, Cutout, ShadowNear, ShadowFar");
+        assert_eq!(parts.len(), CAMERA_GROUPS * BUCKETS + SHADOW_GROUPS);
+        // Adjacent camera buckets of the same arena share capacity but not offset.
+        let b0 = parts[camera_part(0, 0, 0, 1)];
+        let b1 = parts[camera_part(0, 0, 1, 1)];
+        assert_eq!(b0.capacity, b1.capacity);
+        assert_eq!(b1.offset, b0.offset + b0.capacity);
+        // Shadow groups occupy one partition per arena, not K.
+        assert_eq!(
+            shadow_part(1, 0, 1) - shadow_part(0, 0, 1),
+            1,
+            "cascades are adjacent unbucketed partitions"
+        );
     }
 }

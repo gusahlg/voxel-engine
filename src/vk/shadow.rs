@@ -7,6 +7,34 @@
 //! receiver's PCF samples (populated here, sampled in mesh3d.frag by the
 //! Frame-lighting agent). The receiver-side PCF / SHADOW_LIMIT fade lives THERE,
 //! not here.
+//!
+//! # Shared-image hazard analysis
+//!
+//! The depth image is **one** map sampled by both frames in flight, not a
+//! per-slot pair. That stops the previous "key change marks every slot dirty"
+//! double regenerate, where each FIF slot re-drew the same casters.
+//!
+//! - **WAR (write after other-slot sample).** Frame N samples the map in
+//!   `FRAGMENT_SHADER`. Frame N+1, on a miss, rewrites it as a depth
+//!   attachment. Before that write, the producer host-waits the previous
+//!   render's timeline value (`last_render_value`, the other FIF slot). Cache
+//!   hits skip the wait: concurrent `SHADER_READ_ONLY` sampling is legal.
+//! - **RAW (sample after this-slot write).** Same command buffer: the producer
+//!   already barriers `DEPTH_ATTACHMENT` → `SHADER_READ_ONLY` before the color
+//!   pass samples.
+//! - **Layout.** A hit must not transition `UNDEFINED` (that would discard).
+//!   Hits skip the producer pass entirely, leaving `SHADER_READ_ONLY`.
+//!   Recreate / shadows-off invalidate and re-prime.
+//! - **Uniforms.** The cascade UBO stays per-slot (push-descriptor bind is
+//!   slot-indexed). A hit memcpy's the cached `CascadeUniformsGpu` so this
+//!   slot's UBO matches the shared depth without calling `fit()`.
+//! - **Cull.** `shadow_enabled` is 0 on a hit, so the dispatch skips caster
+//!   emission and invisible-slot AABB work. Cascade frusta are not fitted.
+//!
+//! Alternative considered: keep per-slot images and regenerate-only-this-slot.
+//! That still redraws the same key twice (once per slot as each is reused)
+//! unless the other slot samples this slot's image, which reintroduces the
+//! same WAR and needs the same timeline wait. One shared image is simpler.
 
 use ash::vk;
 use glam::{DVec3, Mat4};
@@ -155,36 +183,83 @@ impl ShadowKey {
     }
 }
 
-/// Dirty cache for shadow depth image (per-slot; entire cache invalidates on change).
+/// Dirty cache for the **shared** shadow depth image.
+///
+/// One generation is resident. A key change rebuilds once; the other FIF slot
+/// samples the same image instead of regenerating it.
 pub(crate) struct ShadowCache {
     /// Inputs of the currently-cached generation; `None` forces a render.
     key: Option<ShadowKey>,
-    dirty: [bool; SHADOW_CACHE_SLOTS],
+    /// Cascade UBO matching `key` (and the shadows-off lit-clear). Copied into
+    /// the recording slot's UBO on a hit so that path skips `fit()`.
+    uniforms: Option<CascadeUniformsGpu>,
+    /// Shared map holds the fully-lit shadows-off clear.
+    lit_ready: bool,
+    /// Producer must rewrite the shared map this frame.
+    pending_rebuild: bool,
 }
-
-const SHADOW_CACHE_SLOTS: usize = crate::vk::buffers::FRAMES_IN_FLIGHT as usize;
 
 impl ShadowCache {
     pub(crate) fn new() -> Self {
         Self {
             key: None,
-            dirty: [true; SHADOW_CACHE_SLOTS],
+            uniforms: None,
+            lit_ready: false,
+            pending_rebuild: true,
         }
     }
 
-    /// Mark all slots dirty (layout reset or shadows disabled).
+    /// Mark the shared map invalid (layout reset / target recreate).
     pub(crate) fn invalidate(&mut self) {
         self.key = None;
-        self.dirty = [true; SHADOW_CACHE_SLOTS];
+        self.uniforms = None;
+        self.lit_ready = false;
+        self.pending_rebuild = true;
     }
 
-    /// Check if this slot must re-render (key change re-arms all slots).
-    pub(crate) fn take_render(&mut self, slot: usize, cur: ShadowKey, cfg: &ShadowCfg) -> bool {
-        if self.key.is_none_or(|k| k.differs(&cur, cfg)) {
-            self.key = Some(cur);
-            self.dirty = [true; SHADOW_CACHE_SLOTS];
+    /// Decide this frame's producer/cull work.
+    ///
+    /// `cur = Some` when shadows are on: returns whether casters must be
+    /// emitted and the map rewritten. `cur = None` is the shadows-off path
+    /// (prime a fully-lit clear once, then skip).
+    pub(crate) fn prepare(&mut self, cur: Option<(ShadowKey, &ShadowCfg)>) -> bool {
+        match cur {
+            Some((cur, cfg)) => {
+                let rebuild = self.key.is_none_or(|k| k.differs(&cur, cfg));
+                if rebuild {
+                    self.key = Some(cur);
+                    self.uniforms = None;
+                }
+                self.lit_ready = false;
+                self.pending_rebuild = rebuild;
+                rebuild
+            }
+            None => {
+                self.key = None;
+                self.pending_rebuild = !self.lit_ready;
+                if self.pending_rebuild {
+                    self.uniforms = None;
+                }
+                self.pending_rebuild
+            }
         }
-        std::mem::take(&mut self.dirty[slot])
+    }
+
+    pub(crate) fn pending_rebuild(&self) -> bool {
+        self.pending_rebuild
+    }
+
+    pub(crate) fn store_uniforms(&mut self, u: CascadeUniformsGpu) {
+        self.uniforms = Some(u);
+    }
+
+    pub(crate) fn uniforms(&self) -> Option<&CascadeUniformsGpu> {
+        self.uniforms.as_ref()
+    }
+
+    pub(crate) fn mark_lit_ready(&mut self) {
+        self.lit_ready = true;
+        self.pending_rebuild = false;
     }
 }
 
@@ -260,7 +335,7 @@ impl ShadowPass {
     }
 }
 
-/// Build depth-only pipeline (no cull) for a given caster vertex layout.
+/// Build depth-only pipeline for a given caster vertex layout.
 fn build_depth_only_pipeline(
     device: &ash::Device,
     cache: vk::PipelineCache,
@@ -290,11 +365,14 @@ fn build_depth_only_pipeline(
     let dynamic_state =
         vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
+    // Viewport is y-down (no GL flip — sampling UVs must stay unmirrored).
+    // That reverses winding vs. the color pass, so CLOCKWISE restores world
+    // front faces as FRONT and BACK culling drops interior faces.
     let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
         .line_width(1.0)
-        .cull_mode(vk::CullModeFlags::NONE)
-        .front_face(vk::FrontFace::COUNTER_CLOCKWISE);
+        .cull_mode(vk::CullModeFlags::BACK)
+        .front_face(vk::FrontFace::CLOCKWISE);
 
     let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
@@ -417,7 +495,7 @@ impl Renderer {
         caster_verts: u32,
     ) {
         let device = &self.device.device;
-        let shadow = &self.targets.shadow[FrameSlot::new(slot)];
+        let shadow = &self.targets.shadow;
         let layout = self.pipelines.layout_3d;
 
         let full_range = vk::ImageSubresourceRange {
@@ -528,7 +606,7 @@ impl Renderer {
                         0,
                         bytemuck::bytes_of(&push),
                     );
-                    self.record_shadow_occluders(cmd);
+                    self.record_shadow_occluders(cmd, c);
                 }
                 if caster_verts > 0 {
                     // Avatar boxes: same eye-relative space as the cascade fit, so
@@ -576,7 +654,7 @@ impl Renderer {
         }
     }
 
-    unsafe fn record_shadow_occluders(&self, cmd: vk::CommandBuffer) {
+    unsafe fn record_shadow_occluders(&self, cmd: vk::CommandBuffer, cascade: Cascade) {
         let Some(frame) = &self.cull_frame else {
             return;
         };
@@ -586,7 +664,7 @@ impl Renderer {
             .bound()
             .expect("live records imply the quad IBO is allocated");
         unsafe { device.cmd_bind_index_buffer(cmd, quad_ibo, 0, vk::IndexType::UINT32) };
-        let base = 2 * frame.arena_count;
+        let base = cull::shadow_part(cascade as usize, 0, frame.arena_count);
         for arena in 0..frame.arena_count {
             let part = frame.partitions[base + arena];
             if part.capacity == 0 {
@@ -744,5 +822,48 @@ mod tests {
                 "{c:?}: tall occluder at {n:?} clipped"
             );
         }
+    }
+
+    fn test_key(occluders: u64, casters: u64) -> ShadowKey {
+        ShadowKey::of(
+            DVec3::new(10.0, 20.0, 30.0),
+            SUN,
+            occluders,
+            casters,
+            &ShadowCfg::PROVISIONAL,
+        )
+    }
+
+    #[test]
+    fn shared_cache_rebuilds_once_per_key() {
+        let mut cache = ShadowCache::new();
+        let cfg = ShadowCfg::PROVISIONAL;
+        let a = test_key(1, 0);
+        assert!(cache.prepare(Some((a, &cfg))), "first use must rebuild");
+        assert!(cache.pending_rebuild());
+        assert!(
+            !cache.prepare(Some((a, &cfg))),
+            "same key must not rebuild for the other FIF slot"
+        );
+        assert!(!cache.pending_rebuild());
+        let b = test_key(2, 0);
+        assert!(
+            cache.prepare(Some((b, &cfg))),
+            "occluder change rebuilds once"
+        );
+        assert!(
+            !cache.prepare(Some((b, &cfg))),
+            "second slot samples the shared image"
+        );
+    }
+
+    #[test]
+    fn shadows_off_primes_once() {
+        let mut cache = ShadowCache::new();
+        assert!(cache.prepare(None), "first off-path primes the lit clear");
+        cache.mark_lit_ready();
+        assert!(!cache.prepare(None), "later off-path frames skip");
+        cache.invalidate();
+        assert!(cache.prepare(None), "recreate re-primes");
     }
 }

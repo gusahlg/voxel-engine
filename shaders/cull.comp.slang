@@ -1,5 +1,6 @@
 // Emit indirect draw commands per frustum test: one thread per mesh slot.
-// Partition by (pass, arena); camera uses passes 0/1, shadow uses pass 2.
+// Camera partitions are (pass, arena, distance-bucket); shadows are per-cascade
+// and unbucketed (GROUPS: Opaque, Cutout, ShadowNear, ShadowFar).
 
 #include "common.slang"
 
@@ -82,12 +83,48 @@ bool outside_plane(float4 plane, float3 mn, float3 mx)
     return dot(plane.xyz, corner) + plane.w < 0.0;
 }
 
+// Near-to-far bucket of camera distance of the AABB centre. Splits are genconst.
+uint distance_bucket(float dist)
+{
+    uint b = 0;
+    if (dist >= CULL_BUCKET_SPLIT_0)
+        b = 1;
+    if (dist >= CULL_BUCKET_SPLIT_1)
+        b = 2;
+    if (dist >= CULL_BUCKET_SPLIT_2)
+        b = 3;
+    return min(b, CULL_DISTANCE_BUCKETS - 1u);
+}
+
 void emit(uint part, DrawCmd cmd)
 {
+#ifdef USE_WAVE_ATOMICS
+    // Compact-by-key: one InterlockedAdd per unique partition in the wave,
+    // then each lane writes at base + WavePrefixCountBits. Lanes that did not
+    // call emit() are inactive here, so the ballot is exactly the emitters.
+    while (true)
+    {
+        uint first = WaveReadLaneFirst(part);
+        if (part == first)
+        {
+            uint n = WaveActiveCountBits(true);
+            uint prefix = WavePrefixCountBits(true);
+            uint base = 0;
+            if (WaveIsFirstLane())
+                InterlockedAdd(counts[first], n, base);
+            base = WaveReadLaneFirst(base);
+            uint i = base + prefix;
+            if (i < partitions[first].capacity)
+                commands[partitions[first].offset + i] = cmd;
+            break;
+        }
+    }
+#else
     uint i;
     InterlockedAdd(counts[part], 1, i);
     if (i < partitions[part].capacity)
         commands[partitions[part].offset + i] = cmd;
+#endif
 }
 
 [shader("compute")]
@@ -99,10 +136,14 @@ void computeMain(uint3 id: SV_DispatchThreadID)
         return;
     uint word = slot_arena[slot];
     if (word == 0u)
-        return;
+        return; // dead slot
     bool cam_visible = (visible[slot >> 5] & (1u << (slot & 31u))) != 0u;
-    uint arena = word - 1u;
+    // Invisible slots cannot contribute a camera draw; skip their record load
+    // and frustum math unless this frame is actually regenerating shadows.
+    if (!cam_visible && params.shadow_enabled == 0u)
+        return;
 
+    uint arena = word - 1u;
     MeshRecord rec = records[slot];
     uint pass = (rec.detail_pass >> 4) & 3u;
     if (pass > 1u)
@@ -121,16 +162,26 @@ void computeMain(uint3 id: SV_DispatchThreadID)
     cmd.vertex_offset = rec.vertex_offset;
     cmd.first_instance = slot;
 
-    bool in_frustum = true;
-    [unroll]
-    for (int p = 0; p < 5; p++)
-        in_frustum = in_frustum && !outside_plane(params.cam_planes[p], mn, mx);
-    if (cam_visible && in_frustum)
-        emit(pass * params.arena_count + arena, cmd);
+    if (cam_visible)
+    {
+        bool in_frustum = true;
+        [unroll]
+        for (int p = 0; p < 5; p++)
+            in_frustum = in_frustum && !outside_plane(params.cam_planes[p], mn, mx);
+        if (in_frustum)
+        {
+            float dist = length(0.5 * (mn + mx));
+            uint bucket = distance_bucket(dist);
+            uint part = (pass * params.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
+            emit(part, cmd);
+        }
+    }
 
     // Shadow casters: full-res opaque only. Coarse LOD excluded (harsh self-shadows).
+    // Per-cascade partitions so the near cascade does not vertex-process far casters.
     if (pass == 0u && scale <= 1.0 && params.shadow_enabled != 0u)
     {
+        uint shadow_base = 2u * params.arena_count * CULL_DISTANCE_BUCKETS;
         [unroll]
         for (int c = 0; c < 2; c++)
         {
@@ -139,10 +190,7 @@ void computeMain(uint3 id: SV_DispatchThreadID)
             for (int p = 0; p < 5; p++)
                 cast = cast && !outside_plane(params.shadow_planes[c * 5 + p], mn, mx);
             if (cast)
-            {
-                emit(2u * params.arena_count + arena, cmd);
-                break;
-            }
+                emit(shadow_base + uint(c) * params.arena_count + arena, cmd);
         }
     }
 }

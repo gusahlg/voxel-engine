@@ -43,6 +43,7 @@ impl<T> PerSlot<T> {
     }
 
     /// Iterate both frames for lifecycle passes.
+    #[allow(dead_code)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
         self.0.iter()
     }

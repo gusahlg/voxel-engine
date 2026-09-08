@@ -177,6 +177,17 @@ fn main() {
         compile(slangc, &out_dir, fallback_dir, shader, &[]);
     }
 
+    // Wave-aggregated InterlockedAdd variant of the cull shader. Not in SHADERS:
+    // shaders_spv/ keeps the plain-atomic module (no subgroup caps) as the
+    // no-slangc fallback; this file lives only in OUT_DIR.
+    let cull_wave = Shader {
+        src: "shaders/cull.comp.slang",
+        stage: "compute",
+        entry: "computeMain",
+        dst: "cull_wave.comp.spv",
+    };
+    compile_cull_wave(slangc, &out_dir, &cull_wave);
+
     // Second mesh3d.frag variant: the water depth-absorption path. Declares the
     // depth input attachment (set 0 binding 5) + Δd-driven body tint, compiled
     // only into `mesh3d_transparent_absorb` (dynamic_rendering_local_read, MSAA
@@ -364,6 +375,54 @@ fn lint_slang_file(path: &Path, violations: &mut Vec<String>) {
         }
 
         i += 1;
+    }
+}
+
+/// Compile the subgroup-ballot cull variant. Without slangc, clone the plain
+/// module so `include_bytes!` still resolves; the runtime then picks the plain
+/// pipeline because wave ops are absent.
+fn compile_cull_wave(slangc: bool, out_dir: &Path, shader: &Shader) {
+    let out_path = out_dir.join(shader.dst);
+    if !slangc {
+        let plain = out_dir.join("cull.comp.spv");
+        fs::copy(&plain, &out_path)
+            .unwrap_or_else(|e| panic!("copy plain cull module to {}: {e}", out_path.display()));
+        return;
+    }
+    let output = Command::new("slangc")
+        .args([
+            shader.src,
+            "-target",
+            "spirv",
+            "-profile",
+            "spirv_1_3",
+            "-entry",
+            shader.entry,
+            "-stage",
+            shader.stage,
+            "-matrix-layout-column-major",
+            "-capability",
+            "subgroup_basic_ballot",
+            "-DUSE_WAVE_ATOMICS",
+        ])
+        .arg("-o")
+        .arg(&out_path)
+        .output()
+        .expect("failed to run slangc for cull wave variant");
+    if !output.status.success() {
+        eprintln!(
+            "slangc failed while compiling {} (wave atomics)",
+            shader.src
+        );
+        eprintln!(
+            "--- stdout ---\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        eprintln!(
+            "--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        panic!("shader compilation failed");
     }
 }
 
@@ -564,6 +623,26 @@ fn build_table() -> Vec<Def> {
             name: "CULL_WORKGROUP",
             doc: "GPU cull dispatch workgroup width (one thread per mesh slot). The CPU-side\ndispatch partition math (vk/cull.rs) must divide by the same value.",
             val: Val::UInt(64),
+        },
+        Def {
+            name: "CULL_DISTANCE_BUCKETS",
+            doc: "Front-to-back approximate-order buckets per camera (pass, arena) partition.\nShadow groups stay unbucketed. CPU partition math and the cull shader must agree.",
+            val: Val::UInt(4),
+        },
+        Def {
+            name: "CULL_BUCKET_SPLIT_0",
+            doc: "Camera-distance edge (metres from AABB centre) between cull buckets 0 and 1.\nBucket 0 is nearest; record_mesh_indirect_count draws 0..K-1 near-to-far.",
+            val: Val::Scalar(16.0),
+        },
+        Def {
+            name: "CULL_BUCKET_SPLIT_1",
+            doc: "Camera-distance edge (metres) between cull buckets 1 and 2.",
+            val: Val::Scalar(64.0),
+        },
+        Def {
+            name: "CULL_BUCKET_SPLIT_2",
+            doc: "Camera-distance edge (metres) between cull buckets 2 and 3 (farthest).",
+            val: Val::Scalar(256.0),
         },
         Def {
             name: "EXPOSURE_TILE",

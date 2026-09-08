@@ -112,6 +112,20 @@ static const float SHADOW_RESOLUTION = 2048.0f;
 // dispatch partition math (vk/cull.rs) must divide by the same value.
 static const uint CULL_WORKGROUP = 64;
 
+// Front-to-back approximate-order buckets per camera (pass, arena) partition.
+// Shadow groups stay unbucketed. CPU partition math and the cull shader must agree.
+static const uint CULL_DISTANCE_BUCKETS = 4;
+
+// Camera-distance edge (metres from AABB centre) between cull buckets 0 and 1.
+// Bucket 0 is nearest; record_mesh_indirect_count draws 0..K-1 near-to-far.
+static const float CULL_BUCKET_SPLIT_0 = 16.0f;
+
+// Camera-distance edge (metres) between cull buckets 1 and 2.
+static const float CULL_BUCKET_SPLIT_1 = 64.0f;
+
+// Camera-distance edge (metres) between cull buckets 2 and 3 (farthest).
+static const float CULL_BUCKET_SPLIT_2 = 256.0f;
+
 // Exposure metering tile edge in HDR texels. The CPU-side tile-grid dimensions
 // (vk/exposure.rs) are ceil(hdr_dim / EXPOSURE_TILE) and must agree.
 static const uint EXPOSURE_TILE = 16;
