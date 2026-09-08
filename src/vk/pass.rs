@@ -36,14 +36,13 @@ pub(crate) fn push_descriptor_layouts(
         .offset(0)
         .size(push_constant_size)];
     let set_layouts = [set_layout];
+    let mut info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+    if push_constant_size > 0 {
+        info = info.push_constant_ranges(&push);
+    }
     let layout = unsafe {
         device
-            .create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&set_layouts)
-                    .push_constant_ranges(&push),
-                None,
-            )
+            .create_pipeline_layout(&info, None)
             .unwrap_or_else(|e| panic!("create {label} pipeline layout: {e:?}"))
     };
     (set_layout, layout)

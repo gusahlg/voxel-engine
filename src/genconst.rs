@@ -56,4 +56,16 @@ mod tests {
         assert_eq!(TAA_TILE, 16);
         assert_eq!(EXPOSURE_TILE % 8, 0);
     }
+
+    #[test]
+    fn sky_cloud_lut_in_quality_band() {
+        assert!(
+            (256..=512).contains(&SKY_CLOUD_LUT_SIZE),
+            "SKY_CLOUD_LUT_SIZE={SKY_CLOUD_LUT_SIZE} outside 256..=512"
+        );
+        assert!(
+            SKY_CLOUD_LUT_SIZE.is_multiple_of(SKY_CLOUD_LUT_WG),
+            "LUT size must divide evenly by the workgroup edge"
+        );
+    }
 }

@@ -59,14 +59,18 @@ float3 sky_radiance(float3 ray, FrameUniforms frame)
 {
     float up = clamp(ray.y, 0.0, 1.0);
     float3 base = lerp(frame.horizon.rgb, frame.zenith.rgb, sqrt(up));
-    float3 sun = normalize(frame.sun_dir_elev.xyz);
-    float c = max(dot(ray, sun), 0.0);
-    // Halo widens as the sun drops: low exponent at/below the horizon (wide golden-hour
-    // halo), tightening to the noon look above GLOW_EDGE1. sun_dir_elev.w = elevation [-1,1].
-    float glow_pow = lerp(GLOW_POW_SUNSET, GLOW_POW_DAY,
-                          smoothstep(GLOW_EDGE0, GLOW_EDGE1, frame.sun_dir_elev.w));
-    float3 glow = frame.light.rgb * (pow(c, glow_pow) * (0.5 + frame.zenith.w)); // zenith.w = turbidity
+    // sun_dir_elev.xyz is unit; extras.y = glow_pow, extras.z = 0.5+turbidity
+    // (both filled CPU-side by FrameUniformsGpu::prepare_derived).
+    float c = max(dot(ray, frame.sun_dir_elev.xyz), 0.0);
+    float3 glow = frame.light.rgb * (pow(c, frame.extras.y) * frame.extras.z);
     return base + glow;
+}
+
+// Analytic sun disc with precomputed cone cosines (sky push constants).
+// `sun_dir` is unit. Full tint out to `cos_core`, smoothstepped to zero at `cos_rim`.
+float3 sun_disc_cos(float3 ray, float3 sun_dir, float3 tint, float cos_core, float cos_rim)
+{
+    return tint * smoothstep(cos_rim, cos_core, dot(ray, sun_dir));
 }
 
 // Analytic sun disc — additive linear radiance in a small cone around
@@ -76,10 +80,12 @@ float3 sky_radiance(float3 ray, FrameUniforms frame)
 // reuses it later.
 float3 sun_disc(float3 ray, float3 sun_dir, float3 tint, float radius)
 {
-    float d = dot(ray, normalize(sun_dir));
-    float cos_core = cos(radius * SUN_DISC_CORE);
-    float cos_rim = cos(radius * SUN_DISC_RIM);
-    return tint * smoothstep(cos_rim, cos_core, d);
+    return sun_disc_cos(
+        ray,
+        normalize(sun_dir),
+        tint,
+        cos(radius * SUN_DISC_CORE),
+        cos(radius * SUN_DISC_RIM));
 }
 
 // Unified lighting term. `sky` = linear skylight colour (already shadow-

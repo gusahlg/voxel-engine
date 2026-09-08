@@ -309,6 +309,14 @@ static const float CLOUD_HORIZON_OFFSET = 0.06f;
 // Horizon-hide steepness: saturate((ray.y - CLOUD_HORIZON_OFFSET) * this).
 static const float CLOUD_HORIZON_FADE = 5.0f;
 
+// Edge length of the square octahedral cloud LUT (texels). Quality band
+// [256, 512]; CPU dispatch and the compute shader must agree.
+static const uint SKY_CLOUD_LUT_SIZE = 256;
+
+// Cloud-LUT compute workgroup edge. CPU dispatch divides SKY_CLOUD_LUT_SIZE
+// by this; the shader's [numthreads] uses the same value.
+static const uint SKY_CLOUD_LUT_WG = 8;
+
 // Wave value-noise spatial frequency (1/metres) at the base octave.
 // Higher ⇒ smaller, tighter ripples.
 static const float WATER_WAVE_FREQ = 0.35f;

@@ -66,6 +66,12 @@ const SHADERS: &[Shader] = &[
         dst: "sky.frag.spv",
     },
     Shader {
+        src: "shaders/sky_cloud.comp.slang",
+        stage: "compute",
+        entry: "computeMain",
+        dst: "sky_cloud.comp.spv",
+    },
+    Shader {
         src: "shaders/tonemap.vert.slang",
         stage: "vertex",
         entry: "vertexMain",
@@ -1069,6 +1075,20 @@ fn build_table() -> Vec<Def> {
             doc: "Horizon-hide steepness: saturate((ray.y - CLOUD_HORIZON_OFFSET) * this).",
             val: Val::Scalar(5.0),
         },
+        // Direction-space cloud LUT: one compute dispatch per sky frame marches
+        // the slab into an octahedral upper-hemisphere map; the full-res sky
+        // fragment takes one bilinear tap. 256 is enough — cloud noise is
+        // ~1 km scale — and stays at the cheap end of the 256..512 quality band.
+        Def {
+            name: "SKY_CLOUD_LUT_SIZE",
+            doc: "Edge length of the square octahedral cloud LUT (texels). Quality band\n[256, 512]; CPU dispatch and the compute shader must agree.",
+            val: Val::UInt(256),
+        },
+        Def {
+            name: "SKY_CLOUD_LUT_WG",
+            doc: "Cloud-LUT compute workgroup edge. CPU dispatch divides SKY_CLOUD_LUT_SIZE\nby this; the shader's [numthreads] uses the same value.",
+            val: Val::UInt(8),
+        },
         // Water: animated waves + reflection + glint + interim tint, world-anchored for deterministic goldens.
         Def {
             name: "WATER_WAVE_FREQ",
@@ -1170,7 +1190,7 @@ fn lane_table() -> Vec<Lane> {
     vec![
         Lane {
             name: "sun_dir_elev",
-            doc: "xyz = sun direction (normalized), w = sun elevation (radians).",
+            doc: "xyz = sun direction (unit, engine-normalized in prepare_derived),\nw = sun elevation (game: sun_dir.y in [-1,1]; drives the glow_pow lerp).",
         },
         Lane {
             name: "light",
@@ -1194,7 +1214,7 @@ fn lane_table() -> Vec<Lane> {
         },
         Lane {
             name: "extras",
-            doc: "x = stars gain (1 = night starfield renders, 0 = skipped — the\n`RenderFlags::stars` gate). yzw reserved (always zero); repurposing a\nchannel bumps FRAME_UNIFORMS_VERSION.",
+            doc: "x = stars gain (1 = night starfield renders, 0 = skipped — the\n`RenderFlags::stars` gate). y = glow_pow, z = glow_scale (0.5+turbidity):\nengine-derived sky_radiance terms, filled by FrameUniformsGpu::prepare_derived.\nw reserved (always zero).",
         },
         Lane {
             name: "anim",

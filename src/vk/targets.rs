@@ -337,6 +337,9 @@ pub struct RenderTargets {
     /// Per-slot bloom mip chain. Extent-dependent, so recreated with the
     /// rest of the targets on resize.
     pub(crate) bloom: [BloomChain; FRAMES_IN_FLIGHT as usize],
+    /// Per-slot octahedral cloud LUT (RGBA16F). Size is a genconst, independent
+    /// of the swapchain; still owned here so resize tears it down with everything else.
+    pub(crate) sky_cloud: [ImageResource; FRAMES_IN_FLIGHT as usize],
 }
 
 impl RenderTargets {
@@ -433,6 +436,26 @@ impl RenderTargets {
         let shadow = ShadowMap::new(device, &memory_props);
 
         let bloom = std::array::from_fn(|_| BloomChain::new(device, &memory_props, extent));
+        let lut = crate::genconst::SKY_CLOUD_LUT_SIZE;
+        let sky_cloud = std::array::from_fn(|_| {
+            ImageResource::create(
+                device,
+                &memory_props,
+                &ImageDesc {
+                    extent: vk::Extent2D {
+                        width: lut,
+                        height: lut,
+                    },
+                    format: HDR_COLOR_FORMAT,
+                    usage: vk::ImageUsageFlags::STORAGE
+                        | vk::ImageUsageFlags::SAMPLED
+                        | vk::ImageUsageFlags::TRANSFER_DST,
+                    layers: 1,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                },
+            )
+        });
 
         Self {
             depth,
@@ -445,6 +468,7 @@ impl RenderTargets {
             vrs,
             shadow,
             bloom,
+            sky_cloud,
         }
     }
 
@@ -478,6 +502,9 @@ impl RenderTargets {
             self.shadow.destroy(device);
             for chain in &self.bloom {
                 chain.destroy(device);
+            }
+            for lut in &self.sky_cloud {
+                lut.destroy(device);
             }
         }
     }

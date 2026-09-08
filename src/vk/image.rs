@@ -34,6 +34,10 @@ pub(crate) enum LayoutUse {
     /// Sampled by compute+fragment right after a compute storage write (TAA
     /// history publish: RAW, waits on SHADER_STORAGE_WRITE).
     SampledAfterComputeWrite,
+    /// Color-clear destination (`vkCmdClearColorImage`; sky-cloud LUT skip).
+    TransferClear,
+    /// Sampled by the fragment shader right after a color clear (LUT skip path).
+    FragmentSampledAfterClear,
 }
 
 impl LayoutUse {
@@ -59,6 +63,12 @@ impl LayoutUse {
                 S::COMPUTE_SHADER | S::FRAGMENT_SHADER,
                 A::SHADER_SAMPLED_READ,
             ),
+            LayoutUse::TransferClear => (L::TRANSFER_DST_OPTIMAL, S::CLEAR, A::TRANSFER_WRITE),
+            LayoutUse::FragmentSampledAfterClear => (
+                L::SHADER_READ_ONLY_OPTIMAL,
+                S::FRAGMENT_SHADER,
+                A::SHADER_SAMPLED_READ,
+            ),
         }
     }
 
@@ -75,6 +85,8 @@ impl LayoutUse {
                 (S::COMPUTE_SHADER | S::FRAGMENT_SHADER, A::NONE)
             }
             LayoutUse::SampledAfterComputeWrite => (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE),
+            LayoutUse::TransferClear => (S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ),
+            LayoutUse::FragmentSampledAfterClear => (S::CLEAR, A::TRANSFER_WRITE),
         }
     }
 }
@@ -177,6 +189,10 @@ impl ImageResource {
 
     pub(crate) fn view(&self) -> vk::ImageView {
         self.view
+    }
+
+    pub(crate) fn subresource_range(&self) -> vk::ImageSubresourceRange {
+        self.subresource
     }
 
     /// Barrier from `self.layout` to `to`; tracks the new layout on return.
@@ -295,6 +311,20 @@ mod tests {
             (
                 vk::PipelineStageFlags2::COMPUTE_SHADER,
                 vk::AccessFlags2::SHADER_STORAGE_WRITE
+            )
+        );
+        assert_eq!(
+            LayoutUse::TransferClear.src_when_used(),
+            (
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ
+            )
+        );
+        assert_eq!(
+            LayoutUse::FragmentSampledAfterClear.src_when_used(),
+            (
+                vk::PipelineStageFlags2::CLEAR,
+                vk::AccessFlags2::TRANSFER_WRITE
             )
         );
     }
