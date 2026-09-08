@@ -322,9 +322,9 @@ pub struct RenderTargets {
     /// The HDR format shared by `msaa` + `offscreen`; the geometry pipelines
     /// must be built with this same format. Never the swapchain format.
     pub color_format: vk::Format,
-    /// `Some` when attachment VRS is active. Owns the per-slot rate images and
-    /// their texel size as one consistent value — there is no way to have the
-    /// images without the size or vice versa.
+    /// `Some` when the device supports attachment VRS. Owns the per-slot rate
+    /// images, history, and mix readback. `RenderFlags::vrs` decides whether
+    /// a frame actually classifies and binds the rate attachment.
     pub(crate) vrs: Option<super::vrs::Vrs>,
     /// Cascaded shadow map, per-slot: avoid frame overlap glitches with type-safe indexing.
     pub(crate) shadow: crate::skeleton::PerSlot<ShadowMap>,
@@ -419,13 +419,10 @@ impl RenderTargets {
             )
         });
 
-        // Variable-rate shading is opt-in: `VOXEL_VRS=1` enables it where the
-        // hardware supports it. Otherwise the rate image is never allocated, so
-        // `do_vrs` (which gates on `targets.vrs.is_some()`) stays false and the
-        // full-rate path runs.
-        let vrs = fsr
-            .filter(|_| matches!(std::env::var("VOXEL_VRS").as_deref(), Ok("1")))
-            .map(|f| super::vrs::Vrs::new(device, &memory_props, f, extent));
+        // Rate images exist whenever the device supports attachment FSR.
+        // `RenderFlags::vrs` (default on) is the runtime switch: off skips the
+        // classify dispatch and the rate attachment, shading 1×1 everywhere.
+        let vrs = fsr.map(|f| super::vrs::Vrs::new(device, &memory_props, f, extent));
 
         let shadow = crate::skeleton::PerSlot::new(std::array::from_fn(|_| {
             ShadowMap::new(device, &memory_props)

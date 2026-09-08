@@ -91,8 +91,9 @@ pub struct RenderFlags {
     /// Procedural sky background pass; off shows the clear colour.
     pub sky: bool,
     /// Variable-rate shading: the depth-classified rate image that coarsens
-    /// fragment shading on distant/flat regions. Off skips both the classify
-    /// dispatch and the rate attachment (full-rate shading everywhere).
+    /// fragment shading on distant/flat/sky tiles. Off skips both the classify
+    /// dispatch and the rate attachment (full-rate shading everywhere). No-op
+    /// when the device lacks attachment fragment shading rate.
     pub vrs: bool,
     /// Water surface animation (`anim` lane time). Off freezes the phase:
     /// water renders, tinted and reflective, but still — the cheapest frame

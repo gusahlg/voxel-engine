@@ -36,8 +36,6 @@ use std::sync::mpsc::Sender;
 use ash::{khr, vk};
 
 use crate::frame::DrawLists;
-#[cfg(test)]
-use crate::frame::Scene3D;
 use crate::mesh::Pass;
 use crate::skeleton::{FrameSlot, PerSlot};
 use block_textures::BlockTextures;
@@ -91,8 +89,10 @@ struct SlotState {
     copy_value: TimelineValue,
     imm: HostBuffer,
     indirect: HostBuffer,
-    /// Depth valid with scene fingerprint; gates VRS reuse.
-    vrs_ready: Option<u64>,
+    /// This slot has stored depth at the current extent; VRS may classify it.
+    vrs_ready: bool,
+    /// History image holds a raw classification from a previous VRS dispatch.
+    vrs_history: bool,
     /// Shadow map cleared to all-lit; gates shadow pass skip.
     shadow_lit_ready: bool,
     /// Which image holds the final HDR (offscreen or TAA history).
@@ -191,34 +191,6 @@ fn sun_dir(lists: &DrawLists) -> glam::DVec3 {
         .unwrap_or(glam::DVec3::Y)
 }
 
-/// Hash depth-affecting inputs (view, visibility, draws). Gates VRS reuse.
-fn scene_fingerprint(lists: &DrawLists, draws: &[DrawEntry], visible_mask: &[u32]) -> u64 {
-    use ash::vk::Handle;
-    use std::hash::{Hash, Hasher};
-
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    lists.scene.is_some().hash(&mut h);
-    // Hash visibility mask (flipped bits invalidate reused depth).
-    visible_mask.hash(&mut h);
-    if let Some(scene) = &lists.scene {
-        for c in scene.view_proj.to_cols_array() {
-            c.to_bits().hash(&mut h);
-        }
-    }
-    for d in draws {
-        d.buffer.as_raw().hash(&mut h);
-        // Slot represents placement (records are slot-tied).
-        (d.pass as u8, d.first, d.count, d.vertex_offset, d.slot).hash(&mut h);
-    }
-    // Debug cubes affect depth, not color.
-    for v in &lists.cube_verts {
-        for c in v.pos {
-            c.to_bits().hash(&mut h);
-        }
-    }
-    h.finish()
-}
-
 /// Minimap texture edge length in texels.
 pub(crate) const MINIMAP_SIZE: u32 = 256;
 
@@ -312,9 +284,6 @@ pub(crate) struct Renderer {
 
     slot: usize,
 
-    /// Current scene fingerprint.
-    scene_fingerprint: u64,
-
     vsync: Pending<bool>,
     msaa: Pending<SampleCount>,
     needs_recreate: bool,
@@ -357,7 +326,12 @@ impl Renderer {
         } = cfg;
         let render_scale = Scale::new(render_scale).as_f32();
 
-        let device = Device::new(&instance.instance, &surface_loader, surface);
+        let device = Device::new(
+            &instance.entry,
+            &instance.instance,
+            &surface_loader,
+            surface,
+        );
         let mut transfer_lane = unsafe {
             TransferLane::new(
                 &device.device,
@@ -468,7 +442,8 @@ impl Renderer {
             copy_value: TimelineValue::START,
             imm: HostBuffer::new(vk::BufferUsageFlags::VERTEX_BUFFER),
             indirect: HostBuffer::new(vk::BufferUsageFlags::INDIRECT_BUFFER),
-            vrs_ready: None,
+            vrs_ready: false,
+            vrs_history: false,
             shadow_lit_ready: false,
             hdr_source: HdrSource::Offscreen,
         }));
@@ -571,7 +546,6 @@ impl Renderer {
             copy_slot: None,
             pending_capture: None,
             slot: 0,
-            scene_fingerprint: 0,
             vsync: Pending::new(vsync),
             msaa: Pending::new(msaa),
             needs_recreate: false,
@@ -954,6 +928,24 @@ impl Renderer {
                 self.quad_ibo.collect_transfer(device, transfer_current);
             }
         }
+        self.publish_vrs_mix(slot);
+    }
+
+    /// Last completed VRS histogram for this slot (2-frame delayed). Zeroed
+    /// when VRS is off or the device has no attachment shading rate.
+    fn publish_vrs_mix(&self, slot: usize) {
+        if self.flags.vrs
+            && let Some(vrs) = &self.targets.vrs
+        {
+            let [n1, n2, n4] = vrs.mix(slot);
+            crate::profile::gauge(crate::profile::Gauge::Vrs1x1, n1 as u64);
+            crate::profile::gauge(crate::profile::Gauge::Vrs2x2, n2 as u64);
+            crate::profile::gauge(crate::profile::Gauge::Vrs4x4, n4 as u64);
+        } else {
+            crate::profile::gauge(crate::profile::Gauge::Vrs1x1, 0);
+            crate::profile::gauge(crate::profile::Gauge::Vrs2x2, 0);
+            crate::profile::gauge(crate::profile::Gauge::Vrs4x4, 0);
+        }
     }
 
     /// Resolves the copy hazard on `slot` before it is rendered into: the
@@ -1263,15 +1255,6 @@ impl Renderer {
                 }
             }
         }
-        // The fingerprint exists only so VRS can tell whether a slot's stored
-        // depth still matches the scene it will classify; with VRS off nothing
-        // reads it, so skip the per-frame hash.
-        self.scene_fingerprint = if self.targets.vrs.is_some() {
-            scene_fingerprint(lists, &self.draw_scratch, &self.visible_mask)
-        } else {
-            0
-        };
-
         let indirect_bytes: &[u8] = bytemuck::cast_slice(&self.draw_commands);
         unsafe {
             let indirect = &mut self.slots[FrameSlot::new(slot)].indirect;
@@ -1441,13 +1424,13 @@ impl Renderer {
             }
         }
 
-        // VRS generation needs a validly-written, single-sampled depth image to
-        // classify. MSAA depth would need multisample sampling (skipped), and a
-        // slot's depth is only readable once it has been rendered at least once.
+        // Classify from this slot's previous depth as long as it has been
+        // written once at this extent. One-frame-stale is OK: the classifier
+        // dilates full-rate tiles and never coarsens a tile that was near.
         let do_vrs = lists.scene.is_some()
             && self.flags.vrs
             && self.targets.vrs.is_some()
-            && self.slots[FrameSlot::new(slot)].vrs_ready == Some(self.scene_fingerprint);
+            && self.slots[FrameSlot::new(slot)].vrs_ready;
 
         let device = &self.device.device;
         let stamp = |p| {
@@ -1590,9 +1573,12 @@ impl Renderer {
         }
         self.gpu_timer.finish(slot);
         // The main pass just wrote (and stored) this slot's depth, so a later
-        // cycle reusing this slot may read it for VRS classification. Stamp
-        // ready-and-fingerprint in one write (they can never disagree).
-        self.slots[FrameSlot::new(slot)].vrs_ready = Some(self.scene_fingerprint);
+        // cycle reusing this slot may classify it. A classify this frame also
+        // leaves a raw-rate history image for the next reuse.
+        self.slots[FrameSlot::new(slot)].vrs_ready = true;
+        if do_vrs {
+            self.slots[FrameSlot::new(slot)].vrs_history = true;
+        }
 
         unsafe {
             self.device
@@ -1665,9 +1651,23 @@ impl Renderer {
         let depth = self.targets.sampleable_depth(slot);
         let (depth_layout, depth_stage, depth_access) = self.sampleable_depth_attachment_state();
         let tiles = vrs.tiles();
+        let use_history = self.slots[FrameSlot::new(slot)].vrs_history;
+        let allow_4x4 = self
+            .device
+            .fragment_shading_rate
+            .as_ref()
+            .is_some_and(|f| f.allow_4x4(self.targets.samples));
+        let mut flags = 0u32;
+        if allow_4x4 {
+            flags |= vrs::FLAG_ALLOW_4X4;
+        }
+        if use_history {
+            flags |= vrs::FLAG_USE_HISTORY;
+        }
         unsafe {
-            // depth: read for sampling; rate: write target.
-            let pre = [
+            device.cmd_fill_buffer(cmd, vrs.mix_gpu(slot), 0, vrs::MIX_BYTES, 0);
+
+            let mut images = [
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(depth_stage)
                     .src_access_mask(depth_access)
@@ -1685,10 +1685,43 @@ impl Renderer {
                     .new_layout(vk::ImageLayout::GENERAL)
                     .image(vrs.image(slot))
                     .subresource_range(color_range()),
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(if use_history {
+                        vk::PipelineStageFlags2::COMPUTE_SHADER
+                    } else {
+                        vk::PipelineStageFlags2::NONE
+                    })
+                    .src_access_mask(if use_history {
+                        vk::AccessFlags2::SHADER_STORAGE_WRITE
+                    } else {
+                        vk::AccessFlags2::NONE
+                    })
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_STORAGE_READ
+                            | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    )
+                    .old_layout(if use_history {
+                        vk::ImageLayout::GENERAL
+                    } else {
+                        vk::ImageLayout::UNDEFINED
+                    })
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(vrs.history_image(slot))
+                    .subresource_range(color_range()),
             ];
+            let fill_to_compute = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                )];
             device.cmd_pipeline_barrier2(
                 cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&pre),
+                &vk::DependencyInfo::default()
+                    .memory_barriers(&fill_to_compute)
+                    .image_memory_barriers(&images),
             );
 
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, compute.pipeline);
@@ -1699,6 +1732,13 @@ impl Renderer {
             let rate_info = [vk::DescriptorImageInfo::default()
                 .image_view(vrs.view(slot))
                 .image_layout(vk::ImageLayout::GENERAL)];
+            let history_info = [vk::DescriptorImageInfo::default()
+                .image_view(vrs.history_view(slot))
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let mix_info = [vk::DescriptorBufferInfo::default()
+                .buffer(vrs.mix_gpu(slot))
+                .offset(0)
+                .range(vrs::MIX_BYTES)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_binding(0)
@@ -1708,6 +1748,14 @@ impl Renderer {
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                     .image_info(&rate_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(&history_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&mix_info),
             ];
             self.device.push_descriptor.cmd_push_descriptor_set(
                 cmd,
@@ -1721,6 +1769,11 @@ impl Renderer {
                 d_threshold,
                 texel_w: vrs.texel_size.width,
                 texel_h: vrs.texel_size.height,
+                tiles_x: tiles.width,
+                tiles_y: tiles.height,
+                depth_w: self.render_extent.width,
+                depth_h: self.render_extent.height,
+                flags,
             };
             device.cmd_push_constants(
                 cmd,
@@ -1731,30 +1784,55 @@ impl Renderer {
             );
             device.cmd_dispatch(cmd, tiles.width.div_ceil(8), tiles.height.div_ceil(8), 1);
 
-            // rate → shading-rate attachment; depth → back to attachment layout.
-            let post = [
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADING_RATE_ATTACHMENT_KHR)
-                    .dst_access_mask(vk::AccessFlags2::FRAGMENT_SHADING_RATE_ATTACHMENT_READ_KHR)
-                    .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(vk::ImageLayout::FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR)
-                    .image(vrs.image(slot))
-                    .subresource_range(color_range()),
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .dst_stage_mask(depth_stage)
-                    .dst_access_mask(depth_access)
-                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .new_layout(depth_layout)
-                    .image(depth.image())
-                    .subresource_range(depth_range()),
-            ];
+            // rate → shading-rate attachment; depth → back to attachment layout;
+            // mix histogram → host-visible readback.
+            images[0] = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADING_RATE_ATTACHMENT_KHR)
+                .dst_access_mask(vk::AccessFlags2::FRAGMENT_SHADING_RATE_ATTACHMENT_READ_KHR)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR)
+                .image(vrs.image(slot))
+                .subresource_range(color_range());
+            images[1] = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .dst_stage_mask(depth_stage)
+                .dst_access_mask(depth_access)
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(depth_layout)
+                .image(depth.image())
+                .subresource_range(depth_range());
+            let mix_to_copy = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
             device.cmd_pipeline_barrier2(
                 cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&post),
+                &vk::DependencyInfo::default()
+                    .memory_barriers(&mix_to_copy)
+                    .image_memory_barriers(&images[..2]),
+            );
+            device.cmd_copy_buffer(
+                cmd,
+                vrs.mix_gpu(slot),
+                vrs.mix_cpu(slot),
+                &[vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: vrs::MIX_BYTES,
+                }],
+            );
+            let copy_to_host = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&copy_to_host),
             );
         }
 
@@ -2445,7 +2523,8 @@ impl Renderer {
             // Shadow map recreated (layout UNDEFINED): re-prime the lit clear.
             for slot in 0..FRAMES_IN_FLIGHT as usize {
                 let s = &mut self.slots[FrameSlot::new(slot)];
-                s.vrs_ready = None;
+                s.vrs_ready = false;
+                s.vrs_history = false;
                 s.shadow_lit_ready = false;
             }
             // Shadow images are UNDEFINED after recreate: force both slots to
@@ -3730,31 +3809,6 @@ impl GpuTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn vrs_scene_fingerprint_tracks_view_and_depth_geometry() {
-        let mut lists = DrawLists::new();
-        let base = scene_fingerprint(&lists, &[], &[]);
-
-        lists.scene = Some(Scene3D::test_stub());
-        let with_3d = scene_fingerprint(&lists, &[], &[]);
-        assert_ne!(base, with_3d);
-
-        lists.scene.as_mut().unwrap().view_proj = glam::Mat4::from_rotation_y(0.25);
-        let turned = scene_fingerprint(&lists, &[], &[]);
-        assert_ne!(with_3d, turned);
-
-        lists.cube_verts.push(crate::mesh::DebugVertex {
-            pos: [1.0, 2.0, 3.0],
-            color: [255; 4],
-        });
-        assert_ne!(turned, scene_fingerprint(&lists, &[], &[]));
-
-        // A flipped visibility bit (streamed-in / LOD-settled terrain) must also
-        // invalidate the reused depth — the mask is now the opaque draw source.
-        let masked = scene_fingerprint(&lists, &[], &[0b1]);
-        assert_ne!(scene_fingerprint(&lists, &[], &[]), masked);
-    }
 
     #[test]
     fn scale_clamps_into_range() {

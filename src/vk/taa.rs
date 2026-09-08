@@ -33,7 +33,7 @@ use crate::rev::FrameSlot;
 use super::pass;
 
 /// The view-projection without jitter. Jittered matrix is applied privately
-/// at push-constant packing only. Keeps VRS fingerprinting stable.
+/// at push-constant packing only so culling and TAA reprojection stay stable.
 #[derive(Clone, Copy, Debug)]
 pub struct CleanViewProj(pub Mat4);
 

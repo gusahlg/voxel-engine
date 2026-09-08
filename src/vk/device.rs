@@ -44,6 +44,16 @@ impl Anisotropy {
 
 pub struct FragmentShadingRate {
     pub texel_size: vk::Extent2D,
+    /// Rasterization sample counts that advertise a 4×4 fragment size.
+    /// Empty if the device does not list 4×4 in its shading-rate table.
+    four_x_four: vk::SampleCountFlags,
+}
+
+impl FragmentShadingRate {
+    /// Whether a 4×4 attachment rate is valid for this rasterization sample count.
+    pub fn allow_4x4(&self, samples: vk::SampleCountFlags) -> bool {
+        self.four_x_four.contains(samples)
+    }
 }
 
 pub struct Device {
@@ -86,13 +96,14 @@ struct Candidate {
     draw_indirect_count: bool,
     memory_budget: bool,
     max_anisotropy: Option<f32>,
-    fragment_shading_rate: Option<vk::Extent2D>,
+    fragment_shading_rate: Option<FragmentShadingRate>,
     dynamic_rendering_local_read: bool,
     score: u32,
 }
 
 impl Device {
     pub fn new(
+        entry: &ash::Entry,
         instance: &ash::Instance,
         surface_loader: &khr::surface::Instance,
         surface: vk::SurfaceKHR,
@@ -105,7 +116,7 @@ impl Device {
 
         let best = physical_devices
             .into_iter()
-            .filter_map(|pd| evaluate(instance, pd, surface_loader, surface))
+            .filter_map(|pd| evaluate(entry, instance, pd, surface_loader, surface))
             .max_by_key(|c| c.score)
             .expect("No suitable Vulkan 1.3 GPU found (needs dynamic rendering + synchronization2 + drawIndirectCount + swapchain)");
 
@@ -253,9 +264,16 @@ impl Device {
             .memory_budget
             .then(|| unsafe { MemoryBudget::assume_enabled() });
 
-        let fragment_shading_rate = best
-            .fragment_shading_rate
-            .map(|texel_size| FragmentShadingRate { texel_size });
+        let fragment_shading_rate = best.fragment_shading_rate;
+        match &fragment_shading_rate {
+            Some(fsr) => log::info!(
+                "VRS: attachment texel {}x{}, 4x4 samples {:?}",
+                fsr.texel_size.width,
+                fsr.texel_size.height,
+                fsr.four_x_four,
+            ),
+            None => log::info!("VRS: fragment shading rate unsupported; shading at 1x1"),
+        }
 
         let local_read = best
             .dynamic_rendering_local_read
@@ -310,6 +328,7 @@ impl Device {
 }
 
 fn evaluate(
+    entry: &ash::Entry,
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
     surface_loader: &khr::surface::Instance,
@@ -372,7 +391,10 @@ fn evaluate(
                 let mut fsr_props = vk::PhysicalDeviceFragmentShadingRatePropertiesKHR::default();
                 let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut fsr_props);
                 unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
-                fsr_props.max_fragment_shading_rate_attachment_texel_size
+                FragmentShadingRate {
+                    texel_size: fsr_props.max_fragment_shading_rate_attachment_texel_size,
+                    four_x_four: advertised_4x4(entry, instance, physical),
+                }
             })
         })
         .flatten();
@@ -441,4 +463,31 @@ fn evaluate(
         dynamic_rendering_local_read,
         score,
     })
+}
+
+/// Sample counts for which the device lists a 4×4 fragment shading rate.
+fn advertised_4x4(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+) -> vk::SampleCountFlags {
+    let loader = khr::fragment_shading_rate::Instance::new(entry, instance);
+    let get = loader.fp().get_physical_device_fragment_shading_rates_khr;
+    unsafe {
+        let mut count = 0u32;
+        if get(physical, &mut count, std::ptr::null_mut()) != vk::Result::SUCCESS || count == 0 {
+            return vk::SampleCountFlags::empty();
+        }
+        let mut rates = vec![vk::PhysicalDeviceFragmentShadingRateKHR::default(); count as usize];
+        if get(physical, &mut count, rates.as_mut_ptr()) != vk::Result::SUCCESS {
+            return vk::SampleCountFlags::empty();
+        }
+        rates.truncate(count as usize);
+        rates
+            .iter()
+            .filter(|r| r.fragment_size.width == 4 && r.fragment_size.height == 4)
+            .fold(vk::SampleCountFlags::empty(), |acc, r| {
+                acc | r.sample_counts
+            })
+    }
 }

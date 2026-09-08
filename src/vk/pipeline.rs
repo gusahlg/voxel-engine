@@ -120,7 +120,8 @@ const VRS_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vrs.comp.spv")
 
 /// The VRS classifier compute pipeline plus the depth sampler it reads through.
 /// Present exactly when attachment VRS is enabled. Set 0 is push-descriptor:
-/// binding 0 = depth (combined image sampler), binding 1 = rate storage image.
+/// binding 0 = depth (combined image sampler), binding 1 = rate storage image,
+/// binding 2 = history storage image, binding 3 = mix histogram SSBO.
 pub struct VrsCompute {
     pub pipeline: vk::Pipeline,
     pub layout: vk::PipelineLayout,
@@ -888,6 +889,18 @@ fn create_vrs_compute(device: &ash::Device, cache: vk::PipelineCache) -> VrsComp
         vk::DescriptorSetLayoutBinding::default()
             .binding(1)
             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        // Previous raw classification (same-texel read, then write).
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        // Tile-mix histogram [1x1, 2x2, 4x4].
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(3)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
