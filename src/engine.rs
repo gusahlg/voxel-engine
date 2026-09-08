@@ -269,9 +269,12 @@ impl Engine {
         self.client.max_texture_layers()
     }
 
-    /// Enables opt-in six-way face culling: each mesh submits only its
-    /// camera-facing direction buckets. Off by default (one draw per mesh);
-    /// earns its keep only under heavy vertex load.
+    /// GPU per-direction face-run culling: the cull shader emits contiguous
+    /// camera-facing quad runs instead of a whole-mesh draw.
+    ///
+    /// On by default (`Config` has no field). Safe to toggle at runtime — the
+    /// change is sent on the render-thread command stream and lands at the next
+    /// frame boundary. `false` is an explicit opt-out (whole-mesh draws).
     pub fn set_cull_faces(&mut self, on: bool) {
         self.client.set_cull_faces(on);
     }

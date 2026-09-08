@@ -14,7 +14,7 @@ struct MeshRecord
     float3 aabb_max;
     int vertex_offset;
     uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
-    uint _pad2;
+    uint flags; // bit 0 = packed face-runs valid (cull.comp)
 };
 
 [[vk::binding(0, 0)]]

@@ -240,6 +240,7 @@ impl MeshRecord {
 
     /// Compose a GPU record from mesh metadata and placement.
     pub(crate) fn compose(meta: &MeshMeta, p: crate::mesh::MeshPlacement) -> Self {
+        let (face_quads, flags) = Self::pack_face_quads(&meta.bounds);
         Self {
             block: p.block.to_array(),
             // Detail in bits 0..4, pass in bits 4..6.
@@ -250,18 +251,27 @@ impl MeshRecord {
             index_count: meta.bounds[6],
             aabb_max: meta.aabb_max.to_array(),
             vertex_offset: meta.vertex_offset,
-            face_quads: {
-                let mut packed = [0u32; 3];
-                for (k, slot) in packed.iter_mut().enumerate() {
-                    let q0 = (meta.bounds[k * 2 + 1] - meta.bounds[k * 2]) / 6;
-                    let q1 = (meta.bounds[k * 2 + 2] - meta.bounds[k * 2 + 1]) / 6;
-                    debug_assert!(q0 <= u32::from(u16::MAX) && q1 <= u32::from(u16::MAX));
-                    *slot = q0 | (q1 << 16);
-                }
-                packed
-            },
-            _pad2: 0,
+            face_quads,
+            flags,
         }
+    }
+
+    /// Pack upload-order bucket quad counts as u16 pairs. Overflowing buckets
+    /// wrap in the packed words; [`MESH_FLAG_FACE_RUNS`] stays clear so the
+    /// cull shader emits a whole-mesh draw instead of corrupted ranges.
+    fn pack_face_quads(bounds: &[u32; 7]) -> ([u32; 3], u32) {
+        let mut packed = [0u32; 3];
+        let mut face_runs = true;
+        for (k, slot) in packed.iter_mut().enumerate() {
+            let q0 = (bounds[k * 2 + 1] - bounds[k * 2]) / 6;
+            let q1 = (bounds[k * 2 + 2] - bounds[k * 2 + 1]) / 6;
+            if q0 > u32::from(u16::MAX) || q1 > u32::from(u16::MAX) {
+                face_runs = false;
+            }
+            debug_assert!((q0 <= u32::from(u16::MAX) && q1 <= u32::from(u16::MAX)) || !face_runs);
+            *slot = (q0 & u32::from(u16::MAX)) | ((q1 & u32::from(u16::MAX)) << 16);
+        }
+        (packed, u32::from(face_runs) * MESH_FLAG_FACE_RUNS)
     }
 }
 
@@ -1424,13 +1434,19 @@ pub struct MeshRecord {
     pub vertex_offset: i32,
     /// Packed u16 quad counts for upload slots (0|1, 2|3, 4|5).
     pub face_quads: [u32; 3],
-    pub _pad2: u32,
+    /// Bit 0 ([`MESH_FLAG_FACE_RUNS`]): `face_quads` are valid u16 counts.
+    /// Clear → the cull shader emits a whole-mesh draw for this record.
+    pub flags: u32,
 }
+
+/// `MeshRecord::flags` bit 0: packed `face_quads` fit in u16. Clear on overflow
+/// so GPU face-run culling falls back to a whole-mesh command for that mesh.
+pub(crate) const MESH_FLAG_FACE_RUNS: u32 = 1;
 
 // Stride must match the vertex shaders exactly; layout drift corrupts every draw.
 const _: () = assert!(std::mem::size_of::<MeshRecord>() == 80);
 const _: () = assert!(std::mem::offset_of!(MeshRecord, face_quads) == 64);
-const _: () = assert!(std::mem::offset_of!(MeshRecord, _pad2) == 76);
+const _: () = assert!(std::mem::offset_of!(MeshRecord, flags) == 76);
 
 /// Per-mesh dynamic style, patched on change.
 #[repr(C)]
@@ -2069,7 +2085,7 @@ mod tests {
     /// Verify detail_pass encoding/decoding is consistent.
     #[test]
     fn compose_then_detail_scale_matches_placement_scale() {
-        use super::{DrawDyn, MeshMeta, MeshRecord, PlacementState};
+        use super::{DrawDyn, MESH_FLAG_FACE_RUNS, MeshMeta, MeshRecord, PlacementState};
         use crate::mesh::{Detail, MeshPlacement};
         for k in -2..=13i8 {
             let detail = Detail(k);
@@ -2090,6 +2106,42 @@ mod tests {
                 "biased detail_pass must decode to the placement's scale (k={k})"
             );
             assert_eq!(rec.pass(), crate::mesh::Pass::Opaque, "pass bits intact");
+            assert_eq!(
+                rec.flags & MESH_FLAG_FACE_RUNS,
+                MESH_FLAG_FACE_RUNS,
+                "empty buckets fit in u16 so face-runs stay advertised"
+            );
         }
+    }
+
+    #[test]
+    fn compose_clears_face_runs_when_a_bucket_exceeds_u16() {
+        use super::{DrawDyn, MESH_FLAG_FACE_RUNS, MeshMeta, MeshRecord, PlacementState};
+        use crate::mesh::{Detail, MeshPlacement};
+        let huge = (u32::from(u16::MAX) + 1) * 6;
+        // Upload slot 2 overflows; the other five buckets are empty.
+        let meta = MeshMeta {
+            aabb_min: glam::Vec3::ZERO,
+            aabb_max: glam::Vec3::ONE,
+            bounds: [0, 0, 0, huge, huge, huge, huge],
+            vertex_offset: 12,
+            pass: crate::mesh::Pass::Opaque,
+            placement: PlacementState::Pinned,
+            dyn_lane: DrawDyn::resting(),
+        };
+        let rec = MeshRecord::compose(
+            &meta,
+            MeshPlacement::terrain(glam::IVec3::ZERO, Detail::FULL),
+        );
+        assert_eq!(
+            rec.flags & MESH_FLAG_FACE_RUNS,
+            0,
+            "overflow must not advertise packed face-runs"
+        );
+        assert_eq!(
+            rec.index_count, huge,
+            "index range stays whole-mesh (bounds[0]..bounds[6])"
+        );
+        assert_eq!(rec.vertex_offset, 12);
     }
 }

@@ -85,6 +85,8 @@ pub(crate) enum RenderCmd {
     SetVsync(bool),
     /// Replaces the render thread's feature-flag copy (see [`crate::RenderFlags`]).
     SetFlags(crate::RenderFlags),
+    /// GPU face-run culling; applied at the next cull prepare.
+    SetCullFaces(bool),
     /// Pre-clamped against device caps.
     SetMsaa(u32),
     SetRenderScale(Scale),
@@ -294,7 +296,7 @@ impl RenderClient {
             render_scale: Scale::new(config.render_scale),
             vsync: config.vsync,
             msaa,
-            cull_faces: false,
+            cull_faces: true,
             exposure: reply.exposure,
             join: Some(join),
         };
@@ -467,13 +469,15 @@ impl RenderClient {
         self.caps.max_texture_layers
     }
 
-    /// Cached-only since the GPU cull became unconditional: both the
-    /// GPU opaque/cutout emission and the CPU Blend re-source draw whole-mesh
-    /// index ranges, so per-face splitting has no live consumer. Retained so
-    /// the app's settings toggle still round-trips; INERT until per-face
-    /// partitioning is taught to the cull shader (or the setting is retired).
+    /// GPU face-run culling. On by default; `false` is an explicit opt-out.
+    /// Ships [`RenderCmd::SetCullFaces`] so the render thread follows; a change
+    /// takes effect at the next frame boundary.
     pub(crate) fn set_cull_faces(&mut self, on: bool) {
+        if self.cull_faces == on {
+            return;
+        }
         self.cull_faces = on;
+        let _ = self.tx.send(RenderCmd::SetCullFaces(on));
     }
 
     pub(crate) fn cull_faces(&self) -> bool {
@@ -689,6 +693,7 @@ fn render_loop(
                 RenderCmd::Resize(size) => renderer.on_resize(size),
                 RenderCmd::SetVsync(v) => renderer.set_vsync(v),
                 RenderCmd::SetFlags(f) => renderer.set_flags(f),
+                RenderCmd::SetCullFaces(on) => renderer.set_cull_faces(on),
                 RenderCmd::SetMsaa(m) => {
                     renderer.set_msaa(m);
                 }

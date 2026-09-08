@@ -18,7 +18,7 @@ struct MeshRecord
     float3 aabb_max;
     int vertex_offset;
     uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
-    uint _pad2;
+    uint flags; // bit 0 = packed face-runs valid; clear → whole-mesh draw
 };
 
 // Mirrors vk::cull::PartitionGpu (std430).
@@ -190,7 +190,7 @@ void computeMain(uint3 id: SV_DispatchThreadID)
             float dist = length(0.5 * (mn + mx));
             uint bucket = distance_bucket(dist);
             uint part = (group * params.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
-            if ((params.flags & 1u) == 0u)
+            if ((params.flags & 1u) == 0u || (rec.flags & 1u) == 0u)
             {
                 emit(part, cmd);
                 if ((pc.flags & 1u) != 0)

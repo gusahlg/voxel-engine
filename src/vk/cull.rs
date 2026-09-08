@@ -465,7 +465,8 @@ pub(crate) struct CullState {
     /// Recycled partition table when [`Self::prepare`] returns `None`, so a
     /// frame with nothing to cull does not drop last frame's allocation.
     spare_parts: Vec<PartitionGpu>,
-    /// Per-direction face-run culling (`VOXEL_CULL_FACES`; default on, `"0"` off).
+    /// Per-direction face-run culling. On by default; follows
+    /// [`crate::Engine::set_cull_faces`].
     face_cull: bool,
 }
 
@@ -545,7 +546,6 @@ impl CullState {
             bytes,
             if wave_atomics { "cull-wave" } else { "cull" },
         );
-        let face_cull = !matches!(std::env::var("VOXEL_CULL_FACES").as_deref(), Ok("0"));
         Self {
             set_layout,
             layout,
@@ -567,8 +567,14 @@ impl CullState {
             }),
             stats: std::array::from_fn(|_| StatsReadback::new(device, memory_props)),
             spare_parts: Vec::new(),
-            face_cull,
+            face_cull: true,
         }
+    }
+
+    /// Applied between frames; [`Self::prepare`] snapshots the value so a
+    /// toggle cannot size partitions for one run count and advertise the other.
+    pub fn set_face_cull(&mut self, on: bool) {
+        self.face_cull = on;
     }
 
     /// Last completed histogram for `slot`: `[draws0, idx0, draws1, idx1, draws2, idx2]`.
@@ -610,7 +616,10 @@ impl CullState {
         if partitions.capacity() == 0 {
             partitions = std::mem::take(&mut self.spare_parts);
         }
-        let runs_per_mesh = if self.face_cull { MAX_FACE_RUNS } else { 1 };
+        // One snapshot for both partition capacity and CullParams.flags so a
+        // mid-frame toggle cannot size runs for one value and advertise the other.
+        let face_cull = self.face_cull;
+        let runs_per_mesh = if face_cull { MAX_FACE_RUNS } else { 1 };
         let total = dir.partitions_into(&mut partitions, runs_per_mesh);
         if partitions.is_empty() || total == 0 {
             self.spare_parts = partitions;
@@ -624,7 +633,7 @@ impl CullState {
             cam_frac: eye.frac,
             arena_count: dir.arena_count() as u32,
             shadow_enabled: shadow.is_some() as u32,
-            flags: u32::from(self.face_cull),
+            flags: u32::from(face_cull),
             _pad: [0; 2],
         };
         if let Some(frusta) = shadow {

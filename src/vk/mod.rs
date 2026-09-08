@@ -524,6 +524,12 @@ impl Renderer {
         self.flags = flags;
     }
 
+    /// GPU face-run culling. Takes effect at the next cull prepare so partition
+    /// capacity and the cull-params flag always agree for a frame.
+    pub fn set_cull_faces(&mut self, on: bool) {
+        self.cull.set_face_cull(on);
+    }
+
     /// Set render scale; returns clamped value.
     pub fn set_render_scale(&mut self, scale: f32) -> f32 {
         let clamped = Scale::new(scale).get();
