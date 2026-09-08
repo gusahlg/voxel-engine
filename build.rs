@@ -175,6 +175,16 @@ const MESH3D_LOD: Shader = Shader {
     dst: "mesh3d_lod.frag.spv",
 };
 
+/// Present-time TAA tonemap fragment (`-DTAA_FUSED`): two color attachments
+/// (swapchain + history) and the larger fused push block. The default variant
+/// in SHADERS stays the one-output TAA-off path.
+const TONEMAP_TAA: Shader = Shader {
+    src: "shaders/tonemap.frag.slang",
+    stage: "fragment",
+    entry: "fragmentMain",
+    dst: "tonemap_taa.frag.spv",
+};
+
 /// One compile unit: a shader plus its `-D` defines and extra slangc args.
 struct Job<'a> {
     shader: &'a Shader<'a>,
@@ -279,14 +289,16 @@ fn main() {
         defines: &["-DMESH3D_OPAQUE", "-DMESH3D_LOD"],
         extra_args: &[],
     });
+    jobs.push(Job {
+        shader: &TONEMAP_TAA,
+        defines: &["-DTAA_FUSED"],
+        extra_args: &[],
+    });
     compile_all(toolchain.as_ref(), &out_dir, fallback_dir, &jobs);
     // Wave-aggregated InterlockedAdd variant of the cull shader. Not in SHADERS:
     // shaders_spv/ keeps the plain-atomic module (no subgroup caps) as the
-    // no-slangc fallback; this file lives only in OUT_DIR.
+    // no-slangc fallback; this file lives only in OUT_DIR. See compile_cull_wave.
     compile_cull_wave(toolchain.as_ref(), &out_dir);
-    // Present-time TAA tonemap variant (`-DTAA_FUSED`). Lives only in OUT_DIR
-    // (shaders_spv/ is not refreshed here).
-    compile_tonemap_taa(toolchain.as_ref(), &out_dir);
 
     // Substrate probe: compute shaders for BDA, QUAD, STORAGE, and occupancy tests.
     // Gated behind VOXEL_BUILD_PROBE to avoid requiring extended SPIR-V profile.
@@ -584,10 +596,19 @@ fn fingerprint(toolchain: &Toolchain, args: &[String], src: &Path) -> String {
     format!("{hash:016x}")
 }
 
-/// Wave-aggregated InterlockedAdd variant of the cull shader. Without slangc,
-/// clone the plain module so `include_bytes!` still resolves; the runtime then
-/// picks the plain pipeline because wave ops are absent. Lives only in OUT_DIR
-/// (shaders_spv/ keeps the no-subgroup fallback).
+/// Wave-aggregated InterlockedAdd variant of the cull shader. Lives only in
+/// OUT_DIR: shaders_spv/ keeps the plain-atomic module (no subgroup caps).
+///
+/// Without slangc, `cull_wave.comp.spv` is a copy of the plain `cull.comp.spv`.
+/// That copy is semantically safe: it is a correct plain-atomic module (same
+/// bindings, same push constants, same per-thread InterlockedAdd emit). The
+/// Rust side (`device.cull_wave_atomics`) selects `CULL_COMP_WAVE` vs
+/// `CULL_COMP` from GPU subgroup BASIC+BALLOT, not by inspecting SPIR-V.
+/// Selecting the copy on a wave-capable GPU is equivalent to selecting
+/// `CULL_COMP` — results match; only the wave aggregation is skipped. The
+/// copy does not declare GroupNonUniform, so validation does not require
+/// subgroup features. A dedicated `shaders_spv/cull_wave.comp.spv` is not
+/// needed; unlike `-DTAA_FUSED`, a plain clone is not a different interface.
 fn compile_cull_wave(toolchain: Option<&Toolchain>, out_dir: &Path) {
     const CULL_WAVE: Shader = Shader {
         src: "shaders/cull.comp.slang",
@@ -608,39 +629,11 @@ fn compile_cull_wave(toolchain: Option<&Toolchain>, out_dir: &Path) {
         );
         return;
     }
+    // Plain-atomic clone: see the safety argument on this function.
     let plain = out_dir.join("cull.comp.spv");
     let wave = out_dir.join(CULL_WAVE.dst);
     fs::copy(&plain, &wave)
         .unwrap_or_else(|e| panic!("copy plain cull module to {}: {e}", wave.display()));
-}
-
-/// Fused TAA tonemap fragment (`-DTAA_FUSED`, two color attachments). Without
-/// slangc, clone the plain tonemap module so `include_bytes!` still resolves;
-/// the fused pipeline is only correct when slangc compiled the variant.
-fn compile_tonemap_taa(toolchain: Option<&Toolchain>, out_dir: &Path) {
-    const TONEMAP_TAA: Shader = Shader {
-        src: "shaders/tonemap.frag.slang",
-        stage: "fragment",
-        entry: "fragmentMain",
-        dst: "tonemap_taa.frag.spv",
-    };
-    if toolchain.is_some() {
-        compile_all(
-            toolchain,
-            out_dir,
-            Path::new("shaders_spv"),
-            &[Job {
-                shader: &TONEMAP_TAA,
-                defines: &["-DTAA_FUSED"],
-                extra_args: &[],
-            }],
-        );
-        return;
-    }
-    let plain = out_dir.join("tonemap.frag.spv");
-    let fused = out_dir.join(TONEMAP_TAA.dst);
-    fs::copy(&plain, &fused)
-        .unwrap_or_else(|e| panic!("copy plain tonemap module to {}: {e}", fused.display()));
 }
 
 fn compile(
