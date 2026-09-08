@@ -72,8 +72,8 @@ static const float2 HALTON_23[16] = {
 static const float HISTORY_BLEND = 0.92f;
 
 // TAA neighbourhood variance-clamp width in std-devs: history is clamped to
-// YCoCg mean +/- VARIANCE_GAMMA*stddev of the 3x3 current taps. Wider = steadier
-// (less crawl) but more ghosting. Read by taa_resolve.comp.
+// YCoCg mean +/- VARIANCE_GAMMA*stddev of the 5-tap cross current taps. Wider =
+// steadier (less crawl) but more ghosting. Read by taa_resolve.comp.
 static const float VARIANCE_GAMMA = 1.25f;
 
 // Blocklight candle curve: candle = x*sqrt(x) + (CANDLE_HIGH_MUL*x)^CANDLE_HIGH_POW,
@@ -112,9 +112,31 @@ static const float SHADOW_RESOLUTION = 2048.0f;
 // dispatch partition math (vk/cull.rs) must divide by the same value.
 static const uint CULL_WORKGROUP = 64;
 
+// Front-to-back approximate-order buckets per camera (pass, arena) partition.
+// Shadow groups stay unbucketed. CPU partition math and the cull shader must agree.
+static const uint CULL_DISTANCE_BUCKETS = 4;
+
+// Camera cull groups: full-res Opaque, Cutout, coarse-LOD Opaque.
+// Must match vk::cull::CAMERA_GROUPS; the shader uses this for partition indexing.
+static const uint CULL_CAMERA_GROUPS = 3;
+
+// Camera-distance edge (metres from AABB centre) between cull buckets 0 and 1.
+// Bucket 0 is nearest; record_mesh_indirect_count draws 0..K-1 near-to-far.
+static const float CULL_BUCKET_SPLIT_0 = 16.0f;
+
+// Camera-distance edge (metres) between cull buckets 1 and 2.
+static const float CULL_BUCKET_SPLIT_1 = 64.0f;
+
+// Camera-distance edge (metres) between cull buckets 2 and 3 (farthest).
+static const float CULL_BUCKET_SPLIT_2 = 256.0f;
+
 // Exposure metering tile edge in HDR texels. The CPU-side tile-grid dimensions
 // (vk/exposure.rs) are ceil(hdr_dim / EXPOSURE_TILE) and must agree.
 static const uint EXPOSURE_TILE = 16;
+
+// TAA resolve workgroup edge in texels (groupshared tile + 1-pixel apron).
+// CPU dispatch (vk/taa.rs) must divide by the same value.
+static const uint TAA_TILE = 16;
 
 // Sun-disc soft rim (fade-to-zero edge) as a multiple of the sun angular radius.
 // Tighter rim keeps sun crisp against busier night sky. Complements brighter stars [4.2, 4.5, 5.2] and larger moon.
@@ -175,6 +197,10 @@ static const float BLOOM_SPIRAL_SAMPLES = 6.0f;
 // Mip level the bloom spiral samples the (already downsampled) chain at — the
 // wide soft blur comes from the pyramid; the spiral just spreads and de-aliases it.
 static const float BLOOM_SPIRAL_LOD = 2.0f;
+
+// Bloom pyramid mip cap. Tonemap samples only BLOOM_SPIRAL_LOD, so the chain
+// stops at that level (base + LOD). CPU (vk/targets.rs) must agree.
+static const uint BLOOM_MAX_MIPS = 3;
 
 // Bloom spiral radius in output uv (isotropic). Small — the mip chain already
 // carries the wide blur, so this only softens the seams between taps.
@@ -286,6 +312,14 @@ static const float CLOUD_HORIZON_OFFSET = 0.06f;
 
 // Horizon-hide steepness: saturate((ray.y - CLOUD_HORIZON_OFFSET) * this).
 static const float CLOUD_HORIZON_FADE = 5.0f;
+
+// Edge length of the square octahedral cloud LUT (texels). Quality band
+// [256, 512]; CPU dispatch and the compute shader must agree.
+static const uint SKY_CLOUD_LUT_SIZE = 256;
+
+// Cloud-LUT compute workgroup edge. CPU dispatch divides SKY_CLOUD_LUT_SIZE
+// by this; the shader's [numthreads] uses the same value.
+static const uint SKY_CLOUD_LUT_WG = 8;
 
 // Wave value-noise spatial frequency (1/metres) at the base octave.
 // Higher ⇒ smaller, tighter ripples.

@@ -20,7 +20,8 @@ use crate::vk::vertex_input::{VertexInput, vertex_struct};
 pub const PUSH_BYTES_3D: u32 = size_of::<Mesh3dPush>() as u32;
 pub const PUSH_BYTES_DEBUG: u32 = size_of::<DebugPush>() as u32;
 pub const PUSH_BYTES_2D: u32 = size_of::<[f32; 2]>() as u32; // pixels_to_ndc
-pub const PUSH_BYTES_SKY: u32 = size_of::<SkyParams>() as u32; // inv_view_proj + sun geom + tint
+pub const PUSH_BYTES_SKY: u32 = size_of::<SkyParams>() as u32; // inv_view_proj + disc cosines
+const _: () = assert!(size_of::<SkyParams>() <= 128);
 // exposure + wide-FOV remap coefficients (s, atan_s); see camera::WarpPush.
 pub const PUSH_BYTES_TONEMAP: u32 = size_of::<crate::camera::WarpPush>() as u32;
 
@@ -69,13 +70,15 @@ pub struct DebugPush {
     pub view_proj: Mat4,
 }
 
-/// Sky push constant: inverse view-proj, sun direction and radius, tint color.
+/// Sky push constant: inverse view-proj, unit sun dir, disc tint, precomputed
+/// sun/moon cone cosines (the per-pixel `cos(radius·SUN_DISC_*)` hoist).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SkyParams {
     inv_view_proj: Mat4,
     sun: [f32; 4],
     sun_tint: [f32; 4],
+    moon: [f32; 4],
 }
 
 impl SkyParams {
@@ -84,10 +87,18 @@ impl SkyParams {
         // sun_tint is ALREADY linear (LinearRgb, non-quantising boundary) — no
         // /255 decode: the disc composites in linear light shader-side.
         let [tr, tg, tb] = desc.sun_tint.0;
+        let r = desc.sun_angular_radius;
+        let moon_r = r * crate::genconst::MOON_RADIUS_SCALE;
         Self {
             inv_view_proj,
-            sun: [s.x, s.y, s.z, desc.sun_angular_radius],
-            sun_tint: [tr, tg, tb, 0.0],
+            sun: [s.x, s.y, s.z, (r * crate::genconst::SUN_DISC_CORE).cos()],
+            sun_tint: [tr, tg, tb, (r * crate::genconst::SUN_DISC_RIM).cos()],
+            moon: [
+                (moon_r * crate::genconst::SUN_DISC_CORE).cos(),
+                (moon_r * crate::genconst::SUN_DISC_RIM).cos(),
+                0.0,
+                0.0,
+            ],
         }
     }
 }
@@ -102,7 +113,15 @@ vertex_struct! {
 }
 
 const MESH3D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d.vert.spv"));
+/// Full mesh3d.frag module (water/absorb branch + LOD-slab `discard`): the
+/// Blend pipelines only.
 const MESH3D_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d.frag.spv"));
+/// Full-res opaque variant: no water code and no `discard`, so the driver
+/// keeps early depth writes on for every opaque terrain fragment.
+const MESH3D_OPAQUE_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_opaque.frag.spv"));
+/// Coarse-LOD opaque variant: the slab-clip `discard`, no cascade sampling.
+const MESH3D_LOD_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_lod.frag.spv"));
 /// Shader variant with depth input attachment for water absorption; built
 /// when dynamic_rendering_local_read is available and MSAA is off.
 const MESH3D_WATER_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_water.frag.spv"));
@@ -120,7 +139,8 @@ const VRS_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vrs.comp.spv")
 
 /// The VRS classifier compute pipeline plus the depth sampler it reads through.
 /// Present exactly when attachment VRS is enabled. Set 0 is push-descriptor:
-/// binding 0 = depth (combined image sampler), binding 1 = rate storage image.
+/// binding 0 = depth (combined image sampler), binding 1 = rate storage image,
+/// binding 2 = history storage image, binding 3 = mix histogram SSBO.
 pub struct VrsCompute {
     pub pipeline: vk::Pipeline,
     pub layout: vk::PipelineLayout,
@@ -133,9 +153,14 @@ pub struct Pipelines {
     /// Push-constant-only (view_proj) layout for immediate debug geometry.
     pub layout_debug: vk::PipelineLayout,
     pub layout_2d: vk::PipelineLayout,
+    /// Full-res opaque terrain (`cull::Group::Opaque`): the no-`discard`
+    /// fragment variant, depth read/write, cull back.
     pub mesh3d: vk::Pipeline,
-    /// Same vertex/fragment modules and `layout_3d` as `mesh3d`, but alpha
-    /// blends and reads (never writes) depth. Selected for [`Pass::Blend`].
+    /// Coarse-LOD opaque terrain (`cull::Group::OpaqueLod`): same state as
+    /// `mesh3d` with the slab-clip `discard` fragment variant.
+    pub mesh3d_lod: vk::Pipeline,
+    /// The full fragment module with `layout_3d`, alpha blended, reads (never
+    /// writes) depth. Selected for [`Pass::Blend`].
     pub mesh3d_transparent: vk::Pipeline,
     /// Water-absorption variant when dynamic_rendering_local_read is available and MSAA is off;
     /// fallback to mesh3d_transparent otherwise.
@@ -154,11 +179,14 @@ pub struct Pipelines {
     pub tris2d_present: vk::Pipeline,
     pub tris2d_tex_present: vk::Pipeline,
     /// Vertex-less fullscreen background pass: geometry push constant + set 0
-    /// binding 2 (the shared per-frame `FrameUniforms`). Depth-tests
-    /// (read-only) at the reversed-Z far plane so it shades only pixels the
-    /// terrain left uncovered.
+    /// binding 0 (cloud LUT) and binding 1 (the shared per-frame `FrameUniforms`).
+    /// Depth-tests (read-only) at the reversed-Z far plane so it shades only
+    /// pixels the terrain left uncovered.
     pub sky: vk::Pipeline,
     pub layout_sky: vk::PipelineLayout,
+    pub sky_set_layout: vk::DescriptorSetLayout,
+    /// Linear-clamp sampler pushed with the octahedral cloud LUT.
+    pub sky_lut_sampler: vk::Sampler,
     /// Fullscreen AgX tonemap: samples the HDR offscreen (set 0 push descriptor,
     /// `tonemap_set_layout`) and writes the LDR swapchain image.
     pub tonemap: vk::Pipeline,
@@ -216,16 +244,37 @@ impl Pipelines {
                 .expect("Failed to create debug pipeline layout")
         };
 
-        // Sky layout: geometry push constant across both stages, plus set 0 =
-        // the SAME `mesh3d_set_layout` the mesh passes use, so the sky
-        // fragment reads the per-frame `FrameUniforms` at binding 2 — one UBO,
-        // one descriptor-set-layout, no second definition. The sky shader only
-        // touches binding 2; the other bindings stay unwritten for this pass.
+        // Sky layout: fragment push constant (inv VP + disc cosines) plus set 0
+        // binding 0 = cloud LUT, binding 1 = FrameUniforms. Dedicated rather than
+        // sharing mesh3d_set_layout: the LUT is a sampled image the mesh pass
+        // never touches.
         let push_sky = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(PUSH_BYTES_SKY)];
-        let set_layouts_sky = [mesh3d_set_layout];
+        let sky_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let sky_set_layout = unsafe {
+            device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+                        .bindings(&sky_bindings),
+                    None,
+                )
+                .expect("Failed to create sky set layout")
+        };
+        let set_layouts_sky = [sky_set_layout];
         let layout_sky_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts_sky)
             .push_constant_ranges(&push_sky);
@@ -234,6 +283,7 @@ impl Pipelines {
                 .create_pipeline_layout(&layout_sky_info, None)
                 .expect("Failed to create sky pipeline layout")
         };
+        let sky_lut_sampler = pass::linear_clamp_sampler(device, "sky cloud LUT");
 
         let push_2d = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
@@ -335,6 +385,9 @@ impl Pipelines {
 
         let mesh_vert = pass::shader_module(device, MESH3D_VERT, "mesh3d vertex");
         let mesh_frag = pass::shader_module(device, MESH3D_FRAG, "mesh3d fragment");
+        let mesh_opaque_frag =
+            pass::shader_module(device, MESH3D_OPAQUE_FRAG, "mesh3d opaque fragment");
+        let mesh_lod_frag = pass::shader_module(device, MESH3D_LOD_FRAG, "mesh3d lod fragment");
         let debug_vert = pass::shader_module(device, DEBUG_VERT, "debug vertex");
         let debug_frag = pass::shader_module(device, DEBUG_FRAG, "debug fragment");
         let tri2d_vert = pass::shader_module(device, TRIS2D_VERT, "2d vertex");
@@ -353,20 +406,29 @@ impl Pipelines {
         };
 
         // Depth: reversed-Z, so GREATER_OR_EQUAL and clear to 0.0.
+        let opaque_config = || PipelineConfig {
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            depth: DepthMode::ReadWrite,
+            cull: vk::CullModeFlags::BACK,
+            blend: false,
+            vrs: true,
+            depth_bias: None,
+        };
         let mesh3d = builder.build(
             mesh_vert,
-            mesh_frag,
+            mesh_opaque_frag,
             &bindings_3d,
             attributes_3d,
             layout_3d,
-            PipelineConfig {
-                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                depth: DepthMode::ReadWrite,
-                cull: vk::CullModeFlags::BACK,
-                blend: false,
-                vrs: true,
-                depth_bias: None,
-            },
+            opaque_config(),
+        );
+        let mesh3d_lod = builder.build(
+            mesh_vert,
+            mesh_lod_frag,
+            &bindings_3d,
+            attributes_3d,
+            layout_3d,
+            opaque_config(),
         );
         // Blend world geometry: same modules/layout, alpha blend, depth read-only
         // (all opaque wrote depth first; blend tests but never writes). Double-sided
@@ -569,6 +631,8 @@ impl Pipelines {
             device.destroy_shader_module(tonemap_frag, None);
             device.destroy_shader_module(mesh_vert, None);
             device.destroy_shader_module(mesh_frag, None);
+            device.destroy_shader_module(mesh_opaque_frag, None);
+            device.destroy_shader_module(mesh_lod_frag, None);
             if let Some(m) = mesh3d_water_frag {
                 device.destroy_shader_module(m, None);
             }
@@ -589,6 +653,7 @@ impl Pipelines {
             layout_debug,
             layout_2d,
             mesh3d,
+            mesh3d_lod,
             mesh3d_transparent,
             mesh3d_transparent_absorb,
             debug_tris,
@@ -600,6 +665,8 @@ impl Pipelines {
             tris2d_tex_present,
             sky,
             layout_sky,
+            sky_set_layout,
+            sky_lut_sampler,
             tonemap,
             layout_tonemap,
             tonemap_set_layout,
@@ -609,12 +676,14 @@ impl Pipelines {
     }
 
     /// The 3D pipeline for a mesh's draw pass. Exhaustive so a new [`Pass`]
-    /// variant forces a matching pipeline here.
+    /// variant forces a matching pipeline here. Opaque means the FULL-RES
+    /// partition; the coarse-LOD partition binds [`Self::mesh3d_lod`].
     pub fn pipeline_for(&self, pass: Pass) -> vk::Pipeline {
         match pass {
             Pass::Opaque => self.mesh3d,
-            // Reserved: shares the opaque pipeline (depth write, cull back) until a
-            // `discard` frag variant lands. Sound because nothing emits Cutout yet.
+            // Reserved: shares the opaque pipeline (depth write, cull back) until an
+            // alpha-test `discard` frag variant lands (it must NOT reuse the
+            // no-discard opaque module then). Sound because nothing emits Cutout yet.
             Pass::Cutout => self.mesh3d,
             Pass::Blend => self.blend_pipeline(),
         }
@@ -636,6 +705,7 @@ impl Pipelines {
                 device.destroy_sampler(v.depth_sampler, None);
             }
             device.destroy_pipeline(self.mesh3d, None);
+            device.destroy_pipeline(self.mesh3d_lod, None);
             device.destroy_pipeline(self.mesh3d_transparent, None);
             if let Some(p) = self.mesh3d_transparent_absorb {
                 device.destroy_pipeline(p, None);
@@ -653,6 +723,8 @@ impl Pipelines {
             device.destroy_pipeline_layout(self.layout_debug, None);
             device.destroy_pipeline_layout(self.layout_2d, None);
             device.destroy_pipeline_layout(self.layout_sky, None);
+            device.destroy_descriptor_set_layout(self.sky_set_layout, None);
+            device.destroy_sampler(self.sky_lut_sampler, None);
             device.destroy_pipeline_layout(self.layout_tonemap, None);
             device.destroy_descriptor_set_layout(self.tonemap_set_layout, None);
             device.destroy_sampler(self.tonemap_sampler, None);
@@ -890,6 +962,18 @@ fn create_vrs_compute(device: &ash::Device, cache: vk::PipelineCache) -> VrsComp
             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        // Previous raw classification (same-texel read, then write).
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        // Tile-mix histogram [1x1, 2x2, 4x4].
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(3)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
     let (set_layout, layout) = pass::push_descriptor_layouts(
         device,
@@ -918,5 +1002,57 @@ fn create_vrs_compute(device: &ash::Device, cache: vk::PipelineCache) -> VrsComp
         layout,
         set_layout,
         depth_sampler,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Scan a SPIR-V module for an opcode (low 16 bits of each instruction word).
+    fn spirv_has_opcode(bytes: &[u8], opcode: u32) -> bool {
+        assert!(bytes.len() >= 20 && bytes.len().is_multiple_of(4));
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(words[0], 0x0723_0203, "missing SPIR-V magic");
+        let mut i = 5usize;
+        while i < words.len() {
+            let wc = (words[i] >> 16) as usize;
+            let op = words[i] & 0xffff;
+            if wc == 0 || i + wc > words.len() {
+                break;
+            }
+            if op == opcode {
+                return true;
+            }
+            i += wc;
+        }
+        false
+    }
+
+    const OP_KILL: u32 = 252;
+    const OP_DEMOTE: u32 = 5380;
+
+    #[test]
+    fn opaque_frag_has_no_discard() {
+        assert!(
+            !spirv_has_opcode(super::MESH3D_OPAQUE_FRAG, OP_KILL)
+                && !spirv_has_opcode(super::MESH3D_OPAQUE_FRAG, OP_DEMOTE),
+            "MESH3D_OPAQUE must not OpKill/OpDemote (early depth write)"
+        );
+    }
+
+    #[test]
+    fn lod_and_blend_frags_keep_slab_discard() {
+        assert!(
+            spirv_has_opcode(super::MESH3D_LOD_FRAG, OP_KILL)
+                || spirv_has_opcode(super::MESH3D_LOD_FRAG, OP_DEMOTE),
+            "MESH3D_LOD must keep the slab-clip discard"
+        );
+        assert!(
+            spirv_has_opcode(super::MESH3D_FRAG, OP_KILL)
+                || spirv_has_opcode(super::MESH3D_FRAG, OP_DEMOTE),
+            "Blend mesh3d.frag must keep the slab-clip discard"
+        );
     }
 }

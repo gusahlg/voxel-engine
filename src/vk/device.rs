@@ -44,6 +44,16 @@ impl Anisotropy {
 
 pub struct FragmentShadingRate {
     pub texel_size: vk::Extent2D,
+    /// Rasterization sample counts that advertise a 4×4 fragment size.
+    /// Empty if the device does not list 4×4 in its shading-rate table.
+    four_x_four: vk::SampleCountFlags,
+}
+
+impl FragmentShadingRate {
+    /// Whether a 4×4 attachment rate is valid for this rasterization sample count.
+    pub fn allow_4x4(&self, samples: vk::SampleCountFlags) -> bool {
+        self.four_x_four.contains(samples)
+    }
 }
 
 pub struct Device {
@@ -68,6 +78,8 @@ pub struct Device {
     pub draw_indirect_first_instance: bool,
     /// Required for GPU-driven culling; kept as field for single-source enable.
     pub draw_indirect_count: bool,
+    /// Compute-stage subgroup BASIC+BALLOT: cull uses wave-aggregated atomics.
+    pub cull_wave_atomics: bool,
     pub timestamp_period_ns: f32,
     pub timestamps_supported: bool,
     pub max_image_array_layers: u32,
@@ -86,13 +98,14 @@ struct Candidate {
     draw_indirect_count: bool,
     memory_budget: bool,
     max_anisotropy: Option<f32>,
-    fragment_shading_rate: Option<vk::Extent2D>,
+    fragment_shading_rate: Option<FragmentShadingRate>,
     dynamic_rendering_local_read: bool,
     score: u32,
 }
 
 impl Device {
     pub fn new(
+        entry: &ash::Entry,
         instance: &ash::Instance,
         surface_loader: &khr::surface::Instance,
         surface: vk::SurfaceKHR,
@@ -105,9 +118,9 @@ impl Device {
 
         let best = physical_devices
             .into_iter()
-            .filter_map(|pd| evaluate(instance, pd, surface_loader, surface))
+            .filter_map(|pd| evaluate(entry, instance, pd, surface_loader, surface))
             .max_by_key(|c| c.score)
-            .expect("No suitable Vulkan 1.3 GPU found (needs dynamic rendering + synchronization2 + drawIndirectCount + swapchain)");
+            .expect("No suitable Vulkan 1.3 GPU found (needs dynamic rendering + synchronization2 + shaderDemoteToHelperInvocation + drawIndirectCount + swapchain)");
 
         log::info!(
             "Using GPU: {}",
@@ -174,9 +187,13 @@ impl Device {
             );
         }
 
+        // shaderDemoteToHelperInvocation: SPIR-V 1.6 modules (build.rs
+        // -profile spirv_1_6) lower `discard` to OpDemoteToHelperInvocation,
+        // which needs this core-1.3 feature enabled at device creation.
         let mut vulkan_13_features = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
-            .synchronization2(true);
+            .synchronization2(true)
+            .shader_demote_to_helper_invocation(true);
         let mut vulkan_12_features = vk::PhysicalDeviceVulkan12Features::default()
             .timeline_semaphore(true)
             .draw_indirect_count(best.draw_indirect_count);
@@ -253,13 +270,35 @@ impl Device {
             .memory_budget
             .then(|| unsafe { MemoryBudget::assume_enabled() });
 
-        let fragment_shading_rate = best
-            .fragment_shading_rate
-            .map(|texel_size| FragmentShadingRate { texel_size });
+        let fragment_shading_rate = best.fragment_shading_rate;
+        match &fragment_shading_rate {
+            Some(fsr) => log::info!(
+                "VRS: attachment texel {}x{}, 4x4 samples {:?}",
+                fsr.texel_size.width,
+                fsr.texel_size.height,
+                fsr.four_x_four,
+            ),
+            None => log::info!("VRS: fragment shading rate unsupported; shading at 1x1"),
+        }
 
         let local_read = best
             .dynamic_rendering_local_read
             .then(|| khr::dynamic_rendering_local_read::Device::new(instance, &device));
+
+        let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut subgroup_props = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
+        unsafe { instance.get_physical_device_properties2(best.physical, &mut subgroup_props) };
+        let cull_wave_atomics = subgroup
+            .supported_stages
+            .contains(vk::ShaderStageFlags::COMPUTE)
+            && subgroup
+                .supported_operations
+                .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::BALLOT);
+        if cull_wave_atomics {
+            log::info!("cull: wave-aggregated atomics (compute subgroup ballot)");
+        } else {
+            log::info!("cull: per-thread atomics (no compute subgroup ballot)");
+        }
 
         Self {
             physical: best.physical,
@@ -282,6 +321,7 @@ impl Device {
             multi_draw_indirect: best.multi_draw_indirect,
             draw_indirect_first_instance: best.draw_indirect_first_instance,
             draw_indirect_count: best.draw_indirect_count,
+            cull_wave_atomics,
             timestamp_period_ns: best.properties.limits.timestamp_period,
             timestamps_supported: best.properties.limits.timestamp_compute_and_graphics == vk::TRUE,
             max_image_array_layers: best.properties.limits.max_image_array_layers,
@@ -310,6 +350,7 @@ impl Device {
 }
 
 fn evaluate(
+    entry: &ash::Entry,
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
     surface_loader: &khr::surface::Instance,
@@ -336,8 +377,11 @@ fn evaluate(
         .then_some(properties.limits.max_sampler_anisotropy);
     // Required for GPU-driven culling; reject devices that lack it.
     let draw_indirect_count = vulkan_12_features.draw_indirect_count == vk::TRUE;
+    // shaderDemoteToHelperInvocation is mandatory in Vulkan 1.3 and the
+    // shipped SPIR-V 1.6 fragment modules rely on it (see Device::new).
     if vulkan_13_features.dynamic_rendering != vk::TRUE
         || vulkan_13_features.synchronization2 != vk::TRUE
+        || vulkan_13_features.shader_demote_to_helper_invocation != vk::TRUE
         || !draw_indirect_count
     {
         return None;
@@ -372,7 +416,10 @@ fn evaluate(
                 let mut fsr_props = vk::PhysicalDeviceFragmentShadingRatePropertiesKHR::default();
                 let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut fsr_props);
                 unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
-                fsr_props.max_fragment_shading_rate_attachment_texel_size
+                FragmentShadingRate {
+                    texel_size: fsr_props.max_fragment_shading_rate_attachment_texel_size,
+                    four_x_four: advertised_4x4(entry, instance, physical),
+                }
             })
         })
         .flatten();
@@ -441,4 +488,31 @@ fn evaluate(
         dynamic_rendering_local_read,
         score,
     })
+}
+
+/// Sample counts for which the device lists a 4×4 fragment shading rate.
+fn advertised_4x4(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+) -> vk::SampleCountFlags {
+    let loader = khr::fragment_shading_rate::Instance::new(entry, instance);
+    let get = loader.fp().get_physical_device_fragment_shading_rates_khr;
+    unsafe {
+        let mut count = 0u32;
+        if get(physical, &mut count, std::ptr::null_mut()) != vk::Result::SUCCESS || count == 0 {
+            return vk::SampleCountFlags::empty();
+        }
+        let mut rates = vec![vk::PhysicalDeviceFragmentShadingRateKHR::default(); count as usize];
+        if get(physical, &mut count, rates.as_mut_ptr()) != vk::Result::SUCCESS {
+            return vk::SampleCountFlags::empty();
+        }
+        rates.truncate(count as usize);
+        rates
+            .iter()
+            .filter(|r| r.fragment_size.width == 4 && r.fragment_size.height == 4)
+            .fold(vk::SampleCountFlags::empty(), |acc, r| {
+                acc | r.sample_counts
+            })
+    }
 }

@@ -177,10 +177,14 @@ pub(crate) struct BloomChain {
     pub sample_view: vk::ImageView,
     pub mip_views: Vec<vk::ImageView>,
     pub mip_extents: Vec<vk::Extent2D>,
+    /// True once a bloom-off clear has left this pyramid black in
+    /// `SHADER_READ_ONLY`. Avoids re-clearing every frame.
+    pub cleared: bool,
 }
 
-/// Maximum mip levels; pyramid reaches 1x1 or BLOOM_MAX_MIPS, whichever is shorter.
-const BLOOM_MAX_MIPS: u32 = 6;
+/// Tonemap samples only `BLOOM_SPIRAL_LOD`, so the pyramid stops there.
+const BLOOM_MAX_MIPS: u32 = crate::genconst::BLOOM_MAX_MIPS;
+const _: () = assert!(BLOOM_MAX_MIPS == crate::genconst::BLOOM_SPIRAL_LOD as u32 + 1);
 
 impl BloomChain {
     fn new(
@@ -287,6 +291,7 @@ impl BloomChain {
             sample_view,
             mip_views,
             mip_extents,
+            cleared: false,
         }
     }
 
@@ -322,15 +327,19 @@ pub struct RenderTargets {
     /// The HDR format shared by `msaa` + `offscreen`; the geometry pipelines
     /// must be built with this same format. Never the swapchain format.
     pub color_format: vk::Format,
-    /// `Some` when attachment VRS is active. Owns the per-slot rate images and
-    /// their texel size as one consistent value — there is no way to have the
-    /// images without the size or vice versa.
+    /// `Some` when the device supports attachment VRS. Owns the per-slot rate
+    /// images, history, and mix readback. `RenderFlags::vrs` decides whether
+    /// a frame actually classifies and binds the rate attachment.
     pub(crate) vrs: Option<super::vrs::Vrs>,
-    /// Cascaded shadow map, per-slot: avoid frame overlap glitches with type-safe indexing.
-    pub(crate) shadow: crate::skeleton::PerSlot<ShadowMap>,
+    /// Shared cascaded shadow map (both FIF slots sample the same image).
+    /// Regenerated once per `ShadowKey`; see `shadow.rs` hazard analysis.
+    pub(crate) shadow: ShadowMap,
     /// Per-slot bloom mip chain. Extent-dependent, so recreated with the
     /// rest of the targets on resize.
     pub(crate) bloom: [BloomChain; FRAMES_IN_FLIGHT as usize],
+    /// Per-slot octahedral cloud LUT (RGBA16F). Size is a genconst, independent
+    /// of the swapchain; still owned here so resize tears it down with everything else.
+    pub(crate) sky_cloud: [ImageResource; FRAMES_IN_FLIGHT as usize],
 }
 
 impl RenderTargets {
@@ -419,19 +428,34 @@ impl RenderTargets {
             )
         });
 
-        // Variable-rate shading is opt-in: `VOXEL_VRS=1` enables it where the
-        // hardware supports it. Otherwise the rate image is never allocated, so
-        // `do_vrs` (which gates on `targets.vrs.is_some()`) stays false and the
-        // full-rate path runs.
-        let vrs = fsr
-            .filter(|_| matches!(std::env::var("VOXEL_VRS").as_deref(), Ok("1")))
-            .map(|f| super::vrs::Vrs::new(device, &memory_props, f, extent));
+        // Rate images exist whenever the device supports attachment FSR.
+        // `RenderFlags::vrs` (default on) is the runtime switch: off skips the
+        // classify dispatch and the rate attachment, shading 1×1 everywhere.
+        let vrs = fsr.map(|f| super::vrs::Vrs::new(device, &memory_props, f, extent));
 
-        let shadow = crate::skeleton::PerSlot::new(std::array::from_fn(|_| {
-            ShadowMap::new(device, &memory_props)
-        }));
+        let shadow = ShadowMap::new(device, &memory_props);
 
         let bloom = std::array::from_fn(|_| BloomChain::new(device, &memory_props, extent));
+        let lut = crate::genconst::SKY_CLOUD_LUT_SIZE;
+        let sky_cloud = std::array::from_fn(|_| {
+            ImageResource::create(
+                device,
+                &memory_props,
+                &ImageDesc {
+                    extent: vk::Extent2D {
+                        width: lut,
+                        height: lut,
+                    },
+                    format: HDR_COLOR_FORMAT,
+                    usage: vk::ImageUsageFlags::STORAGE
+                        | vk::ImageUsageFlags::SAMPLED
+                        | vk::ImageUsageFlags::TRANSFER_DST,
+                    layers: 1,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                },
+            )
+        });
 
         Self {
             depth,
@@ -444,6 +468,7 @@ impl RenderTargets {
             vrs,
             shadow,
             bloom,
+            sky_cloud,
         }
     }
 
@@ -474,11 +499,12 @@ impl RenderTargets {
             if let Some(vrs) = &mut self.vrs {
                 vrs.destroy(device);
             }
-            for shadow in self.shadow.iter() {
-                shadow.destroy(device);
-            }
+            self.shadow.destroy(device);
             for chain in &self.bloom {
                 chain.destroy(device);
+            }
+            for lut in &self.sky_cloud {
+                lut.destroy(device);
             }
         }
     }

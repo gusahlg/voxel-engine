@@ -20,6 +20,7 @@ pub(crate) mod pass;
 pub(crate) mod pipeline;
 pub(crate) mod render_client;
 pub(crate) mod shadow;
+pub(crate) mod sky;
 pub(crate) mod swapchain;
 pub(crate) mod taa;
 pub(crate) mod targets;
@@ -36,12 +37,13 @@ use std::sync::mpsc::Sender;
 use ash::{khr, vk};
 
 use crate::frame::DrawLists;
-#[cfg(test)]
-use crate::frame::Scene3D;
 use crate::mesh::Pass;
 use crate::skeleton::{FrameSlot, PerSlot};
 use block_textures::BlockTextures;
-use buffers::{DrawIndexedIndirect, FRAMES_IN_FLIGHT, GpuResident, HostBuffer, MeshResidency};
+use buffers::{
+    DrawIndexedIndirect, FRAMES_IN_FLIGHT, GpuResident, HostBuffer, MESH_CONSUMER_STAGES,
+    MeshResidency,
+};
 use device::Device;
 use instance::InstanceBundle;
 use minimap::MinimapTexture;
@@ -91,10 +93,10 @@ struct SlotState {
     copy_value: TimelineValue,
     imm: HostBuffer,
     indirect: HostBuffer,
-    /// Depth valid with scene fingerprint; gates VRS reuse.
-    vrs_ready: Option<u64>,
-    /// Shadow map cleared to all-lit; gates shadow pass skip.
-    shadow_lit_ready: bool,
+    /// This slot has stored depth at the current extent; VRS may classify it.
+    vrs_ready: bool,
+    /// History image holds a raw classification from a previous VRS dispatch.
+    vrs_history: bool,
     /// Which image holds the final HDR (offscreen or TAA history).
     hdr_source: HdrSource,
 }
@@ -175,6 +177,25 @@ fn jittered_clip(clean: glam::Mat4, jitter_px: glam::Vec2, extent: vk::Extent2D)
 }
 
 /// Get frame's sun direction, defaulting to up if absent.
+/// Shadow-map content key: sun/eye-snap/occluders plus hashed avatar casters.
+fn shadow_key(
+    eye: glam::DVec3,
+    sun: glam::DVec3,
+    occluders: u64,
+    lists: &DrawLists,
+) -> shadow::ShadowKey {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    bytemuck::cast_slice::<_, u8>(&lists.cube_verts).hash(&mut h);
+    shadow::ShadowKey::of(
+        eye,
+        sun,
+        occluders,
+        h.finish(),
+        &crate::skeleton::ShadowCfg::PROVISIONAL,
+    )
+}
+
 fn sun_dir(lists: &DrawLists) -> glam::DVec3 {
     lists
         .scene
@@ -189,34 +210,6 @@ fn sun_dir(lists: &DrawLists) -> glam::DVec3 {
         })
         .filter(|d| d.length_squared() > 1e-6)
         .unwrap_or(glam::DVec3::Y)
-}
-
-/// Hash depth-affecting inputs (view, visibility, draws). Gates VRS reuse.
-fn scene_fingerprint(lists: &DrawLists, draws: &[DrawEntry], visible_mask: &[u32]) -> u64 {
-    use ash::vk::Handle;
-    use std::hash::{Hash, Hasher};
-
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    lists.scene.is_some().hash(&mut h);
-    // Hash visibility mask (flipped bits invalidate reused depth).
-    visible_mask.hash(&mut h);
-    if let Some(scene) = &lists.scene {
-        for c in scene.view_proj.to_cols_array() {
-            c.to_bits().hash(&mut h);
-        }
-    }
-    for d in draws {
-        d.buffer.as_raw().hash(&mut h);
-        // Slot represents placement (records are slot-tied).
-        (d.pass as u8, d.first, d.count, d.vertex_offset, d.slot).hash(&mut h);
-    }
-    // Debug cubes affect depth, not color.
-    for v in &lists.cube_verts {
-        for c in v.pos {
-            c.to_bits().hash(&mut h);
-        }
-    }
-    h.finish()
 }
 
 /// Minimap texture edge length in texels.
@@ -279,6 +272,8 @@ pub(crate) struct Renderer {
     exposure: exposure::ExposureState,
     /// Bloom pipelines.
     bloom: bloom::BloomState,
+    /// Cloud-LUT compute pipeline.
+    sky_cloud: sky::SkyCloudState,
     /// TAA state.
     taa: taa::TaaState,
 
@@ -298,7 +293,8 @@ pub(crate) struct Renderer {
     timeline: Timeline,
     /// Transfer queue for staging copies.
     transfer_lane: TransferLane,
-    /// Highest transfer-lane value submitted this frame.
+    /// Transfer-lane value this graphics submission waits on: last frame's
+    /// deferred mesh copies and/or this frame's quad-IBO grow.
     pending_transfer_wait: Option<TimelineValue>,
     /// Last present copy timeline value.
     last_copy_value: TimelineValue,
@@ -311,9 +307,6 @@ pub(crate) struct Renderer {
     pending_capture: Option<Capture>,
 
     slot: usize,
-
-    /// Current scene fingerprint.
-    scene_fingerprint: u64,
 
     vsync: Pending<bool>,
     msaa: Pending<SampleCount>,
@@ -357,7 +350,12 @@ impl Renderer {
         } = cfg;
         let render_scale = Scale::new(render_scale).as_f32();
 
-        let device = Device::new(&instance.instance, &surface_loader, surface);
+        let device = Device::new(
+            &instance.entry,
+            &instance.instance,
+            &surface_loader,
+            surface,
+        );
         let mut transfer_lane = unsafe {
             TransferLane::new(
                 &device.device,
@@ -468,8 +466,8 @@ impl Renderer {
             copy_value: TimelineValue::START,
             imm: HostBuffer::new(vk::BufferUsageFlags::VERTEX_BUFFER),
             indirect: HostBuffer::new(vk::BufferUsageFlags::INDIRECT_BUFFER),
-            vrs_ready: None,
-            shadow_lit_ready: false,
+            vrs_ready: false,
+            vrs_history: false,
             hdr_source: HdrSource::Offscreen,
         }));
 
@@ -497,10 +495,11 @@ impl Renderer {
         );
         let taa = taa::TaaState::new(&device.device, &memory_props, render_extent, pipeline_cache);
         let bloom = bloom::BloomState::new(&device.device, pipeline_cache);
+        let sky_cloud = sky::SkyCloudState::new(&device.device, pipeline_cache);
 
         let gpu_timer = GpuTimer::new(
             &device.device,
-            device.timestamps_supported,
+            device.timestamps_supported && crate::profile::is_enabled(),
             device.timestamp_period_ns,
         );
 
@@ -517,7 +516,7 @@ impl Renderer {
             exposure: exposure.shared(),
         };
 
-        let cull = cull::CullState::new(&device.device, pipeline_cache);
+        let cull = cull::CullState::new(&device.device, pipeline_cache, device.cull_wave_atomics);
         // GPU-driven emission: opaque/cutout/shadow draws are always emitted
         // by the cull dispatch, so the device must support drawIndirectCount.
         // Device selection enforces this; this assert makes mis-selection fail
@@ -557,6 +556,7 @@ impl Renderer {
             shadow,
             exposure,
             bloom,
+            sky_cloud,
             taa,
             draw_scratch: Vec::new(),
             flags,
@@ -571,7 +571,6 @@ impl Renderer {
             copy_slot: None,
             pending_capture: None,
             slot: 0,
-            scene_fingerprint: 0,
             vsync: Pending::new(vsync),
             msaa: Pending::new(msaa),
             needs_recreate: false,
@@ -625,6 +624,12 @@ impl Renderer {
         if self.flags.taa != flags.taa {
             self.taa.invalidate_history();
         }
+        if self.flags.bloom && !flags.bloom {
+            // Next presented frame must re-clear the stale pyramid to black.
+            for chain in &mut self.targets.bloom {
+                chain.cleared = false;
+            }
+        }
         self.flags = flags;
     }
 
@@ -651,10 +656,23 @@ impl Renderer {
     ) {
         // Grow the shared quad IBO to index this mesh before its draws record.
         self.quad_ibo.require(quads);
-        self.arena_dir
-            .note_upload(slot, generation, resident.buffer(), record.pass());
+        self.arena_dir.note_upload(
+            slot,
+            generation,
+            resident.buffer(),
+            record.pass(),
+            record.detail_scale() > 1.0,
+        );
         self.mesh_res.apply_upload(slot, generation, resident);
         self.records.install(slot, record);
+    }
+
+    /// Replaces a mover's recomposed record, keeping the cull lane counts in
+    /// step should its detail (LOD lane) have changed.
+    pub(crate) fn apply_set_record(&mut self, slot: u32, record: buffers::MeshRecord) {
+        self.arena_dir
+            .note_record(slot, record.pass(), record.detail_scale() > 1.0);
+        self.records.set_record(slot, record);
     }
 
     /// Set one word of the visibility mask.
@@ -770,17 +788,18 @@ impl Renderer {
 
         let slot = self.slot;
         use crate::profile::{Meter, scope};
+        crate::profile::count(crate::profile::Counter::Rendered);
 
-        {
-            let _p = scope(Meter::Fence);
-            self.wait_slot_and_reclaim(slot);
-        }
+        // Timed inside: the slot fence wait (wait tier) apart from the reclaim.
+        self.wait_slot_and_reclaim(slot);
 
         let present_target;
         let guard = {
-            let _p = scope(Meter::Acquire);
-            present_target = self.decide_present(slot);
-            self.acquire_slot(slot)
+            // One scope; the blocking waits inside hand themselves to the wait
+            // tier via `split`, so `acquire` stays pure CPU work.
+            let mut p = scope(Meter::Acquire);
+            present_target = self.decide_present(slot, &mut p);
+            self.acquire_slot(slot, &mut p)
         };
 
         let offsets = {
@@ -802,6 +821,7 @@ impl Renderer {
                 .as_ref()
                 .map(|s| s.frame_uniforms)
                 .unwrap_or_else(crate::skeleton::FrameUniformsGpu::full_bright);
+            u.prepare_derived();
             // Debug-flat: claim the `extras` lane as [r, g, b, enabled] —
             // sRGB-encoded key channels + an enable flag. mesh3d.frag linearises rgb
             // (as it does every CPU colour) and outputs it flat while depth writes.
@@ -820,7 +840,7 @@ impl Renderer {
         }
         let (rs, hdr_readable) = {
             let _p = scope(Meter::Record);
-            self.record_render(&guard, lists, offsets)
+            self.record_render(&guard, lists, offsets, present_target.is_some())
         };
 
         {
@@ -882,6 +902,14 @@ impl Renderer {
                 godray,
             );
         }
+        if self.vsync.current() {
+            // Wait for the copy to pace at display refresh (a wait, not work).
+            let _p = scope(Meter::WaitVsync);
+            unsafe {
+                self.timeline
+                    .wait(&self.device.device, self.last_copy_value);
+            }
+        }
 
         self.slot = (self.slot + 1) % FRAMES_IN_FLIGHT as usize;
     }
@@ -929,8 +957,20 @@ impl Renderer {
     fn wait_slot_and_reclaim(&mut self, slot: usize) {
         let device = &self.device.device;
         unsafe {
-            self.timeline
-                .wait(device, self.slots[FrameSlot::new(slot)].render_value);
+            {
+                let _p = crate::profile::scope(crate::profile::Meter::Fence);
+                self.timeline
+                    .wait(device, self.slots[FrameSlot::new(slot)].render_value);
+            }
+            // Nothing retired (the steady state): skip the two counter reads
+            // and the queue drains, which would find nothing to reclaim.
+            if !self.mesh_res.has_garbage()
+                && self.retired_textures.is_empty()
+                && !self.quad_ibo.has_garbage()
+            {
+                return;
+            }
+            let _p = crate::profile::scope(crate::profile::Meter::Reclaim);
             let current = self.timeline.counter(device);
             // Retired allocations return to the main-owned allocator freelist;
             // staging-block shrink happens main-side after it reclaims them.
@@ -954,20 +994,41 @@ impl Renderer {
                 self.quad_ibo.collect_transfer(device, transfer_current);
             }
         }
+        self.publish_vrs_mix(slot);
+    }
+
+    /// Last completed VRS histogram for this slot (2-frame delayed). Zeroed
+    /// when VRS is off or the device has no attachment shading rate.
+    fn publish_vrs_mix(&self, slot: usize) {
+        if self.flags.vrs
+            && let Some(vrs) = &self.targets.vrs
+        {
+            let [n1, n2, n4] = vrs.mix(slot);
+            crate::profile::gauge(crate::profile::Gauge::Vrs1x1, n1 as u64);
+            crate::profile::gauge(crate::profile::Gauge::Vrs2x2, n2 as u64);
+            crate::profile::gauge(crate::profile::Gauge::Vrs4x4, n4 as u64);
+        } else {
+            crate::profile::gauge(crate::profile::Gauge::Vrs1x1, 0);
+            crate::profile::gauge(crate::profile::Gauge::Vrs2x2, 0);
+            crate::profile::gauge(crate::profile::Gauge::Vrs4x4, 0);
+        }
     }
 
     /// Resolves the copy hazard on `slot` before it is rendered into: the
     /// in-flight present copy may still be reading this slot's offscreen
     /// image, which the render below overwrites. Rare (the copy usually
     /// retires well within the two-frame slot cycle) and sub-millisecond.
-    /// Returns a guard proving the slot is safe to record into.
-    fn acquire_slot(&mut self, slot: usize) -> SlotGuard {
+    /// Returns a guard proving the slot is safe to record into. `p` is the
+    /// caller's `acquire` scope; the wait is split out of it into `copy`.
+    fn acquire_slot(&mut self, slot: usize, p: &mut crate::profile::Guard) -> SlotGuard {
         if self.copy_slot == Some(slot) {
             let device = &self.device.device;
+            p.split(crate::profile::Meter::WaitCopy);
             unsafe {
                 self.timeline
                     .wait(device, self.slots[FrameSlot::new(slot)].copy_value)
             };
+            p.split(crate::profile::Meter::Acquire);
             self.copy_slot = None;
         }
         SlotGuard(slot)
@@ -990,7 +1051,12 @@ impl Renderer {
     /// mailbox drop never stalls), the acquire is only attempted once we know a
     /// copy can be submitted, and a successful acquire is ALWAYS followed by
     /// the copy + present in [`Self::present`] — never skipped.
-    fn decide_present(&mut self, slot: usize) -> Option<u32> {
+    ///
+    /// `p` is the caller's `acquire` scope: the blocking waits here (forced
+    /// copy retire, vsync/forced drawable acquire) are split out of it into the
+    /// wait tier, so `acquire` reports only the non-blocking work.
+    fn decide_present(&mut self, slot: usize, p: &mut crate::profile::Guard) -> Option<u32> {
+        use crate::profile::Meter;
         // With vsync off, throttle presents to refresh cadence to avoid blocking
         // on drawable availability; instead render frames in between unthrottled.
         // Present slightly ahead of the refresh interval so scheduling jitter
@@ -1010,7 +1076,9 @@ impl Renderer {
         unsafe {
             if force {
                 // Wait out the prior copy rather than treating it as a drop.
+                p.split(Meter::WaitCopy);
                 self.timeline.wait(device, self.last_copy_value);
+                p.split(Meter::Acquire);
             }
             // Skip present if previous copy still in flight (mailbox drop).
             let copy_ready =
@@ -1023,12 +1091,20 @@ impl Renderer {
                 } else {
                     0
                 };
-                match acquire_next_image(
+                let blocking = timeout != 0;
+                if blocking {
+                    p.split(Meter::WaitVsync);
+                }
+                let acquired = acquire_next_image(
                     &self.swapchain.loader,
                     self.swapchain.swapchain,
                     timeout,
                     self.slots[FrameSlot::new(slot)].image_available,
-                ) {
+                );
+                if blocking {
+                    p.split(Meter::Acquire);
+                }
+                match acquired {
                     Ok((image_index, suboptimal)) => {
                         if suboptimal {
                             self.recreate_if_stale();
@@ -1122,33 +1198,55 @@ impl Renderer {
             )
         };
 
-        // The cull dispatch owns the shadow set, so these cascade frusta feed
-        // its params.
-        let shadow_frusta = lists
-            .scene
-            .as_ref()
-            .filter(|_| self.flags.shadows)
-            .map(|scene| {
-                let cfg = crate::skeleton::ShadowCfg::PROVISIONAL;
+        // Cull emits shadow casters only when the shared map will actually be
+        // rewritten this frame. A cache hit skips cascade `fit()` and sets
+        // `shadow_enabled = 0` so invisible slots bail before the AABB load.
+        let cfg = crate::skeleton::ShadowCfg::PROVISIONAL;
+        let shadow_frusta = lists.scene.as_ref().and_then(|scene| {
+            if self.flags.shadows {
+                let key = shadow_key(
+                    scene.eye,
+                    sun_dir(lists),
+                    self.records.occluder_rev(),
+                    lists,
+                );
+                if !self.shadow_cache.prepare(Some((key, &cfg))) {
+                    return None;
+                }
                 let sun = sun_dir(lists);
-                [
-                    crate::skeleton::Cascade::Near,
-                    crate::skeleton::Cascade::Far,
-                ]
-                .map(|c| {
-                    crate::camera::Frustum::from_view_proj(
-                        &shadow::fit(scene.eye, sun, c, &cfg).view_proj.0,
-                    )
-                })
-            });
+                Some(
+                    [
+                        crate::skeleton::Cascade::Near,
+                        crate::skeleton::Cascade::Far,
+                    ]
+                    .map(|c| {
+                        crate::camera::Frustum::from_view_proj(
+                            &shadow::fit(scene.eye, sun, c, &cfg).view_proj.0,
+                        )
+                    }),
+                )
+            } else {
+                self.shadow_cache.prepare(None);
+                None
+            }
+        });
 
         // GPU cull prep: the persistent visibility mask IS the dispatch's
         // visibility input, grown to cover every live slot (zero = hidden).
+        // The dispatch (and the mask it reads) stops at the directory's live
+        // end, not the table length: a freed tail is all dead words.
+        // Last frame's partition table is handed back so its allocation is
+        // reused rather than rebuilt from scratch every frame.
+        let recycled = self
+            .cull_frame
+            .take()
+            .map_or_else(Vec::new, |f| f.partitions);
         self.cull_frame = if let Some(scene) = &lists.scene {
             let camera = crate::camera::Frustum::from_view_proj(&scene.view_proj);
             let eye = pipeline::EyeSplit::of(scene.eye);
             if let Some(records) = self.record_buffers {
-                let need = records.slots.div_ceil(32) as usize;
+                let slot_count = records.slots.min(self.arena_dir.live_end());
+                let need = slot_count.div_ceil(32) as usize;
                 if self.visible_mask.len() < need {
                     self.visible_mask.resize(need, 0);
                 }
@@ -1160,10 +1258,12 @@ impl Renderer {
                         self.device.physical,
                         &self.arena_dir,
                         records,
+                        slot_count,
                         &camera,
                         shadow_frusta.as_ref(),
                         eye,
-                        &self.visible_mask,
+                        &self.visible_mask[..need],
+                        recycled,
                     )
                 }
             } else {
@@ -1174,11 +1274,12 @@ impl Renderer {
         };
 
         // CPU Blend re-source: walk the resident, visible, Blend-pass records.
+        // The directory's Blend set is exactly that candidate list, so this is
+        // O(transparent meshes), never a sweep of the whole slot table.
         if let Some(scene) = &lists.scene {
             let camera = crate::camera::Frustum::from_view_proj(&scene.view_proj);
             let eye = pipeline::EyeSplit::of(scene.eye);
-            let slot_count = self.record_buffers.map_or(0, |r| r.slots);
-            for s in 0..slot_count {
+            for &s in self.arena_dir.blend_slots() {
                 // Arena word (0 = not resident) is the arena index + 1, giving
                 // the vertex buffer without a residency-handle lookup. Gated
                 // on `is_arrived` too: a budget-deferred copy is registered in
@@ -1202,9 +1303,11 @@ impl Renderer {
                 let Some(rec) = self.records.record(s) else {
                     continue;
                 };
-                if rec.pass() != Pass::Blend {
-                    continue;
-                }
+                debug_assert_eq!(
+                    rec.pass(),
+                    Pass::Blend,
+                    "Blend set holds a non-Blend record"
+                );
                 // Camera-relative placement reconstructed exactly as the vertex
                 // shader does (integer block minus camera block, then the
                 // fractional remainder), so the CPU sort/cull agrees with the GPU
@@ -1263,15 +1366,6 @@ impl Renderer {
                 }
             }
         }
-        // The fingerprint exists only so VRS can tell whether a slot's stored
-        // depth still matches the scene it will classify; with VRS off nothing
-        // reads it, so skip the per-frame hash.
-        self.scene_fingerprint = if self.targets.vrs.is_some() {
-            scene_fingerprint(lists, &self.draw_scratch, &self.visible_mask)
-        } else {
-            0
-        };
-
         let indirect_bytes: &[u8] = bytemuck::cast_slice(&self.draw_commands);
         unsafe {
             let indirect = &mut self.slots[FrameSlot::new(slot)].indirect;
@@ -1297,6 +1391,7 @@ impl Renderer {
         guard: &SlotGuard,
         lists: &DrawLists,
         offsets: ImmOffsets,
+        will_present: bool,
     ) -> (RenderSubmit, HdrReadable) {
         let slot = guard.0;
         let cmd = self.slots[FrameSlot::new(slot)].cmd;
@@ -1305,15 +1400,14 @@ impl Renderer {
         let profiling = crate::profile::is_enabled();
         if profiling {
             let mut passes = [0.0f64; GpuPass::COUNT];
-            if unsafe {
+            if let Some(total) = unsafe {
                 self.gpu_timer
                     .read_into(&self.device.device, slot, &mut passes)
-            }
-            .is_some()
-            {
+            } {
                 for pass in GpuPass::ALL {
                     crate::profile::add_ms(pass.meter(), passes[pass as usize]);
                 }
+                crate::profile::gpu_frame_ms(total);
             }
         }
         // Begin render submission; this gets the timeline value to stamp mesh copies.
@@ -1327,8 +1421,17 @@ impl Renderer {
             device
                 .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
                 .expect("begin command buffer failed");
+            // Start timing before the staged copies so the whole buffer is
+            // attributed (the `Copies` stamp closes this first span).
+            if profiling {
+                self.gpu_timer.begin(device, cmd, slot);
+            }
 
-            self.pending_transfer_wait = self.mesh_res.flush_copies(
+            // Last frame's separate-queue copies: this submission is the first
+            // that can draw them (see `MeshResidency::flush_copies`). This
+            // frame's copies are flushed next and deferred one frame.
+            let deferred = self.mesh_res.take_deferred_arrival(device, cmd);
+            self.mesh_res.flush_copies(
                 device,
                 &mut self.transfer_lane,
                 cmd,
@@ -1343,10 +1446,10 @@ impl Renderer {
             // never early).
             let arrived = self.mesh_res.take_arrived();
             self.records.mark_arrived(&arrived);
-            // Grow the shared quad IBO (if a bigger mesh arrived) before any draw
-            // indexes it; ordered either by its own barrier (same-queue tiers)
-            // or the lane wait folded into `pending_transfer_wait` below —
-            // exactly like the mesh staging copies above.
+            // Grow the shared quad IBO (if a bigger mesh arrived) before any
+            // draw indexes it. Unified-memory uploads can draw the same frame,
+            // so this copy keeps a same-frame wait (same-queue barrier, or the
+            // lane wait folded into `pending_transfer_wait` below).
             let quad_wait = self.quad_ibo.ensure(
                 &self.instance.instance,
                 device,
@@ -1356,7 +1459,7 @@ impl Renderer {
                 self.device.graphics_family,
                 done_at,
             );
-            self.pending_transfer_wait = match (self.pending_transfer_wait, quad_wait) {
+            self.pending_transfer_wait = match (deferred, quad_wait) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (a, b) => a.or(b),
             };
@@ -1364,7 +1467,7 @@ impl Renderer {
             // live frame command buffer, before the render pass begins.
             self.minimap.sync(device, cmd, slot);
             if profiling {
-                self.gpu_timer.begin(&self.device.device, cmd, slot);
+                self.gpu_timer.mark(device, cmd, slot, GpuPass::Copies);
             }
         }
 
@@ -1386,68 +1489,66 @@ impl Renderer {
                     records,
                     frame,
                 );
+                if profiling {
+                    self.gpu_timer
+                        .mark(&self.device.device, cmd, slot, GpuPass::Cull);
+                }
             }
         }
 
-        // Cascaded shadows: fit both cascades around this frame's frustum,
-        // publish the binding-3 uniforms the receiver samples, and render the
-        // occluders into the shadow map BEFORE the color pass (it leaves the map
-        // in SHADER_READ_ONLY_OPTIMAL for mesh3d.frag's PCF). The mesh pass always
-        // samples binding 4, so this must run whenever a 3D scene exists.
+        // Cascaded shadows: on a miss, fit both cascades, publish binding-3
+        // uniforms, and render occluders into the *shared* map before the color
+        // pass (it leaves the map in SHADER_READ_ONLY_OPTIMAL for mesh3d.frag).
+        // Hits skip the producer (and skip `fit()`); the slot UBO is filled from
+        // the cached block so sampling matches the resident depth.
         if let Some(scene) = &lists.scene {
-            // With shadows disabled the map holds a constant fully-lit clear and
-            // its cascade UBO a constant (SHADOW_LIMIT=∞) block, so once this
-            // slot has primed both there is nothing left to re-record: skip the
-            // per-frame clears + barriers (the bulk of the off-path cost). Any
-            // shadowed frame re-runs the pass and re-arms every slot.
             let cfg = crate::skeleton::ShadowCfg::PROVISIONAL;
             let sun = sun_dir(lists);
-            // Off: the map holds a constant fully-lit clear; prime each slot once
-            // then skip forever (unchanged fast path). The cached generation is
-            // meaningless while off, so re-render both slots on re-enable.
-            // On: additionally gate the re-render on the dirty cache — regenerate
-            // only when the sun/eye-snap/occluders actually shifted the depth.
-            // Avatar boxes cast into the shadow map; hash their geometry so the
-            // cache regenerates on any motion (and stays cached when still).
             let caster_verts = lists.cube_verts.len() as u32;
-            let casters = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::hash::DefaultHasher::new();
-                bytemuck::cast_slice::<_, u8>(&lists.cube_verts).hash(&mut h);
-                h.finish()
-            };
-            let render = if self.flags.shadows {
-                let key = shadow::ShadowKey::of(
-                    scene.eye,
-                    sun,
-                    self.records.occluder_rev(),
-                    casters,
-                    &cfg,
-                );
-                self.shadow_cache.take_render(slot, key, &cfg)
-            } else {
-                self.shadow_cache.invalidate();
-                !self.slots[FrameSlot::new(slot)].shadow_lit_ready
-            };
+            let render = self.shadow_cache.pending_rebuild();
             if render {
                 let _g = crate::profile::scope(crate::profile::Meter::RecShadow);
-                // Write the UBO only on a regenerating frame so the receiver's
-                // sampled cascade matrices always match the depth actually in the
-                // (possibly cached-from-an-earlier-frame) image.
+                // WAR: the other FIF slot may still be sampling the shared map.
+                // Hits skip this wait (concurrent SHADER_READ_ONLY is legal).
+                unsafe {
+                    self.timeline
+                        .wait(&self.device.device, self.last_render_value);
+                }
                 let cu = self.shadow_uniforms(scene.eye, sun, &cfg);
+                self.shadow_cache.store_uniforms(cu);
                 self.shadow.write_uniforms(slot, &cu);
                 self.record_shadow_pass(cmd, slot, scene.eye, sun, &cfg, caster_verts);
-                self.slots[FrameSlot::new(slot)].shadow_lit_ready = !self.flags.shadows;
+                if profiling {
+                    unsafe {
+                        self.gpu_timer
+                            .mark(&self.device.device, cmd, slot, GpuPass::ShadowMap)
+                    };
+                }
+                if !self.flags.shadows {
+                    self.shadow_cache.mark_lit_ready();
+                }
+            } else if let Some(cu) = self.shadow_cache.uniforms() {
+                // Hit: copy cached matrices into this slot's UBO, no `fit()`.
+                self.shadow.write_uniforms(slot, cu);
             }
         }
 
-        // VRS generation needs a validly-written, single-sampled depth image to
-        // classify. MSAA depth would need multisample sampling (skipped), and a
-        // slot's depth is only readable once it has been rendered at least once.
+        // Cloud LUT: march (or zero) before the scene pass so the sky fragment
+        // has a sampled image. Skipped when there is no sky.
+        if self.flags.sky
+            && lists.sky.is_some()
+            && let Some(scene) = &lists.scene
+        {
+            self.record_sky_cloud_lut(cmd, slot, scene.frame_uniforms.anim[3]);
+        }
+
+        // Classify from this slot's previous depth as long as it has been
+        // written once at this extent. One-frame-stale is OK: the classifier
+        // dilates full-rate tiles and never coarsens a tile that was near.
         let do_vrs = lists.scene.is_some()
             && self.flags.vrs
             && self.targets.vrs.is_some()
-            && self.slots[FrameSlot::new(slot)].vrs_ready == Some(self.scene_fingerprint);
+            && self.slots[FrameSlot::new(slot)].vrs_ready;
 
         let device = &self.device.device;
         let stamp = |p| {
@@ -1515,17 +1616,23 @@ impl Renderer {
         // `end`, so when either is active `end` must NOT transition (the barrier
         // would race their writes) — the deferred finalization below owns it
         // instead. With both disabled (the common path) `end` transitions.
+        //
+        // TAA keeps history every frame. Bloom and exposure metering feed only
+        // the tonemap present-copy, so they run solely on frames that will
+        // present (`decide_present` already ran; forced capture always presents).
         let taa = lists.scene.is_some() && self.flags.taa;
-        let exposure = lists.scene.is_some() && self.flags.exposure;
-        let deferred = taa || exposure;
+        let exposure_on = lists.scene.is_some() && self.flags.exposure;
+        let run_exposure = exposure_on && will_present;
+        let deferred = taa || run_exposure;
         // Overlay composited post-tonemap so warp/TAA don't affect the HUD.
         stamp(GpuPass::Overlay);
         // Finalize the offscreen to SHADER_READ_ONLY exactly once and obtain the
         // [`HdrReadable`] proof the tonemap present-copy requires. The branches
-        // are exhaustive and each ends with the offscreen sampled: (a) not
-        // deferred → the render pass transitions; (b) deferred + exposure →
-        // metering owns the transition; (c) deferred + !exposure (TAA-on,
-        // exposure-off) → TAA left COLOR_ATTACHMENT, so transition explicitly.
+        // are exhaustive and each ends with the offscreen sampled when a present
+        // will sample it: (a) not deferred → the render pass transitions (or we
+        // skip the transition on an unpresented frame); (b) deferred + exposure
+        // → metering owns the transition; (c) deferred + !exposure (TAA-on,
+        // exposure-off/skipped) → TAA already left its output sampled.
         // Producing the proof only inside these paths is what makes "nobody
         // finalized the layout" fail to compile at `present` rather than trip the
         // validation layer (the exact bug from the exposure-default-off change).
@@ -1533,11 +1640,14 @@ impl Renderer {
             let _g = crate::profile::scope(crate::profile::Meter::RecTransitions);
             if deferred {
                 unsafe { pass.end_deferred() };
+                // Close the end-rendering/MSAA-resolve span before the deferred
+                // writers, so TAA and exposure report apart from it.
+                stamp(GpuPass::Resolve);
                 // TAA resolve runs AFTER the HDR resolve and BEFORE exposure, so
                 // exposure meters the stabilized image. It reads the current HDR +
                 // reprojected history, writes the resolved HDR back, and leaves it
-                // COLOR_ATTACHMENT for the exposure pass. Reprojection uses the
-                // un-jittered view-proj; a false `flags.taa` never reaches here.
+                // sampled for the exposure pass. Reprojection uses the un-jittered
+                // view-proj; a false `flags.taa` never reaches here.
                 if taa {
                     // `taa` is `lists.scene.is_some() && self.flags.taa` (above).
                     let scene = lists.scene.as_ref().expect("taa true implies a 3D scene");
@@ -1548,51 +1658,85 @@ impl Renderer {
                         scene.eye,
                         scene.jitter.0,
                     );
+                    if profiling {
+                        unsafe {
+                            self.gpu_timer
+                                .mark(&self.device.device, cmd, slot, GpuPass::Taa)
+                        };
+                    }
                 }
-                if exposure {
+                if run_exposure {
                     // Reduce the frame HDR to per-tile mean log2-luma, publish
                     // the smoothed exposure, and finalize the HDR in SHADER_READ.
-                    self.record_exposure_pass(cmd, FrameSlot::new(slot))
+                    let readable = self.record_exposure_pass(cmd, FrameSlot::new(slot));
+                    if profiling {
+                        unsafe {
+                            self.gpu_timer
+                                .mark(&self.device.device, cmd, slot, GpuPass::Exposure)
+                        };
+                    }
+                    readable
                 } else if self.slots[FrameSlot::new(slot)].hdr_source != HdrSource::Offscreen {
                     // TAA published its output as the frame HDR and already
                     // left it (and the offscreen) sampled: nothing to record.
                     HdrReadable::new(slot)
+                } else if will_present {
+                    let readable = unsafe { self.transition_offscreen_to_sampled(cmd, slot) };
+                    // The finalize barrier belongs to the resolve span.
+                    if profiling {
+                        unsafe {
+                            self.gpu_timer
+                                .mark(&self.device.device, cmd, slot, GpuPass::Resolve)
+                        };
+                    }
+                    readable
                 } else {
-                    unsafe { self.transition_offscreen_to_sampled(cmd, slot) }
+                    HdrReadable::new(slot)
                 }
-            } else {
+            } else if will_present {
                 // Common path (TAA + exposure both off): the render pass finalizes.
-                unsafe { pass.end_sampled() }
+                let readable = unsafe { pass.end_sampled() };
+                // Close the resolve/finalize segment (MSAA resolve + transitions)
+                // before bloom records, so the report splits them.
+                if profiling {
+                    unsafe {
+                        self.gpu_timer
+                            .mark(&self.device.device, cmd, slot, GpuPass::Resolve)
+                    };
+                }
+                readable
+            } else {
+                // Unpresented, no later HDR writer: skip the sampled transition;
+                // the next begin discards the offscreen from UNDEFINED.
+                unsafe { pass.end_deferred() };
+                HdrReadable::new(slot)
             }
         };
-        // Close the resolve/finalize segment (MSAA resolve + transitions +
-        // TAA/exposure) before bloom records, so the report splits them.
-        if profiling {
-            unsafe {
-                self.gpu_timer
-                    .mark(&self.device.device, cmd, slot, GpuPass::Resolve)
-            };
-        }
         // Bloom: threshold + downsample the finalized HDR into this slot's
-        // mip chain; the tonemap present-copy composites it. Recorded here so the
-        // render→present semaphore makes the pyramid visible to the tonemap sample,
-        // exactly as it does for the offscreen. A pure function of this frame.
-        self.record_bloom_pass(cmd, FrameSlot::new(slot));
-        // Close the tail: without this stamp the TAA/exposure/bloom work
-        // recorded above ends after the last boundary and never reaches the
-        // report. (The tonemap/present copy runs on the copy command buffer
-        // and remains unmetered — tracked in structural opportunity #15.)
+        // mip chain; the tonemap present-copy composites it. Present-only — a
+        // dropped mailbox frame never samples the pyramid. Forced capture always
+        // presents, so it always gets a fresh chain.
+        if will_present {
+            self.record_bloom_pass(cmd, FrameSlot::new(slot));
+        }
+        // Close the tail: without this stamp the bloom work recorded above
+        // ends after the last boundary and never reaches the report. (The
+        // tonemap/present copy is timed on the copy command buffer; see
+        // `submit_present_copy`.)
         if profiling {
             unsafe {
                 self.gpu_timer
-                    .mark(&self.device.device, cmd, slot, GpuPass::Post)
+                    .mark(&self.device.device, cmd, slot, GpuPass::Bloom)
             };
+            self.gpu_timer.finish(slot);
         }
-        self.gpu_timer.finish(slot);
         // The main pass just wrote (and stored) this slot's depth, so a later
-        // cycle reusing this slot may read it for VRS classification. Stamp
-        // ready-and-fingerprint in one write (they can never disagree).
-        self.slots[FrameSlot::new(slot)].vrs_ready = Some(self.scene_fingerprint);
+        // cycle reusing this slot may classify it. A classify this frame also
+        // leaves a raw-rate history image for the next reuse.
+        self.slots[FrameSlot::new(slot)].vrs_ready = true;
+        if do_vrs {
+            self.slots[FrameSlot::new(slot)].vrs_history = true;
+        }
 
         unsafe {
             self.device
@@ -1665,9 +1809,23 @@ impl Renderer {
         let depth = self.targets.sampleable_depth(slot);
         let (depth_layout, depth_stage, depth_access) = self.sampleable_depth_attachment_state();
         let tiles = vrs.tiles();
+        let use_history = self.slots[FrameSlot::new(slot)].vrs_history;
+        let allow_4x4 = self
+            .device
+            .fragment_shading_rate
+            .as_ref()
+            .is_some_and(|f| f.allow_4x4(self.targets.samples));
+        let mut flags = 0u32;
+        if allow_4x4 {
+            flags |= vrs::FLAG_ALLOW_4X4;
+        }
+        if use_history {
+            flags |= vrs::FLAG_USE_HISTORY;
+        }
         unsafe {
-            // depth: read for sampling; rate: write target.
-            let pre = [
+            device.cmd_fill_buffer(cmd, vrs.mix_gpu(slot), 0, vrs::MIX_BYTES, 0);
+
+            let mut images = [
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(depth_stage)
                     .src_access_mask(depth_access)
@@ -1685,10 +1843,43 @@ impl Renderer {
                     .new_layout(vk::ImageLayout::GENERAL)
                     .image(vrs.image(slot))
                     .subresource_range(color_range()),
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(if use_history {
+                        vk::PipelineStageFlags2::COMPUTE_SHADER
+                    } else {
+                        vk::PipelineStageFlags2::NONE
+                    })
+                    .src_access_mask(if use_history {
+                        vk::AccessFlags2::SHADER_STORAGE_WRITE
+                    } else {
+                        vk::AccessFlags2::NONE
+                    })
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_STORAGE_READ
+                            | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    )
+                    .old_layout(if use_history {
+                        vk::ImageLayout::GENERAL
+                    } else {
+                        vk::ImageLayout::UNDEFINED
+                    })
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(vrs.history_image(slot))
+                    .subresource_range(color_range()),
             ];
+            let fill_to_compute = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                )];
             device.cmd_pipeline_barrier2(
                 cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&pre),
+                &vk::DependencyInfo::default()
+                    .memory_barriers(&fill_to_compute)
+                    .image_memory_barriers(&images),
             );
 
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, compute.pipeline);
@@ -1699,6 +1890,13 @@ impl Renderer {
             let rate_info = [vk::DescriptorImageInfo::default()
                 .image_view(vrs.view(slot))
                 .image_layout(vk::ImageLayout::GENERAL)];
+            let history_info = [vk::DescriptorImageInfo::default()
+                .image_view(vrs.history_view(slot))
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let mix_info = [vk::DescriptorBufferInfo::default()
+                .buffer(vrs.mix_gpu(slot))
+                .offset(0)
+                .range(vrs::MIX_BYTES)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_binding(0)
@@ -1708,6 +1906,14 @@ impl Renderer {
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                     .image_info(&rate_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(&history_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&mix_info),
             ];
             self.device.push_descriptor.cmd_push_descriptor_set(
                 cmd,
@@ -1721,6 +1927,11 @@ impl Renderer {
                 d_threshold,
                 texel_w: vrs.texel_size.width,
                 texel_h: vrs.texel_size.height,
+                tiles_x: tiles.width,
+                tiles_y: tiles.height,
+                depth_w: self.render_extent.width,
+                depth_h: self.render_extent.height,
+                flags,
             };
             device.cmd_push_constants(
                 cmd,
@@ -1731,30 +1942,55 @@ impl Renderer {
             );
             device.cmd_dispatch(cmd, tiles.width.div_ceil(8), tiles.height.div_ceil(8), 1);
 
-            // rate → shading-rate attachment; depth → back to attachment layout.
-            let post = [
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADING_RATE_ATTACHMENT_KHR)
-                    .dst_access_mask(vk::AccessFlags2::FRAGMENT_SHADING_RATE_ATTACHMENT_READ_KHR)
-                    .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(vk::ImageLayout::FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR)
-                    .image(vrs.image(slot))
-                    .subresource_range(color_range()),
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .dst_stage_mask(depth_stage)
-                    .dst_access_mask(depth_access)
-                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .new_layout(depth_layout)
-                    .image(depth.image())
-                    .subresource_range(depth_range()),
-            ];
+            // rate → shading-rate attachment; depth → back to attachment layout;
+            // mix histogram → host-visible readback.
+            images[0] = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADING_RATE_ATTACHMENT_KHR)
+                .dst_access_mask(vk::AccessFlags2::FRAGMENT_SHADING_RATE_ATTACHMENT_READ_KHR)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR)
+                .image(vrs.image(slot))
+                .subresource_range(color_range());
+            images[1] = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .dst_stage_mask(depth_stage)
+                .dst_access_mask(depth_access)
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(depth_layout)
+                .image(depth.image())
+                .subresource_range(depth_range());
+            let mix_to_copy = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
             device.cmd_pipeline_barrier2(
                 cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&post),
+                &vk::DependencyInfo::default()
+                    .memory_barriers(&mix_to_copy)
+                    .image_memory_barriers(&images[..2]),
+            );
+            device.cmd_copy_buffer(
+                cmd,
+                vrs.mix_gpu(slot),
+                vrs.mix_cpu(slot),
+                &[vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: vrs::MIX_BYTES,
+                }],
+            );
+            let copy_to_host = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&copy_to_host),
             );
         }
 
@@ -1765,15 +2001,18 @@ impl Renderer {
     }
 
     /// Submits the recorded command buffer and advances the timeline. Waits
-    /// on the transfer lane's semaphore too when this frame's `flush_copies`/
-    /// `quad_ibo.ensure` submitted on a separate queue — a cross-queue
-    /// dependency needs a semaphore wait; the in-command-buffer barrier used
-    /// otherwise only orders work within one queue.
+    /// on the transfer lane at [`MESH_CONSUMER_STAGES`] when last frame's
+    /// deferred mesh copies and/or this frame's `quad_ibo.ensure` submitted
+    /// on a separate queue — a cross-queue dependency needs a semaphore wait;
+    /// the in-command-buffer barrier used otherwise only orders work within
+    /// one queue. The wait is vertex/index fetch (including the shadow
+    /// cascades), not `ALL_COMMANDS`, so cull/clears/sky/post can overlap
+    /// the copy.
     fn submit_render(&mut self, rs: RenderSubmit, slot: usize) {
         let extra_wait = self
             .pending_transfer_wait
             .take()
-            .map(|value| (self.transfer_lane.semaphore(), value));
+            .map(|value| (self.transfer_lane.semaphore(), value, MESH_CONSUMER_STAGES));
         let completion = unsafe {
             rs.submit(
                 &self.device.device,
@@ -1806,13 +2045,6 @@ impl Renderer {
         if let Some(image_index) = present_target {
             unsafe { self.submit_present_copy(slot, image_index, warp_map, overlay, godray) };
             self.last_present = std::time::Instant::now();
-        }
-        if self.vsync.current() {
-            // Wait for copy to pace at display refresh.
-            unsafe {
-                self.timeline
-                    .wait(&self.device.device, self.last_copy_value);
-            }
         }
     }
 
@@ -1935,6 +2167,15 @@ impl Renderer {
             device
                 .begin_command_buffer(self.copy_cmd, &begin)
                 .expect("begin command buffer failed");
+            // Time the copy on its own pair: read the previous copy (retired —
+            // `decide_present` only acquires once it has) before resetting.
+            let profiling = crate::profile::is_enabled();
+            if profiling {
+                if let Some(ms) = self.gpu_timer.read_copy(device) {
+                    crate::profile::add_ms(crate::profile::Meter::GpuTonemap, ms);
+                }
+                self.gpu_timer.begin_copy(device, self.copy_cmd);
+            }
 
             // Swapchain image → color attachment; old contents discarded.
             let to_color = [vk::ImageMemoryBarrier2::default()
@@ -2166,6 +2407,10 @@ impl Renderer {
                 self.copy_cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&to_present),
             );
+            if profiling {
+                self.gpu_timer.end_copy(device, self.copy_cmd);
+            }
+            crate::profile::count(crate::profile::Counter::Presented);
             device
                 .end_command_buffer(self.copy_cmd)
                 .expect("end command buffer failed");
@@ -2322,12 +2567,15 @@ impl Renderer {
             self.timeline.wait(device, self.timeline.last_reserved());
             self.copy_slot = None;
 
-            if self.mesh_res.has_pending() {
+            let had_pending = self.mesh_res.has_pending();
+            if had_pending || self.mesh_res.has_deferred() {
                 // Reuse slot 0's command buffer. Always real and valid: even
                 // under a separate transfer queue, the `DedicatedFamily` tier
                 // needs a real graphics-side command buffer to record its
                 // ownership-transfer ACQUIRE barrier into (see
-                // `MeshResidency::flush_copies`).
+                // `MeshResidency::flush_copies`). Take the deferred arrival
+                // after this flush so idle reclaim waits out this batch too
+                // (live frames take *before* flush, one frame later).
                 let cmd = self.slots[FrameSlot::new(0)].cmd;
                 device
                     .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
@@ -2337,13 +2585,16 @@ impl Renderer {
                 device
                     .begin_command_buffer(cmd, &begin)
                     .expect("begin command buffer failed");
-                let transfer_wait = self.mesh_res.flush_copies(
-                    device,
-                    &mut self.transfer_lane,
-                    cmd,
-                    self.device.graphics_family,
-                    self.last_render_value,
-                );
+                if had_pending {
+                    self.mesh_res.flush_copies(
+                        device,
+                        &mut self.transfer_lane,
+                        cmd,
+                        self.device.graphics_family,
+                        self.last_render_value,
+                    );
+                }
+                let transfer_wait = self.mesh_res.take_deferred_arrival(device, cmd);
                 device
                     .end_command_buffer(cmd)
                     .expect("end command buffer failed");
@@ -2352,7 +2603,7 @@ impl Renderer {
                     [vk::SemaphoreSubmitInfo::default()
                         .semaphore(self.transfer_lane.semaphore())
                         .value(value.raw())
-                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)]
+                        .stage_mask(MESH_CONSUMER_STAGES)]
                 });
                 let mut submit = vk::SubmitInfo2::default().command_buffer_infos(&cmd_info);
                 if let Some(wait_info) = &wait_info {
@@ -2442,14 +2693,12 @@ impl Renderer {
             // Offscreen images recreated; clear copy tracking.
             self.clear_copy();
             // Depth images recreated (layout UNDEFINED): VRS must re-prime.
-            // Shadow map recreated (layout UNDEFINED): re-prime the lit clear.
             for slot in 0..FRAMES_IN_FLIGHT as usize {
                 let s = &mut self.slots[FrameSlot::new(slot)];
-                s.vrs_ready = None;
-                s.shadow_lit_ready = false;
+                s.vrs_ready = false;
+                s.vrs_history = false;
             }
-            // Shadow images are UNDEFINED after recreate: force both slots to
-            // re-render rather than sample a stale/garbage cached depth.
+            // Shared shadow map is UNDEFINED after recreate: force a rewrite.
             self.shadow_cache.invalidate();
 
             if msaa_changed || format_changed {
@@ -2506,6 +2755,7 @@ impl<'a> RenderPass<'a> {
         let device = &r.device.device;
         let extent = r.render_extent;
         let offscreen_image = r.targets.offscreen[slot].image();
+        let profiling = crate::profile::is_enabled();
         unsafe {
             // Generate the rate map first: it samples this slot's depth (leaving
             // it in DEPTH_ATTACHMENT_OPTIMAL, ready for the pass below) and
@@ -2515,7 +2765,11 @@ impl<'a> RenderPass<'a> {
                 let scene = lists.scene.as_ref().expect("do_vrs implies a 3D scene");
                 let focal_px = 0.5 * extent.height as f32 / scene.fovy_tan_half.max(1e-4);
                 let d_threshold = crate::camera::Z_NEAR / focal_px;
-                r.record_vrs_generate(cmd, slot, d_threshold)
+                let rate = r.record_vrs_generate(cmd, slot, d_threshold);
+                if profiling {
+                    r.gpu_timer.mark(device, cmd, slot, GpuPass::Vrs);
+                }
+                rate
             });
 
             // Transition attachments to render targets; old contents discarded.
@@ -2671,6 +2925,11 @@ impl<'a> RenderPass<'a> {
             }
 
             device.cmd_begin_rendering(cmd, &rendering_info);
+            // Close the begin span (transitions + load-op clears) so the first
+            // draw pass reports only its draws.
+            if profiling {
+                r.gpu_timer.mark(device, cmd, slot, GpuPass::Clear);
+            }
 
             // Negative height for GL-style y-up NDC.
             let viewport = vk::Viewport {
@@ -2744,8 +3003,8 @@ impl<'a> RenderPass<'a> {
             r.block_textures.view,
             r.ubo_ring.buffer(FrameSlot::new(self.slot)),
             r.shadow.ubo(self.slot),
-            r.targets.shadow[FrameSlot::new(self.slot)].sampler,
-            r.targets.shadow[FrameSlot::new(self.slot)].sample_view,
+            r.targets.shadow.sampler,
+            r.targets.shadow.sample_view,
         );
         self.mesh_desc_bound.set(true);
     }
@@ -2915,20 +3174,34 @@ impl<'a> RenderPass<'a> {
     }
 
     /// GPU-culled variant of [`record_mesh_indirect`](Self::record_mesh_indirect):
-    /// one `vkCmdDrawIndexedIndirectCount` per non-empty (pass, arena)
-    /// partition, consuming the commands the cull dispatch emitted earlier in
-    /// this command buffer. Never called for Blend (CPU-sorted path).
+    /// one `vkCmdDrawIndexedIndirectCount` per non-empty (group, arena, bucket)
+    /// partition, near-to-far, consuming the commands the cull dispatch emitted
+    /// earlier in this command buffer. Never called for Blend (CPU-sorted path).
+    /// Opaque draws its full-res partition (no-`discard` pipeline) first, then
+    /// the coarse-LOD partition (slab-clip pipeline) — near before far, so the
+    /// LOD skirt behind full-res terrain is mostly depth-rejected.
     unsafe fn record_mesh_indirect_count(&self, pass: Pass) {
+        let groups: &[(cull::Group, vk::Pipeline)] = match pass {
+            Pass::Opaque => &[
+                (cull::Group::Opaque, self.r.pipelines.mesh3d),
+                (cull::Group::OpaqueLod, self.r.pipelines.mesh3d_lod),
+            ],
+            Pass::Cutout => &[(cull::Group::Cutout, self.r.mesh_pipeline_for(pass))],
+            Pass::Blend => unreachable!("Blend stays on the CPU path"),
+        };
+        for &(group, pipeline) in groups {
+            unsafe { self.record_group_indirect_count(group, pipeline) };
+        }
+    }
+
+    /// Draws every non-empty arena partition of one cull group with `pipeline`.
+    unsafe fn record_group_indirect_count(&self, group: cull::Group, pipeline: vk::Pipeline) {
         let Some(frame) = &self.r.cull_frame else {
             return; // nothing live to draw
         };
-        let group = match pass {
-            Pass::Opaque => 0usize,
-            Pass::Cutout => 1,
-            Pass::Blend => unreachable!("Blend stays on the CPU path"),
-        };
-        let base = group * frame.arena_count;
-        if frame.partitions[base..base + frame.arena_count]
+        let span = frame.arena_count * cull::BUCKETS;
+        let base = group as usize * span;
+        if frame.partitions[base..base + span]
             .iter()
             .all(|p| p.capacity == 0)
         {
@@ -2937,11 +3210,7 @@ impl<'a> RenderPass<'a> {
         unsafe { self.bind_mesh3d_state() };
         let device = &self.r.device.device;
         unsafe {
-            device.cmd_bind_pipeline(
-                self.cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.r.mesh_pipeline_for(pass),
-            );
+            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             let quad_ibo = self
                 .r
                 .quad_ibo
@@ -2949,8 +3218,11 @@ impl<'a> RenderPass<'a> {
                 .expect("live records imply the quad IBO is allocated");
             device.cmd_bind_index_buffer(self.cmd, quad_ibo, 0, vk::IndexType::UINT32);
             for arena in 0..frame.arena_count {
-                let part = frame.partitions[base + arena];
-                if part.capacity == 0 {
+                let first = cull::camera_part(group as usize, arena, 0, frame.arena_count);
+                if frame.partitions[first..first + cull::BUCKETS]
+                    .iter()
+                    .all(|p| p.capacity == 0)
+                {
                     continue;
                 }
                 device.cmd_bind_vertex_buffers(
@@ -2959,15 +3231,22 @@ impl<'a> RenderPass<'a> {
                     &[self.r.arena_dir.arena_buffer(arena)],
                     &[0],
                 );
-                device.cmd_draw_indexed_indirect_count(
-                    self.cmd,
-                    frame.commands,
-                    u64::from(part.offset) * cull::CMD_STRIDE,
-                    frame.counts,
-                    ((base + arena) * 4) as u64,
-                    part.capacity,
-                    cull::CMD_STRIDE as u32,
-                );
+                for bucket in 0..cull::BUCKETS {
+                    let idx = first + bucket;
+                    let part = frame.partitions[idx];
+                    if part.capacity == 0 {
+                        continue;
+                    }
+                    device.cmd_draw_indexed_indirect_count(
+                        self.cmd,
+                        frame.commands,
+                        u64::from(part.offset) * cull::CMD_STRIDE,
+                        frame.counts,
+                        (idx * 4) as u64,
+                        part.capacity,
+                        cull::CMD_STRIDE as u32,
+                    );
+                }
             }
         }
     }
@@ -3109,8 +3388,8 @@ impl<'a> RenderPass<'a> {
         }
     }
 
-    /// The procedural sky background pass (sky pipeline: geometry push constant
-    /// + the shared per-frame `FrameUniforms` at set 0 binding 2, no vertex
+    /// The procedural sky background pass (sky pipeline: fragment push constant,
+    /// FrameUniforms at set 0 binding 1, cloud LUT at binding 0, no vertex
     /// buffer). A single fullscreen triangle at the reversed-Z far plane; the
     /// read-only depth test rejects it wherever terrain wrote closer depth, so
     /// it shades only background pixels. Skipped unless the frame set a sky
@@ -3136,24 +3415,30 @@ impl<'a> RenderPass<'a> {
             device.cmd_push_constants(
                 cmd,
                 self.r.pipelines.layout_sky,
-                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                vk::ShaderStageFlags::FRAGMENT,
                 0,
                 bytemuck::bytes_of(&params),
             );
-            // Push ONLY binding 2 (the per-frame UBO): the sky fragment reads its
-            // colours from the same linear `FrameUniforms` the terrain fog does
-            // Reuses the mesh layout. The layout's other bindings (offsets SSBO, textures,
-            // shadow map) are unused by this pass, so they stay unwritten — valid
-            // for a push-descriptor set when the shader never accesses them.
+            let lut = &self.r.targets.sky_cloud[self.slot];
+            let lut_infos = [vk::DescriptorImageInfo::default()
+                .sampler(self.r.pipelines.sky_lut_sampler)
+                .image_view(lut.view())
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let ubo = self.r.ubo_ring.buffer(FrameSlot::new(self.slot));
             let ubo_infos = [vk::DescriptorBufferInfo::default()
                 .buffer(ubo)
                 .offset(0)
                 .range(vk::WHOLE_SIZE)];
-            let writes = [vk::WriteDescriptorSet::default()
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(&ubo_infos)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&lut_infos),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&ubo_infos),
+            ];
             self.r.device.push_descriptor.cmd_push_descriptor_set(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -3238,6 +3523,7 @@ impl Renderer {
             self.shadow.destroy(device);
             self.exposure.destroy(device);
             self.bloom.destroy(device);
+            self.sky_cloud.destroy(device);
             self.taa.destroy(device);
             self.block_textures.destroy(device);
             self.retired_textures
@@ -3538,8 +3824,21 @@ enum HdrSource {
 
 /// A GPU render pass boundary, in record order. The variant ordinal indexes the
 /// per-pass accumulator (matches the tracking in [`crate::profile::Meter`]).
-#[derive(Clone, Copy, PartialEq)]
+/// Every span of the render command buffer ends at one of these, so the
+/// stamps sum to the whole GPU frame (the present copy is timed apart, see
+/// [`GpuTimer::end_copy`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum GpuPass {
+    /// Staged mesh copies (graphics-queue tiers) + the minimap upload.
+    Copies,
+    /// Cull compute: counts fill, dispatch, DRAW_INDIRECT barrier.
+    Cull,
+    /// The cascaded shadow-map pass (stamped only on regenerating frames).
+    ShadowMap,
+    /// The VRS classify dispatch (stamped only when it runs).
+    Vrs,
+    /// Scene-pass begin: attachment transitions + `cmd_begin_rendering` clears.
+    Clear,
     Opaque,
     Sky,
     Cubes,
@@ -3548,16 +3847,24 @@ enum GpuPass {
     Transparent,
     Overlay,
     /// End of the scene pass: `cmd_end_rendering` (where the MSAA color
-    /// resolve executes), offscreen finalize transitions, TAA, and exposure.
+    /// resolve executes) and the offscreen finalize transitions.
     Resolve,
-    /// The bloom chain — the render-command tail after the resolve. Both tail
-    /// stamps used to not exist (no closing timestamp), silently hiding the
-    /// whole post stack from the report.
-    Post,
+    /// The TAA resolve compute (stamped only when it runs).
+    Taa,
+    /// Exposure metering reduce + finalize (stamped only when it runs).
+    Exposure,
+    /// The bloom chain — the render-command tail. Without this closing stamp
+    /// everything after the last boundary silently vanishes from the report.
+    Bloom,
 }
 
 impl GpuPass {
-    const ALL: [GpuPass; 9] = [
+    const ALL: [GpuPass; 16] = [
+        GpuPass::Copies,
+        GpuPass::Cull,
+        GpuPass::ShadowMap,
+        GpuPass::Vrs,
+        GpuPass::Clear,
         GpuPass::Opaque,
         GpuPass::Sky,
         GpuPass::Cubes,
@@ -3566,13 +3873,20 @@ impl GpuPass {
         GpuPass::Transparent,
         GpuPass::Overlay,
         GpuPass::Resolve,
-        GpuPass::Post,
+        GpuPass::Taa,
+        GpuPass::Exposure,
+        GpuPass::Bloom,
     ];
     const COUNT: usize = Self::ALL.len();
 
     fn meter(self) -> crate::profile::Meter {
         use crate::profile::Meter;
         match self {
+            GpuPass::Copies => Meter::GpuCopies,
+            GpuPass::Cull => Meter::GpuCull,
+            GpuPass::ShadowMap => Meter::GpuShadowMap,
+            GpuPass::Vrs => Meter::GpuVrs,
+            GpuPass::Clear => Meter::GpuClear,
             GpuPass::Opaque => Meter::GpuOpaque,
             GpuPass::Sky => Meter::GpuSky,
             GpuPass::Cubes => Meter::GpuCubes,
@@ -3581,13 +3895,20 @@ impl GpuPass {
             GpuPass::Transparent => Meter::GpuTransparent,
             GpuPass::Overlay => Meter::GpuOverlay,
             GpuPass::Resolve => Meter::GpuResolve,
-            GpuPass::Post => Meter::GpuPost,
+            GpuPass::Taa => Meter::GpuTaa,
+            GpuPass::Exposure => Meter::GpuExposure,
+            GpuPass::Bloom => Meter::GpuBloom,
         }
     }
 }
 
 /// One start timestamp plus one boundary per pass.
 const GPU_STAMPS: usize = GpuPass::COUNT + 1;
+/// The present copy's start/end pair lives after the per-slot render ranges.
+/// One pair suffices: a new copy is only recorded once the previous one has
+/// retired (`decide_present` probes/waits it), so its stamps are read first.
+const COPY_STAMP_BASE: u32 = (GPU_STAMPS * FRAMES_IN_FLIGHT as usize) as u32;
+const QUERY_COUNT: u32 = COPY_STAMP_BASE + 2;
 
 /// Per-pass GPU timing via a timestamp query pool: a start timestamp plus one
 /// after each recorded pass. Only the passes that actually run write a stamp,
@@ -3609,6 +3930,8 @@ struct GpuTimer {
     count: [std::cell::Cell<u32>; FRAMES_IN_FLIGHT as usize],
     /// The pass that ended at each stamp (index `i` labels the span `i-1..i`).
     label: [[std::cell::Cell<GpuPass>; GPU_STAMPS]; FRAMES_IN_FLIGHT as usize],
+    /// Whether the present-copy pair holds a completed range to read back.
+    copy_primed: bool,
 }
 
 impl GpuTimer {
@@ -3616,7 +3939,7 @@ impl GpuTimer {
         let pool = if supported {
             let info = vk::QueryPoolCreateInfo::default()
                 .query_type(vk::QueryType::TIMESTAMP)
-                .query_count(GPU_STAMPS as u32 * FRAMES_IN_FLIGHT as u32);
+                .query_count(QUERY_COUNT);
             unsafe {
                 device
                     .create_query_pool(&info, None)
@@ -3633,6 +3956,7 @@ impl GpuTimer {
             label: std::array::from_fn(|_| {
                 std::array::from_fn(|_| std::cell::Cell::new(GpuPass::Opaque))
             }),
+            copy_primed: false,
         }
     }
 
@@ -3719,6 +4043,60 @@ impl GpuTimer {
         }
     }
 
+    /// Reads the previous present copy's duration (ms). The caller must know
+    /// that copy has retired (a new copy is only recorded once it has), so the
+    /// read never stalls; `None` before the first copy or without timestamps.
+    unsafe fn read_copy(&self, device: &ash::Device) -> Option<f64> {
+        if !self.enabled() || !self.copy_primed {
+            return None;
+        }
+        let mut ts = [0u64; 2];
+        unsafe {
+            device.get_query_pool_results(
+                self.pool,
+                COPY_STAMP_BASE,
+                &mut ts,
+                vk::QueryResultFlags::TYPE_64,
+            )
+        }
+        .ok()?;
+        Some(ts[1].wrapping_sub(ts[0]) as f64 * self.period_ns as f64 / 1.0e6)
+    }
+
+    /// Resets the present-copy pair and writes its start stamp. Recorded on the
+    /// copy command buffer, outside any render pass, after [`Self::read_copy`].
+    unsafe fn begin_copy(&self, device: &ash::Device, cmd: vk::CommandBuffer) {
+        if !self.enabled() {
+            return;
+        }
+        unsafe {
+            device.cmd_reset_query_pool(cmd, self.pool, COPY_STAMP_BASE, 2);
+            device.cmd_write_timestamp2(
+                cmd,
+                vk::PipelineStageFlags2::TOP_OF_PIPE,
+                self.pool,
+                COPY_STAMP_BASE,
+            );
+        }
+    }
+
+    /// Writes the present-copy end stamp (after the last barrier, before the
+    /// command buffer ends) and marks the pair readable by the next copy.
+    unsafe fn end_copy(&mut self, device: &ash::Device, cmd: vk::CommandBuffer) {
+        if !self.enabled() {
+            return;
+        }
+        unsafe {
+            device.cmd_write_timestamp2(
+                cmd,
+                vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                self.pool,
+                COPY_STAMP_BASE + 1,
+            );
+        }
+        self.copy_primed = true;
+    }
+
     unsafe fn destroy(&mut self, device: &ash::Device) {
         if self.enabled() {
             unsafe { device.destroy_query_pool(self.pool, None) };
@@ -3732,28 +4110,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vrs_scene_fingerprint_tracks_view_and_depth_geometry() {
-        let mut lists = DrawLists::new();
-        let base = scene_fingerprint(&lists, &[], &[]);
-
-        lists.scene = Some(Scene3D::test_stub());
-        let with_3d = scene_fingerprint(&lists, &[], &[]);
-        assert_ne!(base, with_3d);
-
-        lists.scene.as_mut().unwrap().view_proj = glam::Mat4::from_rotation_y(0.25);
-        let turned = scene_fingerprint(&lists, &[], &[]);
-        assert_ne!(with_3d, turned);
-
-        lists.cube_verts.push(crate::mesh::DebugVertex {
-            pos: [1.0, 2.0, 3.0],
-            color: [255; 4],
-        });
-        assert_ne!(turned, scene_fingerprint(&lists, &[], &[]));
-
-        // A flipped visibility bit (streamed-in / LOD-settled terrain) must also
-        // invalidate the reused depth — the mask is now the opaque draw source.
-        let masked = scene_fingerprint(&lists, &[], &[0b1]);
-        assert_ne!(scene_fingerprint(&lists, &[], &[]), masked);
+    fn gpu_pass_ordinals_index_all_in_record_order() {
+        // `GpuPass as usize` indexes the per-pass readback sink and ALL is the
+        // record order; every pass also needs a distinct profile meter.
+        let mut meters = Vec::new();
+        for (i, pass) in GpuPass::ALL.into_iter().enumerate() {
+            assert_eq!(pass as usize, i, "{pass:?} is out of order in GpuPass::ALL");
+            meters.push(pass.meter() as usize);
+        }
+        meters.sort_unstable();
+        meters.dedup();
+        assert_eq!(meters.len(), GpuPass::COUNT);
+        assert_eq!(GPU_STAMPS, GpuPass::COUNT + 1);
+        assert_eq!(
+            QUERY_COUNT as usize,
+            GPU_STAMPS * FRAMES_IN_FLIGHT as usize + 2
+        );
     }
 
     #[test]

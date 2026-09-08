@@ -52,5 +52,20 @@ mod tests {
     fn scalars_present() {
         assert_eq!(CANDLE_CLAMP, 4.0);
         assert!(CANDLE_HIGH_MUL > 1.0);
+        assert_eq!(BLOOM_MAX_MIPS, BLOOM_SPIRAL_LOD as u32 + 1);
+        assert_eq!(TAA_TILE, 16);
+        assert_eq!(EXPOSURE_TILE % 8, 0);
+    }
+
+    #[test]
+    fn sky_cloud_lut_in_quality_band() {
+        assert!(
+            (256..=512).contains(&SKY_CLOUD_LUT_SIZE),
+            "SKY_CLOUD_LUT_SIZE={SKY_CLOUD_LUT_SIZE} outside 256..=512"
+        );
+        assert!(
+            SKY_CLOUD_LUT_SIZE.is_multiple_of(SKY_CLOUD_LUT_WG),
+            "LUT size must divide evenly by the workgroup edge"
+        );
     }
 }

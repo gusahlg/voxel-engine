@@ -34,7 +34,7 @@ const FIRST_BLOCK_SIZE: u64 = 16 * 1024 * 1024;
 /// several seconds of sustained emptiness, so a block that briefly drains and
 /// refills (a player leaving and re-entering a region) is never released and
 /// then immediately recreated — the settling window is the anti-thrash guard.
-const DEVICE_SHRINK_SETTLE_TICKS: u32 = 300;
+pub(crate) const DEVICE_SHRINK_SETTLE_TICKS: u32 = 300;
 
 #[derive(Clone, Copy)]
 struct UnifiedMemory(bool);
@@ -67,6 +67,9 @@ struct FreeList {
     used: u64,
     /// Sorted by offset; adjacent ranges are always coalesced.
     free: Vec<FreeRange>,
+    /// Size of the largest hole; `alloc_from_pool` skips a block whose
+    /// hint is smaller than the (alignment-rounded) request.
+    largest_free: u64,
 }
 
 impl FreeList {
@@ -78,6 +81,7 @@ impl FreeList {
                 offset: 0,
                 size: capacity,
             }],
+            largest_free: capacity,
         }
     }
 
@@ -89,12 +93,30 @@ impl FreeList {
         self.used == 0
     }
 
+    fn largest_free(&self) -> u64 {
+        self.largest_free
+    }
+
+    /// Bytes actually reserved for a `size`/`align` request: at least 1,
+    /// rounded up to `align` so a sub-alignment sliver cannot form.
+    fn reserved_size(size: u64, align: u64) -> u64 {
+        size.max(1).next_multiple_of(align.max(1))
+    }
+
+    fn refresh_largest(&mut self) {
+        self.largest_free = self.free.iter().map(|r| r.size).max().unwrap_or(0);
+    }
+
     /// First-fit allocation of `size` bytes at a multiple of `align`.
     /// Returns the offset, or `None` if no hole is large enough.
+    ///
+    /// `size` is rounded up to `align` before the split: a 10-byte alloc at
+    /// 256-byte alignment occupies a full 256-byte unit, so the next hole
+    /// starts aligned and no dead sub-256 sliver accumulates.
     fn alloc(&mut self, size: u64, align: u64) -> Option<u64> {
         debug_assert!(size > 0, "zero-size suballocation");
-        let size = size.max(1);
         let align = align.max(1);
+        let size = Self::reserved_size(size, align);
         for i in 0..self.free.len() {
             let range = self.free[i];
             let aligned = range.offset.next_multiple_of(align);
@@ -103,7 +125,6 @@ impl FreeList {
                 continue;
             }
             let tail = range.size - pad - size;
-            // Alignment padding stays on the free list so no bytes are lost.
             match (pad > 0, tail > 0) {
                 (false, false) => {
                     self.free.remove(i);
@@ -127,6 +148,7 @@ impl FreeList {
                 }
             }
             self.used += size;
+            self.refresh_largest();
             return Some(aligned);
         }
         None
@@ -155,6 +177,7 @@ impl FreeList {
             (false, false) => self.free.insert(idx, FreeRange { offset, size }),
         }
         self.used = self.used.saturating_sub(size);
+        self.refresh_largest();
     }
 }
 
@@ -521,11 +544,16 @@ unsafe fn alloc_from_pool(
 ) -> Result<Allocation, vk::Result> {
     debug_assert!(size > 0, "zero-size GPU allocation");
     let size = size.max(1);
+    let align = align.max(1);
+    let reserved = FreeList::reserved_size(size, align);
 
     for (index, slot) in blocks.iter_mut().enumerate() {
         let Some(block) = slot else { continue };
+        if block.free_list.largest_free() < reserved {
+            continue;
+        }
         if let Some(offset) = block.free_list.alloc(size, align) {
-            return Ok(make_allocation(block, index, offset, size, pool));
+            return Ok(make_allocation(block, index, offset, reserved, pool));
         }
     }
 
@@ -535,8 +563,17 @@ unsafe fn alloc_from_pool(
     } else {
         BLOCK_SIZE
     };
-    let block =
-        unsafe { create_block(device, memory_props, type_prefs, budget, usage, size, floor)? };
+    let block = unsafe {
+        create_block(
+            device,
+            memory_props,
+            type_prefs,
+            budget,
+            usage,
+            reserved,
+            floor,
+        )?
+    };
     // Reuse a destroyed block's slot so existing Allocation indices stay valid.
     let index = match blocks.iter().position(|slot| slot.is_none()) {
         Some(index) => {
@@ -553,7 +590,7 @@ unsafe fn alloc_from_pool(
         .free_list
         .alloc(size, align)
         .expect("fresh block fits");
-    Ok(make_allocation(block, index, offset, size, pool))
+    Ok(make_allocation(block, index, offset, reserved, pool))
 }
 
 fn make_allocation(block: &Block, index: usize, offset: u64, size: u64, pool: Pool) -> Allocation {
@@ -912,8 +949,55 @@ mod tests {
         assert_eq!(fl.alloc(10, 256), Some(0)); // offset 0 satisfies any align
         assert_eq!(fl.alloc(10, 256), Some(256));
         assert_eq!(fl.alloc(10, 256), Some(512));
-        // Padding is kept free, not counted as used.
-        assert_eq!(fl.used(), 30);
+        // Size is rounded up to alignment; no sub-256 slivers between them.
+        assert_eq!(fl.used(), 768);
+        assert_eq!(fl.largest_free(), 256);
+    }
+
+    #[test]
+    fn aligned_alloc_leaves_no_sub_alignment_sliver() {
+        let mut fl = FreeList::new(1024);
+        // Pre-rounding, three 10-byte 256-aligned allocs left 246-byte dead
+        // slivers at offsets 10/266/522 that no later 256-aligned alloc
+        // could consume. Rounding size to align occupies a full unit.
+        let a = fl.alloc(10, 256).unwrap();
+        let b = fl.alloc(10, 256).unwrap();
+        let c = fl.alloc(10, 256).unwrap();
+        assert_eq!((a, b, c), (0, 256, 512));
+        assert_eq!(fl.used(), 768);
+        assert_eq!(
+            fl.free,
+            vec![FreeRange {
+                offset: 768,
+                size: 256
+            }]
+        );
+        assert_eq!(fl.largest_free(), 256);
+        assert_eq!(fl.alloc(10, 256), Some(768));
+        assert_eq!(fl.largest_free(), 0);
+        fl.free(a, 256);
+        fl.free(b, 256);
+        assert_eq!(fl.largest_free(), 512);
+        assert_eq!(fl.alloc(512, 256), Some(0));
+    }
+
+    #[test]
+    fn largest_free_hint_tracks_holes() {
+        let mut fl = FreeList::new(1024);
+        assert_eq!(fl.largest_free(), 1024);
+        let a = fl.alloc(256, 256).unwrap();
+        assert_eq!(fl.largest_free(), 768);
+        let b = fl.alloc(256, 256).unwrap();
+        assert_eq!(fl.largest_free(), 512);
+        fl.free(a, 256);
+        // Two holes: 256 at 0, 512 at 512. Hint is the larger.
+        assert_eq!(fl.largest_free(), 512);
+        assert!(fl.largest_free() < 768);
+        fl.free(b, 256);
+        assert_eq!(fl.largest_free(), 1024);
+        let _ = fl.alloc(1024, 256).unwrap();
+        assert_eq!(fl.largest_free(), 0);
+        assert_eq!(fl.alloc(1, 256), None);
     }
 
     #[test]
@@ -1011,8 +1095,9 @@ mod tests {
                 let align = [1u64, 16, 64, 256][(step % 4) as usize];
                 if let Some(offset) = fl.alloc(size, align) {
                     assert_eq!(offset % align, 0, "misaligned offset at step {step}");
-                    live.push((offset, size));
-                    expected_used += size;
+                    let reserved = FreeList::reserved_size(size, align);
+                    live.push((offset, reserved));
+                    expected_used += reserved;
                 }
             }
             assert_eq!(fl.used(), expected_used, "used-bytes drift at step {step}");

@@ -91,8 +91,9 @@ pub struct RenderFlags {
     /// Procedural sky background pass; off shows the clear colour.
     pub sky: bool,
     /// Variable-rate shading: the depth-classified rate image that coarsens
-    /// fragment shading on distant/flat regions. Off skips both the classify
-    /// dispatch and the rate attachment (full-rate shading everywhere).
+    /// fragment shading on distant/flat/sky tiles. Off skips both the classify
+    /// dispatch and the rate attachment (full-rate shading everywhere). No-op
+    /// when the device lacks attachment fragment shading rate.
     pub vrs: bool,
     /// Water surface animation (`anim` lane time). Off freezes the phase:
     /// water renders, tinted and reflective, but still — the cheapest frame
@@ -142,10 +143,6 @@ pub struct Engine {
     /// `gate_uniforms`; `taa` gates jitter injection). The render thread holds its
     /// own copy on `Renderer`. Both are set from `Config::flags` at construction.
     pub(crate) flags: RenderFlags,
-    /// The most recently submitted frame's draw lists, retained so a blocking
-    /// deterministic capture ([`crate::screenshot_to`]) can re-present the same
-    /// scene until the readback PNG lands instead of a blank frame.
-    pub(crate) last_lists: Box<DrawLists>,
 
     target_fps: u32,
     frame_start: Instant,
@@ -168,7 +165,6 @@ impl Engine {
             input: InputState::new(),
             lists,
             flags: config.flags,
-            last_lists: Box::new(DrawLists::new()),
             target_fps: config.target_fps,
             frame_start: Instant::now(),
             dt: 0.0,
@@ -457,32 +453,31 @@ impl Engine {
     }
 
     pub(crate) fn finish_frame(&mut self) {
-        // Recycle returned buffers/allocations, then swap the recorded snapshot
-        // for a fresh pooled one (this take_frame blocks when the pool is empty,
-        // which is the present-pacing) and submit the recorded one.
+        // Recycle returned buffers/allocations, submit the recorded snapshot,
+        // then take a fresh pooled one to record into. Submit first so the
+        // render thread can start (and recycle a box) while we wait; with a
+        // 3-box pool that wait is rare.
         self.client.drain_returns();
-        let next = self.client.take_frame();
-        let filled = std::mem::replace(&mut self.lists, next);
+        if let Some(next) = self.client.pop_idle_frame() {
+            let filled = std::mem::replace(&mut self.lists, next);
+            self.client.submit_frame(filled);
+        } else {
+            let filled = std::mem::replace(&mut self.lists, self.client.take_placeholder());
+            self.client.submit_frame(filled);
+            let dummy = std::mem::replace(&mut self.lists, self.client.take_frame());
+            self.client.stash_placeholder(dummy);
+        }
         self.lists.reset();
-        // Retain a copy for deterministic capture before the scene crosses to
-        // the render thread (cheap: once-per-frame clone reusing the retained
-        // Vec capacities).
-        // Deref so `DrawLists::clone_from` reuses the retained Vec capacities
-        // rather than `Box::clone_from` reallocating each frame.
-        (*self.last_lists).clone_from(&filled);
-        self.client.submit_frame(filled);
     }
 
-    /// Re-submits the last presented scene ([`Self::last_lists`]) so a pending
-    /// screenshot request latches a real frame. Mirrors [`Self::finish_frame`]'s
-    /// present-pacing (`take_frame` blocks until the render thread returns a
-    /// buffer) but does not touch the in-progress `lists`. Used only by the
-    /// blocking capture path.
+    /// Re-submits the last completed scene so a pending screenshot request
+    /// latches a real frame. Waits for the just-submitted snapshot to return
+    /// (its vertex data is still intact) instead of cloning draw lists every
+    /// frame. Does not touch the in-progress `lists`.
     pub(crate) fn present_last(&mut self) {
         self.client.drain_returns();
-        let mut next = self.client.take_frame();
-        (*next).clone_from(&self.last_lists);
-        self.client.submit_frame(next);
+        let last = self.client.wait_last_drawn();
+        self.client.submit_frame(last);
     }
 
     /// Requests a forced capture of the next presented frame to `path`, with a

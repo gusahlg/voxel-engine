@@ -1,6 +1,25 @@
-use std::{env, fs, path::Path, path::PathBuf, process::Command};
+use std::{
+    collections::HashSet,
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
+};
 
 const REFRESH_SHADER_FALLBACKS: &str = "VOXEL_ENGINE_REFRESH_SHADER_FALLBACKS";
+
+/// Shipping SPIR-V profile. Vulkan 1.3 guarantees SPIR-V 1.6, and at 1.6 Slang
+/// lowers `discard` to `OpDemoteToHelperInvocation` (the quad keeps its
+/// derivatives; core-1.3 feature `shaderDemoteToHelperInvocation`, enabled in
+/// `vk/device.rs`) instead of `OpKill`.
+const SPIRV_PROFILE: &str = "spirv_1_6";
+/// `spirv-val` environment for freshly compiled modules; must match the API
+/// version `vk/device.rs` requires.
+const SPIRV_VAL_TARGET_ENV: &str = "vulkan1.3";
+/// Slang optimisation level. With the pinned toolchain (2025.22.1) `-O3`
+/// emits byte-identical modules to `-O2`, so take the cheaper compile.
+const SLANG_OPT_LEVEL: &str = "-O2";
 
 struct Shader<'a> {
     src: &'a str,
@@ -45,6 +64,12 @@ const SHADERS: &[Shader] = &[
         stage: "fragment",
         entry: "fragmentMain",
         dst: "sky.frag.spv",
+    },
+    Shader {
+        src: "shaders/sky_cloud.comp.slang",
+        stage: "compute",
+        entry: "computeMain",
+        dst: "sky_cloud.comp.spv",
     },
     Shader {
         src: "shaders/tonemap.vert.slang",
@@ -121,12 +146,68 @@ const SHADERS: &[Shader] = &[
     },
 ];
 
-fn have_slangc() -> bool {
-    Command::new("slangc")
-        .arg("-v")
+/// Second mesh3d.frag variant: the water depth-absorption path. Declares the
+/// depth input attachment (set 0 binding 5) + Δd-driven body tint, compiled
+/// only into `mesh3d_transparent_absorb` (dynamic_rendering_local_read, MSAA
+/// off). The default variant in SHADERS stays the interim-tint fallback.
+const MESH3D_WATER: Shader = Shader {
+    src: "shaders/mesh3d.frag.slang",
+    stage: "fragment",
+    entry: "fragmentMain",
+    dst: "mesh3d_water.frag.spv",
+};
+
+/// Opaque-only mesh3d.frag: strips water/absorb and the LOD-slab `discard`, so
+/// the full-res opaque module carries no OpKill (early depth write stays on).
+const MESH3D_OPAQUE: Shader = Shader {
+    src: "shaders/mesh3d.frag.slang",
+    stage: "fragment",
+    entry: "fragmentMain",
+    dst: "mesh3d_opaque.frag.spv",
+};
+
+/// Coarse-LOD opaque mesh3d.frag: opaque ALU diet plus the slab-clip `discard`.
+const MESH3D_LOD: Shader = Shader {
+    src: "shaders/mesh3d.frag.slang",
+    stage: "fragment",
+    entry: "fragmentMain",
+    dst: "mesh3d_lod.frag.spv",
+};
+
+/// One compile unit: a shader plus its `-D` defines and extra slangc args.
+struct Job<'a> {
+    shader: &'a Shader<'a>,
+    defines: &'a [&'a str],
+    extra_args: &'a [&'a str],
+}
+
+/// The shader toolchain found on PATH. `None` when `slangc` is missing, in
+/// which case the checked-in `shaders_spv/` fallbacks are used verbatim.
+struct Toolchain {
+    /// `slangc -v` banner; part of the compile-cache key so a toolchain bump
+    /// recompiles everything even when no source changed.
+    slangc_version: String,
+    /// `spirv-val` on PATH (vulkan-tools in the nix shell): every freshly
+    /// compiled module is validated and the build fails on invalid SPIR-V.
+    spirv_val: bool,
+}
+
+fn detect_toolchain() -> Option<Toolchain> {
+    let output = Command::new("slangc").arg("-v").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // slangc prints its version on stderr; take both streams to be safe.
+    let mut slangc_version = String::from_utf8_lossy(&output.stdout).into_owned();
+    slangc_version.push_str(&String::from_utf8_lossy(&output.stderr));
+    let spirv_val = Command::new("spirv-val")
+        .arg("--version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success());
+    Some(Toolchain {
+        slangc_version: slangc_version.trim().to_owned(),
+        spirv_val,
+    })
 }
 
 fn env_flag(name: &str) -> bool {
@@ -151,9 +232,9 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let refresh_fallbacks = env_flag(REFRESH_SHADER_FALLBACKS);
-    let slangc = have_slangc();
+    let toolchain = detect_toolchain();
     assert!(
-        !refresh_fallbacks || slangc,
+        !refresh_fallbacks || toolchain.is_some(),
         "{REFRESH_SHADER_FALLBACKS}=1 requires slangc"
     );
 
@@ -173,39 +254,49 @@ fn main() {
     // Ensure tunables use generated includes, not hand-written constants.
     lint_slang_constants();
 
-    for shader in SHADERS {
-        compile(slangc, &out_dir, fallback_dir, shader, &[]);
-    }
-
-    // Second mesh3d.frag variant: the water depth-absorption path. Declares the
-    // depth input attachment (set 0 binding 5) + Δd-driven body tint, compiled
-    // only into `mesh3d_transparent_absorb` (dynamic_rendering_local_read, MSAA
-    // off). The default variant above stays the interim-tint fallback.
-    let mesh3d_water = Shader {
-        src: "shaders/mesh3d.frag.slang",
-        stage: "fragment",
-        entry: "fragmentMain",
-        dst: "mesh3d_water.frag.spv",
-    };
-    compile(
-        slangc,
-        &out_dir,
-        fallback_dir,
-        &mesh3d_water,
-        &["-DWATER_DEPTH_ABSORPTION"],
-    );
+    let mut jobs: Vec<Job> = SHADERS
+        .iter()
+        .map(|shader| Job {
+            shader,
+            defines: &[],
+            extra_args: &[],
+        })
+        .collect();
+    jobs.push(Job {
+        shader: &MESH3D_WATER,
+        defines: &["-DWATER_DEPTH_ABSORPTION"],
+        extra_args: &[],
+    });
+    jobs.push(Job {
+        shader: &MESH3D_OPAQUE,
+        defines: &["-DMESH3D_OPAQUE"],
+        extra_args: &[],
+    });
+    jobs.push(Job {
+        shader: &MESH3D_LOD,
+        defines: &["-DMESH3D_OPAQUE", "-DMESH3D_LOD"],
+        extra_args: &[],
+    });
+    compile_all(toolchain.as_ref(), &out_dir, fallback_dir, &jobs);
+    // Wave-aggregated InterlockedAdd variant of the cull shader. Not in SHADERS:
+    // shaders_spv/ keeps the plain-atomic module (no subgroup caps) as the
+    // no-slangc fallback; this file lives only in OUT_DIR.
+    compile_cull_wave(toolchain.as_ref(), &out_dir);
 
     // Substrate probe: compute shaders for BDA, QUAD, STORAGE, and occupancy tests.
     // Gated behind VOXEL_BUILD_PROBE to avoid requiring extended SPIR-V profile.
     if env::var("VOXEL_BUILD_PROBE").is_ok() {
-        compile_probe(slangc, &out_dir);
+        compile_probe(toolchain.is_some(), &out_dir);
     }
 
     // Defer every source-tree write until all requested shaders have compiled,
     // so a compiler failure cannot leave a half-refreshed fallback inventory.
     if refresh_fallbacks {
-        for shader in SHADERS.iter().chain(std::iter::once(&mesh3d_water)) {
-            copy_if_changed(&out_dir.join(shader.dst), &fallback_dir.join(shader.dst));
+        for job in &jobs {
+            copy_if_changed(
+                &out_dir.join(job.shader.dst),
+                &fallback_dir.join(job.shader.dst),
+            );
         }
     }
 }
@@ -341,8 +432,8 @@ fn lint_slang_file(path: &Path, violations: &mut Vec<String>) {
         let after_type = trimmed
             .trim_start_matches("static const")
             .trim_start()
-            .splitn(2, char::is_whitespace)
-            .nth(1)
+            .split_once(char::is_whitespace)
+            .map(|x| x.1)
             .unwrap_or("");
         let name: String = after_type
             .trim_start()
@@ -350,7 +441,7 @@ fn lint_slang_file(path: &Path, violations: &mut Vec<String>) {
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
 
-        let rhs = stmt.splitn(2, '=').nth(1).unwrap_or("");
+        let rhs = stmt.split_once('=').map(|x| x.1).unwrap_or("");
         let has_numeric_literal = rhs.char_indices().any(|(idx, c)| {
             c.is_ascii_digit() && !rhs[..idx].ends_with(|p: char| p.is_alphanumeric() || p == '_')
         });
@@ -367,51 +458,228 @@ fn lint_slang_file(path: &Path, violations: &mut Vec<String>) {
     }
 }
 
-fn compile(slangc: bool, out_dir: &Path, fallback_dir: &Path, shader: &Shader, defines: &[&str]) {
+/// Compile every job on a bounded worker pool (one `slangc` process each).
+/// Failures are collected and reported together so one broken shader does not
+/// hide the diagnostics of another.
+fn compile_all(toolchain: Option<&Toolchain>, out_dir: &Path, fallback_dir: &Path, jobs: &[Job]) {
+    let workers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(jobs.len())
+        .max(1);
+    let next = AtomicUsize::new(0);
+    let failures: Vec<String> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut errors = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(job) = jobs.get(index) else {
+                            break;
+                        };
+                        if let Err(e) = compile(toolchain, out_dir, fallback_dir, job) {
+                            errors.push(e);
+                        }
+                    }
+                    errors
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("shader compile worker panicked"))
+            .collect()
+    });
+    assert!(
+        failures.is_empty(),
+        "shader compilation failed:\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
+fn slangc_args(shader: &Shader, defines: &[&str], extra_args: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        shader.src.to_owned(),
+        "-target".into(),
+        "spirv".into(),
+        "-profile".into(),
+        SPIRV_PROFILE.into(),
+        "-entry".into(),
+        shader.entry.to_owned(),
+        "-stage".into(),
+        shader.stage.to_owned(),
+        "-matrix-layout-column-major".into(),
+        SLANG_OPT_LEVEL.into(),
+    ];
+    args.extend(defines.iter().map(|d| (*d).to_owned()));
+    args.extend(extra_args.iter().map(|a| (*a).to_owned()));
+    args
+}
+
+/// Transitive `#include "..."` closure of `src` (Slang resolves quoted includes
+/// relative to the including file), in deterministic first-visit order. Files
+/// that do not exist are skipped: slangc reports those itself.
+fn include_closure(src: &Path) -> Vec<PathBuf> {
+    let mut order = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![src.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let dir = path.parent().unwrap_or(Path::new(""));
+        // Push in reverse so includes are visited in source order.
+        let mut includes: Vec<PathBuf> = text
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim_start().strip_prefix("#include")?.trim_start();
+                let rest = rest.strip_prefix('"')?;
+                let (name, _) = rest.split_once('"')?;
+                Some(dir.join(name))
+            })
+            .collect();
+        includes.reverse();
+        stack.extend(includes);
+        order.push(path);
+    }
+    order
+}
+
+/// 64-bit FNV-1a: stable across Rust versions (unlike `DefaultHasher`), so a
+/// cache written by one toolchain stays meaningful to the next.
+fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Cache key for one compile: toolchain banner, exact argv, validator, and the
+/// path + contents of the source and every transitive include.
+fn fingerprint(toolchain: &Toolchain, args: &[String], src: &Path) -> String {
+    let mut hash = fnv1a(toolchain.slangc_version.as_bytes(), 0xcbf2_9ce4_8422_2325);
+    hash = fnv1a(SPIRV_VAL_TARGET_ENV.as_bytes(), hash);
+    hash = fnv1a(&[u8::from(toolchain.spirv_val)], hash);
+    for arg in args {
+        hash = fnv1a(arg.as_bytes(), hash);
+        hash = fnv1a(b"\0", hash);
+    }
+    for path in include_closure(src) {
+        hash = fnv1a(path.to_string_lossy().as_bytes(), hash);
+        hash = fnv1a(b"\0", hash);
+        let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        hash = fnv1a(&bytes, hash);
+        hash = fnv1a(b"\0", hash);
+    }
+    format!("{hash:016x}")
+}
+
+/// Wave-aggregated InterlockedAdd variant of the cull shader. Without slangc,
+/// clone the plain module so `include_bytes!` still resolves; the runtime then
+/// picks the plain pipeline because wave ops are absent. Lives only in OUT_DIR
+/// (shaders_spv/ keeps the no-subgroup fallback).
+fn compile_cull_wave(toolchain: Option<&Toolchain>, out_dir: &Path) {
+    const CULL_WAVE: Shader = Shader {
+        src: "shaders/cull.comp.slang",
+        stage: "compute",
+        entry: "computeMain",
+        dst: "cull_wave.comp.spv",
+    };
+    if toolchain.is_some() {
+        compile_all(
+            toolchain,
+            out_dir,
+            Path::new("shaders_spv"),
+            &[Job {
+                shader: &CULL_WAVE,
+                defines: &["-DUSE_WAVE_ATOMICS"],
+                extra_args: &["-capability", "subgroup_basic_ballot"],
+            }],
+        );
+        return;
+    }
+    let plain = out_dir.join("cull.comp.spv");
+    let wave = out_dir.join(CULL_WAVE.dst);
+    fs::copy(&plain, &wave)
+        .unwrap_or_else(|e| panic!("copy plain cull module to {}: {e}", wave.display()));
+}
+
+fn compile(
+    toolchain: Option<&Toolchain>,
+    out_dir: &Path,
+    fallback_dir: &Path,
+    job: &Job,
+) -> Result<(), String> {
+    let shader = job.shader;
     let out_path = out_dir.join(shader.dst);
     let fallback_path = fallback_dir.join(shader.dst);
+    // Fingerprint of the last successful (compiled + validated) build of
+    // `out_path`; skip the compile when nothing feeding it has changed.
+    let stamp_path = out_dir.join(format!("{}.fingerprint", shader.dst));
 
-    if !slangc {
+    let Some(toolchain) = toolchain else {
         assert!(
             fallback_path.exists(),
             "slangc not found and no prebuilt {} — install Slang or restore shaders_spv/",
             fallback_path.display()
         );
         fs::copy(&fallback_path, &out_path).unwrap();
-        return;
+        // The fallback is not a compile of the current source: forget any
+        // stamp so a later toolchain install rebuilds instead of trusting it.
+        let _ = fs::remove_file(&stamp_path);
+        return Ok(());
+    };
+
+    let args = slangc_args(shader, job.defines, job.extra_args);
+    let fingerprint = fingerprint(toolchain, &args, Path::new(shader.src));
+    if out_path.exists() && fs::read_to_string(&stamp_path).is_ok_and(|s| s == fingerprint) {
+        return Ok(());
     }
+    // Never leave a stale stamp next to a module we are about to rewrite.
+    let _ = fs::remove_file(&stamp_path);
 
     let output = Command::new("slangc")
-        .args([
-            shader.src,
-            "-target",
-            "spirv",
-            "-profile",
-            "spirv_1_3",
-            "-entry",
-            shader.entry,
-            "-stage",
-            shader.stage,
-            "-matrix-layout-column-major",
-        ])
-        .args(defines)
+        .args(&args)
         .arg("-o")
         .arg(&out_path)
         .output()
-        .expect("failed to run slangc");
-
+        .map_err(|e| format!("failed to run slangc for {}: {e}", shader.src))?;
     if !output.status.success() {
-        eprintln!("slangc failed while compiling {}", shader.src);
-        eprintln!(
-            "--- stdout ---\n{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-        eprintln!(
-            "--- stderr ---\n{}",
+        return Err(format!(
+            "slangc failed while compiling {} (entry {})\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            shader.src,
+            shader.entry,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        );
-        panic!("shader compilation failed");
+        ));
     }
+
+    if toolchain.spirv_val {
+        let output = Command::new("spirv-val")
+            .arg("--target-env")
+            .arg(SPIRV_VAL_TARGET_ENV)
+            .arg(&out_path)
+            .output()
+            .map_err(|e| format!("failed to run spirv-val for {}: {e}", shader.dst))?;
+        if !output.status.success() {
+            return Err(format!(
+                "spirv-val rejected {} ({} from {}):\n{}",
+                shader.dst,
+                shader.entry,
+                shader.src,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+
+    fs::write(&stamp_path, fingerprint)
+        .map_err(|e| format!("write {}: {e}", stamp_path.display()))?;
+    Ok(())
 }
 
 fn copy_if_changed(compiled: &Path, fallback: &Path) {
@@ -514,7 +782,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "VARIANCE_GAMMA",
-            doc: "TAA neighbourhood variance-clamp width in std-devs: history is clamped to\nYCoCg mean +/- VARIANCE_GAMMA*stddev of the 3x3 current taps. Wider = steadier\n(less crawl) but more ghosting. Read by taa_resolve.comp.",
+            doc: "TAA neighbourhood variance-clamp width in std-devs: history is clamped to\nYCoCg mean +/- VARIANCE_GAMMA*stddev of the 5-tap cross current taps. Wider =\nsteadier (less crawl) but more ghosting. Read by taa_resolve.comp.",
             val: Val::Scalar(1.25),
         },
         Def {
@@ -566,8 +834,38 @@ fn build_table() -> Vec<Def> {
             val: Val::UInt(64),
         },
         Def {
+            name: "CULL_DISTANCE_BUCKETS",
+            doc: "Front-to-back approximate-order buckets per camera (pass, arena) partition.\nShadow groups stay unbucketed. CPU partition math and the cull shader must agree.",
+            val: Val::UInt(4),
+        },
+        Def {
+            name: "CULL_CAMERA_GROUPS",
+            doc: "Camera cull groups: full-res Opaque, Cutout, coarse-LOD Opaque.\nMust match vk::cull::CAMERA_GROUPS; the shader uses this for partition indexing.",
+            val: Val::UInt(3),
+        },
+        Def {
+            name: "CULL_BUCKET_SPLIT_0",
+            doc: "Camera-distance edge (metres from AABB centre) between cull buckets 0 and 1.\nBucket 0 is nearest; record_mesh_indirect_count draws 0..K-1 near-to-far.",
+            val: Val::Scalar(16.0),
+        },
+        Def {
+            name: "CULL_BUCKET_SPLIT_1",
+            doc: "Camera-distance edge (metres) between cull buckets 1 and 2.",
+            val: Val::Scalar(64.0),
+        },
+        Def {
+            name: "CULL_BUCKET_SPLIT_2",
+            doc: "Camera-distance edge (metres) between cull buckets 2 and 3 (farthest).",
+            val: Val::Scalar(256.0),
+        },
+        Def {
             name: "EXPOSURE_TILE",
             doc: "Exposure metering tile edge in HDR texels. The CPU-side tile-grid dimensions\n(vk/exposure.rs) are ceil(hdr_dim / EXPOSURE_TILE) and must agree.",
+            val: Val::UInt(16),
+        },
+        Def {
+            name: "TAA_TILE",
+            doc: "TAA resolve workgroup edge in texels (groupshared tile + 1-pixel apron).\nCPU dispatch (vk/taa.rs) must divide by the same value.",
             val: Val::UInt(16),
         },
         Def {
@@ -662,6 +960,11 @@ fn build_table() -> Vec<Def> {
             name: "BLOOM_SPIRAL_LOD",
             doc: "Mip level the bloom spiral samples the (already downsampled) chain at — the\nwide soft blur comes from the pyramid; the spiral just spreads and de-aliases it.",
             val: Val::Scalar(2.0),
+        },
+        Def {
+            name: "BLOOM_MAX_MIPS",
+            doc: "Bloom pyramid mip cap. Tonemap samples only BLOOM_SPIRAL_LOD, so the chain\nstops at that level (base + LOD). CPU (vk/targets.rs) must agree.",
+            val: Val::UInt(3),
         },
         Def {
             name: "BLOOM_SPIRAL_RADIUS",
@@ -804,6 +1107,20 @@ fn build_table() -> Vec<Def> {
             doc: "Horizon-hide steepness: saturate((ray.y - CLOUD_HORIZON_OFFSET) * this).",
             val: Val::Scalar(5.0),
         },
+        // Direction-space cloud LUT: one compute dispatch per sky frame marches
+        // the slab into an octahedral upper-hemisphere map; the full-res sky
+        // fragment takes one bilinear tap. 256 is enough — cloud noise is
+        // ~1 km scale — and stays at the cheap end of the 256..512 quality band.
+        Def {
+            name: "SKY_CLOUD_LUT_SIZE",
+            doc: "Edge length of the square octahedral cloud LUT (texels). Quality band\n[256, 512]; CPU dispatch and the compute shader must agree.",
+            val: Val::UInt(256),
+        },
+        Def {
+            name: "SKY_CLOUD_LUT_WG",
+            doc: "Cloud-LUT compute workgroup edge. CPU dispatch divides SKY_CLOUD_LUT_SIZE\nby this; the shader's [numthreads] uses the same value.",
+            val: Val::UInt(8),
+        },
         // Water: animated waves + reflection + glint + interim tint, world-anchored for deterministic goldens.
         Def {
             name: "WATER_WAVE_FREQ",
@@ -905,7 +1222,7 @@ fn lane_table() -> Vec<Lane> {
     vec![
         Lane {
             name: "sun_dir_elev",
-            doc: "xyz = sun direction (normalized), w = sun elevation (radians).",
+            doc: "xyz = sun direction (unit, engine-normalized in prepare_derived),\nw = sun elevation (game: sun_dir.y in [-1,1]; drives the glow_pow lerp).",
         },
         Lane {
             name: "light",
@@ -929,11 +1246,27 @@ fn lane_table() -> Vec<Lane> {
         },
         Lane {
             name: "extras",
-            doc: "x = stars gain (1 = night starfield renders, 0 = skipped — the\n`RenderFlags::stars` gate). yzw reserved (always zero); repurposing a\nchannel bumps FRAME_UNIFORMS_VERSION.",
+            doc: "x = stars gain (1 = night starfield renders, 0 = skipped — the\n`RenderFlags::stars` gate). y = glow_pow, z = glow_scale (0.5+turbidity):\nengine-derived sky_radiance terms, filled by FrameUniformsGpu::prepare_derived.\nw reserved (debug-flat may overwrite the whole lane).",
         },
         Lane {
             name: "anim",
             doc: "x = anim_time = world-time seconds mod ANIM_PERIOD; yz = fract(camera_world.xz\n/ ANIM_PERIOD); w = camera world-y (metres, bounded ⇒ no wrap) for the cloud\nslab in sky.frag.",
+        },
+    ]
+}
+
+/// Engine-derived tail appended after [`lane_table`] in the GPU UBO / Slang
+/// `FrameUniforms`. Not part of the public `FrameUniformsGpu` wire the game
+/// writes — the renderer fills these from the public lanes once per frame.
+fn derived_lane_table() -> Vec<Lane> {
+    vec![
+        Lane {
+            name: "ambient_glow",
+            doc: "Engine-derived (not in FrameUniformsGpu). rgb = ambient_floor_color\n(zenith rescaled to candle.w luma; grayscale candle.w when zenith luma is 0);\nw = sky halo exponent (GLOW_POW_SUNSET..DAY smoothstep on sun_dir_elev.w).",
+        },
+        Lane {
+            name: "glow_day",
+            doc: "Engine-derived. rgb = light.rgb * (0.5 + turbidity) (sky-halo tint×scale);\nw = abs(2*day_night_mix - 1) (shadow_fallback day factor).",
         },
     ]
 }
@@ -945,56 +1278,91 @@ fn emit_generated_spdx(s: &mut String) {
     // REUSE-IgnoreEnd
 }
 
-fn emit_rust_uniforms(lanes: &[Lane]) -> String {
+fn emit_rust_uniforms(public: &[Lane], derived: &[Lane]) -> String {
     let mut s = String::new();
     emit_generated_spdx(&mut s);
     s.push_str("// @generated by voxel-engine/build.rs — DO NOT EDIT.\n");
-    s.push_str("// Source of truth: the lane_table() function in build.rs.\n");
-    s.push_str("// Twin file: shaders/generated/frame_uniforms.slang (same lanes/order).\n\n");
+    s.push_str("// Source of truth: lane_table() / derived_lane_table() in build.rs.\n");
+    s.push_str("// Twin file: shaders/generated/frame_uniforms.slang (public then derived).\n\n");
     s.push_str("/// WIRE form of the game's `FrameSnapshot`. Every lane is a `[f32; 4]` so\n");
     s.push_str("/// std140 and scalar layouts cannot diverge. Colors are LINEAR f32\n");
     s.push_str("/// (unclamped — HDR palettes survive). The layout below IS the contract with\n");
     s.push_str(
-        "/// `common.slang`'s `FrameUniforms`; the offset asserts below are the enforcement.\n",
+        "/// `common.slang`'s `FrameUniforms` prefix; the offset asserts below are the enforcement.\n",
     );
     s.push_str("///\n");
     s.push_str("/// Constructed ONLY via the game crate's `From<&FrameSnapshot>` impl.\n");
+    s.push_str("/// Engine-derived extra lanes live on [`FrameUniformsExt`], not here.\n");
     s.push_str("#[repr(C)]\n");
     s.push_str("#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]\n");
     s.push_str("pub struct FrameUniformsGpu {\n");
-    for l in lanes {
+    for l in public {
         doc_lines(l.doc, "    /// ", &mut s);
         s.push_str(&format!("    pub {}: [f32; 4],\n", l.name));
     }
     s.push_str("}\n\n");
     s.push_str(&format!(
         "const _: () = assert!(size_of::<FrameUniformsGpu>() == {});\n",
-        lanes.len() * 16
+        public.len() * 16
     ));
-    for (i, l) in lanes.iter().enumerate() {
+    for (i, l) in public.iter().enumerate() {
         s.push_str(&format!(
             "const _: () = assert!(std::mem::offset_of!(FrameUniformsGpu, {}) == {});\n",
             l.name,
             i * 16
         ));
     }
+    s.push('\n');
+    s.push_str("/// GPU UBO: public [`FrameUniformsGpu`] plus the engine-derived tail.\n");
+    s.push_str("/// The game still writes `FrameUniformsGpu`; the renderer appends the rest.\n");
+    s.push_str("#[repr(C)]\n");
+    s.push_str("#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]\n");
+    s.push_str("pub(crate) struct FrameUniformsExt {\n");
+    s.push_str("    /// Public per-frame lanes the game wrote.\n");
+    s.push_str("    pub base: FrameUniformsGpu,\n");
+    for l in derived {
+        doc_lines(l.doc, "    /// ", &mut s);
+        s.push_str(&format!("    pub {}: [f32; 4],\n", l.name));
+    }
+    s.push_str("}\n\n");
+    s.push_str(&format!(
+        "const _: () = assert!(size_of::<FrameUniformsExt>() == {});\n",
+        (public.len() + derived.len()) * 16
+    ));
+    s.push_str("const _: () = assert!(std::mem::offset_of!(FrameUniformsExt, base) == 0);\n");
+    for (i, l) in derived.iter().enumerate() {
+        s.push_str(&format!(
+            "const _: () = assert!(std::mem::offset_of!(FrameUniformsExt, {}) == {});\n",
+            l.name,
+            (public.len() + i) * 16
+        ));
+    }
     s
 }
 
-fn emit_slang_uniforms(lanes: &[Lane]) -> String {
+fn emit_slang_uniforms(public: &[Lane], derived: &[Lane]) -> String {
     let mut s = String::new();
     emit_generated_spdx(&mut s);
     s.push_str("// @generated by voxel-engine/build.rs — DO NOT EDIT.\n");
-    s.push_str("// Source of truth: the lane_table() function in build.rs.\n");
-    s.push_str("// Twin file: voxel_engine::skeleton::FrameUniformsGpu (same lanes/order).\n");
+    s.push_str("// Source of truth: lane_table() / derived_lane_table() in build.rs.\n");
+    s.push_str("// Twin file: voxel_engine::skeleton::FrameUniformsGpu (public prefix) plus\n");
+    s.push_str("// the engine-derived tail on FrameUniformsExt (same extra lanes/order).\n");
     s.push_str(
         "// Consumed via: #include \"generated/frame_uniforms.slang\" (from common.slang).\n\n",
     );
-    s.push_str("// Per-frame uniform block. Mirrors voxel_engine::skeleton::FrameUniformsGpu.\n");
+    s.push_str("// Per-frame uniform block. Public lanes match FrameUniformsGpu; the tail is\n");
+    s.push_str("// filled by the renderer (vk/uniforms.rs) and is not part of the game wire.\n");
     s.push_str("struct FrameUniforms\n{\n");
-    for l in lanes {
+    for l in public {
         doc_lines(l.doc, "    // ", &mut s);
         s.push_str(&format!("    float4 {};\n", l.name));
+    }
+    if !derived.is_empty() {
+        s.push_str("    // --- engine-derived tail (not in FrameUniformsGpu) ---\n");
+        for l in derived {
+            doc_lines(l.doc, "    // ", &mut s);
+            s.push_str(&format!("    float4 {};\n", l.name));
+        }
     }
     s.push_str("};\n");
     s
@@ -1125,13 +1493,14 @@ fn generate_shared_constants(out_dir: &Path) {
     fs::create_dir_all(gen_dir).unwrap();
     write_if_changed(&gen_dir.join("shader_constants.slang"), &emit_slang(&defs));
 
-    let lanes = lane_table();
+    let public = lane_table();
+    let derived = derived_lane_table();
     write_if_changed(
         &out_dir.join("gen_frame_uniforms.rs"),
-        &emit_rust_uniforms(&lanes),
+        &emit_rust_uniforms(&public, &derived),
     );
     write_if_changed(
         &gen_dir.join("frame_uniforms.slang"),
-        &emit_slang_uniforms(&lanes),
+        &emit_slang_uniforms(&public, &derived),
     );
 }

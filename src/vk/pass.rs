@@ -36,14 +36,13 @@ pub(crate) fn push_descriptor_layouts(
         .offset(0)
         .size(push_constant_size)];
     let set_layouts = [set_layout];
+    let mut info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+    if push_constant_size > 0 {
+        info = info.push_constant_ranges(&push);
+    }
     let layout = unsafe {
         device
-            .create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&set_layouts)
-                    .push_constant_ranges(&push),
-                None,
-            )
+            .create_pipeline_layout(&info, None)
             .unwrap_or_else(|e| panic!("create {label} pipeline layout: {e:?}"))
     };
     (set_layout, layout)
@@ -90,6 +89,24 @@ pub(crate) fn linear_clamp_sampler(device: &ash::Device, label: &str) -> vk::Sam
                 &vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::LINEAR)
                     .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("create {label} sampler: {e:?}"))
+    }
+}
+
+/// Nearest-filter, clamp-to-edge sampler — point depth fetches (TAA reprojection)
+/// must not interpolate reversed-Z.
+pub(crate) fn nearest_clamp_sampler(device: &ash::Device, label: &str) -> vk::Sampler {
+    unsafe {
+        device
+            .create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::NEAREST)
+                    .min_filter(vk::Filter::NEAREST)
                     .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),

@@ -1,6 +1,7 @@
 // exposure_reduce.comp.slang — first stage of scene metering.
-// One thread per 16x16-texel tile. Averages log2(luma) over tile, writes to buffer.
-// CPU does final reduction. log2 space (not linear) to avoid firefly domination.
+// One 8×8 workgroup per 16×16-texel tile. Each thread sums a 2×2 of the tile,
+// then a groupshared tree reduces to one mean log2(luma). CPU does the final
+// reduction over tiles. log2 space (not linear) to avoid firefly domination.
 
 #include "common.slang"
 
@@ -18,27 +19,25 @@ struct Push
 };
 [[vk::push_constant]] Push pc;
 
+groupshared float gs_sum[64];
+groupshared uint gs_cnt[64];
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void computeMain(uint3 gid: SV_DispatchThreadID)
+void computeMain(uint3 lid: SV_GroupThreadID, uint3 wid: SV_GroupID)
 {
-    if (gid.x >= pc.tiles.x || gid.y >= pc.tiles.y)
-        return;
-
-    uint2 origin = gid.xy * TILE;
+    uint2 origin = wid.xy * TILE;
+    uint sub = TILE / 8; // 2 when TILE=16: each thread covers a 2×2 of the tile
     float sum_log2 = 0.0;
     uint counted = 0;
-    for (uint ty = 0; ty < TILE; ++ty)
+    for (uint ty = 0; ty < sub; ++ty)
     {
-        uint py = origin.y + ty;
-        if (py >= pc.hdr_dim.y)
-            break;
-        for (uint tx = 0; tx < TILE; ++tx)
+        for (uint tx = 0; tx < sub; ++tx)
         {
-            uint px = origin.x + tx;
-            if (px >= pc.hdr_dim.x)
-                break;
-            float2 uv = (float2(px, py) + 0.5) / float2(pc.hdr_dim);
+            uint2 px = origin + lid.xy * sub + uint2(tx, ty);
+            if (px.x >= pc.hdr_dim.x || px.y >= pc.hdr_dim.y)
+                continue;
+            float2 uv = (float2(px) + 0.5) / float2(pc.hdr_dim);
             float3 hdr = hdrTex.SampleLevel(uv, 0).rgb;
             float luma = max(luma709(hdr), LUMA_FLOOR);
             sum_log2 += log2(luma);
@@ -46,6 +45,25 @@ void computeMain(uint3 gid: SV_DispatchThreadID)
         }
     }
 
-    float mean_log2 = counted > 0 ? sum_log2 / float(counted) : log2(LUMA_FLOOR);
-    tileMeans[gid.y * pc.tiles.x + gid.x] = mean_log2;
+    uint idx = lid.y * 8 + lid.x;
+    gs_sum[idx] = sum_log2;
+    gs_cnt[idx] = counted;
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint s = 32; s > 0; s >>= 1)
+    {
+        if (idx < s)
+        {
+            gs_sum[idx] += gs_sum[idx + s];
+            gs_cnt[idx] += gs_cnt[idx + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (idx == 0 && wid.x < pc.tiles.x && wid.y < pc.tiles.y)
+    {
+        float mean_log2 = gs_cnt[0] > 0 ? gs_sum[0] / float(gs_cnt[0]) : log2(LUMA_FLOOR);
+        tileMeans[wid.y * pc.tiles.x + wid.x] = mean_log2;
+    }
 }

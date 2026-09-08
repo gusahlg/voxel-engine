@@ -1,10 +1,12 @@
 //! Scene exposure metering — compute-based reduction with temporal smoothing.
 //!
 //! A compute pass reduces the linear-HDR offscreen to a small per-tile buffer of
-//! mean `log2(luma)` (16×16 texels/tile, `exposure_reduce.comp`). The CPU averages
-//! the tile means after the slot's fence, maps the geometric-mean luma through the
-//! exposure curve, and temporally smooths the result — yielding the exposure
-//! multiplier the tonemap pass applies before its tone curve.
+//! mean `log2(luma)` (16×16 texels/tile, 8×8 groupshared reduce in
+//! `exposure_reduce.comp`). The CPU averages the tile means after the slot's
+//! fence, maps the geometric-mean luma through the exposure curve, and temporally
+//! smooths the result — yielding the exposure multiplier the tonemap pass applies
+//! before its tone curve. GPU metering runs only on presented frames; smoothing
+//! stays wall-clock `dt` so skipped mailbox frames do not freeze the tau.
 //!
 //! All of this package's engine code lives here (not `vk/mod.rs`): the pipeline,
 //! the double-buffered readback ring, `Renderer::record_exposure_pass`, and
@@ -424,10 +426,12 @@ impl ExposureState {
 impl super::Renderer {
     /// Record the metering reduction and fold the previous result into the
     /// published exposure. Inserted by the orchestrator AFTER the HDR pass and
-    /// BEFORE tonemap. `slot` is this frame's slot; `views(slot)` reads and
-    /// then overwrites the SAME slot's buffer — the read value is the one this
-    /// slot's fence (already waited this frame) proves complete, and the read
-    /// happens at record time, before the overwriting dispatch is submitted.
+    /// BEFORE tonemap, and only on frames that will present. `slot` is this
+    /// frame's slot; `views(slot)` reads and then overwrites the SAME slot's
+    /// buffer — the read value is the one this slot's fence (already waited this
+    /// frame) proves complete, and the read happens at record time, before the
+    /// overwriting dispatch is submitted. `dt` is wall-clock since the previous
+    /// presented metering, so unpresented frames keep time-based smoothing.
     ///
     /// This pass owns the offscreen's `COLOR_ATTACHMENT → SHADER_READ_ONLY`
     /// transition (it samples the HDR for the reduction and leaves it sampled),
@@ -518,7 +522,8 @@ impl super::Renderer {
                 0,
                 bytemuck::bytes_of(&push),
             );
-            device.cmd_dispatch(cmd, tiles.width.div_ceil(8), tiles.height.div_ceil(8), 1);
+            // One 8×8 workgroup per tile (groupshared reduce); not 8 tiles per group.
+            device.cmd_dispatch(cmd, tiles.width, tiles.height, 1);
 
             // Compute storage write → host read (next cycle) and HDR back to
             // color-attachment layout for the tonemap sample.
@@ -590,5 +595,24 @@ mod tests {
             }
             last_writer[write] = Some(frame);
         }
+    }
+
+    /// Skipping GPU metering on unpresented frames and applying one wall-clock
+    /// `dt` on the next present equals iterating the mix on the skipped frames
+    /// (constant target) — so mailbox drops must not switch to per-present tau.
+    #[test]
+    fn time_based_smoothing_is_dt_associative() {
+        let target = 2.0f32;
+        let prev = 1.0f32;
+        let dt = 0.016f32;
+        let k = (-dt * 1.25).exp();
+        let one = target * (1.0 - k) + prev * k;
+        let dt_small = dt / 16.0;
+        let mut x = prev;
+        for _ in 0..16 {
+            let ks = (-dt_small * 1.25).exp();
+            x = target * (1.0 - ks) + x * ks;
+        }
+        assert!((one - x).abs() < 1e-5);
     }
 }

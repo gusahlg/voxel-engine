@@ -36,9 +36,10 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
 /// The capture targets the engine's *last submitted* scene: the caller records
 /// and finishes the frame it wants (drops its [`Frame`](crate::Frame)), then
 /// calls this. The request forces the next present (the pacer cannot drop it),
-/// so re-presenting the retained scene once latches real terrain rather than a
+/// so re-presenting that snapshot once latches real terrain rather than a
 /// blank frame; completion (and any encode error) arrives over the reply
-/// channel, not by polling the filesystem.
+/// channel, not by polling the filesystem. The snapshot is the pooled box the
+/// render thread just returned — not a per-frame clone of the draw lists.
 pub fn screenshot_to(engine: &mut Engine, path: &Path) -> std::io::Result<()> {
     let rx = engine.request_capture(path.to_path_buf());
     let deadline = Instant::now() + CAPTURE_TIMEOUT;

@@ -305,7 +305,11 @@ pub fn upload_image(
                         device,
                         graphics_queue,
                         &done,
-                        Some((lane.semaphore(), value)),
+                        Some((
+                            lane.semaphore(),
+                            value,
+                            vk::PipelineStageFlags2::ALL_COMMANDS,
+                        )),
                     );
                     done.wait(device, completion.value());
                     done.destroy(device);

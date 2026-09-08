@@ -98,6 +98,7 @@ fn gate_uniforms(f: &crate::engine::RenderFlags, mut u: FrameUniformsGpu) -> Fra
         // Zero the stars gain; sky.frag skips the starfield evaluation.
         u.extras[0] = 0.0;
     }
+    u.prepare_derived();
     u
 }
 
@@ -131,41 +132,15 @@ pub(crate) struct Scene3D {
     /// Wide-FOV lens for this scope. `Identity` in rectilinear mode.
     pub warp_map: WarpMap,
     /// Sub-pixel camera jitter (PIXELS, +/-0.5) for this 3D scope, injected here
-    /// — the sole injection point. `view_proj` above stays CLEAN so culling,
-    /// VRS fingerprinting, and TAA reprojection never see the jitter.
+    /// — the sole injection point. `view_proj` above stays CLEAN so culling
+    /// and TAA reprojection never see the jitter.
     pub jitter: JitterOffset,
-}
-
-#[cfg(test)]
-impl Scene3D {
-    /// Placeholder scene for tests exercising `DrawLists`/fingerprint logic
-    /// that don't care about the actual camera/lighting values.
-    pub(crate) fn test_stub() -> Self {
-        Scene3D {
-            view_proj: Mat4::IDENTITY,
-            camera: Camera3D {
-                position: Vec3::ZERO,
-                target: Vec3::ZERO,
-                up: Vec3::Y,
-                fovy: 60.0,
-                lens: crate::camera::Lens::Rectilinear,
-            },
-            frame_uniforms: FrameUniformsGpu::full_bright(),
-            cam_pos: Vec3::ZERO,
-            eye: DVec3::ZERO,
-            fovy_tan_half: 1.0,
-            warp_map: WarpMap::Identity,
-            jitter: JitterOffset::ZERO,
-        }
-    }
 }
 
 /// CPU-side draw lists for one frame. Vec capacities persist across frames.
 ///
-/// `Clone` exists solely for deterministic capture ([`crate::screenshot_to`]):
-/// the last submitted lists are retained so the blocking capture can re-present
-/// the same scene until the readback PNG lands, rather than a blank frame.
-#[derive(Clone)]
+/// Blocking capture ([`crate::screenshot_to`]) re-presents the last completed
+/// pooled snapshot rather than cloning these lists every frame.
 pub(crate) struct DrawLists {
     pub clear: LinearRgb,
     /// `Some` for exactly the frames between `begin_3d` and the next `reset`;
@@ -708,18 +683,23 @@ mod tests {
     use super::*;
 
     /// The stars gain rides `extras.x`; the flag gate must zero exactly that
-    /// channel and leave the rest of the lane (debug-flat scratch) alone.
+    /// channel. `extras.yz` are engine-derived glow terms (filled by
+    /// `prepare_derived`); `w` stays reserved zero.
     #[test]
     fn stars_gate_zeroes_extras_x() {
         let mut u = FrameUniformsGpu::full_bright();
         u.extras = [1.0, 0.0, 0.0, 0.0];
         let on = gate_uniforms(&crate::engine::RenderFlags::default(), u);
-        assert_eq!(on.extras, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(on.extras[0], 1.0);
+        assert!((on.extras[1] - crate::genconst::GLOW_POW_DAY).abs() < 1e-5);
+        assert!((on.extras[2] - 0.5).abs() < 1e-5);
+        assert_eq!(on.extras[3], 0.0);
         let flags = crate::engine::RenderFlags {
             stars: false,
             ..Default::default()
         };
         let off = gate_uniforms(&flags, u);
-        assert_eq!(off.extras, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(off.extras[0], 0.0);
+        assert!((off.extras[1] - crate::genconst::GLOW_POW_DAY).abs() < 1e-5);
     }
 }
