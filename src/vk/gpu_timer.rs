@@ -21,7 +21,13 @@ pub(super) enum GpuPass {
     ShadowMap,
     /// Scene-pass begin: attachment transitions + `cmd_begin_rendering` clears.
     Clear,
-    Opaque,
+    /// Full-res opaque (camera group 0, all distance buckets).
+    OpaqueFull,
+    /// Coarse-LOD opaque (camera group 2); recorded after full-res so the
+    /// LOD skirt is mostly depth-rejected. Before cutout.
+    OpaqueLod,
+    /// Cutout (camera group 1); recorded after both opaque partitions.
+    Cutout,
     Sky,
     Cubes,
     Lines,
@@ -47,12 +53,14 @@ pub(super) enum GpuPass {
 }
 
 impl GpuPass {
-    pub(super) const ALL: [GpuPass; 16] = [
+    pub(super) const ALL: [GpuPass; 18] = [
         GpuPass::Copies,
         GpuPass::Cull,
         GpuPass::ShadowMap,
         GpuPass::Clear,
-        GpuPass::Opaque,
+        GpuPass::OpaqueFull,
+        GpuPass::OpaqueLod,
+        GpuPass::Cutout,
         GpuPass::Sky,
         GpuPass::Cubes,
         GpuPass::Lines,
@@ -74,7 +82,9 @@ impl GpuPass {
             GpuPass::Cull => Meter::GpuCull,
             GpuPass::ShadowMap => Meter::GpuShadowMap,
             GpuPass::Clear => Meter::GpuClear,
-            GpuPass::Opaque => Meter::GpuOpaque,
+            GpuPass::OpaqueFull => Meter::GpuOpaqueFull,
+            GpuPass::OpaqueLod => Meter::GpuOpaqueLod,
+            GpuPass::Cutout => Meter::GpuCutout,
             GpuPass::Sky => Meter::GpuSky,
             GpuPass::Cubes => Meter::GpuCubes,
             GpuPass::Lines => Meter::GpuLines,
@@ -87,6 +97,15 @@ impl GpuPass {
             GpuPass::Exposure => Meter::GpuExposure,
             GpuPass::Bloom => Meter::GpuBloom,
         }
+    }
+
+    /// Combined opaque span (full-res + coarse LOD + cutout). Not a stamped
+    /// pass — summed from the three group stamps at readback so the `opaque`
+    /// meter stays comparable with reports that predate the split.
+    pub(super) fn opaque_ms(passes: &[f64; Self::COUNT]) -> f64 {
+        passes[Self::OpaqueFull as usize]
+            + passes[Self::OpaqueLod as usize]
+            + passes[Self::Cutout as usize]
     }
 }
 
@@ -164,7 +183,7 @@ impl GpuTimer {
             primed: [false; FRAMES_IN_FLIGHT as usize],
             count: std::array::from_fn(|_| std::cell::Cell::new(0)),
             label: std::array::from_fn(|_| {
-                std::array::from_fn(|_| std::cell::Cell::new(GpuPass::Opaque))
+                std::array::from_fn(|_| std::cell::Cell::new(GpuPass::OpaqueFull))
             }),
             copy_primed: false,
             prev_end: None,
@@ -357,6 +376,25 @@ mod tests {
             QUERY_COUNT as usize,
             GPU_STAMPS * FRAMES_IN_FLIGHT as usize + 2
         );
+        // Opaque split: stamped after each camera group, in draw order
+        // (full-res, coarse LOD, then cutout). Combined `opaque` is summed
+        // at readback and is not a GpuPass.
+        assert_eq!(GpuPass::OpaqueFull as usize, GpuPass::Clear as usize + 1);
+        assert_eq!(
+            GpuPass::OpaqueLod as usize,
+            GpuPass::OpaqueFull as usize + 1
+        );
+        assert_eq!(GpuPass::Cutout as usize, GpuPass::OpaqueLod as usize + 1);
+        assert_eq!(GpuPass::Sky as usize, GpuPass::Cutout as usize + 1);
+    }
+
+    #[test]
+    fn opaque_ms_sums_the_three_group_stamps() {
+        let mut passes = [0.0f64; GpuPass::COUNT];
+        passes[GpuPass::OpaqueFull as usize] = 0.03;
+        passes[GpuPass::OpaqueLod as usize] = 0.05;
+        passes[GpuPass::Cutout as usize] = 0.01;
+        assert!((GpuPass::opaque_ms(&passes) - 0.09).abs() < 1e-12);
     }
 
     #[test]

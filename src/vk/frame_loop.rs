@@ -445,13 +445,15 @@ impl Renderer {
 
     /// Last completed cull geometry stats for this slot (2-frame delayed).
     /// `draws.full` / `tris.full` are camera group 0 (full-res opaque);
-    /// `draws.lod` / `tris.lod` are group 2 (coarse LOD). Cutout (group 1) is
-    /// accumulated on the GPU but not published here.
+    /// `draws.cutout` / `tris.cutout` are group 1; `draws.lod` / `tris.lod`
+    /// are group 2 (coarse LOD). Gauges no-op when profiling is off.
     fn publish_cull_stats(&self, slot: usize) {
-        let [d0, i0, _d1, _i1, d2, i2] = self.cull.stats(slot);
+        let [d0, i0, d1, i1, d2, i2] = self.cull.stats(slot);
         crate::profile::gauge(crate::profile::Gauge::DrawsFull, d0 as u64);
+        crate::profile::gauge(crate::profile::Gauge::DrawsCutout, d1 as u64);
         crate::profile::gauge(crate::profile::Gauge::DrawsLod, d2 as u64);
         crate::profile::gauge(crate::profile::Gauge::TrisFull, u64::from(i0 / 3));
+        crate::profile::gauge(crate::profile::Gauge::TrisCutout, u64::from(i1 / 3));
         crate::profile::gauge(crate::profile::Gauge::TrisLod, u64::from(i2 / 3));
     }
 
@@ -862,6 +864,12 @@ impl Renderer {
                 for pass in GpuPass::ALL {
                     crate::profile::add_ms(pass.meter(), passes[pass as usize]);
                 }
+                // Combined `opaque` is the three group stamps, not a fourth
+                // timestamp — keeps pre-split reports comparable.
+                crate::profile::add_ms(
+                    crate::profile::Meter::GpuOpaque,
+                    GpuPass::opaque_ms(&passes),
+                );
                 crate::profile::gpu_frame_ms(total);
                 if let Some(gap) = gap {
                     crate::profile::gpu_gap_ms(gap, total);
@@ -1046,9 +1054,10 @@ impl Renderer {
                     pass.record_mesh_indirect(Pass::Opaque);
                     // Cutout writes depth like opaque, so it belongs in the opaque
                     // prefix (before sky). Dormant until a block emits it.
+                    // Each camera group stamps itself (OpaqueFull / OpaqueLod /
+                    // Cutout) inside `record_group_indirect_count`.
                     pass.record_mesh_indirect(Pass::Cutout);
                 }
-                stamp(GpuPass::Opaque);
                 // Sky fills the background (uncovered pixels) right after opaque
                 // depth is laid down. It must precede the immediate debug
                 // cubes/lines: the highlight lines are depth read-only (no depth

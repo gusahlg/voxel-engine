@@ -94,7 +94,15 @@ pub enum Meter {
     GpuVrs,
     /// Scene-pass begin: attachment transitions + `cmd_begin_rendering` clears.
     GpuClear,
+    /// Combined opaque span (full-res + cutout + coarse LOD), summed at GPU
+    /// timestamp readback. The three group meters are substages of this.
     GpuOpaque,
+    /// Full-res opaque (camera group 0). Substage of [`Meter::GpuOpaque`].
+    GpuOpaqueFull,
+    /// Cutout (camera group 1). Substage of [`Meter::GpuOpaque`].
+    GpuCutout,
+    /// Coarse-LOD opaque (camera group 2). Substage of [`Meter::GpuOpaque`].
+    GpuOpaqueLod,
     GpuSky,
     GpuCubes,
     GpuLines,
@@ -129,7 +137,7 @@ pub enum Meter {
 }
 
 impl Meter {
-    const ALL: [Meter; 52] = [
+    const ALL: [Meter; 55] = [
         Meter::NetEvents,
         Meter::Physics,
         Meter::StreamDrain,
@@ -164,6 +172,9 @@ impl Meter {
         Meter::GpuVrs,
         Meter::GpuClear,
         Meter::GpuOpaque,
+        Meter::GpuOpaqueFull,
+        Meter::GpuCutout,
+        Meter::GpuOpaqueLod,
         Meter::GpuSky,
         Meter::GpuCubes,
         Meter::GpuLines,
@@ -221,6 +232,9 @@ impl Meter {
             Meter::GpuVrs => "vrs",
             Meter::GpuClear => "clear",
             Meter::GpuOpaque => "opaque",
+            Meter::GpuOpaqueFull => "opaque.full",
+            Meter::GpuCutout => "cutout",
+            Meter::GpuOpaqueLod => "opaque.lod",
             Meter::GpuSky => "sky",
             Meter::GpuCubes => "cubes",
             Meter::GpuLines => "lines",
@@ -273,6 +287,9 @@ impl Meter {
             | Meter::GpuVrs
             | Meter::GpuClear
             | Meter::GpuOpaque
+            | Meter::GpuOpaqueFull
+            | Meter::GpuCutout
+            | Meter::GpuOpaqueLod
             | Meter::GpuSky
             | Meter::GpuCubes
             | Meter::GpuLines
@@ -307,8 +324,10 @@ pub enum Gauge {
     UploadBytes,
     DrawsPacked,
     DrawsFull,
+    DrawsCutout,
     DrawsLod,
     TrisFull,
+    TrisCutout,
     TrisLod,
     Vrs1x1,
     Vrs2x2,
@@ -316,7 +335,7 @@ pub enum Gauge {
 }
 
 impl Gauge {
-    const ALL: [Gauge; 13] = [
+    const ALL: [Gauge; 15] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
@@ -324,8 +343,10 @@ impl Gauge {
         Gauge::UploadBytes,
         Gauge::DrawsPacked,
         Gauge::DrawsFull,
+        Gauge::DrawsCutout,
         Gauge::DrawsLod,
         Gauge::TrisFull,
+        Gauge::TrisCutout,
         Gauge::TrisLod,
         Gauge::Vrs1x1,
         Gauge::Vrs2x2,
@@ -342,8 +363,10 @@ impl Gauge {
             Gauge::UploadBytes => "upload.bytes",
             Gauge::DrawsPacked => "draws.packed",
             Gauge::DrawsFull => "draws.full",
+            Gauge::DrawsCutout => "draws.cutout",
             Gauge::DrawsLod => "draws.lod",
             Gauge::TrisFull => "tris.full",
+            Gauge::TrisCutout => "tris.cutout",
             Gauge::TrisLod => "tris.lod",
             Gauge::Vrs1x1 => "vrs.1x1",
             Gauge::Vrs2x2 => "vrs.2x2",
@@ -721,6 +744,23 @@ fn report(frames: u64) {
             if matches!(m, Meter::GpuTonemap) && ms_per_sample[m as usize] > 0.0 {
                 line.push_str(&format!(" ({:.2}/present)", ms_per_sample[m as usize]));
             }
+            // Opaque group split: substages of `opaque` (not in the gpu total),
+            // hottest-first, so the combined number stays comparable.
+            if matches!(m, Meter::GpuOpaque) {
+                let split = sorted(vec![
+                    Meter::GpuOpaqueFull,
+                    Meter::GpuCutout,
+                    Meter::GpuOpaqueLod,
+                ]);
+                line.push_str(" [");
+                for (i, s) in split.into_iter().enumerate() {
+                    if i > 0 {
+                        line.push(' ');
+                    }
+                    line.push_str(&format!("{} {:.2}", s.label(), ms_per_frame[s as usize]));
+                }
+                line.push(']');
+            }
         }
         if tier == Tier::Gpu {
             // Idle gap is GPU device time but not GPU *work*; keep it off the
@@ -777,10 +817,10 @@ fn report(frames: u64) {
     eprintln!("{sline}");
 }
 
-/// Tile/record sub-stage meters are reported inline, not as their own tier
-/// entries (they double-count a parent). `GpuGap` is idle between submits —
-/// reported at the end of the gpu line and as `idle N%` in the header, never
-/// in the gpu total.
+/// Tile/record/opaque-group sub-stage meters are reported inline, not as their
+/// own tier entries (they double-count a parent). `GpuGap` is idle between
+/// submits — reported at the end of the gpu line and as `idle N%` in the
+/// header, never in the gpu total.
 fn is_substage(m: Meter) -> bool {
     matches!(
         m,
@@ -794,6 +834,9 @@ fn is_substage(m: Meter) -> bool {
             | Meter::RecOverlay
             | Meter::RecTransitions
             | Meter::GpuGap
+            | Meter::GpuOpaqueFull
+            | Meter::GpuCutout
+            | Meter::GpuOpaqueLod
     )
 }
 
@@ -829,6 +872,24 @@ mod tests {
             labels.sort_unstable();
             labels.dedup();
             assert_eq!(labels.len(), n, "duplicate label in tier {}", tier.label());
+        }
+    }
+
+    #[test]
+    fn opaque_group_meters_are_gpu_substages() {
+        assert!(matches!(Meter::GpuOpaque.tier(), Tier::Gpu));
+        assert!(!is_substage(Meter::GpuOpaque));
+        for m in [Meter::GpuOpaqueFull, Meter::GpuCutout, Meter::GpuOpaqueLod] {
+            assert!(
+                matches!(m.tier(), Tier::Gpu),
+                "{} should be a GPU meter",
+                m.label()
+            );
+            assert!(
+                is_substage(m),
+                "{} should not join the gpu total",
+                m.label()
+            );
         }
     }
 
