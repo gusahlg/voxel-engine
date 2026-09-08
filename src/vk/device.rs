@@ -107,7 +107,7 @@ impl Device {
             .into_iter()
             .filter_map(|pd| evaluate(instance, pd, surface_loader, surface))
             .max_by_key(|c| c.score)
-            .expect("No suitable Vulkan 1.3 GPU found (needs dynamic rendering + synchronization2 + drawIndirectCount + swapchain)");
+            .expect("No suitable Vulkan 1.3 GPU found (needs dynamic rendering + synchronization2 + shaderDemoteToHelperInvocation + drawIndirectCount + swapchain)");
 
         log::info!(
             "Using GPU: {}",
@@ -174,9 +174,13 @@ impl Device {
             );
         }
 
+        // shaderDemoteToHelperInvocation: SPIR-V 1.6 modules (build.rs
+        // -profile spirv_1_6) lower `discard` to OpDemoteToHelperInvocation,
+        // which needs this core-1.3 feature enabled at device creation.
         let mut vulkan_13_features = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
-            .synchronization2(true);
+            .synchronization2(true)
+            .shader_demote_to_helper_invocation(true);
         let mut vulkan_12_features = vk::PhysicalDeviceVulkan12Features::default()
             .timeline_semaphore(true)
             .draw_indirect_count(best.draw_indirect_count);
@@ -336,8 +340,11 @@ fn evaluate(
         .then_some(properties.limits.max_sampler_anisotropy);
     // Required for GPU-driven culling; reject devices that lack it.
     let draw_indirect_count = vulkan_12_features.draw_indirect_count == vk::TRUE;
+    // shaderDemoteToHelperInvocation is mandatory in Vulkan 1.3 and the
+    // shipped SPIR-V 1.6 fragment modules rely on it (see Device::new).
     if vulkan_13_features.dynamic_rendering != vk::TRUE
         || vulkan_13_features.synchronization2 != vk::TRUE
+        || vulkan_13_features.shader_demote_to_helper_invocation != vk::TRUE
         || !draw_indirect_count
     {
         return None;

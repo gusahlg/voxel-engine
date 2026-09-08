@@ -1,6 +1,25 @@
-use std::{env, fs, path::Path, path::PathBuf, process::Command};
+use std::{
+    collections::HashSet,
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
+};
 
 const REFRESH_SHADER_FALLBACKS: &str = "VOXEL_ENGINE_REFRESH_SHADER_FALLBACKS";
+
+/// Shipping SPIR-V profile. Vulkan 1.3 guarantees SPIR-V 1.6, and at 1.6 Slang
+/// lowers `discard` to `OpDemoteToHelperInvocation` (the quad keeps its
+/// derivatives; core-1.3 feature `shaderDemoteToHelperInvocation`, enabled in
+/// `vk/device.rs`) instead of `OpKill`.
+const SPIRV_PROFILE: &str = "spirv_1_6";
+/// `spirv-val` environment for freshly compiled modules; must match the API
+/// version `vk/device.rs` requires.
+const SPIRV_VAL_TARGET_ENV: &str = "vulkan1.3";
+/// Slang optimisation level. With the pinned toolchain (2025.22.1) `-O3`
+/// emits byte-identical modules to `-O2`, so take the cheaper compile.
+const SLANG_OPT_LEVEL: &str = "-O2";
 
 struct Shader<'a> {
     src: &'a str,
@@ -121,12 +140,50 @@ const SHADERS: &[Shader] = &[
     },
 ];
 
-fn have_slangc() -> bool {
-    Command::new("slangc")
-        .arg("-v")
+/// Second mesh3d.frag variant: the water depth-absorption path. Declares the
+/// depth input attachment (set 0 binding 5) + Δd-driven body tint, compiled
+/// only into `mesh3d_transparent_absorb` (dynamic_rendering_local_read, MSAA
+/// off). The default variant in SHADERS stays the interim-tint fallback.
+const MESH3D_WATER: Shader = Shader {
+    src: "shaders/mesh3d.frag.slang",
+    stage: "fragment",
+    entry: "fragmentMain",
+    dst: "mesh3d_water.frag.spv",
+};
+
+/// One compile unit: a shader plus its `-D` defines.
+struct Job<'a> {
+    shader: &'a Shader<'a>,
+    defines: &'a [&'a str],
+}
+
+/// The shader toolchain found on PATH. `None` when `slangc` is missing, in
+/// which case the checked-in `shaders_spv/` fallbacks are used verbatim.
+struct Toolchain {
+    /// `slangc -v` banner; part of the compile-cache key so a toolchain bump
+    /// recompiles everything even when no source changed.
+    slangc_version: String,
+    /// `spirv-val` on PATH (vulkan-tools in the nix shell): every freshly
+    /// compiled module is validated and the build fails on invalid SPIR-V.
+    spirv_val: bool,
+}
+
+fn detect_toolchain() -> Option<Toolchain> {
+    let output = Command::new("slangc").arg("-v").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // slangc prints its version on stderr; take both streams to be safe.
+    let mut slangc_version = String::from_utf8_lossy(&output.stdout).into_owned();
+    slangc_version.push_str(&String::from_utf8_lossy(&output.stderr));
+    let spirv_val = Command::new("spirv-val")
+        .arg("--version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success());
+    Some(Toolchain {
+        slangc_version: slangc_version.trim().to_owned(),
+        spirv_val,
+    })
 }
 
 fn env_flag(name: &str) -> bool {
@@ -151,9 +208,9 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let refresh_fallbacks = env_flag(REFRESH_SHADER_FALLBACKS);
-    let slangc = have_slangc();
+    let toolchain = detect_toolchain();
     assert!(
-        !refresh_fallbacks || slangc,
+        !refresh_fallbacks || toolchain.is_some(),
         "{REFRESH_SHADER_FALLBACKS}=1 requires slangc"
     );
 
@@ -173,39 +230,33 @@ fn main() {
     // Ensure tunables use generated includes, not hand-written constants.
     lint_slang_constants();
 
-    for shader in SHADERS {
-        compile(slangc, &out_dir, fallback_dir, shader, &[]);
-    }
-
-    // Second mesh3d.frag variant: the water depth-absorption path. Declares the
-    // depth input attachment (set 0 binding 5) + Δd-driven body tint, compiled
-    // only into `mesh3d_transparent_absorb` (dynamic_rendering_local_read, MSAA
-    // off). The default variant above stays the interim-tint fallback.
-    let mesh3d_water = Shader {
-        src: "shaders/mesh3d.frag.slang",
-        stage: "fragment",
-        entry: "fragmentMain",
-        dst: "mesh3d_water.frag.spv",
-    };
-    compile(
-        slangc,
-        &out_dir,
-        fallback_dir,
-        &mesh3d_water,
-        &["-DWATER_DEPTH_ABSORPTION"],
-    );
+    let mut jobs: Vec<Job> = SHADERS
+        .iter()
+        .map(|shader| Job {
+            shader,
+            defines: &[],
+        })
+        .collect();
+    jobs.push(Job {
+        shader: &MESH3D_WATER,
+        defines: &["-DWATER_DEPTH_ABSORPTION"],
+    });
+    compile_all(toolchain.as_ref(), &out_dir, fallback_dir, &jobs);
 
     // Substrate probe: compute shaders for BDA, QUAD, STORAGE, and occupancy tests.
     // Gated behind VOXEL_BUILD_PROBE to avoid requiring extended SPIR-V profile.
     if env::var("VOXEL_BUILD_PROBE").is_ok() {
-        compile_probe(slangc, &out_dir);
+        compile_probe(toolchain.is_some(), &out_dir);
     }
 
     // Defer every source-tree write until all requested shaders have compiled,
     // so a compiler failure cannot leave a half-refreshed fallback inventory.
     if refresh_fallbacks {
-        for shader in SHADERS.iter().chain(std::iter::once(&mesh3d_water)) {
-            copy_if_changed(&out_dir.join(shader.dst), &fallback_dir.join(shader.dst));
+        for job in &jobs {
+            copy_if_changed(
+                &out_dir.join(job.shader.dst),
+                &fallback_dir.join(job.shader.dst),
+            );
         }
     }
 }
@@ -367,51 +418,197 @@ fn lint_slang_file(path: &Path, violations: &mut Vec<String>) {
     }
 }
 
-fn compile(slangc: bool, out_dir: &Path, fallback_dir: &Path, shader: &Shader, defines: &[&str]) {
+/// Compile every job on a bounded worker pool (one `slangc` process each).
+/// Failures are collected and reported together so one broken shader does not
+/// hide the diagnostics of another.
+fn compile_all(toolchain: Option<&Toolchain>, out_dir: &Path, fallback_dir: &Path, jobs: &[Job]) {
+    let workers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(jobs.len())
+        .max(1);
+    let next = AtomicUsize::new(0);
+    let failures: Vec<String> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut errors = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(job) = jobs.get(index) else {
+                            break;
+                        };
+                        if let Err(e) = compile(toolchain, out_dir, fallback_dir, job) {
+                            errors.push(e);
+                        }
+                    }
+                    errors
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("shader compile worker panicked"))
+            .collect()
+    });
+    assert!(
+        failures.is_empty(),
+        "shader compilation failed:\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
+fn slangc_args(shader: &Shader, defines: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        shader.src.to_owned(),
+        "-target".into(),
+        "spirv".into(),
+        "-profile".into(),
+        SPIRV_PROFILE.into(),
+        "-entry".into(),
+        shader.entry.to_owned(),
+        "-stage".into(),
+        shader.stage.to_owned(),
+        "-matrix-layout-column-major".into(),
+        SLANG_OPT_LEVEL.into(),
+    ];
+    args.extend(defines.iter().map(|d| (*d).to_owned()));
+    args
+}
+
+/// Transitive `#include "..."` closure of `src` (Slang resolves quoted includes
+/// relative to the including file), in deterministic first-visit order. Files
+/// that do not exist are skipped: slangc reports those itself.
+fn include_closure(src: &Path) -> Vec<PathBuf> {
+    let mut order = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![src.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let dir = path.parent().unwrap_or(Path::new(""));
+        // Push in reverse so includes are visited in source order.
+        let mut includes: Vec<PathBuf> = text
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim_start().strip_prefix("#include")?.trim_start();
+                let rest = rest.strip_prefix('"')?;
+                let (name, _) = rest.split_once('"')?;
+                Some(dir.join(name))
+            })
+            .collect();
+        includes.reverse();
+        stack.extend(includes);
+        order.push(path);
+    }
+    order
+}
+
+/// 64-bit FNV-1a: stable across Rust versions (unlike `DefaultHasher`), so a
+/// cache written by one toolchain stays meaningful to the next.
+fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Cache key for one compile: toolchain banner, exact argv, validator, and the
+/// path + contents of the source and every transitive include.
+fn fingerprint(toolchain: &Toolchain, args: &[String], src: &Path) -> String {
+    let mut hash = fnv1a(toolchain.slangc_version.as_bytes(), 0xcbf2_9ce4_8422_2325);
+    hash = fnv1a(SPIRV_VAL_TARGET_ENV.as_bytes(), hash);
+    hash = fnv1a(&[u8::from(toolchain.spirv_val)], hash);
+    for arg in args {
+        hash = fnv1a(arg.as_bytes(), hash);
+        hash = fnv1a(b"\0", hash);
+    }
+    for path in include_closure(src) {
+        hash = fnv1a(path.to_string_lossy().as_bytes(), hash);
+        hash = fnv1a(b"\0", hash);
+        let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        hash = fnv1a(&bytes, hash);
+        hash = fnv1a(b"\0", hash);
+    }
+    format!("{hash:016x}")
+}
+
+fn compile(
+    toolchain: Option<&Toolchain>,
+    out_dir: &Path,
+    fallback_dir: &Path,
+    job: &Job,
+) -> Result<(), String> {
+    let shader = job.shader;
     let out_path = out_dir.join(shader.dst);
     let fallback_path = fallback_dir.join(shader.dst);
+    // Fingerprint of the last successful (compiled + validated) build of
+    // `out_path`; skip the compile when nothing feeding it has changed.
+    let stamp_path = out_dir.join(format!("{}.fingerprint", shader.dst));
 
-    if !slangc {
+    let Some(toolchain) = toolchain else {
         assert!(
             fallback_path.exists(),
             "slangc not found and no prebuilt {} — install Slang or restore shaders_spv/",
             fallback_path.display()
         );
         fs::copy(&fallback_path, &out_path).unwrap();
-        return;
+        // The fallback is not a compile of the current source: forget any
+        // stamp so a later toolchain install rebuilds instead of trusting it.
+        let _ = fs::remove_file(&stamp_path);
+        return Ok(());
+    };
+
+    let args = slangc_args(shader, job.defines);
+    let fingerprint = fingerprint(toolchain, &args, Path::new(shader.src));
+    if out_path.exists() && fs::read_to_string(&stamp_path).is_ok_and(|s| s == fingerprint) {
+        return Ok(());
     }
+    // Never leave a stale stamp next to a module we are about to rewrite.
+    let _ = fs::remove_file(&stamp_path);
 
     let output = Command::new("slangc")
-        .args([
-            shader.src,
-            "-target",
-            "spirv",
-            "-profile",
-            "spirv_1_3",
-            "-entry",
-            shader.entry,
-            "-stage",
-            shader.stage,
-            "-matrix-layout-column-major",
-        ])
-        .args(defines)
+        .args(&args)
         .arg("-o")
         .arg(&out_path)
         .output()
-        .expect("failed to run slangc");
-
+        .map_err(|e| format!("failed to run slangc for {}: {e}", shader.src))?;
     if !output.status.success() {
-        eprintln!("slangc failed while compiling {}", shader.src);
-        eprintln!(
-            "--- stdout ---\n{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-        eprintln!(
-            "--- stderr ---\n{}",
+        return Err(format!(
+            "slangc failed while compiling {} (entry {})\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            shader.src,
+            shader.entry,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        );
-        panic!("shader compilation failed");
+        ));
     }
+
+    if toolchain.spirv_val {
+        let output = Command::new("spirv-val")
+            .arg("--target-env")
+            .arg(SPIRV_VAL_TARGET_ENV)
+            .arg(&out_path)
+            .output()
+            .map_err(|e| format!("failed to run spirv-val for {}: {e}", shader.dst))?;
+        if !output.status.success() {
+            return Err(format!(
+                "spirv-val rejected {} ({} from {}):\n{}",
+                shader.dst,
+                shader.entry,
+                shader.src,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+
+    fs::write(&stamp_path, fingerprint)
+        .map_err(|e| format!("write {}: {e}", stamp_path.display()))?;
+    Ok(())
 }
 
 fn copy_if_changed(compiled: &Path, fallback: &Path) {

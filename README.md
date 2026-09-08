@@ -39,10 +39,14 @@ See the maintained [demo](src/bin/demo.rs) for a complete API example.
 
 - `cargo run --release --bin demo` — spinning demo scene (F fullscreen,
   V vsync, M MSAA cycle, Esc quit).
-- Shaders are Slang (`shaders/`), compiled by `build.rs` with `slangc` and
-  embedded into the binary; checked-in SPIR-V under `shaders_spv/` is used as
-  a fallback when `slangc` is not installed. Ordinary builds never rewrite
-  these files. Refresh them with the pinned compiler via
+- Shaders are Slang (`shaders/`), compiled by `build.rs` with `slangc`
+  (`-O2`, SPIR-V 1.6 — the Vulkan 1.3 baseline) and embedded into the binary.
+  Modules compile in parallel, are re-validated with `spirv-val` whenever it
+  is on PATH (the build fails on invalid SPIR-V), and are only recompiled when
+  the source, an include, the flags or the compiler change (fingerprints live
+  in `OUT_DIR`). Checked-in SPIR-V under `shaders_spv/` is used as a fallback
+  when `slangc` is not installed. Ordinary builds never rewrite these files.
+  Refresh them with the pinned compiler via
   `nix develop --command env VOXEL_ENGINE_REFRESH_SHADER_FALLBACKS=1 cargo check --locked`.
 - `nix develop` — dev shell with Rust, slangc, the Vulkan loader/tools and
   validation layers. `nix run` builds and runs the demo.
@@ -51,7 +55,11 @@ See the maintained [demo](src/bin/demo.rs) for a complete API example.
 - `cargo test` — CPU-side unit tests (font atlas, input semantics, frustum &
   projection math, allocator free-list).
 
-For performance consider installing mold and creating this file.
+For performance consider installing mold and creating this file. It is
+deliberately a per-user config rather than a checked-in `.cargo/config.toml`:
+cargo reads config from the directory it is invoked in, so a file here would
+not reach the game's build anyway, and `target-cpu=native` would make any
+shipped binary machine-specific.
 ```
 cat ~/.cargo/config.toml
 [target.x86_64-unknown-linux-gnu]
