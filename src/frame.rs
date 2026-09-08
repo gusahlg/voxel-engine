@@ -131,33 +131,9 @@ pub(crate) struct Scene3D {
     /// Wide-FOV lens for this scope. `Identity` in rectilinear mode.
     pub warp_map: WarpMap,
     /// Sub-pixel camera jitter (PIXELS, +/-0.5) for this 3D scope, injected here
-    /// — the sole injection point. `view_proj` above stays CLEAN so culling,
-    /// VRS fingerprinting, and TAA reprojection never see the jitter.
+    /// — the sole injection point. `view_proj` above stays CLEAN so culling
+    /// and TAA reprojection never see the jitter.
     pub jitter: JitterOffset,
-}
-
-#[cfg(test)]
-impl Scene3D {
-    /// Placeholder scene for tests exercising `DrawLists`/fingerprint logic
-    /// that don't care about the actual camera/lighting values.
-    pub(crate) fn test_stub() -> Self {
-        Scene3D {
-            view_proj: Mat4::IDENTITY,
-            camera: Camera3D {
-                position: Vec3::ZERO,
-                target: Vec3::ZERO,
-                up: Vec3::Y,
-                fovy: 60.0,
-                lens: crate::camera::Lens::Rectilinear,
-            },
-            frame_uniforms: FrameUniformsGpu::full_bright(),
-            cam_pos: Vec3::ZERO,
-            eye: DVec3::ZERO,
-            fovy_tan_half: 1.0,
-            warp_map: WarpMap::Identity,
-            jitter: JitterOffset::ZERO,
-        }
-    }
 }
 
 /// CPU-side draw lists for one frame. Vec capacities persist across frames.

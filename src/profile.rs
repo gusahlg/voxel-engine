@@ -289,16 +289,22 @@ pub enum Gauge {
     WorldSkins,
     UploadBytes,
     DrawsPacked,
+    Vrs1x1,
+    Vrs2x2,
+    Vrs4x4,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 6] = [
+    const ALL: [Gauge; 9] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
         Gauge::WorldSkins,
         Gauge::UploadBytes,
         Gauge::DrawsPacked,
+        Gauge::Vrs1x1,
+        Gauge::Vrs2x2,
+        Gauge::Vrs4x4,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -310,6 +316,9 @@ impl Gauge {
             Gauge::WorldSkins => "skins",
             Gauge::UploadBytes => "upload.bytes",
             Gauge::DrawsPacked => "draws.packed",
+            Gauge::Vrs1x1 => "vrs.1x1",
+            Gauge::Vrs2x2 => "vrs.2x2",
+            Gauge::Vrs4x4 => "vrs.4x4",
         }
     }
 }
