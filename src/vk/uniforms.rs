@@ -12,7 +12,9 @@
 use ash::vk;
 use glam::Vec3;
 
-use crate::genconst::{GLOW_EDGE0, GLOW_EDGE1, GLOW_POW_DAY, GLOW_POW_SUNSET};
+use crate::genconst::{
+    GLOW_EDGE0, GLOW_EDGE1, GLOW_POW_DAY, GLOW_POW_SUNSET, SHADOW_BOUNCE_TINT, SHADOW_SKY_AMBIENT,
+};
 use crate::rev::{FrameSlot, PerSlot};
 use crate::vk::buffers::HostBuffer;
 
@@ -67,14 +69,21 @@ fn glow_smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Rec.709 relative luminance. Twin of `luma709` in `common.slang`.
+fn luma709(c: Vec3) -> f32 {
+    c.dot(Vec3::new(0.2126, 0.7152, 0.0722))
+}
+
 impl FrameUniformsExt {
     /// Hoist per-frame uniform-only math the shaders used to recompute every
-    /// fragment: ambient floor colour, sky-halo exponent, halo tint×scale, and
-    /// the shadow-fallback day factor. Mirrors `common.slang`.
+    /// fragment: ambient floor colour, sky-halo exponent, halo tint×scale,
+    /// the shadow-fallback day factor, and the sky-dome shadow fill. Mirrors
+    /// `common.slang`.
     fn derive(u: FrameUniformsGpu) -> Self {
         let zenith = Vec3::new(u.zenith[0], u.zenith[1], u.zenith[2]);
+        let light = Vec3::new(u.light[0], u.light[1], u.light[2]);
         let floor = u.candle[3];
-        let zl = zenith.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+        let zl = luma709(zenith);
         let ambient = if zl > 1e-6 {
             zenith * (floor / zl)
         } else {
@@ -82,19 +91,26 @@ impl FrameUniformsExt {
         };
         let t = glow_smoothstep(GLOW_EDGE0, GLOW_EDGE1, u.sun_dir_elev[3]);
         let glow_pow = GLOW_POW_SUNSET + (GLOW_POW_DAY - GLOW_POW_SUNSET) * t;
-        let glow_rgb = Vec3::new(u.light[0], u.light[1], u.light[2]) * (0.5 + u.zenith[3]);
+        let glow_rgb = light * (0.5 + u.zenith[3]);
         let day = (u.light[3] * 2.0 - 1.0).abs();
+        let bounce_src = if zl > 1e-6 {
+            light.lerp(zenith * (luma709(light) / zl), SHADOW_BOUNCE_TINT)
+        } else {
+            light
+        };
+        let bounce = bounce_src * SHADOW_SKY_AMBIENT;
         Self {
             base: u,
             ambient_glow: [ambient.x, ambient.y, ambient.z, glow_pow],
             glow_day: [glow_rgb.x, glow_rgb.y, glow_rgb.z, day],
+            shadow_bounce: [bounce.x, bounce.y, bounce.z, 0.0],
         }
     }
 }
 
 // Bumped when the GPU `FrameUniforms` layout changes (public prefix extras.yz
 // sky lanes, or the engine-derived tail).
-pub const FRAME_UNIFORMS_VERSION: u32 = 5;
+pub const FRAME_UNIFORMS_VERSION: u32 = 6;
 
 /// The per-frame UBO ring. Indexed only by [`FrameSlot`] (the parity type),
 /// so raw-usize slot confusion is inexpressible here.
@@ -186,9 +202,10 @@ mod tests {
     #[test]
     fn public_wire_stays_eight_lanes() {
         assert_eq!(size_of::<FrameUniformsGpu>(), 128);
-        assert_eq!(size_of::<FrameUniformsExt>(), 160);
+        assert_eq!(size_of::<FrameUniformsExt>(), 176);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, ambient_glow), 128);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, glow_day), 144);
+        assert_eq!(std::mem::offset_of!(FrameUniformsExt, shadow_bounce), 160);
     }
 
     #[test]
@@ -200,7 +217,7 @@ mod tests {
         u.sun_dir_elev[3] = 0.2;
 
         let ext = FrameUniformsExt::derive(u);
-        let luma = 0.2126 * 0.09 + 0.7152 * 0.22 + 0.0722 * 0.45;
+        let luma = luma709(Vec3::new(0.09, 0.22, 0.45));
         let scale = 0.30 / luma;
         for i in 0..3 {
             assert!(
@@ -216,6 +233,41 @@ mod tests {
         assert!((ext.glow_day[1] - 1.15 * glow_scale).abs() < 1e-6);
         assert!((ext.glow_day[2] - 1.0 * glow_scale).abs() < 1e-6);
         assert!((ext.glow_day[3] - 1.0).abs() < 1e-7);
+
+        let light = Vec3::new(1.25, 1.15, 1.0);
+        let zenith = Vec3::new(0.09, 0.22, 0.45);
+        let bounce_src = light.lerp(
+            zenith * (luma709(light) / luma709(zenith)),
+            SHADOW_BOUNCE_TINT,
+        );
+        let bounce = bounce_src * SHADOW_SKY_AMBIENT;
+        for i in 0..3 {
+            assert!(
+                (ext.shadow_bounce[i] - bounce[i]).abs() < 1e-6,
+                "shadow_bounce[{i}]"
+            );
+        }
+        assert_eq!(ext.shadow_bounce[3], 0.0);
+    }
+
+    /// `SHADOW_BOUNCE_TINT == 0` ⇒ lane is `SHADOW_SKY_AMBIENT * light.rgb`.
+    /// Skipped when this build selected the new (non-zero) tint.
+    #[test]
+    fn shadow_bounce_is_sun_scaled_when_tint_is_zero() {
+        if SHADOW_BOUNCE_TINT.abs() > 1e-8 {
+            return;
+        }
+        let mut u = FrameUniformsGpu::full_bright();
+        u.light = [1.25, 1.15, 1.0, 1.0];
+        u.zenith = [0.09, 0.22, 0.45, 2.0];
+        let ext = FrameUniformsExt::derive(u);
+        for i in 0..3 {
+            assert!(
+                (ext.shadow_bounce[i] - u.light[i] * SHADOW_SKY_AMBIENT).abs() < 1e-6,
+                "shadow_bounce[{i}]"
+            );
+        }
+        assert_eq!(ext.shadow_bounce[3], 0.0);
     }
 
     #[test]

@@ -104,6 +104,25 @@ static const float SHADOW_FALLBACK_POW = 10.0f;
 // (sky_amount 0) stay dark; only outdoor shadow gains the floor.
 static const float SHADOW_SKY_AMBIENT = 0.22f;
 
+// Fraction of the near split over which near/far PCF cross-fade; 0 = hard
+// switch. New look 0.15; VOXEL_LIGHT_LEGACY=1 keeps the hard 64 m cut.
+static const float CASCADE_BLEND_FRAC = 0.15f;
+
+// How far the sun-shadow fill tints from sun colour toward luma-matched
+// zenith colour. 0 = fill is SHADOW_SKY_AMBIENT × sun colour (legacy);
+// 0.75 pulls the fill toward sky-blue so shadowed ground is sky-lit, not warm.
+static const float SHADOW_BOUNCE_TINT = 0.75f;
+
+// Fraction of baked AO applied to the direct sun term. Dome/ambient/blocklight
+// keep full AO. 1.0 = AO darkens direct sun as much as ambient (legacy,
+// double-darkens creases the cascade already shades); 0.5 is the new look.
+static const float AO_DIRECT = 0.5f;
+
+// Lower clamp of the far cascade split when fitted to DrawLists::lod_clip.
+// 96 >= 64·1.15 + 16 m fade band, so the blend band and SHADOW_LIMIT fade
+// never overlap the near split. Legacy 256 keeps the fixed far radius.
+static const float SHADOW_FAR_MIN_RADIUS = 96.0f;
+
 // Cascade shadow map edge in texels. Mirror of vk/targets.rs (asserted equal
 // there); lets the PCF derive texel size without a per-fragment GetDimensions.
 static const float SHADOW_RESOLUTION = 2048.0f;

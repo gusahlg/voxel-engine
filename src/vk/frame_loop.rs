@@ -84,17 +84,12 @@ fn shadow_key(
     sun: glam::DVec3,
     occluders: u64,
     lists: &DrawLists,
+    cfg: &crate::skeleton::ShadowCfg,
 ) -> shadow::ShadowKey {
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
     bytemuck::cast_slice::<_, u8>(&lists.cube_verts).hash(&mut h);
-    shadow::ShadowKey::of(
-        eye,
-        sun,
-        occluders,
-        h.finish(),
-        &crate::skeleton::ShadowCfg::PROVISIONAL,
-    )
+    shadow::ShadowKey::of(eye, sun, occluders, h.finish(), cfg)
 }
 
 fn sun_dir(lists: &DrawLists) -> glam::DVec3 {
@@ -599,7 +594,9 @@ impl Renderer {
         // Cull emits shadow casters only when the shared map will actually be
         // rewritten this frame. A cache hit skips cascade `fit()` and sets
         // `shadow_enabled = 0` so invisible slots bail before the AABB load.
-        let cfg = crate::skeleton::ShadowCfg::PROVISIONAL;
+        // Far cascade radius follows full-res coverage (`lod_clip`); a render-
+        // distance change snaps `ShadowKey` from `cfg.splits` and rebuilds once.
+        let cfg = crate::skeleton::ShadowCfg::for_coverage(lists.lod_clip);
         let shadow_frusta = lists.scene.as_ref().and_then(|scene| {
             if self.flags.shadows {
                 let key = shadow_key(
@@ -607,6 +604,7 @@ impl Renderer {
                     sun_dir(lists),
                     self.records.occluder_rev(),
                     lists,
+                    &cfg,
                 );
                 if !self.shadow_cache.prepare(Some((key, &cfg))) {
                     return None;
@@ -907,7 +905,7 @@ impl Renderer {
         // Hits skip the producer (and skip `fit()`); the slot UBO is filled from
         // the cached block so sampling matches the resident depth.
         if let Some(scene) = &lists.scene {
-            let cfg = crate::skeleton::ShadowCfg::PROVISIONAL;
+            let cfg = crate::skeleton::ShadowCfg::for_coverage(lists.lod_clip);
             let sun = sun_dir(lists);
             let caster_verts = lists.cube_verts.len() as u32;
             let render = self.shadow_cache.pending_rebuild();

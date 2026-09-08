@@ -225,6 +225,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shaders_spv");
     println!("cargo:rerun-if-env-changed={REFRESH_SHADER_FALLBACKS}");
     println!("cargo:rerun-if-env-changed=VOXEL_BUILD_PROBE");
+    println!("cargo:rerun-if-env-changed=VOXEL_LIGHT_LEGACY");
     // Emitting any rerun-if-changed replaces cargo's default "rerun if any
     // package file changed", so build.rs itself must be listed explicitly —
     // otherwise edits to the CONSTS table below would not regenerate outputs.
@@ -726,6 +727,12 @@ fn lit(x: f32) -> String {
 }
 
 fn build_table() -> Vec<Def> {
+    // VOXEL_LIGHT_LEGACY=1 selects constant values that make Steps 2–4 of the
+    // lighting look algebraically identical to the pre-change shaders. Unset
+    // (the default) is the new sky-tinted / AO-shaped / blended-cascade look.
+    // Step 1 (varying diet) is bit-identical either way.
+    let light_legacy = env_flag("VOXEL_LIGHT_LEGACY");
+
     // Precompute the sRGB decode table once here so CPU and shader agree exactly.
     let mut srgb = Vec::with_capacity(256);
     for v in 0u32..256 {
@@ -822,6 +829,26 @@ fn build_table() -> Vec<Def> {
             name: "SHADOW_SKY_AMBIENT",
             doc: "Floor on the skylight's lit factor under sun shadow: the sky DOME still\nlights a sun-shadowed surface (blue-sky bounce), so shadow can attenuate\nskylight only down to this fraction — never to the black pit that erased\nall material detail in shadowed cliffs. Scales with sky_amount, so caves\n(sky_amount 0) stay dark; only outdoor shadow gains the floor.",
             val: Val::Scalar(0.22),
+        },
+        Def {
+            name: "CASCADE_BLEND_FRAC",
+            doc: "Fraction of the near split over which near/far PCF cross-fade; 0 = hard\nswitch. New look 0.15; VOXEL_LIGHT_LEGACY=1 keeps the hard 64 m cut.",
+            val: Val::Scalar(if light_legacy { 0.0 } else { 0.15 }),
+        },
+        Def {
+            name: "SHADOW_BOUNCE_TINT",
+            doc: "How far the sun-shadow fill tints from sun colour toward luma-matched\nzenith colour. 0 = fill is SHADOW_SKY_AMBIENT × sun colour (legacy);\n0.75 pulls the fill toward sky-blue so shadowed ground is sky-lit, not warm.",
+            val: Val::Scalar(if light_legacy { 0.0 } else { 0.75 }),
+        },
+        Def {
+            name: "AO_DIRECT",
+            doc: "Fraction of baked AO applied to the direct sun term. Dome/ambient/blocklight\nkeep full AO. 1.0 = AO darkens direct sun as much as ambient (legacy,\ndouble-darkens creases the cascade already shades); 0.5 is the new look.",
+            val: Val::Scalar(if light_legacy { 1.0 } else { 0.5 }),
+        },
+        Def {
+            name: "SHADOW_FAR_MIN_RADIUS",
+            doc: "Lower clamp of the far cascade split when fitted to DrawLists::lod_clip.\n96 >= 64·1.15 + 16 m fade band, so the blend band and SHADOW_LIMIT fade\nnever overlap the near split. Legacy 256 keeps the fixed far radius.",
+            val: Val::Scalar(if light_legacy { 256.0 } else { 96.0 }),
         },
         Def {
             name: "SHADOW_RESOLUTION",
@@ -1267,6 +1294,10 @@ fn derived_lane_table() -> Vec<Lane> {
         Lane {
             name: "glow_day",
             doc: "Engine-derived. rgb = light.rgb * (0.5 + turbidity) (sky-halo tint×scale);\nw = abs(2*day_night_mix - 1) (shadow_fallback day factor).",
+        },
+        Lane {
+            name: "shadow_bounce",
+            doc: "Engine-derived. rgb = SHADOW_SKY_AMBIENT * lerp(light.rgb, zenith.rgb *\nluma709(light)/luma709(zenith), SHADOW_BOUNCE_TINT); light.rgb when zenith\nluma is 0. w reserved 0.",
         },
     ]
 }
