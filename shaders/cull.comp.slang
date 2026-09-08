@@ -1,6 +1,8 @@
 // Emit indirect draw commands per frustum test: one thread per mesh slot.
-// Camera partitions are (pass, arena, distance-bucket); shadows are per-cascade
-// and unbucketed (GROUPS: Opaque, Cutout, ShadowNear, ShadowFar).
+// Camera partitions are (group, arena, distance-bucket); shadows are
+// per-cascade and unbucketed. Camera groups (CULL_CAMERA_GROUPS): 0 full-res
+// Opaque, 1 Cutout, 2 coarse-LOD Opaque (scale > 1, the only camera draws
+// that pay for the slab-clip `discard`).
 
 #include "common.slang"
 
@@ -170,9 +172,11 @@ void computeMain(uint3 id: SV_DispatchThreadID)
             in_frustum = in_frustum && !outside_plane(params.cam_planes[p], mn, mx);
         if (in_frustum)
         {
+            // Camera group: the pass index, except coarse-LOD opaque → group 2.
+            uint group = (pass == 0u && scale > 1.0) ? 2u : pass;
             float dist = length(0.5 * (mn + mx));
             uint bucket = distance_bucket(dist);
-            uint part = (pass * params.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
+            uint part = (group * params.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
             emit(part, cmd);
         }
     }
@@ -181,7 +185,7 @@ void computeMain(uint3 id: SV_DispatchThreadID)
     // Per-cascade partitions so the near cascade does not vertex-process far casters.
     if (pass == 0u && scale <= 1.0 && params.shadow_enabled != 0u)
     {
-        uint shadow_base = 2u * params.arena_count * CULL_DISTANCE_BUCKETS;
+        uint shadow_base = CULL_CAMERA_GROUPS * params.arena_count * CULL_DISTANCE_BUCKETS;
         [unroll]
         for (int c = 0; c < 2; c++)
         {
