@@ -500,7 +500,7 @@ impl Renderer {
 
         let gpu_timer = GpuTimer::new(
             &device.device,
-            device.timestamps_supported,
+            device.timestamps_supported && crate::profile::is_enabled(),
             device.timestamp_period_ns,
         );
 
@@ -770,17 +770,18 @@ impl Renderer {
 
         let slot = self.slot;
         use crate::profile::{Meter, scope};
+        crate::profile::count(crate::profile::Counter::Rendered);
 
-        {
-            let _p = scope(Meter::Fence);
-            self.wait_slot_and_reclaim(slot);
-        }
+        // Timed inside: the slot fence wait (wait tier) apart from the reclaim.
+        self.wait_slot_and_reclaim(slot);
 
         let present_target;
         let guard = {
-            let _p = scope(Meter::Acquire);
-            present_target = self.decide_present(slot);
-            self.acquire_slot(slot)
+            // One scope; the blocking waits inside hand themselves to the wait
+            // tier via `split`, so `acquire` stays pure CPU work.
+            let mut p = scope(Meter::Acquire);
+            present_target = self.decide_present(slot, &mut p);
+            self.acquire_slot(slot, &mut p)
         };
 
         let offsets = {
@@ -882,6 +883,14 @@ impl Renderer {
                 godray,
             );
         }
+        if self.vsync.current() {
+            // Wait for the copy to pace at display refresh (a wait, not work).
+            let _p = scope(Meter::WaitVsync);
+            unsafe {
+                self.timeline
+                    .wait(&self.device.device, self.last_copy_value);
+            }
+        }
 
         self.slot = (self.slot + 1) % FRAMES_IN_FLIGHT as usize;
     }
@@ -929,8 +938,12 @@ impl Renderer {
     fn wait_slot_and_reclaim(&mut self, slot: usize) {
         let device = &self.device.device;
         unsafe {
-            self.timeline
-                .wait(device, self.slots[FrameSlot::new(slot)].render_value);
+            {
+                let _p = crate::profile::scope(crate::profile::Meter::Fence);
+                self.timeline
+                    .wait(device, self.slots[FrameSlot::new(slot)].render_value);
+            }
+            let _p = crate::profile::scope(crate::profile::Meter::Reclaim);
             let current = self.timeline.counter(device);
             // Retired allocations return to the main-owned allocator freelist;
             // staging-block shrink happens main-side after it reclaims them.
@@ -960,14 +973,17 @@ impl Renderer {
     /// in-flight present copy may still be reading this slot's offscreen
     /// image, which the render below overwrites. Rare (the copy usually
     /// retires well within the two-frame slot cycle) and sub-millisecond.
-    /// Returns a guard proving the slot is safe to record into.
-    fn acquire_slot(&mut self, slot: usize) -> SlotGuard {
+    /// Returns a guard proving the slot is safe to record into. `p` is the
+    /// caller's `acquire` scope; the wait is split out of it into `copy`.
+    fn acquire_slot(&mut self, slot: usize, p: &mut crate::profile::Guard) -> SlotGuard {
         if self.copy_slot == Some(slot) {
             let device = &self.device.device;
+            p.split(crate::profile::Meter::WaitCopy);
             unsafe {
                 self.timeline
                     .wait(device, self.slots[FrameSlot::new(slot)].copy_value)
             };
+            p.split(crate::profile::Meter::Acquire);
             self.copy_slot = None;
         }
         SlotGuard(slot)
@@ -990,7 +1006,12 @@ impl Renderer {
     /// mailbox drop never stalls), the acquire is only attempted once we know a
     /// copy can be submitted, and a successful acquire is ALWAYS followed by
     /// the copy + present in [`Self::present`] — never skipped.
-    fn decide_present(&mut self, slot: usize) -> Option<u32> {
+    ///
+    /// `p` is the caller's `acquire` scope: the blocking waits here (forced
+    /// copy retire, vsync/forced drawable acquire) are split out of it into the
+    /// wait tier, so `acquire` reports only the non-blocking work.
+    fn decide_present(&mut self, slot: usize, p: &mut crate::profile::Guard) -> Option<u32> {
+        use crate::profile::Meter;
         // With vsync off, throttle presents to refresh cadence to avoid blocking
         // on drawable availability; instead render frames in between unthrottled.
         // Present slightly ahead of the refresh interval so scheduling jitter
@@ -1010,7 +1031,9 @@ impl Renderer {
         unsafe {
             if force {
                 // Wait out the prior copy rather than treating it as a drop.
+                p.split(Meter::WaitCopy);
                 self.timeline.wait(device, self.last_copy_value);
+                p.split(Meter::Acquire);
             }
             // Skip present if previous copy still in flight (mailbox drop).
             let copy_ready =
@@ -1023,12 +1046,20 @@ impl Renderer {
                 } else {
                     0
                 };
-                match acquire_next_image(
+                let blocking = timeout != 0;
+                if blocking {
+                    p.split(Meter::WaitVsync);
+                }
+                let acquired = acquire_next_image(
                     &self.swapchain.loader,
                     self.swapchain.swapchain,
                     timeout,
                     self.slots[FrameSlot::new(slot)].image_available,
-                ) {
+                );
+                if blocking {
+                    p.split(Meter::Acquire);
+                }
+                match acquired {
                     Ok((image_index, suboptimal)) => {
                         if suboptimal {
                             self.recreate_if_stale();
@@ -1305,15 +1336,14 @@ impl Renderer {
         let profiling = crate::profile::is_enabled();
         if profiling {
             let mut passes = [0.0f64; GpuPass::COUNT];
-            if unsafe {
+            if let Some(total) = unsafe {
                 self.gpu_timer
                     .read_into(&self.device.device, slot, &mut passes)
-            }
-            .is_some()
-            {
+            } {
                 for pass in GpuPass::ALL {
                     crate::profile::add_ms(pass.meter(), passes[pass as usize]);
                 }
+                crate::profile::gpu_frame_ms(total);
             }
         }
         // Begin render submission; this gets the timeline value to stamp mesh copies.
@@ -1327,6 +1357,11 @@ impl Renderer {
             device
                 .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
                 .expect("begin command buffer failed");
+            // Start timing before the staged copies so the whole buffer is
+            // attributed (the `Copies` stamp closes this first span).
+            if profiling {
+                self.gpu_timer.begin(device, cmd, slot);
+            }
 
             self.pending_transfer_wait = self.mesh_res.flush_copies(
                 device,
@@ -1364,7 +1399,7 @@ impl Renderer {
             // live frame command buffer, before the render pass begins.
             self.minimap.sync(device, cmd, slot);
             if profiling {
-                self.gpu_timer.begin(&self.device.device, cmd, slot);
+                self.gpu_timer.mark(device, cmd, slot, GpuPass::Copies);
             }
         }
 
@@ -1386,6 +1421,10 @@ impl Renderer {
                     records,
                     frame,
                 );
+                if profiling {
+                    self.gpu_timer
+                        .mark(&self.device.device, cmd, slot, GpuPass::Cull);
+                }
             }
         }
 
@@ -1437,6 +1476,12 @@ impl Renderer {
                 let cu = self.shadow_uniforms(scene.eye, sun, &cfg);
                 self.shadow.write_uniforms(slot, &cu);
                 self.record_shadow_pass(cmd, slot, scene.eye, sun, &cfg, caster_verts);
+                if profiling {
+                    unsafe {
+                        self.gpu_timer
+                            .mark(&self.device.device, cmd, slot, GpuPass::ShadowMap)
+                    };
+                }
                 self.slots[FrameSlot::new(slot)].shadow_lit_ready = !self.flags.shadows;
             }
         }
@@ -1533,6 +1578,9 @@ impl Renderer {
             let _g = crate::profile::scope(crate::profile::Meter::RecTransitions);
             if deferred {
                 unsafe { pass.end_deferred() };
+                // Close the end-rendering/MSAA-resolve span before the deferred
+                // writers, so TAA and exposure report apart from it.
+                stamp(GpuPass::Resolve);
                 // TAA resolve runs AFTER the HDR resolve and BEFORE exposure, so
                 // exposure meters the stabilized image. It reads the current HDR +
                 // reprojected history, writes the resolved HDR back, and leaves it
@@ -1548,47 +1596,69 @@ impl Renderer {
                         scene.eye,
                         scene.jitter.0,
                     );
+                    if profiling {
+                        unsafe {
+                            self.gpu_timer
+                                .mark(&self.device.device, cmd, slot, GpuPass::Taa)
+                        };
+                    }
                 }
                 if exposure {
                     // Reduce the frame HDR to per-tile mean log2-luma, publish
                     // the smoothed exposure, and finalize the HDR in SHADER_READ.
-                    self.record_exposure_pass(cmd, FrameSlot::new(slot))
+                    let readable = self.record_exposure_pass(cmd, FrameSlot::new(slot));
+                    if profiling {
+                        unsafe {
+                            self.gpu_timer
+                                .mark(&self.device.device, cmd, slot, GpuPass::Exposure)
+                        };
+                    }
+                    readable
                 } else if self.slots[FrameSlot::new(slot)].hdr_source != HdrSource::Offscreen {
                     // TAA published its output as the frame HDR and already
                     // left it (and the offscreen) sampled: nothing to record.
                     HdrReadable::new(slot)
                 } else {
-                    unsafe { self.transition_offscreen_to_sampled(cmd, slot) }
+                    let readable = unsafe { self.transition_offscreen_to_sampled(cmd, slot) };
+                    // The finalize barrier belongs to the resolve span.
+                    if profiling {
+                        unsafe {
+                            self.gpu_timer
+                                .mark(&self.device.device, cmd, slot, GpuPass::Resolve)
+                        };
+                    }
+                    readable
                 }
             } else {
                 // Common path (TAA + exposure both off): the render pass finalizes.
-                unsafe { pass.end_sampled() }
+                let readable = unsafe { pass.end_sampled() };
+                // Close the resolve/finalize segment (MSAA resolve + transitions)
+                // before bloom records, so the report splits them.
+                if profiling {
+                    unsafe {
+                        self.gpu_timer
+                            .mark(&self.device.device, cmd, slot, GpuPass::Resolve)
+                    };
+                }
+                readable
             }
         };
-        // Close the resolve/finalize segment (MSAA resolve + transitions +
-        // TAA/exposure) before bloom records, so the report splits them.
-        if profiling {
-            unsafe {
-                self.gpu_timer
-                    .mark(&self.device.device, cmd, slot, GpuPass::Resolve)
-            };
-        }
         // Bloom: threshold + downsample the finalized HDR into this slot's
         // mip chain; the tonemap present-copy composites it. Recorded here so the
         // render→present semaphore makes the pyramid visible to the tonemap sample,
         // exactly as it does for the offscreen. A pure function of this frame.
         self.record_bloom_pass(cmd, FrameSlot::new(slot));
-        // Close the tail: without this stamp the TAA/exposure/bloom work
-        // recorded above ends after the last boundary and never reaches the
-        // report. (The tonemap/present copy runs on the copy command buffer
-        // and remains unmetered — tracked in structural opportunity #15.)
+        // Close the tail: without this stamp the bloom work recorded above
+        // ends after the last boundary and never reaches the report. (The
+        // tonemap/present copy is timed on the copy command buffer; see
+        // `submit_present_copy`.)
         if profiling {
             unsafe {
                 self.gpu_timer
-                    .mark(&self.device.device, cmd, slot, GpuPass::Post)
+                    .mark(&self.device.device, cmd, slot, GpuPass::Bloom)
             };
+            self.gpu_timer.finish(slot);
         }
-        self.gpu_timer.finish(slot);
         // The main pass just wrote (and stored) this slot's depth, so a later
         // cycle reusing this slot may read it for VRS classification. Stamp
         // ready-and-fingerprint in one write (they can never disagree).
@@ -1807,13 +1877,6 @@ impl Renderer {
             unsafe { self.submit_present_copy(slot, image_index, warp_map, overlay, godray) };
             self.last_present = std::time::Instant::now();
         }
-        if self.vsync.current() {
-            // Wait for copy to pace at display refresh.
-            unsafe {
-                self.timeline
-                    .wait(&self.device.device, self.last_copy_value);
-            }
-        }
     }
 
     /// Draws the 2D overlay (text atlas + minimap) into the currently-bound
@@ -1935,6 +1998,15 @@ impl Renderer {
             device
                 .begin_command_buffer(self.copy_cmd, &begin)
                 .expect("begin command buffer failed");
+            // Time the copy on its own pair: read the previous copy (retired —
+            // `decide_present` only acquires once it has) before resetting.
+            let profiling = crate::profile::is_enabled();
+            if profiling {
+                if let Some(ms) = self.gpu_timer.read_copy(device) {
+                    crate::profile::add_ms(crate::profile::Meter::GpuTonemap, ms);
+                }
+                self.gpu_timer.begin_copy(device, self.copy_cmd);
+            }
 
             // Swapchain image → color attachment; old contents discarded.
             let to_color = [vk::ImageMemoryBarrier2::default()
@@ -2166,6 +2238,10 @@ impl Renderer {
                 self.copy_cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&to_present),
             );
+            if profiling {
+                self.gpu_timer.end_copy(device, self.copy_cmd);
+            }
+            crate::profile::count(crate::profile::Counter::Presented);
             device
                 .end_command_buffer(self.copy_cmd)
                 .expect("end command buffer failed");
@@ -2506,6 +2582,7 @@ impl<'a> RenderPass<'a> {
         let device = &r.device.device;
         let extent = r.render_extent;
         let offscreen_image = r.targets.offscreen[slot].image();
+        let profiling = crate::profile::is_enabled();
         unsafe {
             // Generate the rate map first: it samples this slot's depth (leaving
             // it in DEPTH_ATTACHMENT_OPTIMAL, ready for the pass below) and
@@ -2515,7 +2592,11 @@ impl<'a> RenderPass<'a> {
                 let scene = lists.scene.as_ref().expect("do_vrs implies a 3D scene");
                 let focal_px = 0.5 * extent.height as f32 / scene.fovy_tan_half.max(1e-4);
                 let d_threshold = crate::camera::Z_NEAR / focal_px;
-                r.record_vrs_generate(cmd, slot, d_threshold)
+                let rate = r.record_vrs_generate(cmd, slot, d_threshold);
+                if profiling {
+                    r.gpu_timer.mark(device, cmd, slot, GpuPass::Vrs);
+                }
+                rate
             });
 
             // Transition attachments to render targets; old contents discarded.
@@ -2671,6 +2752,11 @@ impl<'a> RenderPass<'a> {
             }
 
             device.cmd_begin_rendering(cmd, &rendering_info);
+            // Close the begin span (transitions + load-op clears) so the first
+            // draw pass reports only its draws.
+            if profiling {
+                r.gpu_timer.mark(device, cmd, slot, GpuPass::Clear);
+            }
 
             // Negative height for GL-style y-up NDC.
             let viewport = vk::Viewport {
@@ -3538,8 +3624,21 @@ enum HdrSource {
 
 /// A GPU render pass boundary, in record order. The variant ordinal indexes the
 /// per-pass accumulator (matches the tracking in [`crate::profile::Meter`]).
-#[derive(Clone, Copy, PartialEq)]
+/// Every span of the render command buffer ends at one of these, so the
+/// stamps sum to the whole GPU frame (the present copy is timed apart, see
+/// [`GpuTimer::end_copy`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum GpuPass {
+    /// Staged mesh copies (graphics-queue tiers) + the minimap upload.
+    Copies,
+    /// Cull compute: counts fill, dispatch, DRAW_INDIRECT barrier.
+    Cull,
+    /// The cascaded shadow-map pass (stamped only on regenerating frames).
+    ShadowMap,
+    /// The VRS classify dispatch (stamped only when it runs).
+    Vrs,
+    /// Scene-pass begin: attachment transitions + `cmd_begin_rendering` clears.
+    Clear,
     Opaque,
     Sky,
     Cubes,
@@ -3548,16 +3647,24 @@ enum GpuPass {
     Transparent,
     Overlay,
     /// End of the scene pass: `cmd_end_rendering` (where the MSAA color
-    /// resolve executes), offscreen finalize transitions, TAA, and exposure.
+    /// resolve executes) and the offscreen finalize transitions.
     Resolve,
-    /// The bloom chain — the render-command tail after the resolve. Both tail
-    /// stamps used to not exist (no closing timestamp), silently hiding the
-    /// whole post stack from the report.
-    Post,
+    /// The TAA resolve compute (stamped only when it runs).
+    Taa,
+    /// Exposure metering reduce + finalize (stamped only when it runs).
+    Exposure,
+    /// The bloom chain — the render-command tail. Without this closing stamp
+    /// everything after the last boundary silently vanishes from the report.
+    Bloom,
 }
 
 impl GpuPass {
-    const ALL: [GpuPass; 9] = [
+    const ALL: [GpuPass; 16] = [
+        GpuPass::Copies,
+        GpuPass::Cull,
+        GpuPass::ShadowMap,
+        GpuPass::Vrs,
+        GpuPass::Clear,
         GpuPass::Opaque,
         GpuPass::Sky,
         GpuPass::Cubes,
@@ -3566,13 +3673,20 @@ impl GpuPass {
         GpuPass::Transparent,
         GpuPass::Overlay,
         GpuPass::Resolve,
-        GpuPass::Post,
+        GpuPass::Taa,
+        GpuPass::Exposure,
+        GpuPass::Bloom,
     ];
     const COUNT: usize = Self::ALL.len();
 
     fn meter(self) -> crate::profile::Meter {
         use crate::profile::Meter;
         match self {
+            GpuPass::Copies => Meter::GpuCopies,
+            GpuPass::Cull => Meter::GpuCull,
+            GpuPass::ShadowMap => Meter::GpuShadowMap,
+            GpuPass::Vrs => Meter::GpuVrs,
+            GpuPass::Clear => Meter::GpuClear,
             GpuPass::Opaque => Meter::GpuOpaque,
             GpuPass::Sky => Meter::GpuSky,
             GpuPass::Cubes => Meter::GpuCubes,
@@ -3581,13 +3695,20 @@ impl GpuPass {
             GpuPass::Transparent => Meter::GpuTransparent,
             GpuPass::Overlay => Meter::GpuOverlay,
             GpuPass::Resolve => Meter::GpuResolve,
-            GpuPass::Post => Meter::GpuPost,
+            GpuPass::Taa => Meter::GpuTaa,
+            GpuPass::Exposure => Meter::GpuExposure,
+            GpuPass::Bloom => Meter::GpuBloom,
         }
     }
 }
 
 /// One start timestamp plus one boundary per pass.
 const GPU_STAMPS: usize = GpuPass::COUNT + 1;
+/// The present copy's start/end pair lives after the per-slot render ranges.
+/// One pair suffices: a new copy is only recorded once the previous one has
+/// retired (`decide_present` probes/waits it), so its stamps are read first.
+const COPY_STAMP_BASE: u32 = (GPU_STAMPS * FRAMES_IN_FLIGHT as usize) as u32;
+const QUERY_COUNT: u32 = COPY_STAMP_BASE + 2;
 
 /// Per-pass GPU timing via a timestamp query pool: a start timestamp plus one
 /// after each recorded pass. Only the passes that actually run write a stamp,
@@ -3609,6 +3730,8 @@ struct GpuTimer {
     count: [std::cell::Cell<u32>; FRAMES_IN_FLIGHT as usize],
     /// The pass that ended at each stamp (index `i` labels the span `i-1..i`).
     label: [[std::cell::Cell<GpuPass>; GPU_STAMPS]; FRAMES_IN_FLIGHT as usize],
+    /// Whether the present-copy pair holds a completed range to read back.
+    copy_primed: bool,
 }
 
 impl GpuTimer {
@@ -3616,7 +3739,7 @@ impl GpuTimer {
         let pool = if supported {
             let info = vk::QueryPoolCreateInfo::default()
                 .query_type(vk::QueryType::TIMESTAMP)
-                .query_count(GPU_STAMPS as u32 * FRAMES_IN_FLIGHT as u32);
+                .query_count(QUERY_COUNT);
             unsafe {
                 device
                     .create_query_pool(&info, None)
@@ -3633,6 +3756,7 @@ impl GpuTimer {
             label: std::array::from_fn(|_| {
                 std::array::from_fn(|_| std::cell::Cell::new(GpuPass::Opaque))
             }),
+            copy_primed: false,
         }
     }
 
@@ -3719,6 +3843,60 @@ impl GpuTimer {
         }
     }
 
+    /// Reads the previous present copy's duration (ms). The caller must know
+    /// that copy has retired (a new copy is only recorded once it has), so the
+    /// read never stalls; `None` before the first copy or without timestamps.
+    unsafe fn read_copy(&self, device: &ash::Device) -> Option<f64> {
+        if !self.enabled() || !self.copy_primed {
+            return None;
+        }
+        let mut ts = [0u64; 2];
+        unsafe {
+            device.get_query_pool_results(
+                self.pool,
+                COPY_STAMP_BASE,
+                &mut ts,
+                vk::QueryResultFlags::TYPE_64,
+            )
+        }
+        .ok()?;
+        Some(ts[1].wrapping_sub(ts[0]) as f64 * self.period_ns as f64 / 1.0e6)
+    }
+
+    /// Resets the present-copy pair and writes its start stamp. Recorded on the
+    /// copy command buffer, outside any render pass, after [`Self::read_copy`].
+    unsafe fn begin_copy(&self, device: &ash::Device, cmd: vk::CommandBuffer) {
+        if !self.enabled() {
+            return;
+        }
+        unsafe {
+            device.cmd_reset_query_pool(cmd, self.pool, COPY_STAMP_BASE, 2);
+            device.cmd_write_timestamp2(
+                cmd,
+                vk::PipelineStageFlags2::TOP_OF_PIPE,
+                self.pool,
+                COPY_STAMP_BASE,
+            );
+        }
+    }
+
+    /// Writes the present-copy end stamp (after the last barrier, before the
+    /// command buffer ends) and marks the pair readable by the next copy.
+    unsafe fn end_copy(&mut self, device: &ash::Device, cmd: vk::CommandBuffer) {
+        if !self.enabled() {
+            return;
+        }
+        unsafe {
+            device.cmd_write_timestamp2(
+                cmd,
+                vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                self.pool,
+                COPY_STAMP_BASE + 1,
+            );
+        }
+        self.copy_primed = true;
+    }
+
     unsafe fn destroy(&mut self, device: &ash::Device) {
         if self.enabled() {
             unsafe { device.destroy_query_pool(self.pool, None) };
@@ -3730,6 +3908,25 @@ impl GpuTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_pass_ordinals_index_all_in_record_order() {
+        // `GpuPass as usize` indexes the per-pass readback sink and ALL is the
+        // record order; every pass also needs a distinct profile meter.
+        let mut meters = Vec::new();
+        for (i, pass) in GpuPass::ALL.into_iter().enumerate() {
+            assert_eq!(pass as usize, i, "{pass:?} is out of order in GpuPass::ALL");
+            meters.push(pass.meter() as usize);
+        }
+        meters.sort_unstable();
+        meters.dedup();
+        assert_eq!(meters.len(), GpuPass::COUNT);
+        assert_eq!(GPU_STAMPS, GpuPass::COUNT + 1);
+        assert_eq!(
+            QUERY_COUNT as usize,
+            GPU_STAMPS * FRAMES_IN_FLIGHT as usize + 2
+        );
+    }
 
     #[test]
     fn vrs_scene_fingerprint_tracks_view_and_depth_geometry() {

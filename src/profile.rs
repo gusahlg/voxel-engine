@@ -12,7 +12,14 @@
 //! three domains are directly comparable:
 //! - CPU tiers run sequentially on the main thread, so `sim + list + submit`
 //!   ≈ the main-thread frame cost.
-//! - GPU runs asynchronously to the CPU; its total is the GPU frame cost.
+//! - The wait tier is time a thread spent BLOCKED (not working): the main
+//!   thread in the frame-pool handoff, the render thread in its timeline
+//!   waits. It is reported apart from the CPU tiers so `submit` stays pure
+//!   render-thread work.
+//! - GPU runs asynchronously to the CPU; its total is the GPU frame cost, per
+//!   RENDERED frame (the render thread may coalesce main-thread frames). The
+//!   tonemap present copy runs only on presented frames; its meter carries the
+//!   per-rendered-frame share, with the per-presented cost alongside.
 //! - Workers run in parallel off the critical path; their ms/frame is *offered
 //!   load* — if it exceeds the frame wall-time, the backlog grows and far
 //!   terrain lags behind the player.
@@ -20,8 +27,8 @@
 //! Gated by `VOXEL_PROFILE`: disabled → every entry point is a cheap no-op.
 
 use std::cell::Cell;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// A timed stage. Ordinal indexes the accumulator arrays; grouped by [`tier`].
@@ -42,14 +49,13 @@ pub enum Meter {
     ListWorld,
     ListHud,
     // Tier::CpuSubmit — submit-side CPU (draw_frame)
-    Fence,
     Acquire,
     Upload,
     Pack,
     Record,
     // Record sub-stages: the CPU cost of recording each pass inside `Record`.
     // Substages (like the tile ones) — excluded from the submit tier total and
-    // printed on their own breakdown line, so they never double-count `Record`.
+    // printed in brackets after it, so they never double-count `Record`.
     RecShadow,
     RecMesh,
     RecSky,
@@ -58,7 +64,31 @@ pub enum Meter {
     RecTransitions,
     Submit,
     Present,
-    // Tier::Gpu — GPU render passes (timestamp readback)
+    /// Retired-resource reclaim after the slot fence (render thread).
+    Reclaim,
+    // Tier::Wait — time blocked, not working
+    /// Main thread blocked in the frame-pool handoff (`take_frame`): the
+    /// present-pacing wait for the render thread to return a snapshot.
+    WaitFrame,
+    /// Render thread blocked on the slot's previous render (timeline wait).
+    Fence,
+    /// Render thread blocked on an in-flight present copy (slot reuse, forced
+    /// capture).
+    WaitCopy,
+    /// Render thread blocked pacing to the display: the vsync copy wait or a
+    /// blocking drawable acquire.
+    WaitVsync,
+    // Tier::Gpu — GPU render passes (timestamp readback), in record order
+    /// Staged mesh copies + minimap upload ahead of the cull.
+    GpuCopies,
+    /// Cull compute: counts fill, dispatch, and the DRAW_INDIRECT barrier.
+    GpuCull,
+    /// Cascaded shadow-map pass (only on regenerating frames).
+    GpuShadowMap,
+    /// VRS classify dispatch (only with a rate image and primed depth).
+    GpuVrs,
+    /// Scene-pass begin: attachment transitions + `cmd_begin_rendering` clears.
+    GpuClear,
     GpuOpaque,
     GpuSky,
     GpuCubes,
@@ -66,11 +96,18 @@ pub enum Meter {
     GpuShadows,
     GpuTransparent,
     GpuOverlay,
-    /// End of the scene pass: `cmd_end_rendering` (the 8x-MSAA color resolve
-    /// lands here), the offscreen finalize transitions, and TAA/exposure.
+    /// End of the scene pass: `cmd_end_rendering` (the MSAA color resolve lands
+    /// here) and the offscreen finalize transitions.
     GpuResolve,
-    /// The render-command tail after the resolve: the bloom chain.
-    GpuPost,
+    /// TAA resolve compute.
+    GpuTaa,
+    /// Exposure metering reduce + finalize.
+    GpuExposure,
+    /// The bloom chain — the render-command tail.
+    GpuBloom,
+    /// The present copy (tonemap + godrays + warp + 2D overlay) — a separate
+    /// submit that runs only on presented frames.
+    GpuTonemap,
     // Tier::Workers — off-thread chunk jobs; the tile stages are sub-timings
     WorkGenerate,
     WorkMesh,
@@ -81,7 +118,7 @@ pub enum Meter {
 }
 
 impl Meter {
-    const ALL: [Meter; 38] = [
+    const ALL: [Meter; 50] = [
         Meter::NetEvents,
         Meter::Physics,
         Meter::StreamDrain,
@@ -92,7 +129,6 @@ impl Meter {
         Meter::ListSky,
         Meter::ListWorld,
         Meter::ListHud,
-        Meter::Fence,
         Meter::Acquire,
         Meter::Upload,
         Meter::Pack,
@@ -105,6 +141,16 @@ impl Meter {
         Meter::RecTransitions,
         Meter::Submit,
         Meter::Present,
+        Meter::Reclaim,
+        Meter::WaitFrame,
+        Meter::Fence,
+        Meter::WaitCopy,
+        Meter::WaitVsync,
+        Meter::GpuCopies,
+        Meter::GpuCull,
+        Meter::GpuShadowMap,
+        Meter::GpuVrs,
+        Meter::GpuClear,
         Meter::GpuOpaque,
         Meter::GpuSky,
         Meter::GpuCubes,
@@ -113,7 +159,10 @@ impl Meter {
         Meter::GpuTransparent,
         Meter::GpuOverlay,
         Meter::GpuResolve,
-        Meter::GpuPost,
+        Meter::GpuTaa,
+        Meter::GpuExposure,
+        Meter::GpuBloom,
+        Meter::GpuTonemap,
         Meter::WorkGenerate,
         Meter::WorkMesh,
         Meter::WorkLight,
@@ -135,7 +184,6 @@ impl Meter {
             Meter::ListSky => "list.sky",
             Meter::ListWorld => "list.world",
             Meter::ListHud => "list.hud",
-            Meter::Fence => "fence",
             Meter::Acquire => "acquire",
             Meter::Upload => "upload",
             Meter::Pack => "pack",
@@ -148,6 +196,16 @@ impl Meter {
             Meter::RecTransitions => "rec.trans",
             Meter::Submit => "submit",
             Meter::Present => "present",
+            Meter::Reclaim => "reclaim",
+            Meter::WaitFrame => "frame",
+            Meter::Fence => "fence",
+            Meter::WaitCopy => "copy",
+            Meter::WaitVsync => "vsync",
+            Meter::GpuCopies => "copies",
+            Meter::GpuCull => "cull",
+            Meter::GpuShadowMap => "shadowmap",
+            Meter::GpuVrs => "vrs",
+            Meter::GpuClear => "clear",
             Meter::GpuOpaque => "opaque",
             Meter::GpuSky => "sky",
             Meter::GpuCubes => "cubes",
@@ -156,7 +214,10 @@ impl Meter {
             Meter::GpuTransparent => "transparent",
             Meter::GpuOverlay => "overlay",
             Meter::GpuResolve => "resolve",
-            Meter::GpuPost => "post",
+            Meter::GpuTaa => "taa",
+            Meter::GpuExposure => "exposure",
+            Meter::GpuBloom => "bloom",
+            Meter::GpuTonemap => "tonemap",
             Meter::WorkGenerate => "generate",
             Meter::WorkMesh => "mesh",
             Meter::WorkLight => "light",
@@ -176,8 +237,7 @@ impl Meter {
             | Meter::StreamTiles
             | Meter::StreamOcclusion => Tier::CpuSim,
             Meter::ListSky | Meter::ListWorld | Meter::ListHud => Tier::CpuList,
-            Meter::Fence
-            | Meter::Acquire
+            Meter::Acquire
             | Meter::Upload
             | Meter::Pack
             | Meter::Record
@@ -188,8 +248,15 @@ impl Meter {
             | Meter::RecOverlay
             | Meter::RecTransitions
             | Meter::Submit
-            | Meter::Present => Tier::CpuSubmit,
-            Meter::GpuOpaque
+            | Meter::Present
+            | Meter::Reclaim => Tier::CpuSubmit,
+            Meter::WaitFrame | Meter::Fence | Meter::WaitCopy | Meter::WaitVsync => Tier::Wait,
+            Meter::GpuCopies
+            | Meter::GpuCull
+            | Meter::GpuShadowMap
+            | Meter::GpuVrs
+            | Meter::GpuClear
+            | Meter::GpuOpaque
             | Meter::GpuSky
             | Meter::GpuCubes
             | Meter::GpuLines
@@ -197,7 +264,10 @@ impl Meter {
             | Meter::GpuTransparent
             | Meter::GpuOverlay
             | Meter::GpuResolve
-            | Meter::GpuPost => Tier::Gpu,
+            | Meter::GpuTaa
+            | Meter::GpuExposure
+            | Meter::GpuBloom
+            | Meter::GpuTonemap => Tier::Gpu,
             Meter::WorkGenerate
             | Meter::WorkMesh
             | Meter::WorkLight
@@ -260,15 +330,17 @@ enum Tier {
     CpuSim,
     CpuList,
     CpuSubmit,
+    Wait,
     Gpu,
     Workers,
 }
 
 impl Tier {
-    const ALL: [Tier; 5] = [
+    const ALL: [Tier; 6] = [
         Tier::CpuSim,
         Tier::CpuList,
         Tier::CpuSubmit,
+        Tier::Wait,
         Tier::Gpu,
         Tier::Workers,
     ];
@@ -278,10 +350,61 @@ impl Tier {
             Tier::CpuSim => "sim",
             Tier::CpuList => "list",
             Tier::CpuSubmit => "submit",
+            Tier::Wait => "wait",
             Tier::Gpu => "gpu",
             Tier::Workers => "workers",
         }
     }
+}
+
+/// A per-window event count (reset with the meters). `Rendered` is the GPU
+/// tier's denominator; `Presented` is the tonemap meter's.
+#[derive(Clone, Copy)]
+pub enum Counter {
+    /// Frames the render thread actually drew (`draw_frame` past its early outs).
+    Rendered,
+    /// Frames that reached a present copy + `vkQueuePresentKHR`.
+    Presented,
+}
+
+impl Counter {
+    const COUNT: usize = 2;
+}
+
+static COUNTERS: [AtomicU64; Counter::COUNT] = [const { AtomicU64::new(0) }; Counter::COUNT];
+
+/// Count one event. Cheap no-op when profiling is off.
+pub fn count(c: Counter) {
+    if enabled() {
+        COUNTERS[c as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Per-rendered-frame GPU totals (render command buffer, ms) fed by the render
+/// thread's timestamp readback; drained by `report` for the p50/p95 header.
+/// Capped so a runaway window can never grow it unboundedly.
+static GPU_FRAMES: Mutex<Vec<f32>> = Mutex::new(Vec::new());
+const GPU_FRAME_CAP: usize = 4096;
+
+/// Record one rendered frame's total GPU time (ms). Cheap no-op when off.
+pub fn gpu_frame_ms(ms: f64) {
+    if !enabled() || !ms.is_finite() || ms < 0.0 {
+        return;
+    }
+    let mut samples = GPU_FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if samples.len() < GPU_FRAME_CAP {
+        samples.push(ms as f32);
+    }
+}
+
+/// Nearest-rank quantile of `samples` (sorted in place). `None` when empty.
+fn quantile(samples: &mut [f32], q: f64) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable_by(f32::total_cmp);
+    let idx = ((samples.len() - 1) as f64 * q).round() as usize;
+    Some(samples[idx.min(samples.len() - 1)] as f64)
 }
 
 /// Frames per reporting window (~3.3s at 72fps).
@@ -319,6 +442,20 @@ pub fn is_enabled() -> bool {
 pub struct Guard {
     meter: Meter,
     start: Option<Instant>,
+}
+
+impl Guard {
+    /// Closes the running segment under the current meter and keeps timing
+    /// under `meter` from now. Lets one scope hand a blocking wait in its
+    /// middle to a wait meter without nesting (which would double-count).
+    pub fn split(&mut self, meter: Meter) {
+        if let Some(start) = self.start {
+            let now = Instant::now();
+            add(self.meter, now.duration_since(start));
+            self.start = Some(now);
+        }
+        self.meter = meter;
+    }
 }
 
 impl Drop for Guard {
@@ -408,6 +545,11 @@ thread_local! {
 fn report(frames: u64) {
     let wall = WINDOW_START.replace(Some(Instant::now()));
     let f = frames as f64;
+    let rendered = COUNTERS[Counter::Rendered as usize].swap(0, Ordering::Relaxed);
+    let presented = COUNTERS[Counter::Presented as usize].swap(0, Ordering::Relaxed);
+    // GPU meters are per RENDERED frame (the render thread may coalesce);
+    // without a rendered count (no timestamps, minimized) fall back to frames.
+    let gpu_f = if rendered > 0 { rendered as f64 } else { f };
 
     // Swap-read every meter (reset for the next window). ms/frame and per-sample
     // ms are both derived here so the caller sees a stable snapshot.
@@ -417,10 +559,12 @@ fn report(frames: u64) {
     for m in Meter::ALL {
         let ns = METERS.nanos[m as usize].swap(0, Ordering::Relaxed) as f64;
         let c = METERS.count[m as usize].swap(0, Ordering::Relaxed) as f64;
-        ms_per_frame[m as usize] = ns / f / 1.0e6;
+        let den = if m.tier() == Tier::Gpu { gpu_f } else { f };
+        ms_per_frame[m as usize] = ns / den / 1.0e6;
         ms_per_sample[m as usize] = if c > 0.0 { ns / c / 1.0e6 } else { 0.0 };
         per_frame_count[m as usize] = c / f;
     }
+    let mut gpu_frames = std::mem::take(&mut *GPU_FRAMES.lock().unwrap_or_else(|e| e.into_inner()));
 
     // Header: real frame period (hence fps) when we have a prior window mark,
     // plus the window's worst single frame — a stall that lasted only a few
@@ -443,13 +587,30 @@ fn report(frames: u64) {
             .sum()
     };
     let cpu = tier_total(Tier::CpuSim) + tier_total(Tier::CpuList) + tier_total(Tier::CpuSubmit);
+    // The wait tier split by thread: `frame` is the main thread's, the rest the
+    // render thread's. Neither is work, so neither joins `cpu`.
+    let wait_main = ms_per_frame[Meter::WaitFrame as usize];
     header.push_str(&format!(
-        " | cpu {:.2} (sim {:.2} list {:.2} submit {:.2}) gpu {:.2} work {:.2}",
+        " | cpu {:.2} (sim {:.2} list {:.2} submit {:.2}) wait {:.2} (main {:.2} render {:.2}) gpu {:.2}",
         cpu,
         tier_total(Tier::CpuSim),
         tier_total(Tier::CpuList),
         tier_total(Tier::CpuSubmit),
+        tier_total(Tier::Wait),
+        wait_main,
+        tier_total(Tier::Wait) - wait_main,
         tier_total(Tier::Gpu),
+    ));
+    // Per-frame GPU distribution (render command buffer totals): the average
+    // above hides a bimodal frame mix (e.g. shadow-map regeneration frames).
+    if let (Some(p50), Some(p95)) = (
+        quantile(&mut gpu_frames, 0.5),
+        quantile(&mut gpu_frames, 0.95),
+    ) {
+        header.push_str(&format!(" (p50 {p50:.2} p95 {p95:.2})"));
+    }
+    header.push_str(&format!(
+        " work {:.2} | rendered {rendered} presented {presented}",
         tier_total(Tier::Workers),
     ));
     // `eprintln!`, not `log::info!`: `VOXEL_PROFILE` is an explicit opt-in, so
@@ -458,15 +619,21 @@ fn report(frames: u64) {
     eprintln!("{header}");
 
     // One line per tier, meters sorted hottest-first. Workers report ms/job and
-    // jobs/frame (they are off-thread), with the tile sub-stages appended.
-    for tier in Tier::ALL {
-        let mut meters: Vec<Meter> = Meter::ALL
-            .into_iter()
-            .filter(|m| m.tier() == tier && !is_substage(*m))
-            .collect();
+    // jobs/frame (they are off-thread), with the tile sub-stages appended; the
+    // submit line appends the record sub-stages the same way.
+    let sorted = |mut meters: Vec<Meter>| {
         meters.sort_unstable_by(|a, b| {
             ms_per_frame[*b as usize].total_cmp(&ms_per_frame[*a as usize])
         });
+        meters
+    };
+    for tier in Tier::ALL {
+        let meters = sorted(
+            Meter::ALL
+                .into_iter()
+                .filter(|m| m.tier() == tier && !is_substage(*m))
+                .collect(),
+        );
         let mut line = format!("  {:<7}:", tier.label());
         for m in meters {
             if tier == Tier::Workers {
@@ -480,6 +647,12 @@ fn report(frames: u64) {
             } else {
                 line.push_str(&format!(" {} {:.2}", m.label(), ms_per_frame[m as usize]));
             }
+            // The present copy runs once per PRESENTED frame: its per-rendered
+            // share is what the gpu total sums; the real per-present cost is
+            // the number a tonemap change moves.
+            if matches!(m, Meter::GpuTonemap) && ms_per_sample[m as usize] > 0.0 {
+                line.push_str(&format!(" ({:.2}/present)", ms_per_sample[m as usize]));
+            }
         }
         if tier == Tier::Workers {
             line.push_str(&format!(
@@ -487,6 +660,27 @@ fn report(frames: u64) {
                 ms_per_sample[Meter::TileSample as usize],
                 ms_per_sample[Meter::TileMesh as usize],
             ));
+        }
+        if tier == Tier::CpuSubmit {
+            // Record breakdown: the CPU sub-costs inside `record`, hottest-first.
+            // Substages (not in the submit total), so this explains where the
+            // `record` number goes without double-counting it.
+            let rec = sorted(vec![
+                Meter::RecShadow,
+                Meter::RecMesh,
+                Meter::RecSky,
+                Meter::RecImmediate,
+                Meter::RecOverlay,
+                Meter::RecTransitions,
+            ]);
+            line.push_str(" [");
+            for (i, m) in rec.into_iter().enumerate() {
+                if i > 0 {
+                    line.push(' ');
+                }
+                line.push_str(&format!("{} {:.2}", m.label(), ms_per_frame[m as usize]));
+            }
+            line.push(']');
         }
         eprintln!("{line}");
     }
@@ -503,26 +697,6 @@ fn report(frames: u64) {
         ));
     }
     eprintln!("{sline}");
-
-    // Record breakdown: the CPU sub-costs inside `Record`, hottest-first. These
-    // are substages (not in the submit tier total); this line explains where the
-    // `record` number goes without double-counting it.
-    let mut rec: Vec<Meter> = [
-        Meter::RecShadow,
-        Meter::RecMesh,
-        Meter::RecSky,
-        Meter::RecImmediate,
-        Meter::RecOverlay,
-        Meter::RecTransitions,
-    ]
-    .into_iter()
-    .collect();
-    rec.sort_unstable_by(|a, b| ms_per_frame[*b as usize].total_cmp(&ms_per_frame[*a as usize]));
-    let mut rline = String::from("  record :");
-    for m in rec {
-        rline.push_str(&format!(" {} {:.2}", m.label(), ms_per_frame[m as usize]));
-    }
-    eprintln!("{rline}");
 }
 
 /// Tile sub-stage meters are reported inline in the workers line, not as their
@@ -539,4 +713,76 @@ fn is_substage(m: Meter) -> bool {
             | Meter::RecOverlay
             | Meter::RecTransitions
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meter_ordinals_index_all_in_order() {
+        // `Meter as usize` indexes the accumulators; ALL must list every variant
+        // at its own ordinal or a label drifts from the time it names.
+        for (i, m) in Meter::ALL.into_iter().enumerate() {
+            assert_eq!(m as usize, i, "{} is out of order in Meter::ALL", m.label());
+        }
+    }
+
+    #[test]
+    fn meter_labels_are_unique_within_a_tier() {
+        for tier in Tier::ALL {
+            let mut labels: Vec<&str> = Meter::ALL
+                .into_iter()
+                .filter(|m| m.tier() == tier)
+                .map(Meter::label)
+                .collect();
+            let n = labels.len();
+            labels.sort_unstable();
+            labels.dedup();
+            assert_eq!(labels.len(), n, "duplicate label in tier {}", tier.label());
+        }
+    }
+
+    #[test]
+    fn every_tier_has_a_meter_and_wait_holds_only_waits() {
+        for tier in Tier::ALL {
+            assert!(Meter::ALL.iter().any(|m| m.tier() == tier));
+        }
+        let waits: Vec<Meter> = Meter::ALL
+            .into_iter()
+            .filter(|m| m.tier() == Tier::Wait)
+            .collect();
+        assert!(waits.iter().all(|m| matches!(
+            m,
+            Meter::WaitFrame | Meter::Fence | Meter::WaitCopy | Meter::WaitVsync
+        )));
+        assert_eq!(waits.len(), 4);
+    }
+
+    #[test]
+    fn quantile_is_nearest_rank() {
+        let mut empty: [f32; 0] = [];
+        assert_eq!(quantile(&mut empty, 0.5), None);
+        let mut one = [3.0f32];
+        assert_eq!(quantile(&mut one, 0.95), Some(3.0));
+        // Unsorted 1..=100: p50 lands on 51, p95 on 95 (nearest rank).
+        let mut v: Vec<f32> = (1..=100).rev().map(|x| x as f32).collect();
+        assert_eq!(quantile(&mut v, 0.5), Some(51.0));
+        assert_eq!(quantile(&mut v, 0.95), Some(95.0));
+        assert_eq!(quantile(&mut v, 1.0), Some(100.0));
+        assert_eq!(quantile(&mut v, 0.0), Some(1.0));
+    }
+
+    #[test]
+    fn split_on_a_disabled_guard_only_retargets() {
+        // With profiling off the guard carries no start; `split` must stay a
+        // no-op apart from retargeting the meter (no panic, nothing recorded).
+        let mut g = Guard {
+            meter: Meter::Acquire,
+            start: None,
+        };
+        g.split(Meter::WaitCopy);
+        assert!(matches!(g.meter, Meter::WaitCopy));
+        assert!(g.start.is_none());
+    }
 }

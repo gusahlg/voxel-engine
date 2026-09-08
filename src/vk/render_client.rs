@@ -486,6 +486,9 @@ impl RenderClient {
         if let Some(b) = self.frame_pool.pop() {
             return b;
         }
+        // Empty pool: this recv is the present-pacing wait. Timed as wait, not
+        // main-thread work; the non-blocking pop above is not a wait.
+        let _p = crate::profile::scope(crate::profile::Meter::WaitFrame);
         loop {
             match self.ret_rx.recv() {
                 Ok(RenderReturn::Frame(b)) => return b,
