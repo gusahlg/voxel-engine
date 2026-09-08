@@ -2,7 +2,8 @@
 // Camera partitions are (group, arena, distance-bucket); shadows are
 // per-cascade and unbucketed. Camera groups (CULL_CAMERA_GROUPS): 0 full-res
 // Opaque, 1 Cutout, 2 coarse-LOD Opaque (scale > 1, the only camera draws
-// that pay for the slab-clip `discard`).
+// that pay for the slab-clip `discard`). Group 2 meshes whose AABB is fully
+// inside that slab are not emitted (every fragment would be discarded).
 
 #include "common.slang"
 
@@ -49,8 +50,8 @@ struct CullParams
     uint arena_count;
     uint shadow_enabled;
     uint flags; // bit 0 = per-direction face-run culling
-    uint pad1;
-    uint pad2;
+    float clip;   // full-res slab radius; 0 = disabled (same as mesh3d push)
+    float clip_v; // full-res slab half-height; 0 = disabled
 };
 
 [[vk::binding(0, 0)]]
@@ -110,6 +111,22 @@ uint distance_bucket(float dist)
     if (dist >= CULL_BUCKET_SPLIT_2)
         b = 3;
     return min(b, CULL_DISTANCE_BUCKETS - 1u);
+}
+
+// True when every fragment of a camera-relative AABB would be discarded by the
+// coarse-LOD slab clip (`mesh3d.frag.slang`). Both extents must be active:
+// `clip_v == 0` makes the fragment `inside_v` false, so nothing is discarded.
+// Horizontal test uses the farthest xz corner (max |x|, max |z|) so a skip is
+// exact for the per-fragment `length(world.xz) < clip` test. Host mirror:
+// `lod_aabb_inside_slab` in vk/cull.rs.
+bool lod_aabb_inside_slab(float3 mn, float3 mx, float clip, float clip_v)
+{
+    if (!(clip > 0.0 && clip_v > 0.0))
+        return false;
+    float2 far_xz = max(abs(mn.xz), abs(mx.xz));
+    bool inside_h = length(far_xz) < clip;
+    bool inside_v = max(abs(mn.y), abs(mx.y)) < clip_v;
+    return inside_h && inside_v;
 }
 
 void emit(uint part, DrawCmd cmd)
@@ -187,60 +204,78 @@ void computeMain(uint3 id: SV_DispatchThreadID)
         {
             // Camera group: the pass index, except coarse-LOD opaque → group 2.
             uint group = (pass == 0u && scale > 1.0) ? 2u : pass;
-            float dist = length(0.5 * (mn + mx));
-            uint bucket = distance_bucket(dist);
-            uint part = (group * params.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
-            if ((params.flags & 1u) == 0u || (rec.flags & 1u) == 0u)
+            // Group 2 fully inside the slab would discard every fragment.
+            if (group != 2u || !lod_aabb_inside_slab(mn, mx, params.clip, params.clip_v))
             {
-                emit(part, cmd);
-                if ((pc.flags & 1u) != 0)
+                float dist = length(0.5 * (mn + mx));
+                uint bucket = distance_bucket(dist);
+                uint part = (group * params.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
+                if ((params.flags & 1u) == 0u || (rec.flags & 1u) == 0u)
                 {
-                    uint unused;
-                    InterlockedAdd(stats[group * 2u], 1u, unused);
-                    InterlockedAdd(stats[group * 2u + 1u], cmd.index_count, unused);
-                }
-            }
-            else
-            {
-                // Cumulative 6*quads from packed u16 pairs (upload slots 0|1, 2|3, 4|5).
-                uint b[7];
-                b[0] = 0u;
-                [unroll]
-                for (uint i = 0u; i < 3u; i++)
-                {
-                    uint packed = rec.face_quads[i];
-                    b[i * 2u + 1u] = b[i * 2u] + 6u * (packed & 0xFFFFu);
-                    b[i * 2u + 2u] = b[i * 2u + 1u] + 6u * (packed >> 16);
-                }
-                // +axis vis iff mn[axis] < 0; −axis iff mx[axis] > 0. +Y uses the
-                // drooped AABB because mesh3d.vert lowers far vertices by
-                // min(|xz|²·CURVE_INV_2R, CURVE_MAX_DROP). −Y without droop is
-                // already conservative.
-                bool vis[6];
-                vis[0] = mn.x < 0.0;
-                float2 far = max(abs(mn.xz), abs(mx.xz));
-                float droop = min(dot(far, far) * CURVE_INV_2R, CURVE_MAX_DROP);
-                vis[1] = (mn.y - droop) < 0.0;
-                vis[2] = mn.z < 0.0;
-                vis[3] = mx.x > 0.0;
-                vis[4] = mx.y > 0.0;
-                vis[5] = mx.z > 0.0;
-                // Merge consecutive visible non-empty buckets. emit may be called
-                // ≤3 times per lane; the wave path already handles divergent callers.
-                uint start = ~0u;
-                for (uint k = 0u; k < 6u; k++)
-                {
-                    bool occ = vis[k] && (b[k + 1u] != b[k]);
-                    if (occ)
+                    emit(part, cmd);
+                    if ((pc.flags & 1u) != 0)
                     {
-                        if (start == ~0u)
-                            start = k;
+                        uint unused;
+                        InterlockedAdd(stats[group * 2u], 1u, unused);
+                        InterlockedAdd(stats[group * 2u + 1u], cmd.index_count, unused);
                     }
-                    else if (start != ~0u)
+                }
+                else
+                {
+                    // Cumulative 6*quads from packed u16 pairs (upload slots 0|1, 2|3, 4|5).
+                    uint b[7];
+                    b[0] = 0u;
+                    [unroll]
+                    for (uint i = 0u; i < 3u; i++)
+                    {
+                        uint packed = rec.face_quads[i];
+                        b[i * 2u + 1u] = b[i * 2u] + 6u * (packed & 0xFFFFu);
+                        b[i * 2u + 2u] = b[i * 2u + 1u] + 6u * (packed >> 16);
+                    }
+                    // +axis vis iff mn[axis] < 0; −axis iff mx[axis] > 0. +Y uses the
+                    // drooped AABB because mesh3d.vert lowers far vertices by
+                    // min(|xz|²·CURVE_INV_2R, CURVE_MAX_DROP). −Y without droop is
+                    // already conservative.
+                    bool vis[6];
+                    vis[0] = mn.x < 0.0;
+                    float2 far = max(abs(mn.xz), abs(mx.xz));
+                    float droop = min(dot(far, far) * CURVE_INV_2R, CURVE_MAX_DROP);
+                    vis[1] = (mn.y - droop) < 0.0;
+                    vis[2] = mn.z < 0.0;
+                    vis[3] = mx.x > 0.0;
+                    vis[4] = mx.y > 0.0;
+                    vis[5] = mx.z > 0.0;
+                    // Merge consecutive visible non-empty buckets. emit may be called
+                    // ≤3 times per lane; the wave path already handles divergent callers.
+                    uint start = ~0u;
+                    for (uint k = 0u; k < 6u; k++)
+                    {
+                        bool occ = vis[k] && (b[k + 1u] != b[k]);
+                        if (occ)
+                        {
+                            if (start == ~0u)
+                                start = k;
+                        }
+                        else if (start != ~0u)
+                        {
+                            DrawCmd run = cmd;
+                            run.first_index = b[start];
+                            run.index_count = b[k] - b[start];
+                            emit(part, run);
+                            if ((pc.flags & 1u) != 0)
+                            {
+                                uint unused;
+                                InterlockedAdd(stats[group * 2u], 1u, unused);
+                                InterlockedAdd(stats[group * 2u + 1u], run.index_count, unused);
+                            }
+                            start = ~0u;
+                        }
+                    }
+                    if (start != ~0u)
                     {
                         DrawCmd run = cmd;
                         run.first_index = b[start];
-                        run.index_count = b[k] - b[start];
+                        run.index_count = b[6] - b[start];
                         emit(part, run);
                         if ((pc.flags & 1u) != 0)
                         {
@@ -248,20 +283,6 @@ void computeMain(uint3 id: SV_DispatchThreadID)
                             InterlockedAdd(stats[group * 2u], 1u, unused);
                             InterlockedAdd(stats[group * 2u + 1u], run.index_count, unused);
                         }
-                        start = ~0u;
-                    }
-                }
-                if (start != ~0u)
-                {
-                    DrawCmd run = cmd;
-                    run.first_index = b[start];
-                    run.index_count = b[6] - b[start];
-                    emit(part, run);
-                    if ((pc.flags & 1u) != 0)
-                    {
-                        uint unused;
-                        InterlockedAdd(stats[group * 2u], 1u, unused);
-                        InterlockedAdd(stats[group * 2u + 1u], run.index_count, unused);
                     }
                 }
             }

@@ -6,8 +6,10 @@
 //! Camera groups (bucketed): full-res Opaque, Cutout, coarse-LOD Opaque
 //! (`scale > 1`). The LOD split exists so full-res opaque draws bind a
 //! fragment module with no `discard` (early depth write) while only the LOD
-//! partition pays for the slab clip. Shadow Near/Far stay unbucketed and
-//! reuse the full-res Opaque live count.
+//! partition pays for the slab clip. Coarse-LOD meshes whose camera-relative
+//! AABB lies entirely inside that slab are not emitted (every fragment would
+//! be discarded). Shadow Near/Far stay unbucketed and reuse the full-res
+//! Opaque live count.
 
 use std::num::NonZeroU32;
 
@@ -59,6 +61,24 @@ const _: () = assert!(crate::genconst::CULL_DISTANCE_BUCKETS == 4);
 const _: () = assert!(crate::genconst::CULL_CAMERA_GROUPS == CAMERA_GROUPS as u32);
 const _: () = assert!(GROUPS == CAMERA_GROUPS + SHADOW_GROUPS);
 const _: () = assert!(Group::OpaqueLod as usize + 1 == CAMERA_GROUPS);
+
+/// True when every fragment of a camera-relative AABB would be discarded by
+/// the coarse-LOD slab clip (`mesh3d.frag.slang`). Both extents must be
+/// active (`clip_v == 0` makes the fragment `inside_v` false). Horizontal
+/// test uses the farthest xz corner (max |x|, max |z|) so a skip is exact
+/// for the per-fragment `length(world.xz) < clip` test. Mirrored by
+/// `lod_aabb_inside_slab` in `cull.comp.slang`.
+#[cfg(test)]
+fn lod_aabb_inside_slab(mn: [f32; 3], mx: [f32; 3], clip: f32, clip_v: f32) -> bool {
+    if !(clip > 0.0 && clip_v > 0.0) {
+        return false;
+    }
+    let far_x = mn[0].abs().max(mx[0].abs());
+    let far_z = mn[2].abs().max(mx[2].abs());
+    let inside_h = (far_x * far_x + far_z * far_z).sqrt() < clip;
+    let inside_v = mn[1].abs().max(mx[1].abs()) < clip_v;
+    inside_h && inside_v
+}
 
 /// Camera-distance bucket of an AABB centre, matching `cull.comp.slang`.
 #[cfg(test)]
@@ -117,9 +137,10 @@ struct CullParamsGpu {
     arena_count: u32,
     shadow_enabled: u32,
     flags: u32,
-    _pad: [u32; 2],
+    clip: f32,
+    clip_v: f32,
 }
-// Padding ensures alignment matches shader layout.
+// std140: clip/clip_v occupy the former pad tail (same 288-byte size).
 const _: () = assert!(size_of::<CullParamsGpu>() == 288);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, cam_planes) == 0);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, shadow_planes) == 80);
@@ -129,6 +150,8 @@ const _: () = assert!(std::mem::offset_of!(CullParamsGpu, cam_frac) == 256);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, arena_count) == 268);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, shadow_enabled) == 272);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, flags) == 276);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, clip) == 280);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, clip_v) == 284);
 
 /// Arena registry with live counts per (arena, lane).
 pub(crate) struct ArenaDirectory {
@@ -594,7 +617,9 @@ impl CullState {
     ///
     /// `slot_count` bounds the dispatch (the caller trims it to the directory's
     /// live end); `visible` must cover it. `partitions` is last frame's table
-    /// handed back for reuse (its contents are discarded).
+    /// handed back for reuse (its contents are discarded). `clip` / `clip_v`
+    /// are the full-res slab extents (`DrawLists::lod_clip`, `lod_clip_v`);
+    /// 0 disables, matching the mesh3d push constants.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn prepare(
         &mut self,
@@ -608,6 +633,8 @@ impl CullState {
         camera: &Frustum,
         shadow: Option<&[Frustum; 2]>,
         eye: super::pipeline::EyeSplit,
+        clip: f32,
+        clip_v: f32,
         visible: &[u32],
         mut partitions: Vec<PartitionGpu>,
     ) -> Option<CullFrame> {
@@ -634,7 +661,8 @@ impl CullState {
             arena_count: dir.arena_count() as u32,
             shadow_enabled: shadow.is_some() as u32,
             flags: u32::from(face_cull),
-            _pad: [0; 2],
+            clip,
+            clip_v,
         };
         if let Some(frusta) = shadow {
             for (c, f) in frusta.iter().enumerate() {
@@ -1315,6 +1343,63 @@ mod tests {
         assert_eq!(STATS_COUNT, 6);
         assert_eq!(STATS_BYTES, 24);
         assert_eq!(FLAG_STATS, 1);
+    }
+
+    #[test]
+    fn cull_params_std140_tail_is_slab_extents() {
+        assert_eq!(size_of::<CullParamsGpu>(), 288);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, flags), 276);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, clip), 280);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, clip_v), 284);
+    }
+
+    #[test]
+    fn lod_aabb_inside_slab_matches_fragment_discard() {
+        // Fully inside: farthest xz = (3, 4) length 5 < 10; |y| = 2 < 8.
+        assert!(lod_aabb_inside_slab(
+            [-3.0, -2.0, -4.0],
+            [1.0, 2.0, 2.0],
+            10.0,
+            8.0
+        ));
+
+        // Straddling the circle: origin is inside, farthest (8, 8) length ~11.3 > 10.
+        assert!(!lod_aabb_inside_slab(
+            [-1.0, -1.0, -1.0],
+            [8.0, 1.0, 8.0],
+            10.0,
+            8.0
+        ));
+        // On the circle (6-8-10) is not strictly inside; skip only if farthest is inside.
+        assert!(!lod_aabb_inside_slab(
+            [0.0, -1.0, 0.0],
+            [6.0, 1.0, 8.0],
+            10.0,
+            8.0
+        ));
+
+        // Inside horizontally (length 5 < 10) but |y| = 9 is outside clip_v = 8.
+        assert!(!lod_aabb_inside_slab(
+            [-3.0, -9.0, -4.0],
+            [3.0, 1.0, 4.0],
+            10.0,
+            8.0
+        ));
+
+        // clip == 0 disables the fragment discard, so never skip.
+        assert!(!lod_aabb_inside_slab(
+            [-1.0, -1.0, -1.0],
+            [1.0, 1.0, 1.0],
+            0.0,
+            8.0
+        ));
+        // clip_v == 0 likewise (inside_v is then false in the fragment shader).
+        assert!(!lod_aabb_inside_slab(
+            [-1.0, -1.0, -1.0],
+            [1.0, 1.0, 1.0],
+            10.0,
+            0.0
+        ));
     }
 
     #[test]
