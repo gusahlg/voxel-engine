@@ -34,7 +34,7 @@ const FIRST_BLOCK_SIZE: u64 = 16 * 1024 * 1024;
 /// several seconds of sustained emptiness, so a block that briefly drains and
 /// refills (a player leaving and re-entering a region) is never released and
 /// then immediately recreated — the settling window is the anti-thrash guard.
-const DEVICE_SHRINK_SETTLE_TICKS: u32 = 300;
+pub(crate) const DEVICE_SHRINK_SETTLE_TICKS: u32 = 300;
 
 #[derive(Clone, Copy)]
 struct UnifiedMemory(bool);

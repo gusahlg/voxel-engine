@@ -162,10 +162,8 @@ impl Scene3D {
 
 /// CPU-side draw lists for one frame. Vec capacities persist across frames.
 ///
-/// `Clone` exists solely for deterministic capture ([`crate::screenshot_to`]):
-/// the last submitted lists are retained so the blocking capture can re-present
-/// the same scene until the readback PNG lands, rather than a blank frame.
-#[derive(Clone)]
+/// Blocking capture ([`crate::screenshot_to`]) re-presents the last completed
+/// pooled snapshot rather than cloning these lists every frame.
 pub(crate) struct DrawLists {
     pub clear: LinearRgb,
     /// `Some` for exactly the frames between `begin_3d` and the next `reset`;
