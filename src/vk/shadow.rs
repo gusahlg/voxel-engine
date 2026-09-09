@@ -214,8 +214,14 @@ pub(crate) struct ShadowCache {
     /// Inputs of the currently-cached generation; `None` forces a render.
     key: Option<ShadowKey>,
     /// Cascade UBO matching `key` (and the shadows-off lit-clear). Copied into
-    /// the recording slot's UBO on a hit so that path skips `fit()`.
+    /// a recording slot's UBO only when that slot does not already hold
+    /// [`Self::uniforms_gen`].
     uniforms: Option<CascadeUniformsGpu>,
+    /// Generation of `uniforms`. Bumped on [`Self::store_uniforms`]; 0 means
+    /// never stored. Lets each FIF slot skip the BAR memcpy when the cascade
+    /// block is unchanged (shadows-off after the lit-clear prime, or a cache
+    /// hit on a slot written since the last rebuild).
+    uniforms_gen: u64,
     /// Cascade fits computed once on a rebuild; consumed by uniforms + recording.
     fits: Option<PerCascade<CascadeFit>>,
     /// Shared map holds the fully-lit shadows-off clear.
@@ -229,6 +235,7 @@ impl ShadowCache {
         Self {
             key: None,
             uniforms: None,
+            uniforms_gen: 0,
             fits: None,
             lit_ready: false,
             pending_rebuild: true,
@@ -279,7 +286,15 @@ impl ShadowCache {
     }
 
     pub(crate) fn store_uniforms(&mut self, u: CascadeUniformsGpu) {
+        self.uniforms_gen = self.uniforms_gen.wrapping_add(1);
+        if self.uniforms_gen == 0 {
+            self.uniforms_gen = 1;
+        }
         self.uniforms = Some(u);
+    }
+
+    pub(crate) fn uniforms_gen(&self) -> u64 {
+        self.uniforms_gen
     }
 
     pub(crate) fn store_fits(&mut self, fits: PerCascade<CascadeFit>) {
@@ -305,6 +320,8 @@ pub(crate) struct ShadowPass {
     /// Depth-only caster for immediate `DebugVertex` boxes (player avatars).
     debug_pipeline: vk::Pipeline,
     ubo: [HostBuffer; FRAMES_IN_FLIGHT as usize],
+    /// [`ShadowCache::uniforms_gen`] last written into each slot's UBO.
+    slot_gen: [u64; FRAMES_IN_FLIGHT as usize],
 }
 
 impl ShadowPass {
@@ -349,6 +366,7 @@ impl ShadowPass {
             pipeline,
             debug_pipeline,
             ubo: std::array::from_fn(|_| make_ubo()),
+            slot_gen: [0; FRAMES_IN_FLIGHT as usize],
         }
     }
 
@@ -358,8 +376,14 @@ impl ShadowPass {
             .expect("the cascade UBO is written before any receiver binds it")
     }
 
-    pub(crate) fn write_uniforms(&mut self, slot: usize, u: &CascadeUniformsGpu) {
+    /// Copy `u` into `slot`'s mapped cascade UBO unless it already holds
+    /// generation `generation`. `generation` is [`ShadowCache::uniforms_gen`].
+    pub(crate) fn write_uniforms(&mut self, slot: usize, u: &CascadeUniformsGpu, generation: u64) {
+        if generation != 0 && self.slot_gen[slot] == generation {
+            return;
+        }
         unsafe { self.ubo[slot].write(0, bytemuck::bytes_of(u)) };
+        self.slot_gen[slot] = generation;
     }
 
     pub(crate) unsafe fn destroy(&mut self, device: &ash::Device) {
@@ -1040,5 +1064,24 @@ mod tests {
         assert!(!cache.prepare(None), "later off-path frames skip");
         cache.invalidate();
         assert!(cache.prepare(None), "recreate re-primes");
+    }
+
+    #[test]
+    fn store_uniforms_bumps_generation() {
+        let mut cache = ShadowCache::new();
+        assert_eq!(cache.uniforms_gen(), 0);
+        let u = <CascadeUniformsGpu as bytemuck::Zeroable>::zeroed();
+        cache.store_uniforms(u);
+        assert_eq!(cache.uniforms_gen(), 1);
+        cache.store_uniforms(u);
+        assert_eq!(cache.uniforms_gen(), 2);
+        cache.invalidate();
+        assert_eq!(
+            cache.uniforms_gen(),
+            2,
+            "invalidate drops the block, not the generation"
+        );
+        cache.store_uniforms(u);
+        assert_eq!(cache.uniforms_gen(), 3);
     }
 }

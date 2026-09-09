@@ -345,6 +345,12 @@ impl<'a> RenderPass<'a> {
 
     /// Pushes `layout_3d` descriptors only if a foreign pass disturbed them.
     /// Skips redundant pushes when adjacent mesh passes share state.
+    ///
+    /// `mesh3d` and `mesh3d_lod` share `layout_3d`, so one
+    /// `vkCmdPushDescriptorSetKHR` remains valid across both pipeline binds
+    /// (push-descriptor state is per compatible layout, not per pipeline).
+    /// Shadows-off still pushes the cascade UBO + shadow sampler: the layout
+    /// requires every binding; the skip is the host UBO memcpy, not this push.
     unsafe fn push_mesh3d_descriptors(&self) {
         if self.mesh_desc_bound.get() {
             return;

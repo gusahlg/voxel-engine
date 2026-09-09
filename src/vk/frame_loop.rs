@@ -1187,7 +1187,8 @@ impl Renderer {
                     .expect("pending rebuild stores fits in prepare_mesh_draws");
                 let cu = self.shadow_uniforms(&fits, &cfg);
                 self.shadow_cache.store_uniforms(cu);
-                self.shadow.write_uniforms(slot, &cu);
+                self.shadow
+                    .write_uniforms(slot, &cu, self.shadow_cache.uniforms_gen());
                 self.record_shadow_pass(cmd, slot, &fits, scene.eye, &cfg, caster_verts);
                 if profiling {
                     unsafe {
@@ -1199,8 +1200,10 @@ impl Renderer {
                     self.shadow_cache.mark_lit_ready();
                 }
             } else if let Some(cu) = self.shadow_cache.uniforms() {
-                // Hit: copy cached matrices into this slot's UBO, no `fit()`.
-                self.shadow.write_uniforms(slot, cu);
+                // Hit / shadows-off after prime: skip the BAR copy when this
+                // slot already holds the current cascade generation.
+                self.shadow
+                    .write_uniforms(slot, cu, self.shadow_cache.uniforms_gen());
             }
         }
 
