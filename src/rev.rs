@@ -23,10 +23,26 @@ impl Rev {
 /// 3 adds one frame of input-to-photon latency — negligible above 1000 FPS;
 /// with vsync on, the frame loop waits one slot earlier in
 /// `wait_slot_and_reclaim` so the effective depth stays 2 (a third in-flight
-/// frame would add a full refresh of latency). Tune here; every per-slot
-/// array and the main/render frame pool derive from this constant.
+/// frame would add a full refresh of latency). Must be at least
+/// [`SUBMIT_BATCH_MAX`] + 1 so an unpresented batch can sit unsubmitted
+/// without wrapping onto a slot whose command buffer is still pending.
+/// Tune here; every per-slot array and the main/render frame pool derive from
+/// this constant.
+///
+/// Each extra slot duplicates offscreen color and depth, the MSAA resolve
+/// target, bloom chain, spill, cloud LUT, VRS rate/history, cull output, UBO,
+/// immediates, and a primary command buffer. Raise only when
+/// [`SUBMIT_BATCH_MAX`] needs another slot of slack.
 pub const FRAMES_IN_FLIGHT: u64 = 3;
 const _: () = assert!(FRAMES_IN_FLIGHT >= 2);
+
+/// Max unpresented frames coalesced into one `vkQueueSubmit2` when vsync is
+/// off. Default 2; runtime `VOXEL_SUBMIT_BATCH` (1 = submit every frame, as
+/// before batching). A presented frame always submits on its own after any
+/// pending batch. [`FRAMES_IN_FLIGHT`] must cover a full batch plus the slot
+/// being recorded next.
+pub const SUBMIT_BATCH_MAX: usize = 2;
+const _: () = assert!(FRAMES_IN_FLIGHT as usize >= SUBMIT_BATCH_MAX + 1);
 
 /// Frame slot index in `0..FRAMES_IN_FLIGHT`; type-safe prevents raw-usize indexing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

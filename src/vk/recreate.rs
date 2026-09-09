@@ -19,12 +19,14 @@ impl Renderer {
     /// in-flight fences, flushes any staged mesh copies with a standalone
     /// submit, and frees the whole retire queue.
     pub(super) unsafe fn reclaim_while_idle(&mut self) {
+        self.flush_pending_submits();
         if !self.mesh_res.has_pending() && !self.mesh_res.has_garbage() {
             return;
         }
         let device = &self.device.device;
         unsafe {
-            // Wait for all in-flight submits to complete.
+            // Wait for all in-flight submits to complete. Pending batches
+            // were flushed above so `last_reserved` is a submitted value.
             self.timeline.wait(device, self.timeline.last_reserved());
             self.copy_slot = None;
 
@@ -96,6 +98,9 @@ impl Renderer {
 
     /// Applies pending vsync/MSAA changes and rebuilds swapchain-sized state.
     pub(super) unsafe fn apply_pending(&mut self) {
+        // Unsubmitted command buffers are invisible to `device_wait_idle`
+        // and would keep sampling images this rebuild destroys.
+        self.flush_pending_submits();
         unsafe {
             self.device
                 .device

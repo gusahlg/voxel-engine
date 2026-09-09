@@ -46,7 +46,7 @@ use crate::skeleton::{FrameSlot, PerSlot};
 use block_textures::BlockTextures;
 use buffers::{DrawIndexedIndirect, FRAMES_IN_FLIGHT, GpuResident, HostBuffer, MeshResidency};
 use device::Device;
-use frame_loop::{DrawEntry, DrawRun};
+use frame_loop::{DrawEntry, DrawRun, PendingSubmit};
 use gpu_timer::{GpuPipeStats, GpuTimer};
 use image::AllocError;
 use instance::InstanceBundle;
@@ -218,6 +218,10 @@ pub(crate) struct Renderer {
     /// Extra primary CBs for `empty_submit` > 1: `(K-1) * FRAMES_IN_FLIGHT`,
     /// indexed `slot * (K-1) + i`. The slot's usual `cmd` is the first of K.
     empty_extra: Box<[vk::CommandBuffer]>,
+    /// Uncapped unpresented frames waiting to share one `vkQueueSubmit2`.
+    pending_submits: Vec<PendingSubmit>,
+    /// Runtime batch limit (`VOXEL_SUBMIT_BATCH`, default [`crate::rev::SUBMIT_BATCH_MAX`]).
+    submit_batch_limit: usize,
 }
 
 impl Renderer {
@@ -540,6 +544,8 @@ impl Renderer {
             pipe_stats,
             empty_submit,
             empty_extra,
+            pending_submits: Vec::with_capacity(crate::rev::SUBMIT_BATCH_MAX),
+            submit_batch_limit: frame_loop::submit_batch_limit(),
         };
         Ok((renderer, reply))
     }
@@ -658,6 +664,9 @@ impl Renderer {
 
     /// Retire a freed mesh resident.
     pub(crate) fn apply_free_mesh(&mut self, slot: u32, generation: NonZeroU32) {
+        // Pending frames may still draw this mesh; submit them so
+        // `last_render_value` covers the batch before the free is stamped.
+        self.flush_pending_submits();
         self.arena_dir.note_free(slot, generation);
         self.records.clear_arena(slot);
         self.mesh_res
@@ -689,6 +698,9 @@ impl Renderer {
 
     /// Replace block texture array; old one retired through timeline.
     pub fn set_block_textures(&mut self, size: u32, layers: &[Vec<u8>]) {
+        // Pending frames sample the old array; submit them so `last_reserved`
+        // is a value the GPU will actually signal.
+        self.flush_pending_submits();
         // Clamp to device's max image array layers.
         let cap = self.device.max_image_array_layers as usize;
         let layers = if layers.len() > cap {
@@ -737,6 +749,7 @@ impl Renderer {
     /// buffers and then `vkDestroyDevice` in the correct order. Consuming `self`
     /// (rather than `Drop`) is what lets those fields move out to main.
     pub(crate) fn teardown(mut self) -> DeviceLeftovers {
+        self.flush_pending_submits();
         unsafe {
             let device = &self.device.device;
             let _ = device.device_wait_idle();

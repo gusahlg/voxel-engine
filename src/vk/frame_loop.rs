@@ -8,14 +8,16 @@ use crate::frame::DrawLists;
 use crate::mesh::Pass;
 use crate::skeleton::FrameSlot;
 
-use super::buffers::{DrawIndexedIndirect, FRAMES_IN_FLIGHT, MESH_CONSUMER_STAGES};
+use super::buffers::{
+    DrawIndexedIndirect, FRAMES_IN_FLIGHT, MESH_CONSUMER_STAGES, SUBMIT_BATCH_MAX,
+};
 use super::gpu_timer::{GpuPass, PipeStatPass};
 use super::pipeline;
 use super::present::{HdrReadable, OverlayPresent};
 use super::render_client::RenderReturn;
 use super::scene_pass::RenderPass;
 use super::shadow;
-use super::timeline::{RenderSubmit, acquire_next_image};
+use super::timeline::{RenderSubmit, TimelineValue, acquire_next_image};
 use super::{
     Env, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, depth_range, sampleable_depth_attachment_state,
 };
@@ -72,6 +74,61 @@ pub(super) struct DrawRun {
     pub(super) pass: Pass,
     pub(super) first: u32,
     pub(super) count: u32,
+}
+
+/// Recorded but not yet submitted: one entry per deferred unpresented frame.
+pub(super) struct PendingSubmit {
+    slot: usize,
+    cmd: vk::CommandBuffer,
+    extra_wait: Option<TimelineValue>,
+    /// Value reserved by `begin_render`; the batch signals the last entry's.
+    signal: TimelineValue,
+}
+
+/// Whether the just-recorded frame may join the pending batch (`Defer`) or
+/// must be submitted this call (`Flush`). `pending_count` includes the current
+/// frame. A presented / vsync-on frame always `Flush`es (the caller submits
+/// any already-pending batch first, then this frame on its own).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitBatchAction {
+    Defer,
+    Flush,
+}
+
+fn submit_batch_action(
+    uncapped: bool,
+    present: bool,
+    pending_count: usize,
+    limit: usize,
+) -> SubmitBatchAction {
+    if !uncapped || present || pending_count >= limit {
+        SubmitBatchAction::Flush
+    } else {
+        SubmitBatchAction::Defer
+    }
+}
+
+/// True when `wait_slot` still has an unsubmitted command buffer. Waiting
+/// then would block on a value that has not been queued (or, if `render_value`
+/// was left at the slot's previous use, return immediately and reset a CB
+/// still in the pending list).
+fn pending_blocks_wait(pending_slots: impl IntoIterator<Item = usize>, wait_slot: usize) -> bool {
+    pending_slots.into_iter().any(|s| s == wait_slot)
+}
+
+/// `VOXEL_SUBMIT_BATCH` (integer ≥ 1): command buffers per `vkQueueSubmit2`
+/// for unpresented uncapped frames. Unset uses [`SUBMIT_BATCH_MAX`]. Clamped
+/// to `1..=FRAMES_IN_FLIGHT-1` so the ring always has a free slot. Read once
+/// at renderer creation.
+pub(super) fn submit_batch_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let parsed = std::env::var("VOXEL_SUBMIT_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(SUBMIT_BATCH_MAX);
+        parsed.clamp(1, FRAMES_IN_FLIGHT as usize - 1)
+    })
 }
 
 /// Applies sub-pixel jitter to the view-proj matrix. Jitter only exists at
@@ -159,7 +216,8 @@ impl Renderer {
     /// 2. [`Self::decide_present`]        — copy-fence check + acquire
     /// 3. [`Self::write_immediates`]      — pack cube/line/2D verts
     /// 4. [`Self::record_render`]         — barriers, rendering, draws
-    /// 5. [`Self::submit_render`]         — render queue submit (fence)
+    /// 5. [`Self::submit_or_defer`]       — render queue submit, or defer into
+    ///    a pending batch (uncapped, unpresented frames only)
     /// 6. [`Self::present`]               — copy submit + queue_present
     pub(crate) fn draw_frame(&mut self, lists: &DrawLists) {
         let size = self.size;
@@ -282,7 +340,11 @@ impl Renderer {
 
         {
             let _p = scope(Meter::Submit);
-            self.submit_render(rs, slot);
+            self.submit_or_defer(
+                rs,
+                slot,
+                present_target.is_some() || self.needs_recreate || self.pending_capture.is_some(),
+            );
         }
 
         {
@@ -380,6 +442,7 @@ impl Renderer {
             };
             self.slots[FrameSlot::new(slot)].render_value = completion.value();
             self.last_render_value = completion.value();
+            crate::profile::count(crate::profile::Counter::Submits);
         }
         self.slot = (self.slot + 1) % FRAMES_IN_FLIGHT as usize;
     }
@@ -457,13 +520,32 @@ impl Renderer {
     ///
     /// With vsync on, waits [`reclaim_wait_slot`] (one slot earlier than the
     /// reuse target) so the effective in-flight depth stays 2.
+    ///
+    /// Flushes a still-pending batch that occupies `slot` before waiting:
+    /// the wait must never target a timeline value that has not been submitted,
+    /// and a deferred frame's host-visible slot (uniforms, cull buffers, query
+    /// readback) must not be overwritten until its batch signals.
     fn wait_slot_and_reclaim(&mut self, slot: usize) {
+        let vsync = self.vsync.current();
+        let wait_slot = reclaim_wait_slot(slot, vsync);
+        // Never wait on a timeline value that has not been submitted: if this
+        // slot (or the vsync wait-slot) is still in the pending batch, flush
+        // first. With `FRAMES_IN_FLIGHT >= SUBMIT_BATCH_MAX + 1` this is a
+        // safety net, not the steady-state path.
+        if pending_blocks_wait(self.pending_submits.iter().map(|p| p.slot), wait_slot)
+            || pending_blocks_wait(self.pending_submits.iter().map(|p| p.slot), slot)
+        {
+            self.flush_pending_submits();
+        }
+        assert!(
+            !pending_blocks_wait(self.pending_submits.iter().map(|p| p.slot), wait_slot),
+            "wait_slot_and_reclaim must not wait on an unsubmitted frame"
+        );
         let device = &self.device.device;
         unsafe {
             {
                 let _p = crate::profile::scope(crate::profile::Meter::Fence);
-                let vsync = self.vsync.current();
-                let value = self.slots[FrameSlot::new(reclaim_wait_slot(slot, vsync))].render_value;
+                let value = self.slots[FrameSlot::new(wait_slot)].render_value;
                 if vsync {
                     self.timeline.wait(device, value);
                 } else {
@@ -1341,35 +1423,86 @@ impl Renderer {
         self.slots[FrameSlot::new(slot)].vrs_history = true;
     }
 
-    /// Submits the recorded command buffer and advances the timeline. Waits
-    /// on the transfer lane at [`MESH_CONSUMER_STAGES`] when last frame's
-    /// deferred mesh copies and/or this frame's `quad_ibo.ensure` submitted
-    /// on a separate queue — a cross-queue dependency needs a semaphore wait;
-    /// the in-command-buffer barrier used otherwise only orders work within
-    /// one queue. The wait is vertex/index fetch (including the shadow
-    /// cascades), not `ALL_COMMANDS`, so cull/clears/sky/post can overlap
-    /// the copy.
-    fn submit_render(&mut self, rs: RenderSubmit, slot: usize) {
+    /// Submits the recorded command buffer, or defers it into the pending
+    /// batch. Uncapped unpresented frames join the batch until it reaches
+    /// the runtime limit (`VOXEL_SUBMIT_BATCH`) or a flush condition. A
+    /// presented / recreate / vsync-on frame flushes any pending batch first,
+    /// then submits on its own (batch-size-1 semantics).
+    ///
+    /// Transfer-lane waits captured at record time ride the submit that
+    /// actually queues the command buffer: a batch waits on the max value
+    /// among its frames.
+    fn submit_or_defer(&mut self, rs: RenderSubmit, slot: usize, present: bool) {
+        let extra_wait = self.pending_transfer_wait.take();
+        let uncapped = !self.vsync.current();
+        // Presented / recreate / vsync: pending batch first, then this frame
+        // alone. `submit_batch_action` returns Flush for these, so the second
+        // flush submits the just-pushed frame as its own `vkQueueSubmit2`.
+        if present || !uncapped {
+            self.flush_pending_submits();
+        }
+        let (signal, cmd) = rs.into_parts();
+        self.pending_submits.push(PendingSubmit {
+            slot,
+            cmd,
+            extra_wait,
+            signal,
+        });
+        if submit_batch_action(
+            uncapped,
+            present,
+            self.pending_submits.len(),
+            self.submit_batch_limit,
+        ) == SubmitBatchAction::Flush
+        {
+            self.flush_pending_submits();
+        }
+    }
+
+    /// One `vkQueueSubmit2` for every pending command buffer, in frame order,
+    /// with a single timeline signal at the last frame's reserved value.
+    /// Every slot in the batch records that value as `render_value`, so
+    /// reclamation waits for the whole batch. No-op when the list is empty.
+    pub(super) fn flush_pending_submits(&mut self) {
+        if self.pending_submits.is_empty() {
+            return;
+        }
         let extra_wait = self
-            .pending_transfer_wait
-            .take()
+            .pending_submits
+            .iter()
+            .filter_map(|p| p.extra_wait)
+            .max()
             .map(|value| (self.transfer_lane.semaphore(), value, MESH_CONSUMER_STAGES));
+        let signal = self
+            .pending_submits
+            .last()
+            .expect("non-empty pending batch")
+            .signal;
+        let cmds: Vec<vk::CommandBuffer> = self.pending_submits.iter().map(|p| p.cmd).collect();
         let completion = unsafe {
-            rs.submit(
+            self.timeline.submit_render(
                 &self.device.device,
                 self.device.graphics_queue,
-                &self.timeline,
+                &cmds,
+                signal,
                 extra_wait,
             )
         };
-        self.slots[FrameSlot::new(slot)].render_value = completion.value();
-        self.last_render_value = completion.value();
+        crate::profile::count(crate::profile::Counter::Submits);
+        let done = completion.value();
+        for p in self.pending_submits.drain(..) {
+            self.slots[FrameSlot::new(p.slot)].render_value = done;
+        }
+        self.last_render_value = done;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FRAMES_IN_FLIGHT, reclaim_wait_slot};
+    use super::{
+        FRAMES_IN_FLIGHT, SUBMIT_BATCH_MAX, SubmitBatchAction, pending_blocks_wait,
+        reclaim_wait_slot, submit_batch_action,
+    };
 
     #[test]
     fn reclaim_wait_slot_stays_at_two_deep_when_vsync() {
@@ -1385,5 +1518,119 @@ mod tests {
                 (slot + FRAMES_IN_FLIGHT as usize - 2) % FRAMES_IN_FLIGHT as usize
             );
         }
+    }
+
+    #[test]
+    fn submit_batch_action_defers_uncapped_unpresented_until_limit() {
+        let limit = SUBMIT_BATCH_MAX;
+        assert_eq!(
+            submit_batch_action(true, false, 1, limit),
+            SubmitBatchAction::Defer,
+            "first unpresented frame of a batch of {limit} must defer"
+        );
+        assert_eq!(
+            submit_batch_action(true, false, limit, limit),
+            SubmitBatchAction::Flush,
+            "reaching the limit must flush"
+        );
+        assert_eq!(
+            submit_batch_action(true, false, limit + 1, limit),
+            SubmitBatchAction::Flush
+        );
+    }
+
+    #[test]
+    fn submit_batch_action_flush_when_presented_or_capped_or_limit_one() {
+        assert_eq!(
+            submit_batch_action(true, true, 1, 2),
+            SubmitBatchAction::Flush,
+            "a presented frame never joins a batch"
+        );
+        assert_eq!(
+            submit_batch_action(false, false, 1, 2),
+            SubmitBatchAction::Flush,
+            "vsync/capped is batch-size-1"
+        );
+        assert_eq!(
+            submit_batch_action(true, false, 1, 1),
+            SubmitBatchAction::Flush,
+            "VOXEL_SUBMIT_BATCH=1 is today's per-frame submit"
+        );
+    }
+
+    #[test]
+    fn fif_covers_a_full_batch_plus_the_slot_being_recorded() {
+        assert!(FRAMES_IN_FLIGHT as usize >= SUBMIT_BATCH_MAX + 1);
+    }
+
+    /// Walk the slot ring under the production defer/flush rules. The next
+    /// slot to record must not still be in the pending list — otherwise
+    /// `wait_slot_and_reclaim` would wait on a value that has not been
+    /// submitted (or, worse, on the slot's previous already-signalled value
+    /// and reset an unsubmitted command buffer).
+    fn simulate_ring(uncapped: bool, limit: usize, present: impl Fn(usize) -> bool) {
+        let fif = FRAMES_IN_FLIGHT as usize;
+        let mut pending: Vec<usize> = Vec::new();
+        let mut slot = 0usize;
+        for i in 0..64 {
+            let will_present = present(i);
+            assert!(
+                !pending_blocks_wait(pending.iter().copied(), slot),
+                "slot {slot} still pending at reuse (frame {i}, pending {pending:?}); \
+                 FRAMES_IN_FLIGHT must be SUBMIT_BATCH_MAX + 1"
+            );
+            if will_present || !uncapped {
+                pending.clear();
+            }
+            pending.push(slot);
+            if submit_batch_action(uncapped, will_present, pending.len(), limit)
+                == SubmitBatchAction::Flush
+            {
+                pending.clear();
+            }
+            slot = (slot + 1) % fif;
+        }
+    }
+
+    #[test]
+    fn slot_ring_stays_available_under_uncapped_batching() {
+        simulate_ring(true, SUBMIT_BATCH_MAX, |i| i % 5 == 0);
+        simulate_ring(true, SUBMIT_BATCH_MAX, |_| false);
+        simulate_ring(true, 1, |_| false);
+        simulate_ring(false, SUBMIT_BATCH_MAX, |_| false);
+        simulate_ring(true, SUBMIT_BATCH_MAX, |_| true);
+    }
+
+    #[test]
+    fn pending_slot_is_not_available_until_flushed() {
+        assert!(!pending_blocks_wait(std::iter::empty(), 0));
+        assert!(pending_blocks_wait([0], 0));
+        assert!(!pending_blocks_wait([0], 1));
+        assert!(pending_blocks_wait([0, 1], 1));
+        // The wait-path flush: once the blocking slot is submitted, reuse is
+        // legal (the subsequent timeline wait covers the batch signal).
+        let mut pending = vec![0, 1];
+        assert!(pending_blocks_wait(pending.iter().copied(), 0));
+        pending.clear();
+        assert!(!pending_blocks_wait(pending.iter().copied(), 0));
+    }
+
+    #[test]
+    fn a_pending_batch_as_large_as_the_ring_occupies_the_next_slot() {
+        // Why FRAMES_IN_FLIGHT >= SUBMIT_BATCH_MAX + 1: a pending list of FIF
+        // frames would occupy the slot about to be reused, and the wait path
+        // would have to flush before waiting (the safety net in
+        // `wait_slot_and_reclaim`). The extra slot keeps that path cold.
+        let fif = FRAMES_IN_FLIGHT as usize;
+        let pending: Vec<usize> = (0..fif).collect();
+        assert!(
+            pending_blocks_wait(pending.iter().copied(), 0),
+            "reusing slot 0 while it is still pending is illegal"
+        );
+        let slack: Vec<usize> = (0..fif - 1).collect();
+        assert!(
+            !pending_blocks_wait(slack.iter().copied(), fif - 1),
+            "a batch of FIF-1 leaves the next ring slot free"
+        );
     }
 }

@@ -456,10 +456,14 @@ pub enum Counter {
     Presented,
     /// Queued game frames dropped by the render loop (kept only the newest).
     Coalesced,
+    /// Render `vkQueueSubmit2` calls (a batched submit of N command buffers
+    /// counts as one). Compared with [`Self::Rendered`] this is how much
+    /// uncapped submission batching coalesced.
+    Submits,
 }
 
 impl Counter {
-    const COUNT: usize = 3;
+    const COUNT: usize = 4;
 }
 
 static COUNTERS: [AtomicU64; Counter::COUNT] = [const { AtomicU64::new(0) }; Counter::COUNT];
@@ -662,6 +666,7 @@ fn report(frames: u64) {
     let rendered = COUNTERS[Counter::Rendered as usize].swap(0, Ordering::Relaxed);
     let presented = COUNTERS[Counter::Presented as usize].swap(0, Ordering::Relaxed);
     let coalesced = COUNTERS[Counter::Coalesced as usize].swap(0, Ordering::Relaxed);
+    let submits = COUNTERS[Counter::Submits as usize].swap(0, Ordering::Relaxed);
     // GPU meters are per RENDERED frame (the render thread may coalesce);
     // without a rendered count (no timestamps, minimized) fall back to frames.
     let gpu_f = if rendered > 0 { rendered as f64 } else { f };
@@ -732,7 +737,7 @@ fn report(frames: u64) {
         header.push_str(&format!(" idle {:.0}%", idle * 100.0));
     }
     header.push_str(&format!(
-        " work {:.2} | rendered {rendered} coalesced {coalesced} presented {presented}",
+        " work {:.2} | rendered {rendered} coalesced {coalesced} submits {submits} presented {presented}",
         tier_total(Tier::Workers),
     ));
     // `eprintln!`, not `log::info!`: `VOXEL_PROFILE` is an explicit opt-in, so
@@ -878,6 +883,15 @@ fn is_substage(m: Meter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_submits_is_the_fourth_window_count() {
+        assert_eq!(Counter::Rendered as usize, 0);
+        assert_eq!(Counter::Presented as usize, 1);
+        assert_eq!(Counter::Coalesced as usize, 2);
+        assert_eq!(Counter::Submits as usize, 3);
+        assert_eq!(Counter::COUNT, 4);
+    }
 
     #[test]
     fn gauge_ordinals_index_all_in_order() {

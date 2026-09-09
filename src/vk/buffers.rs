@@ -43,7 +43,7 @@ const _: () = {
     assert!(MESH_ALIGN % std::mem::size_of::<crate::mesh::MeshVertex>() as u64 == 0);
     assert!(MESH_ALIGN % GPU_OFFSET_ALIGN == 0);
 };
-pub use crate::rev::FRAMES_IN_FLIGHT;
+pub use crate::rev::{FRAMES_IN_FLIGHT, SUBMIT_BATCH_MAX};
 
 /// A deferred-reclaim queue: items stamped with their last possible GPU use.
 /// [`collect`](Self::collect) only reclaims items the GPU has provably passed.
