@@ -116,6 +116,8 @@ pub const FRAME_UNIFORMS_VERSION: u32 = 6;
 /// so raw-usize slot confusion is inexpressible here.
 pub(crate) struct UboRing {
     bufs: PerSlot<HostBuffer>,
+    last: PerSlot<Option<FrameUniformsExt>>,
+    last_gpu: PerSlot<Option<FrameUniformsGpu>>,
 }
 
 impl UboRing {
@@ -138,6 +140,8 @@ impl UboRing {
         };
         Self {
             bufs: PerSlot::new(std::array::from_fn(|_| make())),
+            last: PerSlot::new(std::array::from_fn(|_| None)),
+            last_gpu: PerSlot::new(std::array::from_fn(|_| None)),
         }
     }
 
@@ -145,9 +149,24 @@ impl UboRing {
     /// into `slot`'s mapped buffer. Coherent memory: the write is visible to
     /// the GPU with no explicit flush. `prepare_derived` runs once on the
     /// producer (begin_3d / full_bright); `FrameUniformsExt::derive` runs once
-    /// on the render thread before this write.
+    /// on the render thread before this write. Identical bytes for this slot
+    /// skip the map write.
     pub(crate) fn write(&mut self, slot: FrameSlot, ext: &FrameUniformsExt) {
+        if self.last[slot].as_ref() == Some(ext) {
+            return;
+        }
         unsafe { self.bufs[slot].write(0, bytemuck::bytes_of(ext)) };
+        self.last[slot] = Some(*ext);
+    }
+
+    /// Derive the engine tail and write, skipping both when this slot already
+    /// holds `u` (sky/lighting-dependent work independent of jittered view-proj).
+    pub(crate) fn write_from_gpu(&mut self, slot: FrameSlot, u: FrameUniformsGpu) {
+        if self.last_gpu[slot] == Some(u) {
+            return;
+        }
+        self.write(slot, &FrameUniformsExt::derive(u));
+        self.last_gpu[slot] = Some(u);
     }
 
     /// The buffer bound at set 0, binding 2 for `slot`. The per-frame UBO is

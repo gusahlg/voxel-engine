@@ -18,7 +18,7 @@ use crate::vk::uniforms::FrameUniformsGpu;
 /// `FrameUniforms` UBO, the SAME linear source the terrain fog reads, so the two
 /// can never diverge (one source of truth for sky data). The engine adds the inverse
 /// view-projection at record time, so the app never touches a matrix.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct SkyDesc {
     pub sun_dir: Vec3,
     /// Linear disc/glow tint (no OETF on this path); the analytic sun disc adds
@@ -30,7 +30,7 @@ pub struct SkyDesc {
 }
 
 /// Full-res coverage slab. Use the same value for both streaming and LOD culling.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct CoverageVolume {
     pub radius: f32,
     pub half_height: f32,
@@ -255,8 +255,33 @@ impl<'e> Frame<'e> {
             JitterOffset::ZERO
         };
         let frame_uniforms = match light {
-            Lighting::Composed(u) => gate_uniforms(&self.eng.flags, u),
-            Lighting::FullBright => FrameUniformsGpu::full_bright(),
+            Lighting::Composed(u) => {
+                if self.eng.last_composed == Some(u) && self.eng.last_gate_flags == self.eng.flags {
+                    self.eng
+                        .last_gated
+                        .expect("gated uniforms cached with last_composed")
+                } else {
+                    let gated = gate_uniforms(&self.eng.flags, u);
+                    self.eng.last_composed = Some(u);
+                    self.eng.last_gate_flags = self.eng.flags;
+                    self.eng.last_gated = Some(gated);
+                    gated
+                }
+            }
+            Lighting::FullBright => {
+                if self.eng.last_composed.is_none()
+                    && self.eng.last_gated.is_some()
+                    && self.eng.last_gate_flags == self.eng.flags
+                {
+                    self.eng.last_gated.expect("full-bright uniforms cached")
+                } else {
+                    let gated = FrameUniformsGpu::full_bright();
+                    self.eng.last_composed = None;
+                    self.eng.last_gate_flags = self.eng.flags;
+                    self.eng.last_gated = Some(gated);
+                    gated
+                }
+            }
         };
         self.eng.lists.scene = Some(Scene3D {
             view_proj,
@@ -389,8 +414,14 @@ pub struct Frame3D<'f, 'e> {
 impl Frame3D<'_, '_> {
     /// Sets chunk→LOD slab extents. Must equal the streamed full-res volume.
     pub fn set_lod_clip(&mut self, v: CoverageVolume) {
-        self.frame.eng.lists.lod_clip = v.radius.max(0.0);
-        self.frame.eng.lists.lod_clip_v = v.half_height.max(0.0);
+        let radius = v.radius.max(0.0);
+        let half_height = v.half_height.max(0.0);
+        if self.frame.eng.lists.lod_clip == radius && self.frame.eng.lists.lod_clip_v == half_height
+        {
+            return;
+        }
+        self.frame.eng.lists.lod_clip = radius;
+        self.frame.eng.lists.lod_clip_v = half_height;
     }
 
     /// Sets the procedural sky drawn behind this frame's geometry. The
@@ -398,6 +429,9 @@ impl Frame3D<'_, '_> {
     /// reversed-Z depth trick), so it is near-free. Call once inside the
     /// `begin_3d` scope; leaving it unset shows the flat clear colour.
     pub fn set_sky(&mut self, desc: SkyDesc) {
+        if self.frame.eng.lists.sky == Some(desc) {
+            return;
+        }
         self.frame.eng.lists.sky = Some(desc);
     }
 

@@ -314,10 +314,7 @@ impl Renderer {
                     1.0,
                 ];
             }
-            self.ubo_ring.write(
-                FrameSlot::new(slot),
-                &super::uniforms::FrameUniformsExt::derive(u),
-            );
+            self.ubo_ring.write_from_gpu(FrameSlot::new(slot), u);
         }
         let warp_map = lists
             .scene

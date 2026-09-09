@@ -1361,7 +1361,7 @@ fn emit_rust_uniforms(public: &[Lane], derived: &[Lane]) -> String {
     s.push_str("/// Constructed ONLY via the game crate's `From<&FrameSnapshot>` impl.\n");
     s.push_str("/// Engine-derived extra lanes live on [`FrameUniformsExt`], not here.\n");
     s.push_str("#[repr(C)]\n");
-    s.push_str("#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]\n");
+    s.push_str("#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]\n");
     s.push_str("pub struct FrameUniformsGpu {\n");
     for l in public {
         doc_lines(l.doc, "    /// ", &mut s);
@@ -1383,7 +1383,7 @@ fn emit_rust_uniforms(public: &[Lane], derived: &[Lane]) -> String {
     s.push_str("/// GPU UBO: public [`FrameUniformsGpu`] plus the engine-derived tail.\n");
     s.push_str("/// The game still writes `FrameUniformsGpu`; the renderer appends the rest.\n");
     s.push_str("#[repr(C)]\n");
-    s.push_str("#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]\n");
+    s.push_str("#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]\n");
     s.push_str("pub(crate) struct FrameUniformsExt {\n");
     s.push_str("    /// Public per-frame lanes the game wrote.\n");
     s.push_str("    pub base: FrameUniformsGpu,\n");
