@@ -1,6 +1,6 @@
 /// The Vulkan renderer: instance, device, swapchain, render targets, pipelines,
 /// GPU memory, and frame loop. Vulkan 1.3 with dynamic rendering + synchronization2;
-/// 2 frames in flight; reversed-Z depth; optional MSAA with resolve.
+/// `FRAMES_IN_FLIGHT` command buffers in flight; reversed-Z depth; optional MSAA with resolve.
 ///
 /// Rendering and presentation decouple: frames render into offscreen images and
 /// present only when a swapchain image is available (mailbox). On macOS, vsync

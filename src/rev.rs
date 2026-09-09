@@ -14,19 +14,33 @@ impl Rev {
     }
 }
 
-/// Frame slot index (0 or 1); type-safe prevents raw-usize indexing.
+/// GPU command-buffer / per-slot resource ring depth.
+///
+/// 3 pipelines the submit-to-completion round trip (doorbell + scheduling,
+/// ~10 µs on an RTX 3070) behind the previous frame's execution. With 2 slots
+/// every frame waits for N−1 before recording N+1, so that latency sits on
+/// the critical path and tiny frames cannot exceed ~1 / (GPU work + submit).
+/// 3 adds one frame of input-to-photon latency — negligible above 1000 FPS;
+/// with vsync on, the frame loop waits one slot earlier in
+/// `wait_slot_and_reclaim` so the effective depth stays 2 (a third in-flight
+/// frame would add a full refresh of latency). Tune here; every per-slot
+/// array and the main/render frame pool derive from this constant.
+pub const FRAMES_IN_FLIGHT: u64 = 3;
+const _: () = assert!(FRAMES_IN_FLIGHT >= 2);
+
+/// Frame slot index in `0..FRAMES_IN_FLIGHT`; type-safe prevents raw-usize indexing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FrameSlot(u8);
 
 impl FrameSlot {
-    /// The other frame (2FIF: exactly two slots).
+    /// Next slot in the in-flight ring (historically "the other" of two slots).
     #[must_use]
     pub fn other(self) -> FrameSlot {
-        FrameSlot(1 - self.0)
+        FrameSlot((self.0 + 1) % FRAMES_IN_FLIGHT as u8)
     }
     /// Crate-internal: create a slot from index.
     pub(crate) fn new(index: usize) -> FrameSlot {
-        debug_assert!(index < 2);
+        debug_assert!(index < FRAMES_IN_FLIGHT as usize);
         FrameSlot(index as u8)
     }
     pub(crate) fn index(self) -> usize {
@@ -35,17 +49,22 @@ impl FrameSlot {
 }
 
 /// Per-frame-in-flight resources, indexable only by FrameSlot (no usize impl).
-pub struct PerSlot<T>([T; 2]);
+pub struct PerSlot<T>([T; FRAMES_IN_FLIGHT as usize]);
 
 impl<T> PerSlot<T> {
-    pub fn new(pair: [T; 2]) -> Self {
-        PerSlot(pair)
+    pub fn new(slots: [T; FRAMES_IN_FLIGHT as usize]) -> Self {
+        PerSlot(slots)
     }
 
-    /// Iterate both frames for lifecycle passes.
+    /// Iterate every in-flight slot for lifecycle passes.
     #[allow(dead_code)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
         self.0.iter()
+    }
+
+    /// Mutable iterate every in-flight slot for teardown.
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.0.iter_mut()
     }
 }
 
@@ -156,11 +175,22 @@ mod tests {
         assert_eq!(a.max(b), b);
     }
 
-    /// Parity resolver is its own inverse and never aliases.
+    /// The ring walk visits every slot once and returns to the start.
     #[test]
-    fn frame_slot_other_is_involution() {
-        let a = FrameSlot::new(0);
-        assert_eq!(a.other().other(), a);
-        assert_ne!(a.other(), a);
+    fn frame_slot_other_walks_the_ring() {
+        let start = FrameSlot::new(0);
+        let mut s = start;
+        let mut seen = [false; FRAMES_IN_FLIGHT as usize];
+        for _ in 0..FRAMES_IN_FLIGHT {
+            assert!(
+                !seen[s.index()],
+                "ring must not repeat a slot before wrapping"
+            );
+            seen[s.index()] = true;
+            s = s.other();
+        }
+        assert_eq!(s, start);
+        assert!(seen.iter().all(|&v| v));
+        assert_ne!(start.other(), start);
     }
 }

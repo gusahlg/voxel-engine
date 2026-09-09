@@ -121,11 +121,11 @@ const QUERY_COUNT: u32 = COPY_STAMP_BASE + 2;
 /// after each recorded pass. Only the passes that actually run write a stamp,
 /// and the label written alongside each stamp keeps deltas attributable even
 /// when a frame skips passes (no 3D, VRS off). A slot's results are read one
-/// cycle later, after its fence is waited, so the read never stalls — and
-/// because that wait is in render order, consecutive `read_into` calls are
-/// consecutive rendered frames (possibly different slots). Their timestamps
-/// share the device clock, so `start(N) - end(N-1)` is the idle gap before
-/// this submit.
+/// reuse cycle later (`FRAMES_IN_FLIGHT` frames), after its fence is waited, so
+/// the read never stalls — and because that wait is in render order, consecutive
+/// `read_into` calls are consecutive rendered frames (possibly different slots).
+/// Their timestamps share the device clock, so `start(N) - end(N-1)` is the idle
+/// gap before this submit.
 ///
 /// `count`/`label` are [`Cell`]s so a mark needs only `&self`: the render pass
 /// holds an immutable `&Renderer` while recording, and all timer state is

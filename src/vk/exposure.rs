@@ -80,7 +80,7 @@ struct ExposurePush {
     tiles: [u32; 2],
 }
 
-// Double-buffered tile-mean buffers for per-slot GPU readback.
+// Per-slot tile-mean buffers for GPU readback (one host-visible buffer per FIF slot).
 
 /// One slot's host-visible, persistently-mapped tile-mean buffer (mean log2
 /// luma per tile). Host-coherent so no flush/invalidate is needed on readback.
@@ -155,16 +155,16 @@ impl TileMeans {
     }
 }
 
-/// Fence-safe double-buffered exposure readback: read last frame, write this frame from same slot.
+/// Fence-safe per-slot exposure readback: read this slot's previous write, then overwrite it.
 pub struct ExposureRing {
     slots: [TileMeans; FRAMES_IN_FLIGHT as usize],
     tile_count: usize,
 }
 
-/// The slot-index parity rule as a pure `(write, read)` mapping — extracted so
+/// The slot-index rule as a pure `(write, read)` mapping — extracted so
 /// the fence-safety argument is unit-testable without a device: the read index
 /// must name a buffer whose last GPU write is fence-proven complete, and the
-/// only such buffer under 2-frames-in-flight is the waited slot's own.
+/// only such buffer is the waited slot's own (written `FRAMES_IN_FLIGHT` frames ago).
 fn slot_parity(waited: FrameSlot) -> (usize, usize) {
     (waited.index(), waited.index())
 }
@@ -181,8 +181,8 @@ impl ExposureRing {
         }
     }
 
-    /// The parity resolver: the CPU reads the waited slot's buffer (its value
-    /// is from the frame two-back, fence-proven), then the compute pass
+    /// The slot resolver: the CPU reads the waited slot's buffer (its value
+    /// is from the frame `FRAMES_IN_FLIGHT`-back, fence-proven), then the compute pass
     /// overwrites that same buffer. Baked HERE so no call site can mix views.
     pub fn views(&self, s: FrameSlot) -> (ExposureWrite<'_>, ExposureRead<'_>) {
         let (write, read) = slot_parity(s);
@@ -447,7 +447,7 @@ impl super::Renderer {
         let (hdr_image, hdr_view) = self.hdr_of(slot.index());
         let exp = &mut self.exposure;
 
-        // Parity resolver: read the waited slot's buffer (frame N-2's result,
+        // Slot resolver: read the waited slot's buffer (frame N−FIF's result,
         // fence-proven), then let this frame's dispatch overwrite it.
         let now = std::time::Instant::now();
         let dt = now.duration_since(exp.last).as_secs_f32();
@@ -572,14 +572,15 @@ mod tests {
     use super::*;
 
     /// The fence-safety argument for the readback, as a pure timeline model:
-    /// frame `i` records on slot `i % 2` after waiting THAT slot's fence, so
-    /// the only buffer whose last GPU write is provably complete is the waited
-    /// slot's own (written by frame `i - 2`). Reading any buffer written more
-    /// recently — the old `s.other()` rule read frame `i - 1`'s — races an
-    /// in-flight dispatch.
+    /// frame `i` records on slot `i % FRAMES_IN_FLIGHT` after waiting THAT slot's
+    /// fence, so the only buffer whose last GPU write is provably complete is
+    /// the waited slot's own (written by frame `i - FRAMES_IN_FLIGHT`). Reading
+    /// any buffer written more recently — the old `s.other()` rule under 2 FIF
+    /// read frame `i - 1`'s — races an in-flight dispatch.
     #[test]
     fn readback_reads_only_fence_proven_buffers() {
-        let mut last_writer: [Option<usize>; FRAMES_IN_FLIGHT as usize] = [None, None];
+        let mut last_writer: [Option<usize>; FRAMES_IN_FLIGHT as usize] =
+            [None; FRAMES_IN_FLIGHT as usize];
         for frame in 0..64 {
             let slot = FrameSlot::new(frame % FRAMES_IN_FLIGHT as usize);
             let (write, read) = slot_parity(slot);

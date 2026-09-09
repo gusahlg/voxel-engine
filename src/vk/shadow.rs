@@ -10,7 +10,7 @@
 //!
 //! # Shared-image hazard analysis
 //!
-//! The depth image is **one** map sampled by both frames in flight, not a
+//! The depth image is **one** map sampled by every frame in flight, not a
 //! per-slot pair. That stops the previous "key change marks every slot dirty"
 //! double regenerate, where each FIF slot re-drew the same casters.
 //!
@@ -47,7 +47,7 @@ use super::pass::shader_module;
 use super::taa::CleanViewProj;
 use crate::rev::FrameSlot;
 use crate::vk::Renderer;
-use crate::vk::buffers::HostBuffer;
+use crate::vk::buffers::{FRAMES_IN_FLIGHT, HostBuffer};
 use crate::vk::targets::{SHADOW_CASCADES, SHADOW_FORMAT, SHADOW_RESOLUTION};
 use crate::vk::vertex_input::VertexInput;
 
@@ -304,7 +304,7 @@ pub(crate) struct ShadowPass {
     pipeline: vk::Pipeline,
     /// Depth-only caster for immediate `DebugVertex` boxes (player avatars).
     debug_pipeline: vk::Pipeline,
-    ubo: [HostBuffer; 2],
+    ubo: [HostBuffer; FRAMES_IN_FLIGHT as usize],
 }
 
 impl ShadowPass {
@@ -348,7 +348,7 @@ impl ShadowPass {
         Self {
             pipeline,
             debug_pipeline,
-            ubo: [make_ubo(), make_ubo()],
+            ubo: std::array::from_fn(|_| make_ubo()),
         }
     }
 
@@ -366,8 +366,9 @@ impl ShadowPass {
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline(self.debug_pipeline, None);
-            self.ubo[0].destroy(device);
-            self.ubo[1].destroy(device);
+            for ubo in &mut self.ubo {
+                ubo.destroy(device);
+            }
         }
     }
 }

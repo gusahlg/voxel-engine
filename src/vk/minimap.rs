@@ -50,7 +50,7 @@ impl MinimapTexture {
             )
             .expect("minimap image")
         };
-        let images = [make_img(), make_img()];
+        let images = std::array::from_fn(|_| make_img());
 
         // Pre-allocate staging buffers.
         let mut staging =

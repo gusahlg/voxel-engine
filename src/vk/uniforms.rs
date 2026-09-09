@@ -1,6 +1,6 @@
 //! Per-frame uniform buffer ring (set 0, binding 2) — the engine-side home of
-//! `UboRing`. Two host-visible, host-coherent, persistently
-//! mapped buffers (one per frame-in-flight), each the size of the GPU struct
+//! `UboRing`. One host-visible, host-coherent, persistently
+//! mapped buffer per frame-in-flight, each the size of the GPU struct
 //! (public [`FrameUniformsGpu`] plus the engine-derived tail). Written once per
 //! frame before recording; bound by push descriptor alongside the offsets SSBO
 //! (binding 0) and block texture (binding 1).
@@ -112,14 +112,14 @@ impl FrameUniformsExt {
 // sky lanes, or the engine-derived tail).
 pub const FRAME_UNIFORMS_VERSION: u32 = 6;
 
-/// The per-frame UBO ring. Indexed only by [`FrameSlot`] (the parity type),
+/// The per-frame UBO ring. Indexed only by [`FrameSlot`],
 /// so raw-usize slot confusion is inexpressible here.
 pub(crate) struct UboRing {
     bufs: PerSlot<HostBuffer>,
 }
 
 impl UboRing {
-    /// Allocate both slots' UBOs, each sized to the GPU struct (public wire +
+    /// Allocate every slot's UBO, each sized to the GPU struct (public wire +
     /// derived tail). [`HostBuffer`] is `HOST_VISIBLE | HOST_COHERENT` by
     /// construction, so no flush is ever needed and the skeleton's "assert
     /// coherent at creation" requirement is satisfied structurally. Call at
@@ -137,7 +137,7 @@ impl UboRing {
             b
         };
         Self {
-            bufs: PerSlot::new([make(), make()]),
+            bufs: PerSlot::new(std::array::from_fn(|_| make())),
         }
     }
 
@@ -159,9 +159,8 @@ impl UboRing {
     }
 
     pub(crate) unsafe fn destroy(&mut self, device: &ash::Device) {
-        unsafe {
-            self.bufs[FrameSlot::new(0)].destroy(device);
-            self.bufs[FrameSlot::new(1)].destroy(device);
+        for buf in self.bufs.iter_mut() {
+            unsafe { buf.destroy(device) };
         }
     }
 }

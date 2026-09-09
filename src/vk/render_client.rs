@@ -145,8 +145,10 @@ pub(crate) struct DeviceLeftovers {
 }
 
 /// Recording snapshots in circulation. GPU frames-in-flight is
-/// [`FRAMES_IN_FLIGHT`] (2); the extra box means [`RenderClient::take_frame`]
-/// rarely parks waiting for the render thread to recycle one.
+/// [`FRAMES_IN_FLIGHT`]; the extra box is the one the main thread records into.
+/// Slack is therefore `FRAMES_IN_FLIGHT` (the GPU-depth boxes plus last_drawn
+/// parking), which is at least `FRAMES_IN_FLIGHT - 1` so main does not serialize
+/// on the render thread's slot wait.
 const FRAME_POOL_SIZE: usize = FRAMES_IN_FLIGHT as usize + 1;
 
 /// Pooled [`DrawLists`] boxes plus the most recently completed snapshot, used
@@ -745,7 +747,10 @@ mod tests {
     #[test]
     fn frame_pool_is_one_ahead_of_gpu_slots() {
         assert_eq!(FRAME_POOL_SIZE, FRAMES_IN_FLIGHT as usize + 1);
-        assert_eq!(FRAME_POOL_SIZE, 3);
+        assert!(
+            FRAME_POOL_SIZE >= FRAMES_IN_FLIGHT as usize,
+            "slack (pool minus the recording box) must be at least FRAMES_IN_FLIGHT - 1"
+        );
     }
 
     #[test]

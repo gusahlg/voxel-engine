@@ -469,7 +469,7 @@ impl Engine {
         // Recycle returned buffers/allocations, submit the recorded snapshot,
         // then take a fresh pooled one to record into. Submit first so the
         // render thread can start (and recycle a box) while we wait; with a
-        // 3-box pool that wait is rare.
+        // pool of FRAMES_IN_FLIGHT + 1 that wait is rare.
         self.client.drain_returns();
         if let Some(next) = self.client.pop_idle_frame() {
             let filled = std::mem::replace(&mut self.lists, next);

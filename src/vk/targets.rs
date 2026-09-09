@@ -313,8 +313,8 @@ impl BloomChain {
 }
 
 pub struct RenderTargets {
-    /// Per-slot so the VRS compute pass can sample this slot's depth from two
-    /// cycles ago (fence-synchronised) while the other slot is in flight.
+    /// Per-slot so the VRS compute pass can sample this slot's depth from
+    /// `FRAMES_IN_FLIGHT` cycles ago (fence-synchronised) while other slots are in flight.
     pub(crate) depth: [ImageResource; FRAMES_IN_FLIGHT as usize],
     /// Per-slot single-sample MSAA depth resolve target; `Some` only when
     /// multisampled. The MS `depth` can't feed a `Sampler2D`, so the geometry
@@ -337,7 +337,7 @@ pub struct RenderTargets {
     /// images, history, and mix readback. `RenderFlags::vrs` decides whether
     /// a frame actually classifies and binds the rate attachment.
     pub(crate) vrs: Option<super::vrs::Vrs>,
-    /// Shared cascaded shadow map (both FIF slots sample the same image).
+    /// Shared cascaded shadow map (every FIF slot samples the same image).
     /// Regenerated once per `ShadowKey`; see `shadow.rs` hazard analysis.
     pub(crate) shadow: ShadowMap,
     /// Per-slot bloom mip chain. Extent-dependent, so recreated with the
@@ -346,7 +346,7 @@ pub struct RenderTargets {
     /// Per-slot quarter-res RGBA16F spill (bloom composite + godrays). Written
     /// by compute on presented frames, sampled by the tonemap fragment. Recreated
     /// with the targets; new images begin UNDEFINED. One image per FIF slot so
-    /// the in-flight present copy of the other slot can still sample its own.
+    /// an in-flight present copy of another slot can still sample its own.
     pub(crate) spill: [ImageResource; FRAMES_IN_FLIGHT as usize],
     /// Per-slot octahedral cloud LUT (RGBA16F). Size is a genconst, independent
     /// of the swapchain; still owned here so resize tears it down with everything else.

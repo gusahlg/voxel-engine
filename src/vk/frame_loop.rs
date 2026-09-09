@@ -24,6 +24,22 @@ use super::{
 /// (its copy hazard is resolved).
 struct SlotGuard(usize);
 
+/// Slot whose `render_value` [`Renderer::wait_slot_and_reclaim`] waits before
+/// recording into `slot`.
+///
+/// Uncapped: wait only the slot being reused, so all [`FRAMES_IN_FLIGHT`]
+/// command buffers can sit on the GPU and hide submit latency. Vsync: wait the
+/// slot that is two frames old so the effective depth stays 2 — a third
+/// in-flight frame would add a full refresh of latency. Timeline values are
+/// monotone, so that wait also proves `slot` itself is idle.
+fn reclaim_wait_slot(slot: usize, vsync: bool) -> usize {
+    if vsync {
+        (slot + FRAMES_IN_FLIGHT as usize - 2) % FRAMES_IN_FLIGHT as usize
+    } else {
+        slot
+    }
+}
+
 /// Byte offsets within a frame's packed immediate buffer.
 #[derive(Clone, Copy)]
 pub(super) struct ImmOffsets {
@@ -376,13 +392,17 @@ impl Renderer {
     /// command buffer and immediate buffer), then reclaims retired GPU memory
     /// whose last possible use the timeline has reached. Publishes the
     /// one-cycle-late VRS mix and cull geometry gauges after the wait.
+    ///
+    /// With vsync on, waits [`reclaim_wait_slot`] (one slot earlier than the
+    /// reuse target) so the effective in-flight depth stays 2.
     fn wait_slot_and_reclaim(&mut self, slot: usize) {
         let device = &self.device.device;
         unsafe {
             {
                 let _p = crate::profile::scope(crate::profile::Meter::Fence);
-                let value = self.slots[FrameSlot::new(slot)].render_value;
-                if self.vsync.current() {
+                let vsync = self.vsync.current();
+                let value = self.slots[FrameSlot::new(reclaim_wait_slot(slot, vsync))].render_value;
+                if vsync {
                     self.timeline.wait(device, value);
                 } else {
                     const FENCE_SPIN_BUDGET: std::time::Duration =
@@ -426,8 +446,8 @@ impl Renderer {
         }
     }
 
-    /// Last completed VRS histogram for this slot (2-frame delayed). Zeroed
-    /// when VRS is off or the device has no attachment shading rate.
+    /// Last completed VRS histogram for this slot (`FRAMES_IN_FLIGHT`-frame delayed).
+    /// Zeroed when VRS is off or the device has no attachment shading rate.
     fn publish_vrs_mix(&self, slot: usize) {
         if self.flags.vrs
             && let Some(vrs) = &self.targets.vrs
@@ -443,7 +463,7 @@ impl Renderer {
         }
     }
 
-    /// Last completed cull geometry stats for this slot (2-frame delayed).
+    /// Last completed cull geometry stats for this slot (`FRAMES_IN_FLIGHT`-frame delayed).
     /// `draws.full` / `tris.full` are camera group 0 (full-res opaque);
     /// `draws.cutout` / `tris.cutout` are group 1; `draws.lod` / `tris.lod`
     /// are group 2 (coarse LOD). Gauges no-op when profiling is off.
@@ -460,7 +480,7 @@ impl Renderer {
     /// Resolves the copy hazard on `slot` before it is rendered into: the
     /// in-flight present copy may still be reading this slot's offscreen
     /// image, which the render below overwrites. Rare (the copy usually
-    /// retires well within the two-frame slot cycle) and sub-millisecond.
+    /// retires well within the in-flight slot cycle) and sub-millisecond.
     /// Returns a guard proving the slot is safe to record into. `p` is the
     /// caller's `acquire` scope; the wait is split out of it into `copy`.
     fn acquire_slot(&mut self, slot: usize, p: &mut crate::profile::Guard) -> SlotGuard {
@@ -1027,7 +1047,7 @@ impl Renderer {
         }
 
         // Bind the rate image classified at the end of this slot's previous
-        // use (two frames ago at 2FIF) — the same staleness the old
+        // use (`FRAMES_IN_FLIGHT` frames ago) — the same staleness the old
         // begin-of-frame classify accepted. First scene pass after
         // create/recreate skips VRS (`vrs_ready` is false); we still classify
         // at end so the next use is primed.
@@ -1185,7 +1205,7 @@ impl Renderer {
     }
 
     /// End-of-frame classify: this slot's just-written depth, for the next use
-    /// of the slot (two frames later). Depth already rests in
+    /// of the slot (`FRAMES_IN_FLIGHT` frames later). Depth already rests in
     /// [`SAMPLEABLE_DEPTH_REST_LAYOUT`]; rate/history → GENERAL joined the
     /// post-scene barrier. Sets `vrs_ready` / `vrs_history` so the next scene
     /// pass of this slot can bind the rate image.
@@ -1239,5 +1259,26 @@ impl Renderer {
         };
         self.slots[FrameSlot::new(slot)].render_value = completion.value();
         self.last_render_value = completion.value();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FRAMES_IN_FLIGHT, reclaim_wait_slot};
+
+    #[test]
+    fn reclaim_wait_slot_stays_at_two_deep_when_vsync() {
+        for slot in 0..FRAMES_IN_FLIGHT as usize {
+            assert_eq!(reclaim_wait_slot(slot, false), slot);
+            let waited = reclaim_wait_slot(slot, true);
+            // Two frames old: not the slot being reused (unless FIF == 2) and
+            // not the just-submitted previous slot.
+            let prev = (slot + FRAMES_IN_FLIGHT as usize - 1) % FRAMES_IN_FLIGHT as usize;
+            assert_ne!(waited, prev, "vsync must not serialize to 1 in flight");
+            assert_eq!(
+                waited,
+                (slot + FRAMES_IN_FLIGHT as usize - 2) % FRAMES_IN_FLIGHT as usize
+            );
+        }
     }
 }
