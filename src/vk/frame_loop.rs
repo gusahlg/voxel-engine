@@ -888,6 +888,8 @@ impl Renderer {
                         self.device.physical,
                         &mut self.arena_dir,
                         records,
+                        self.records.records(),
+                        |s| self.mesh_res.is_arrived(s),
                         slot_count,
                         camera,
                         shadow_frusta.as_ref(),
