@@ -31,7 +31,8 @@ pub struct BlockTextures {
     mip_levels: u32,
     /// CPU palette; used for diffs and for a capacity-overflow rebuild.
     layer_pixels: Vec<Vec<u8>>,
-    /// High-water of layers written on the GPU (UNDEFINED vs SHADER_READ).
+    /// High-water of layers written on the GPU (sampled vs never sampled).
+    /// All `capacity` layers rest in SHADER_READ_ONLY after creation.
     written: u32,
     pending: Vec<PendingLayer>,
     command_pool: vk::CommandPool,
@@ -170,6 +171,31 @@ pub(crate) fn consecutive_runs(mut indices: Vec<u32>) -> Vec<(u32, u32)> {
     }
     runs.push((start, prev - start + 1));
     runs
+}
+
+/// Barrier plan for a newly allocated capacity-backed array on the grow path.
+/// The whole `capacity` is UNDEFINED → SHADER_READ_ONLY once; only layers that
+/// GPU-copy or staging-upload then go SHADER_READ → TRANSFER_DST → SHADER_READ.
+/// The old image's TRANSFER_SRC range is exactly the GPU-copied prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrowTransitionPlan {
+    pub init_layer_count: u32,
+    pub dst_runs: Vec<(u32, u32)>,
+    pub src_layer_count: u32,
+}
+
+pub(crate) fn grow_transition_plan(
+    copied: u32,
+    staging: &[u32],
+    capacity: u32,
+) -> GrowTransitionPlan {
+    let mut dst: Vec<u32> = (0..copied).collect();
+    dst.extend_from_slice(staging);
+    GrowTransitionPlan {
+        init_layer_count: capacity,
+        dst_runs: consecutive_runs(dst),
+        src_layer_count: copied,
+    }
 }
 
 fn color_range(mip_levels: u32, base_layer: u32, layer_count: u32) -> vk::ImageSubresourceRange {
@@ -633,7 +659,7 @@ impl BlockTextures {
                     .src_access_mask(vk::AccessFlags2::NONE)
                     .dst_stage_mask(vk::PipelineStageFlags2::COPY)
                     .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                     .image(image)
                     .subresource_range(color_range(mip_levels, base, count)),
@@ -762,21 +788,43 @@ impl BlockTextures {
         );
 
         let copied = grow.copied.min(new_used);
+        let staging_idx: Vec<u32> = grow.staging.iter().map(|p| p.index).collect();
+        let plan = grow_transition_plan(copied, &staging_idx, new_capacity);
         let staging_layers = grow.staging;
 
-        // New image: UNDEFINED → TRANSFER_DST on every layer this grow writes.
-        let mut barriers = vec![
-            vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .image(new_image)
-                .subresource_range(color_range(new_mips, 0, new_used)),
-        ];
-        if copied > 0 {
+        // Whole capacity UNDEFINED → SHADER_READ so the sampled view is valid
+        // on unused headroom (must not overlap the TRANSFER_DST barriers).
+        let init = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::NONE)
+            .src_access_mask(vk::AccessFlags2::NONE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::NONE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(new_image)
+            .subresource_range(color_range(new_mips, 0, plan.init_layer_count))];
+        unsafe {
+            device.cmd_pipeline_barrier2(
+                graphics_cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&init),
+            );
+        }
+
+        let mut barriers = Vec::new();
+        for &(base, count) in &plan.dst_runs {
+            barriers.push(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .image(new_image)
+                    .subresource_range(color_range(new_mips, base, count)),
+            );
+        }
+        if plan.src_layer_count > 0 {
             // In-flight frames sample the old array as SHADER_READ. This later
             // graphics CB's barrier waits that fragment work (same-queue
             // submission order) before TRANSFER_SRC.
@@ -789,16 +837,18 @@ impl BlockTextures {
                     .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                     .image(self.image)
-                    .subresource_range(color_range(self.mip_levels, 0, copied)),
+                    .subresource_range(color_range(self.mip_levels, 0, plan.src_layer_count)),
             );
         }
         unsafe {
-            device.cmd_pipeline_barrier2(
-                graphics_cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&barriers),
-            );
-            if copied > 0 {
-                let copies = image_copy_mips(self.size, self.mip_levels, copied);
+            if !barriers.is_empty() {
+                device.cmd_pipeline_barrier2(
+                    graphics_cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&barriers),
+                );
+            }
+            if plan.src_layer_count > 0 {
+                let copies = image_copy_mips(self.size, self.mip_levels, plan.src_layer_count);
                 device.cmd_copy_image(
                     graphics_cmd,
                     self.image,
@@ -833,20 +883,27 @@ impl BlockTextures {
             self.staging_retire.push(done_at, (staging, staging_mem));
         }
 
-        let to_sampled = [vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COPY)
-            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image(new_image)
-            .subresource_range(color_range(new_mips, 0, new_used))];
-        unsafe {
-            device.cmd_pipeline_barrier2(
-                graphics_cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
+        let mut to_sampled = Vec::new();
+        for &(base, count) in &plan.dst_runs {
+            to_sampled.push(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image(new_image)
+                    .subresource_range(color_range(new_mips, base, count)),
             );
+        }
+        unsafe {
+            if !to_sampled.is_empty() {
+                device.cmd_pipeline_barrier2(
+                    graphics_cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
+                );
+            }
         }
 
         let old = RetiredBlockTextures {
@@ -1229,8 +1286,8 @@ fn build_mip_chain(base: &[u8], size: u32, levels: u32) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_LAYER_CAPACITY, build_mip_chain, changed_layer_indices, consecutive_runs, grow_plan,
-        layer_capacity,
+        GrowTransitionPlan, MIN_LAYER_CAPACITY, build_mip_chain, changed_layer_indices,
+        consecutive_runs, grow_plan, grow_transition_plan, layer_capacity,
     };
 
     #[test]
@@ -1280,6 +1337,41 @@ mod tests {
             (0, vec![0, 1, 2]),
             "texel-size change cannot GPU-copy"
         );
+    }
+
+    #[test]
+    fn grow_transition_covers_capacity_and_only_written_dst() {
+        let append = grow_transition_plan(2, &[2], 64);
+        assert_eq!(
+            append,
+            GrowTransitionPlan {
+                init_layer_count: 64,
+                dst_runs: vec![(0, 3)],
+                src_layer_count: 2,
+            }
+        );
+        let size_change = grow_transition_plan(0, &[0, 1, 2], 64);
+        assert_eq!(
+            size_change,
+            GrowTransitionPlan {
+                init_layer_count: 64,
+                dst_runs: vec![(0, 3)],
+                src_layer_count: 0,
+            }
+        );
+        let sparse = grow_transition_plan(2, &[0, 4], 128);
+        assert_eq!(
+            sparse,
+            GrowTransitionPlan {
+                init_layer_count: 128,
+                dst_runs: vec![(0, 2), (4, 1)],
+                src_layer_count: 2,
+            }
+        );
+        let unused_only = grow_transition_plan(0, &[], 64);
+        assert_eq!(unused_only.init_layer_count, 64);
+        assert!(unused_only.dst_runs.is_empty());
+        assert_eq!(unused_only.src_layer_count, 0);
     }
 
     #[test]

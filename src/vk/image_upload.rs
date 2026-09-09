@@ -147,17 +147,19 @@ pub fn upload_image(
         device.unmap_memory(staging_memory);
     }
 
-    // Barriers cover only the layers the copy writes (capacity-backed arrays
-    // leave unused layers UNDEFINED). The view spans the full image so later
-    // per-layer uploads can fill those slots without recreating it.
-    let copy_range = copy_layer_range(params.regions, params.mip_levels);
-    let view_range = vk::ImageSubresourceRange {
+    // The sampled view spans every allocated array layer. Transition the
+    // whole capacity (all mips) so unused headroom is SHADER_READ_ONLY rather
+    // than UNDEFINED — a descriptor whose view covers those layers is accessed
+    // at every draw (VUID-vkCmdDraw-None-09600). Copies still write only the
+    // used layers in `regions`.
+    let copy_range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
         level_count: params.mip_levels,
         base_array_layer: 0,
         layer_count: params.array_layers,
     };
+    let view_range = copy_range;
 
     let separate_queue = lane.is_separate_queue();
     let needs_qfot = lane.needs_ownership_transfer();
@@ -362,26 +364,4 @@ pub fn upload_image(
     };
 
     (image, memory, view)
-}
-
-/// Tightest COLOR range covering every copy region (all mips, only touched layers).
-fn copy_layer_range(regions: &[vk::BufferImageCopy], mip_levels: u32) -> vk::ImageSubresourceRange {
-    let mut lo = u32::MAX;
-    let mut hi = 0;
-    for r in regions {
-        let s = r.image_subresource;
-        lo = lo.min(s.base_array_layer);
-        hi = hi.max(s.base_array_layer + s.layer_count);
-    }
-    if lo == u32::MAX {
-        lo = 0;
-        hi = 1;
-    }
-    vk::ImageSubresourceRange {
-        aspect_mask: vk::ImageAspectFlags::COLOR,
-        base_mip_level: 0,
-        level_count: mip_levels,
-        base_array_layer: lo,
-        layer_count: (hi - lo).max(1),
-    }
 }
