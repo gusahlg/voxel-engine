@@ -15,9 +15,11 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{
+    Receiver, RecvError, Sender, SyncSender, TryRecvError, channel, sync_channel,
+};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ash::{khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -632,7 +634,11 @@ impl RenderClient {
     /// returns a buffer only after it has consumed one). Never takes
     /// [`FramePool::last_drawn`]: that box still holds the last completed
     /// scene for [`Self::wait_last_drawn`].
-    pub(crate) fn take_frame(&mut self) -> Box<DrawLists> {
+    ///
+    /// `spin` is true only when the engine is uncapped (vsync off and no FPS
+    /// cap): poll the return channel briefly before parking so a 20 µs frame
+    /// does not pay a futex wake every hand-off.
+    pub(crate) fn take_frame(&mut self, spin: bool) -> Box<DrawLists> {
         loop {
             if let Some(b) = self.frames.pop_idle() {
                 return b;
@@ -646,7 +652,7 @@ impl RenderClient {
             // main-thread work; the non-blocking pop above is not a wait.
             let r = {
                 let _p = crate::profile::scope(crate::profile::Meter::WaitFrame);
-                self.ret_rx.recv()
+                recv_spin(&self.ret_rx, spin)
             };
             match r {
                 Ok(r) => self.handle_return(r),
@@ -712,6 +718,31 @@ impl Drop for RenderClient {
 /// applying resource commands in order and coalescing frames to the latest, draw
 /// once, then recycle retired allocations. Returns the device leftovers for
 /// main to finish teardown.
+/// Same idea as [`super::timeline::Timeline::wait_spin`] / `FENCE_SPIN_BUDGET`
+/// in `frame_loop`: spin a short, bounded window so a producer that is already
+/// on the way does not pay a futex park. Never spin when vsync or an FPS cap
+/// is pacing the loop — there the sleep is the point.
+const CHANNEL_SPIN_BUDGET: Duration = Duration::from_micros(50);
+
+fn recv_spin<T>(rx: &Receiver<T>, spin: bool) -> Result<T, RecvError> {
+    if spin {
+        let start = Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok(v) => return Ok(v),
+                Err(TryRecvError::Disconnected) => return Err(RecvError),
+                Err(TryRecvError::Empty) => {
+                    if start.elapsed() >= CHANNEL_SPIN_BUDGET {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+    rx.recv()
+}
+
 fn render_loop(
     mut renderer: Renderer,
     rx: Receiver<RenderCmd>,
@@ -719,7 +750,11 @@ fn render_loop(
     frames_rendered: Arc<AtomicU64>,
     frames_coalesced: Arc<AtomicU64>,
 ) -> DeviceLeftovers {
-    while let Ok(first) = rx.recv() {
+    loop {
+        let spin = !renderer.vsync.effective();
+        let Ok(first) = recv_spin(&rx, spin) else {
+            break;
+        };
         let mut latest_frame: Option<Box<DrawLists>> = None;
         let mut cmd = Some(first);
         while let Some(c) = cmd.take().or_else(|| rx.try_recv().ok()) {
@@ -778,7 +813,8 @@ fn render_loop(
 #[cfg(test)]
 mod tests {
     use super::super::buffers::FRAMES_IN_FLIGHT;
-    use super::{FRAME_POOL_SIZE, FramePool};
+    use super::{CHANNEL_SPIN_BUDGET, FRAME_POOL_SIZE, FramePool, recv_spin};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn frame_pool_keeps_main_at_most_one_ahead() {
@@ -802,5 +838,32 @@ mod tests {
         assert!(p.pop_idle().is_some());
         assert!(p.pop_idle().is_none());
         assert!(p.last_drawn.take().is_some());
+    }
+
+    #[test]
+    fn recv_spin_returns_immediately_when_queued() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(7).unwrap();
+        let start = Instant::now();
+        assert_eq!(recv_spin(&rx, true).unwrap(), 7);
+        assert!(
+            start.elapsed() < CHANNEL_SPIN_BUDGET,
+            "already-queued value must not wait out the spin budget"
+        );
+    }
+
+    #[test]
+    fn recv_spin_falls_back_to_blocking_after_budget() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(CHANNEL_SPIN_BUDGET + Duration::from_millis(2));
+            tx.send(1).unwrap();
+        });
+        let start = Instant::now();
+        assert_eq!(recv_spin(&rx, true).unwrap(), 1);
+        assert!(
+            start.elapsed() >= CHANNEL_SPIN_BUDGET,
+            "empty channel must spin the budget then block until the value arrives"
+        );
     }
 }

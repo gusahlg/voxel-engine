@@ -166,7 +166,7 @@ pub struct Engine {
 impl Engine {
     fn new(event_loop: &ActiveEventLoop, config: &Config) -> Result<Self, String> {
         let (window, mut client) = RenderClient::spawn(event_loop, config)?;
-        let lists = client.take_frame();
+        let lists = client.take_frame(!config.vsync && config.target_fps == 0);
         let exposure_shared = client.exposure();
         Ok(Self {
             client,
@@ -493,7 +493,8 @@ impl Engine {
         } else {
             let filled = std::mem::replace(&mut self.lists, self.client.take_placeholder());
             self.client.submit_frame(filled);
-            let dummy = std::mem::replace(&mut self.lists, self.client.take_frame());
+            let spin = self.is_uncapped();
+            let dummy = std::mem::replace(&mut self.lists, self.client.take_frame(spin));
             self.client.stash_placeholder(dummy);
         }
         self.lists.reset();
@@ -537,6 +538,11 @@ impl Engine {
             self.fps_window_frames = 0;
             self.fps_window_start = now;
         }
+    }
+
+    /// Vsync off and no FPS cap: the loop should not park on purpose.
+    fn is_uncapped(&self) -> bool {
+        !self.vsync() && self.target_fps == 0
     }
 
     /// Event-driven cadence: the deadline at which the next sim frame must run
