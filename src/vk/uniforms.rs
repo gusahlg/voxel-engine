@@ -38,6 +38,13 @@ pub(crate) fn lane_enable_bits(f: &RenderFlags) -> f32 {
     f32::from_bits(bits)
 }
 
+/// Compile-time lean opaque/LOD fragment: every optional lighting lane is off
+/// and fog is off. Matches the runtime path `shadow_bounce.w` bits == 0 and
+/// `frame.horizon.w == 0`.
+pub(crate) fn mesh_lean(flags: &RenderFlags) -> bool {
+    lane_enable_bits(flags).to_bits() == 0 && !flags.fog
+}
+
 pub const FRAME_UNIFORMS_SET: u32 = 0;
 pub const FRAME_UNIFORMS_BINDING: u32 = 2;
 
@@ -301,6 +308,36 @@ mod tests {
             ext.shadow_bounce[3].to_bits(),
             lane_enable_bits(&RenderFlags::default()).to_bits()
         );
+    }
+
+    #[test]
+    fn mesh_lean_when_every_optional_lane_is_off() {
+        let all_off = RenderFlags {
+            shadows: false,
+            blocklight: false,
+            ambient: false,
+            fog: false,
+            ..RenderFlags::default()
+        };
+        assert!(mesh_lean(&all_off));
+        assert_eq!(lane_enable_bits(&all_off).to_bits(), 0);
+        assert!(!mesh_lean(&RenderFlags {
+            fog: true,
+            ..all_off
+        }));
+        assert!(!mesh_lean(&RenderFlags {
+            shadows: true,
+            ..all_off
+        }));
+        assert!(!mesh_lean(&RenderFlags {
+            blocklight: true,
+            ..all_off
+        }));
+        assert!(!mesh_lean(&RenderFlags {
+            ambient: true,
+            ..all_off
+        }));
+        assert!(!mesh_lean(&RenderFlags::default()));
     }
 
     #[test]

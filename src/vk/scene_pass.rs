@@ -38,6 +38,9 @@ pub(super) struct RenderPass<'a> {
     /// `RENDERING_LOCAL_READ` and the absorb input-attachment mapping is live
     /// for that pass. Water-free frames keep `DEPTH_ATTACHMENT_OPTIMAL`.
     absorb_this_frame: bool,
+    /// Lean opaque/LOD fragment pipelines this frame: every optional lighting
+    /// lane is off and fog is off. Chosen once per frame from `RenderFlags`.
+    mesh_lean: bool,
 }
 
 impl<'a> RenderPass<'a> {
@@ -53,6 +56,7 @@ impl<'a> RenderPass<'a> {
         sample_depth: bool,
         store_color: bool,
         absorb_this_frame: bool,
+        mesh_lean: bool,
     ) -> RenderPass<'a> {
         let device = &r.device.device;
         let extent = r.render_extent;
@@ -312,6 +316,7 @@ impl<'a> RenderPass<'a> {
             index_bound: std::cell::Cell::new(false),
             sample_depth,
             absorb_this_frame,
+            mesh_lean,
         }
     }
 
@@ -354,8 +359,8 @@ impl<'a> RenderPass<'a> {
     /// Pushes `layout_3d` descriptors only if a foreign pass disturbed them.
     /// Skips redundant pushes when adjacent mesh passes share state.
     ///
-    /// `mesh3d` and `mesh3d_lod` share `layout_3d`, so one
-    /// `vkCmdPushDescriptorSetKHR` remains valid across both pipeline binds
+    /// `mesh3d` / `mesh3d_lod` and their lean twins share `layout_3d`, so one
+    /// `vkCmdPushDescriptorSetKHR` remains valid across those pipeline binds
     /// (push-descriptor state is per compatible layout, not per pipeline).
     /// Shadows-off still pushes the cascade UBO + shadow sampler: the layout
     /// requires every binding; the skip is the host UBO memcpy, not this push.
@@ -548,16 +553,19 @@ impl<'a> RenderPass<'a> {
     /// LOD skirt behind full-res terrain is mostly depth-rejected. Each group's
     /// draws close a GPU timestamp (`OpaqueFull` / `OpaqueLod` / `Cutout`).
     unsafe fn record_mesh_indirect_count(&self, pass: Pass) {
-        let groups: &[(cull::Group, vk::Pipeline)] = match pass {
-            Pass::Opaque => &[
-                (cull::Group::Opaque, self.r.pipelines.mesh3d),
-                (cull::Group::OpaqueLod, self.r.pipelines.mesh3d_lod),
-            ],
-            Pass::Cutout => &[(cull::Group::Cutout, self.r.mesh_pipeline_for(pass))],
+        match pass {
+            Pass::Opaque => {
+                let (full, lod) = self.r.pipelines.opaque_pipelines(self.mesh_lean);
+                unsafe { self.record_group_indirect_count(cull::Group::Opaque, full) };
+                unsafe { self.record_group_indirect_count(cull::Group::OpaqueLod, lod) };
+            }
+            Pass::Cutout => unsafe {
+                self.record_group_indirect_count(
+                    cull::Group::Cutout,
+                    self.r.mesh_pipeline_for(pass),
+                );
+            },
             Pass::Blend => unreachable!("Blend stays on the CPU path"),
-        };
-        for &(group, pipeline) in groups {
-            unsafe { self.record_group_indirect_count(group, pipeline) };
         }
     }
 

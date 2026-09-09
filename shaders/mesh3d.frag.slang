@@ -8,6 +8,15 @@
 //                                (no OpKill ⇒ early depth write stays enabled).
 //   MESH3D_OPAQUE + MESH3D_LOD   coarse-LOD opaque (scale > 1): keeps the slab
 //                                clip `discard`, never samples the cascades.
+//   MESH3D_OPAQUE + MESH3D_LEAN  full-res opaque with every optional lane compiled
+//                                out (no cascade taps, no candle curve, no ambient
+//                                floor, no fog). Bit-identical to the non-lean
+//                                module when `shadow_bounce.w` bits are 0 and
+//                                `frame.horizon.w == 0`. Pipeline layout / push
+//                                descriptors stay the full set; this module simply
+//                                does not read the cascade UBO or sample the map.
+//   MESH3D_OPAQUE + MESH3D_LOD
+//     + MESH3D_LEAN              coarse-LOD opaque + the same lane-off diet.
 
 #include "common.slang"
 #ifndef MESH3D_OPAQUE
@@ -54,8 +63,11 @@ Sampler2DArray blockTex;
 [[vk::binding(2, 0)]]
 ConstantBuffer<FrameUniforms> frame;
 
+#ifndef MESH3D_LEAN
 // Set 0, binding 3: shadow sampling uniforms (CascadeUniformsGpu).
 // Set by the shadow-plumbing pass; this shader consumes the frozen layout.
+// Lean variants keep these bindings on the pipeline layout (push-descriptor
+// compatibility) but do not declare or read them.
 struct CascadeUniforms
 {
     float4x4 view_proj[2]; // per-cascade light-space clip transform (CLEAN)
@@ -78,6 +90,7 @@ ConstantBuffer<CascadeUniforms> cascade;
 // binding-5 sampler).
 [[vk::binding(4, 0)]]
 Sampler2DArrayShadow shadowMap;
+#endif
 
 #ifdef WATER_DEPTH_ABSORPTION
 // Scene depth input attachment for water depth absorption (absorption variant only).
@@ -90,6 +103,7 @@ SubpassInput opaqueDepthInput;
 static const float WATER_Z_NEAR = Z_NEAR;
 #endif
 
+#ifndef MESH3D_LEAN
 // PCF tap count: 4 = Castaño's optimized 4-tap/16-texel [1 2 1]² tent, 9 = the
 // fixed 3x3 grid at the configured blur spread. Both are fixed-pattern (no
 // per-pixel dither: that quantized every penumbra to quarters at a random
@@ -211,6 +225,7 @@ float sun_shadow(float3 world, float3 N, float raw_ndl, float ndl, float dist, f
                     shadow_map_term(world, N, ndl_c, 1u), (dist - b0) / (s0 - b0));
     return lerp(map, fallback, fade);
 }
+#endif
 
 [shader("fragment")]
 float4 fragmentMain(FragmentInput input) : SV_Target
@@ -265,7 +280,9 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     float block_amount = input.light_lv.y;
     float ao = input.light_lv.z;
     float3 N = FACE_NORMAL[face];
+#ifndef MESH3D_LEAN
     float dist = length(input.world);
+#endif
     float raw_ndl = dot(N, frame.sun_dir_elev.xyz);
 
     // Omnidirectional wrap: day/night cycle flips lit hemisphere to moon side.
@@ -278,6 +295,10 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // the shadow value is moot: skip the cascade taps there too.
 #if defined(MESH3D_LOD)
     float shadow = shadow_fallback(frame, sky_amount);
+#elif defined(MESH3D_LEAN)
+    // Shadows lane off: `sun_shadow` returns 1.0 without tapping the map.
+    // Caves still take the 0.0 skip — same as the full opaque module.
+    float shadow = sky_amount > 0.0 ? 1.0 : 0.0;
 #elif defined(MESH3D_OPAQUE)
     float shadow = sky_amount > 0.0
         ? sun_shadow(input.world, N, raw_ndl, ndl, dist, sky_amount)
@@ -333,6 +354,7 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     }
 #endif
 
+#ifndef MESH3D_LEAN
     // Fog: fade toward sky radiance along the view ray. Uniform-density gate:
     // horizon.w == 0 (fog off / RenderFlags::fog) skips the sky eval and lerp.
     if (frame.horizon.w > 0.0) {
@@ -340,5 +362,6 @@ float4 fragmentMain(FragmentInput input) : SV_Target
         float fog = 1.0 - exp(-dist * frame.horizon.w); // horizon.w = fog density
         rgb = lerp(rgb, fog_color, fog);
     }
+#endif
     return float4(rgb, alpha);
 }

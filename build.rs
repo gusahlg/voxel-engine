@@ -175,6 +175,22 @@ const MESH3D_LOD: Shader = Shader {
     dst: "mesh3d_lod.frag.spv",
 };
 
+/// Full-res opaque with every optional lane compiled out (no cascade/candle/fog).
+const MESH3D_OPAQUE_LEAN: Shader = Shader {
+    src: "shaders/mesh3d.frag.slang",
+    stage: "fragment",
+    entry: "fragmentMain",
+    dst: "mesh3d_opaque_lean.frag.spv",
+};
+
+/// Coarse-LOD opaque plus the same lane-off diet as `MESH3D_OPAQUE_LEAN`.
+const MESH3D_LOD_LEAN: Shader = Shader {
+    src: "shaders/mesh3d.frag.slang",
+    stage: "fragment",
+    entry: "fragmentMain",
+    dst: "mesh3d_lod_lean.frag.spv",
+};
+
 /// Present-time TAA tonemap fragment (`-DTAA_FUSED`): two color attachments
 /// (swapchain + history) and the larger fused push block. The default variant
 /// in SHADERS stays the one-output TAA-off path.
@@ -287,6 +303,16 @@ fn main() {
     jobs.push(Job {
         shader: &MESH3D_LOD,
         defines: &["-DMESH3D_OPAQUE", "-DMESH3D_LOD"],
+        extra_args: &[],
+    });
+    jobs.push(Job {
+        shader: &MESH3D_OPAQUE_LEAN,
+        defines: &["-DMESH3D_OPAQUE", "-DMESH3D_LEAN"],
+        extra_args: &[],
+    });
+    jobs.push(Job {
+        shader: &MESH3D_LOD_LEAN,
+        defines: &["-DMESH3D_OPAQUE", "-DMESH3D_LOD", "-DMESH3D_LEAN"],
         extra_args: &[],
     });
     jobs.push(Job {

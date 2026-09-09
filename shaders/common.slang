@@ -65,6 +65,7 @@ static const float3 FACE_NORMAL[6] = {
 // 2^(bits-DETAIL_GPU_BIAS) from IEEE exponent bits: bits∈[0,15], bias 2 ⇒ exponent field 125..140, exact.
 float detail_scale(uint detail_pass) { return asfloat(((detail_pass & 0xFu) + (127u - DETAIL_GPU_BIAS)) << 23u); }
 
+#ifndef MESH3D_LEAN
 // Blocklight (torch/candle) response curve. `x` is a
 // per-channel block-light level in [0,1] (`candle.rgb · level`); the curve lifts
 // it into an HDR glow near full brightness. Constants match CPU values exactly,
@@ -74,6 +75,7 @@ float3 candle_curve(float3 x)
     float3 hi = pow(CANDLE_HIGH_MUL * x, float3(CANDLE_HIGH_POW));
     return min(x * sqrt(x) + hi, float3(CANDLE_CLAMP));
 }
+#endif
 
 // Analytic sky radiance along `ray` — THE sky formula, single source of truth
 // for the sky background, the distance fog (fog == sky evaluated at the
@@ -119,6 +121,12 @@ float3 sun_disc(float3 ray, float3 sun_dir, float3 tint, float radius)
 // pick. Only caller is mesh3d.frag.
 float3 light_eval(float3 sky, float3 block, float ao, FrameUniforms frame)
 {
+#ifdef MESH3D_LEAN
+    // Compile-time equivalent of `shadow_bounce.w` bits 1 (blocklight) and 2
+    // (ambient) clear: no candle_curve, no ambient floor. Host already zeroes
+    // candle.rgb / candle.w on that path, so `max(0*ao + sky, 0) == sky`.
+    return sky;
+#else
     // Uniform branch: RenderFlags::blocklight rides shadow_bounce.w bit 1.
     // Off already zeroes candle.rgb on the host, so candle_curve(0) == 0;
     // skip the pow/sqrt when the lane is clear.
@@ -126,6 +134,7 @@ float3 light_eval(float3 sky, float3 block, float ao, FrameUniforms frame)
         ? float3(0.0, 0.0, 0.0)
         : candle_curve(block) * ao;
     return max(frame.ambient_glow.rgb * ao + sky, block_term);
+#endif
 }
 
 // Far-field shadow fallback beyond shadow-map cascades. Uses baked sky-visibility

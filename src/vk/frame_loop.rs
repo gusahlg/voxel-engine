@@ -1326,6 +1326,9 @@ impl Renderer {
         // `prepare_blend_draws` already filled `draw_runs`.
         let absorb_this_frame = self.pipelines.mesh3d_transparent_absorb.is_some()
             && self.draw_runs.iter().any(|run| run.pass == Pass::Blend);
+        // Lean opaque/LOD fragments: compile-time equivalent of every optional
+        // lighting lane off and fog off. Chosen once per frame from flags.
+        let mesh_lean = super::uniforms::mesh_lean(&self.flags);
         // HDR colour is only read by bloom/exposure/spill/tonemap, all of which
         // run on presented frames. Minimap is a separate texture; screenshots
         // copy the swapchain after tonemap; VRS classify reads depth not colour.
@@ -1349,6 +1352,7 @@ impl Renderer {
                     sample_depth,
                     will_present,
                     absorb_this_frame,
+                    mesh_lean,
                 )
             }
         };
