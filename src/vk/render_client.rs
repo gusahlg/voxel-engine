@@ -429,28 +429,11 @@ impl RenderClient {
     }
 
     fn upload(&mut self, data: &MeshData, placement: Option<MeshPlacement>) -> Option<MeshHandle> {
-        let (meta, resident) = match self.acquire_and_write(data) {
-            Some(staging) => unsafe {
-                build_mesh_resident_staged(
-                    &self.device,
-                    &mut self.mesh_alloc,
-                    &self.mesh_staging,
-                    staging,
-                    data.quad_counts(),
-                    data.pass(),
-                )?
-            },
-            // Pool exhausted: keep the pre-staging path so CPU-side uploads
-            // still succeed while workers occupy the ring.
-            None => unsafe { build_mesh_resident(&self.device, &mut self.mesh_alloc, data)? },
-        };
+        // Legacy CPU-side MeshData never uses the staging ring: workers that
+        // already wrote into a region go through `upload_mesh_staged`.
+        let (meta, resident) =
+            unsafe { build_mesh_resident(&self.device, &mut self.mesh_alloc, data)? };
         self.install(meta, resident, placement)
-    }
-
-    fn acquire_and_write(&self, data: &MeshData) -> Option<MeshStaging> {
-        let mut staging = self.mesh_staging.stager().acquire(data.vertex_bytes())?;
-        staging.write_vertices(std::array::from_fn(|i| data.vertices[i].as_slice()));
-        Some(staging)
     }
 
     fn install(

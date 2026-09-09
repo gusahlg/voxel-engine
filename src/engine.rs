@@ -443,6 +443,11 @@ impl Engine {
     }
 
     /// Install a worker-written staging region as a placed mesh.
+    ///
+    /// The AABB is taken from the region ([`MeshStaging::write_vertices`],
+    /// [`MeshStaging::vertex_writer`], or [`MeshStaging::set_aabb`]). A
+    /// raw [`MeshStaging::bytes`] fill without `set_aabb` scans the ring
+    /// as a documented fallback.
     pub fn upload_mesh_staged(
         &mut self,
         staging: MeshStaging,

@@ -249,6 +249,10 @@ impl Renderer {
             crate::profile::Gauge::PoolAcquires,
             super::mesh_staging::take_acquire_count(),
         );
+        crate::profile::gauge(
+            crate::profile::Gauge::PoolAabbFallback,
+            super::mesh_staging::take_aabb_fallback_count(),
+        );
         crate::profile::gauge(crate::profile::Gauge::PoolCopies, 0);
         crate::profile::gauge(crate::profile::Gauge::PoolArrivalFrames, 0);
 

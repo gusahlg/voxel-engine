@@ -4,22 +4,22 @@
 //! Game workers acquire a region, write vertices straight into the mapped
 //! bytes, and hand the region to the main thread. Main copies those bytes into
 //! a mesh arena block (host memcpy when the arena is mapped, otherwise one
-//! `vkCmdCopyBuffer` batched on the graphics command buffer with a single
-//! barrier) and stamps the region so reclaim can recycle it. Stale builds
-//! [`Drop`] the region; reclaim never GPU-waits. The ring lives in system
-//! memory: it is transient staging, not a vertex buffer.
+//! `vkCmdCopyBuffer` through the transfer lane) and stamps the region so
+//! reclaim can recycle it. Stale builds [`Drop`] the region; reclaim never
+//! GPU-waits. The ring lives in cached system memory: it is transient staging,
+//! not a vertex buffer.
 //!
 //! The ring is a FIFO (`reclaim` advances `tail` only past a contiguous ready
 //! prefix) and therefore holds only **transient** data. A live mesh must never
 //! pin a region: that stalls the tail, and after ~one pool of cumulative
 //! uploads `acquire` returns `None` forever. Zero-copy residency (binding the
 //! pool as the vertex buffer) would need a general-purpose allocator over the
-//! pool (free-list, not FIFO) and is future work. `vertex_resident` in the
-//! create log is informational only.
+//! pool (free-list, not FIFO) and is future work.
 //!
 //! Cost: uploads are many and small, so the ring is the only per-acquire work
 //! on the worker. Reclaim, copies, and barriers stay batched on the render
-//! thread (one pass / one graphics-CB copy batch / one barrier per frame).
+//! thread (one pass / one transfer CB / one barrier per frame). Legacy
+//! [`crate::mesh::MeshData`] uploads never touch the ring.
 
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
@@ -35,10 +35,17 @@ use crate::mesh::{FACE_UPLOAD_ORDER, MeshVertex};
 
 /// Acquires since the last [`take_acquire_count`] (profiler).
 static ACQUIRE_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Regions that reached upload with no AABB recorded (fallback scan).
+static AABB_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Swap-out the acquire counter. Called once per render frame.
 pub(crate) fn take_acquire_count() -> u64 {
     ACQUIRE_COUNT.swap(0, Ordering::Relaxed)
+}
+
+/// Swap-out the AABB-fallback counter. Called once per render frame.
+pub(crate) fn take_aabb_fallback_count() -> u64 {
+    AABB_FALLBACK_COUNT.swap(0, Ordering::Relaxed)
 }
 
 /// Default host-visible mesh staging ring size (32 MiB).
@@ -69,27 +76,26 @@ fn parse_mesh_staging_mb(s: &str) -> Option<u64> {
     Some(mb.saturating_mul(1 << 20))
 }
 
-/// Host-coherent system memory for the transient staging ring: skip
-/// `DEVICE_LOCAL` (BAR/ReBAR) so CPU writes and GPU copies match the old
-/// per-mesh staging blocks. Falls back to any host-coherent type.
+/// Cached system memory for the transient staging ring: prefer
+/// `HOST_VISIBLE | HOST_COHERENT | HOST_CACHED` without `DEVICE_LOCAL` so
+/// resident-mode memcpy (ring → mapped arena) is a cached load. Falls back
+/// to any host-coherent type.
 fn sysmem_staging_type(
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     type_filter: u32,
 ) -> Option<u32> {
     let n = memory_props.memory_type_count;
-    let sysmem = (0..n).find(|&i| {
+    let cached = (0..n).find(|&i| {
         if type_filter & (1 << i) == 0 {
             return false;
         }
         let flags = memory_props.memory_types[i as usize].property_flags;
-        flags.contains(HOST_COHERENT) && !flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        flags.contains(HOST_COHERENT)
+            && flags.contains(vk::MemoryPropertyFlags::HOST_CACHED)
+            && !flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
     });
-    sysmem.or_else(|| try_find_memory_type(memory_props, type_filter, HOST_COHERENT))
+    cached.or_else(|| try_find_memory_type(memory_props, type_filter, HOST_COHERENT))
 }
-
-/// Same 1 GiB cutoff [`super::alloc`] uses to tell ReBAR / unified from a
-/// discrete GPU's small BAR window.
-const SMALL_BAR_HEAP: u64 = 1 << 30;
 
 /// Vertex stride; regions are aligned to this.
 const VERTEX_STRIDE: u64 = std::mem::size_of::<MeshVertex>() as u64;
@@ -113,9 +119,8 @@ pub(crate) struct StagingRegion {
 pub(crate) enum Stamp {
     Held,
     Render(u64),
-    /// Transfer-lane timeline. Kept for reclaim tests and any copy that still
-    /// submits on the lane; pooled copies stamp [`Self::Render`].
-    #[allow(dead_code)]
+    /// Transfer-lane timeline. Pooled copies stamp this on the separate-queue
+    /// tier and [`Self::Render`] on the same-queue fallback.
     Transfer(u64),
 }
 
@@ -310,14 +315,33 @@ pub(crate) fn write_dir_vertices(dst: &mut [u8], dir_slices: [&[MeshVertex]; 6])
     cursor
 }
 
+/// Expand `aabb` by the 5-bit local positions of `verts` (same decode as
+/// [`crate::mesh::MeshData::quad`]).
+fn expand_aabb(aabb: &mut Option<([f32; 3], [f32; 3])>, verts: &[MeshVertex]) {
+    for v in verts {
+        let p = v.local_pos();
+        match aabb {
+            None => *aabb = Some((p, p)),
+            Some((min, max)) => {
+                for i in 0..3 {
+                    min[i] = min[i].min(p[i]);
+                    max[i] = max[i].max(p[i]);
+                }
+            }
+        }
+    }
+}
+
 /// Typed cursor over a staging region's mapped bytes.
 pub struct MeshVertexWriter<'a> {
     buf: &'a mut [u8],
     pos: usize,
+    aabb: &'a mut Option<([f32; 3], [f32; 3])>,
 }
 
 impl MeshVertexWriter<'_> {
-    /// Appends `verts`; returns `false` if they would not fit.
+    /// Appends `verts` and tracks their 5-bit local-position AABB; returns
+    /// `false` if they would not fit.
     pub fn write(&mut self, verts: &[MeshVertex]) -> bool {
         let n = std::mem::size_of_val(verts);
         let Some(dst) = self.buf.get_mut(self.pos..self.pos + n) else {
@@ -325,7 +349,19 @@ impl MeshVertexWriter<'_> {
         };
         dst.copy_from_slice(bytemuck::cast_slice(verts));
         self.pos += n;
+        expand_aabb(self.aabb, verts);
         true
+    }
+
+    /// Appends one quad and tracks the AABB of its 5-bit local positions,
+    /// mirroring [`crate::mesh::MeshData::quad`]. Returns `false` if the
+    /// quad would not fit.
+    ///
+    /// Unlike `MeshData::quad`, vertices are written sequentially (the
+    /// caller is responsible for GPU upload order); only the AABB decode
+    /// is shared.
+    pub fn quad(&mut self, corners: [MeshVertex; 4]) -> bool {
+        self.write(&corners)
     }
 
     /// Bytes written so far.
@@ -357,6 +393,10 @@ impl MeshStager {
 /// A mapped staging region. Write with [`Self::bytes`], [`Self::write_vertices`],
 /// or [`Self::vertex_writer`]; [`Drop`] (and `Engine::release_mesh_staging`)
 /// returns it to the pool's reclaim list without a GPU wait.
+///
+/// [`Self::write_vertices`] and [`MeshVertexWriter::quad`] track the mesh AABB
+/// as they write. Callers that fill [`Self::bytes`] raw must call
+/// [`Self::set_aabb`] so install does not scan the region.
 #[must_use = "dropping a MeshStaging releases the region; pass it to upload_mesh_staged to keep the bytes"]
 pub struct MeshStaging {
     pool: Arc<MeshStagingPool>,
@@ -365,6 +405,9 @@ pub struct MeshStaging {
     /// Raw pointer so this type is `!Sync` (exclusive writer) while `Send`.
     ptr: *mut u8,
     consumed: bool,
+    /// Inclusive min/max of 5-bit local positions, as `f32`. `None` until a
+    /// write path or [`Self::set_aabb`] records them.
+    aabb: Option<([f32; 3], [f32; 3])>,
 }
 
 // SAFETY: the mapped range is exclusively owned by this region until release;
@@ -373,6 +416,11 @@ unsafe impl Send for MeshStaging {}
 
 impl MeshStaging {
     /// Mapped bytes of the acquire request (not the aligned reservation).
+    ///
+    /// Filling this slice raw does not track an AABB; call [`Self::set_aabb`]
+    /// before [`crate::Engine::upload_mesh_staged`]. Prefer
+    /// [`Self::write_vertices`] or [`Self::vertex_writer`] when the source is
+    /// typed vertices.
     pub fn bytes(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.requested) }
     }
@@ -381,17 +429,72 @@ impl MeshStaging {
         unsafe { std::slice::from_raw_parts(self.ptr, self.requested) }
     }
 
-    /// Concatenate per-direction vertex slices in GPU upload order.
+    pub(crate) fn requested_bytes(&self) -> usize {
+        self.requested
+    }
+
+    /// Concatenate per-direction vertex slices in GPU upload order and track
+    /// the AABB of their 5-bit local positions (same decode as
+    /// [`crate::mesh::MeshData::quad`]).
     pub fn write_vertices(&mut self, dir_slices: [&[MeshVertex]; 6]) {
         write_dir_vertices(self.bytes(), dir_slices);
+        for slice in dir_slices {
+            expand_aabb(&mut self.aabb, slice);
+        }
     }
 
     /// Sequential typed writer over [`Self::bytes`].
+    ///
+    /// [`MeshVertexWriter::quad`] and [`MeshVertexWriter::write`] track the
+    /// AABB as they write.
     pub fn vertex_writer(&mut self) -> MeshVertexWriter<'_> {
         MeshVertexWriter {
-            buf: self.bytes(),
+            buf: unsafe { std::slice::from_raw_parts_mut(self.ptr, self.requested) },
             pos: 0,
+            aabb: &mut self.aabb,
         }
+    }
+
+    /// Record the mesh AABB for a region filled through [`Self::bytes`].
+    ///
+    /// `min` and `max` are the inclusive 5-bit local positions (chunk-local
+    /// `0..=16`), converted the same way [`crate::mesh::MeshData::quad`]
+    /// converts [`crate::mesh::MeshVertex::local_pos`]. Callers that use
+    /// [`Self::write_vertices`] or [`MeshVertexWriter::quad`] do not need
+    /// this: those paths track the bounds as they write.
+    pub fn set_aabb(&mut self, min: [u8; 3], max: [u8; 3]) {
+        self.aabb = Some((
+            [min[0] as f32, min[1] as f32, min[2] as f32],
+            [max[0] as f32, max[1] as f32, max[2] as f32],
+        ));
+    }
+
+    /// AABB recorded by a write path or [`Self::set_aabb`]. `None` if the
+    /// region was filled through [`Self::bytes`] without `set_aabb`.
+    pub(crate) fn recorded_aabb(&self) -> Option<([f32; 3], [f32; 3])> {
+        self.aabb
+    }
+
+    /// AABB for install: the recorded bounds, or a scan of `vertex_bytes`
+    /// from this (cached) region. The scan is a documented fallback for
+    /// callers that filled [`Self::bytes`] without [`Self::set_aabb`]; it is
+    /// counted in the `pool.aabb` profiler gauge.
+    pub(crate) fn aabb_for_upload(&self, vertex_bytes: usize) -> ([f32; 3], [f32; 3]) {
+        if let Some(aabb) = self.recorded_aabb() {
+            return aabb;
+        }
+        AABB_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+        let verts: &[MeshVertex] = bytemuck::cast_slice(&self.as_bytes()[..vertex_bytes]);
+        let mut aabb_min = [f32::INFINITY; 3];
+        let mut aabb_max = [f32::NEG_INFINITY; 3];
+        for v in verts {
+            let p = v.local_pos();
+            for i in 0..3 {
+                aabb_min[i] = aabb_min[i].min(p[i]);
+                aabb_max[i] = aabb_max[i].max(p[i]);
+            }
+        }
+        (aabb_min, aabb_max)
     }
 
     /// Explicit release; same as drop.
@@ -459,13 +562,12 @@ unsafe impl Send for MeshStagingPool {}
 unsafe impl Sync for MeshStagingPool {}
 
 impl MeshStagingPool {
-    /// Allocate the pool buffer in host-coherent *system* memory.
+    /// Allocate the pool buffer in host-visible *system* memory.
     ///
-    /// The ring is transient staging (copied out the same frame it is
-    /// acquired), so a BAR/ReBAR heap is the wrong place: CPU reads and
-    /// transfer-queue copies from that window serialize the graphics wait
-    /// that pooled copies used to arm every frame. `size == 0` disables the
-    /// pool (acquire always returns `None`).
+    /// Prefers `HOST_VISIBLE | HOST_COHERENT | HOST_CACHED` so resident-mode
+    /// memcpy (ring → mapped arena) is a cached load; falls back to any
+    /// host-coherent type. The ring is transient staging, never a vertex
+    /// buffer. `size == 0` disables the pool (acquire always returns `None`).
     pub(crate) unsafe fn new(
         instance: &ash::Instance,
         device: &ash::Device,
@@ -512,11 +614,9 @@ impl MeshStagingPool {
                 .expect("map mesh staging buffer") as *mut u8
         };
         let flags = memory_props.memory_types[type_index as usize].property_flags;
-        let heap = memory_props.memory_types[type_index as usize].heap_index as usize;
-        let vertex_resident = flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-            && memory_props.memory_heaps[heap].size >= SMALL_BAR_HEAP;
+        let cached = flags.contains(vk::MemoryPropertyFlags::HOST_CACHED);
         log::info!(
-            "mesh staging pool: {} MiB, vertex_resident={vertex_resident} (memory type {type_index})",
+            "mesh staging pool: {} MiB, memory type {type_index} cached={cached} ({flags:?})",
             size / (1024 * 1024)
         );
         Arc::new(Self {
@@ -561,11 +661,12 @@ impl MeshStagingPool {
             requested: bytes,
             ptr: unsafe { mapped.as_ptr().add(region.offset as usize) },
             consumed: false,
+            aabb: None,
         })
     }
 
     /// One reclaim pass: regions whose stamp the given timelines have passed
-    /// become reusable. `transfer` is `None` when copies ride the graphics queue.
+    /// become reusable. `transfer` is `None` on the same-queue fallback tier.
     pub(crate) fn reclaim(&self, render: TimelineValue, transfer: Option<TimelineValue>) {
         self.ring
             .reclaim(render.raw(), transfer.map(TimelineValue::raw));
@@ -836,6 +937,35 @@ mod tests {
     }
 
     #[test]
+    fn sysmem_staging_prefers_cached_system_memory() {
+        let cached = HOST_COHERENT | vk::MemoryPropertyFlags::HOST_CACHED;
+        let uncached = HOST_COHERENT;
+        let bar = HOST_COHERENT | vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        let discrete = memory_props(
+            &[
+                (vk::MemoryPropertyFlags::DEVICE_LOCAL, 0),
+                (uncached, 1),
+                (cached, 1),
+                (bar, 2),
+            ],
+            &[8 << 30, 16 << 30, 16 << 30, 256 << 20],
+        );
+        assert_eq!(sysmem_staging_type(&discrete, 0b1111), Some(2));
+        // Cached BAR must not beat uncached sysmem: prefer any HOST_COHERENT
+        // only when no cached sysmem type exists.
+        let cached_bar = cached | vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        let no_cached_sys = memory_props(
+            &[
+                (vk::MemoryPropertyFlags::DEVICE_LOCAL, 0),
+                (uncached, 1),
+                (cached_bar, 0),
+            ],
+            &[8 << 30, 16 << 30],
+        );
+        assert_eq!(sysmem_staging_type(&no_cached_sys, 0b111), Some(1));
+    }
+
+    #[test]
     fn transfer_stamp_uses_the_transfer_timeline_not_render() {
         let r = ring(16);
         let a = r.acquire(16).unwrap();
@@ -861,30 +991,34 @@ mod tests {
     #[test]
     fn pooled_copy_arrival_latency_is_one_frame_on_a_fake_timeline() {
         // Mirrors the render loop: apply_upload (Held) in the command drain,
-        // then note_frame + flush (Stamp::Render of this graphics submit) in
-        // draw. is_arrived becomes true at flush; reclaim waits for that
-        // render value — one deferred frame, no GPU wait on the host.
+        // then note_frame + flush (Stamp::Transfer of the lane submit) in
+        // draw. The graphics wait is deferred one frame; reclaim waits for
+        // the transfer counter — no same-frame GPU wait on the host.
         let r = ring(16);
         let region = r.acquire(16).unwrap();
         let queued_frame = 0u64;
         assert_eq!(region.offset, 0);
 
-        // Frame 1: flush stamps the graphics timeline value; region still live.
+        // Frame 1: flush stamps the transfer timeline; region still live.
         let frame = queued_frame + 1;
         assert_eq!(
             frame - queued_frame,
             1,
             "flushed the iteration it was applied"
         );
-        r.stamp(region, Stamp::Render(frame));
+        r.stamp(region, Stamp::Transfer(frame));
         r.reclaim(0, None);
         assert!(
             r.acquire(8).is_none(),
-            "Render(1) region waits for the fake render timeline"
+            "Transfer(1) region waits for the fake transfer timeline"
         );
 
-        // Frame 1's graphics has completed: next reclaim frees it.
         r.reclaim(frame, None);
+        assert!(
+            r.acquire(8).is_none(),
+            "a high render value does not free a Transfer stamp"
+        );
+        r.reclaim(0, Some(frame));
         let recycled = r
             .acquire(16)
             .expect("pooled region reclaimed one frame later");
@@ -906,6 +1040,77 @@ mod tests {
         send_sync::<MeshStager>();
         send::<MeshStaging>();
         send_sync::<Arc<MeshStagingPool>>();
+    }
+
+    fn tagged_quad(normal: Normal, tag: u8, pos: [u8; 3]) -> [MeshVertex; 4] {
+        std::array::from_fn(|i| {
+            MeshVertex::new(
+                [pos[0] + i as u8, pos[1], pos[2]],
+                normal,
+                u16::from(tag),
+                Ao::NONE,
+                Light::FULL,
+                false,
+            )
+        })
+    }
+
+    #[test]
+    fn write_vertices_and_quad_writer_track_aabb_like_meshdata() {
+        let mut data = MeshData::new(Pass::Opaque);
+        let a = tagged_quad(Normal::NegY, 1, [1, 2, 3]);
+        let b = tagged_quad(Normal::PosX, 2, [4, 5, 6]);
+        data.quad(a);
+        data.quad(b);
+
+        let n = data.vertex_bytes().max(64);
+        let pool = MeshStagingPool::new_host(n * 2);
+        let stager = pool.stager();
+        let mut staging = stager.acquire(data.vertex_bytes()).unwrap();
+        assert!(staging.recorded_aabb().is_none());
+        staging.write_vertices(std::array::from_fn(|i| data.vertices[i].as_slice()));
+        assert_eq!(staging.recorded_aabb(), Some(data.aabb()));
+
+        let mut writer_staging = stager.acquire(data.vertex_bytes()).unwrap();
+        {
+            let mut w = writer_staging.vertex_writer();
+            assert!(w.quad(a));
+            assert!(w.quad(b));
+        }
+        assert_eq!(writer_staging.recorded_aabb(), Some(data.aabb()));
+    }
+
+    #[test]
+    fn set_aabb_records_bounds_for_a_raw_bytes_fill() {
+        let pool = MeshStagingPool::new_host(32);
+        let mut staging = pool.stager().acquire(8).unwrap();
+        staging.bytes()[0] = 1;
+        assert!(staging.recorded_aabb().is_none());
+        staging.set_aabb([1, 2, 3], [4, 5, 6]);
+        assert_eq!(
+            staging.recorded_aabb(),
+            Some(([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]))
+        );
+    }
+
+    #[test]
+    fn aabb_for_upload_scans_when_unrecorded() {
+        let mut data = MeshData::new(Pass::Opaque);
+        data.quad(tagged_quad(Normal::PosY, 0, [2, 3, 4]));
+        let pool = MeshStagingPool::new_host(data.vertex_bytes().max(32));
+        let mut staging = pool.stager().acquire(data.vertex_bytes()).unwrap();
+        staging
+            .bytes()
+            .copy_from_slice(bytemuck::cast_slice(&data.vertices()));
+        let _ = take_aabb_fallback_count();
+        let got = staging.aabb_for_upload(data.vertex_bytes());
+        assert_eq!(got, data.aabb());
+        assert_eq!(take_aabb_fallback_count(), 1);
+        // A recorded AABB must not scan.
+        staging.set_aabb([0, 0, 0], [1, 1, 1]);
+        let recorded = staging.aabb_for_upload(data.vertex_bytes());
+        assert_eq!(recorded, ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]));
+        assert_eq!(take_aabb_fallback_count(), 0);
     }
 
     #[test]

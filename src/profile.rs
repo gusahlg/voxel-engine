@@ -345,10 +345,12 @@ pub enum Gauge {
     /// Frames a pooled mesh sat in `pending` before `is_arrived` (1 = flushed
     /// the same render-loop iteration it was applied; >1 = budget-deferred).
     PoolArrivalFrames,
+    /// Staged uploads that had to scan the region because no AABB was recorded.
+    PoolAabbFallback,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 24] = [
+    const ALL: [Gauge; 25] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
@@ -373,6 +375,7 @@ impl Gauge {
         Gauge::PoolAcquires,
         Gauge::PoolCopies,
         Gauge::PoolArrivalFrames,
+        Gauge::PoolAabbFallback,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -402,6 +405,7 @@ impl Gauge {
             Gauge::PoolAcquires => "pool.acq",
             Gauge::PoolCopies => "pool.copies",
             Gauge::PoolArrivalFrames => "pool.arrive",
+            Gauge::PoolAabbFallback => "pool.aabb",
         }
     }
 }
