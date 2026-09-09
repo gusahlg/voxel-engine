@@ -298,7 +298,8 @@ impl Renderer {
                 .as_ref()
                 .map(|s| s.frame_uniforms)
                 .unwrap_or_else(crate::skeleton::FrameUniformsGpu::full_bright);
-            u.prepare_derived();
+            // `prepare_derived` already ran in `Frame::begin_3d` (`gate_uniforms`)
+            // or `full_bright`; do not redo it here.
             // Debug-flat: claim the `extras` lane as [r, g, b, enabled] —
             // sRGB-encoded key channels + an enable flag. mesh3d.frag linearises rgb
             // (as it does every CPU colour) and outputs it flat while depth writes.
@@ -313,7 +314,10 @@ impl Renderer {
                     1.0,
                 ];
             }
-            self.ubo_ring.write(FrameSlot::new(slot), &u);
+            self.ubo_ring.write(
+                FrameSlot::new(slot),
+                &super::uniforms::FrameUniformsExt::derive(u),
+            );
         }
         let warp_map = lists
             .scene

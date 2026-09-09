@@ -79,7 +79,7 @@ impl FrameUniformsExt {
     /// fragment: ambient floor colour, sky-halo exponent, halo tint×scale,
     /// the shadow-fallback day factor, and the sky-dome shadow fill. Mirrors
     /// `common.slang`.
-    fn derive(u: FrameUniformsGpu) -> Self {
+    pub(crate) fn derive(u: FrameUniformsGpu) -> Self {
         let zenith = Vec3::new(u.zenith[0], u.zenith[1], u.zenith[2]);
         let light = Vec3::new(u.light[0], u.light[1], u.light[2]);
         let floor = u.candle[3];
@@ -141,12 +141,13 @@ impl UboRing {
         }
     }
 
-    /// Copy this frame's uniforms into `slot`'s mapped buffer, appending the
-    /// derived tail. Coherent memory: the write is visible to the GPU with no
-    /// explicit flush.
-    pub(crate) fn write(&mut self, slot: FrameSlot, u: &FrameUniformsGpu) {
-        let ext = FrameUniformsExt::derive(*u);
-        unsafe { self.bufs[slot].write(0, bytemuck::bytes_of(&ext)) };
+    /// Copy this frame's already-derived uniforms (176-byte `FrameUniformsExt`)
+    /// into `slot`'s mapped buffer. Coherent memory: the write is visible to
+    /// the GPU with no explicit flush. `prepare_derived` runs once on the
+    /// producer (begin_3d / full_bright); `FrameUniformsExt::derive` runs once
+    /// on the render thread before this write.
+    pub(crate) fn write(&mut self, slot: FrameSlot, ext: &FrameUniformsExt) {
+        unsafe { self.bufs[slot].write(0, bytemuck::bytes_of(ext)) };
     }
 
     /// The buffer bound at set 0, binding 2 for `slot`. The per-frame UBO is
