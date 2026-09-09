@@ -68,7 +68,11 @@ const STATS_BYTES: u64 = (STATS_COUNT * size_of::<u32>()) as u64;
 const FLAG_STATS: u32 = 1;
 /// Live camera-group records at or below this count skip the GPU cull and
 /// emit the same commands on the CPU. Overridable via `VOXEL_CPU_CULL_MAX`.
-const CPU_CULL_MAX: u32 = 64;
+///
+/// Forcing the CPU path was +5 % at 567 meshes on an RTX 3070 and +25 % on an
+/// RTX 4060 with a Ryzen 5 5500; at 2025 meshes it was +8 % on the Ryzen box
+/// and -3 % on the i5 box. 1024 keeps the win without paying on fast GPUs.
+const CPU_CULL_MAX: u32 = 1024;
 
 static CULL_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cull.comp.spv"));
 static CULL_COMP_WAVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cull_wave.comp.spv"));
@@ -2452,8 +2456,8 @@ mod tests {
     }
 
     #[test]
-    fn cpu_cull_max_defaults_to_64_and_parses_env() {
-        assert_eq!(CPU_CULL_MAX, 64);
+    fn cpu_cull_max_defaults_to_1024_and_parses_env() {
+        assert_eq!(CPU_CULL_MAX, 1024);
         assert_eq!(
             std::env::var("VOXEL_CPU_CULL_MAX")
                 .ok()
