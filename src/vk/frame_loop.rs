@@ -1250,7 +1250,7 @@ impl Renderer {
         let vrs_on = lists.scene.is_some() && self.flags.vrs && self.targets.vrs.is_some();
         let do_vrs = vrs_on && self.slots[FrameSlot::new(slot)].vrs_ready;
         let classify_vrs = vrs_on;
-        let build_hiz = lists.scene.is_some() && self.flags.occlusion;
+        let build_hiz = lists.scene.is_some() && self.occlusion;
         // Depth consumers after the scene pass, computed once: VRS classify,
         // Hi-Z reduce, spill/godrays (presented + bloom or a live march), fused TAA.
         let spill_live = self.flags.bloom || godray.strength > 0.0;

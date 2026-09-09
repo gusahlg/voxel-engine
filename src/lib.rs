@@ -5,7 +5,7 @@
 //! runtime-swappable block texture arrays, device-local
 //! mesh memory with same-frame uploads and deferred frees, reversed-Z depth,
 //! frustum culling, an embedded 8x8 font for 2D overlay, and runtime graphics
-//! settings (fullscreen, vsync, MSAA).
+//! settings (fullscreen, vsync, MSAA, occlusion).
 //!
 //! Entry point: [`run`] with a per-frame callback over [`Engine`].
 

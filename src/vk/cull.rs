@@ -544,7 +544,7 @@ const _: () = assert!(std::mem::offset_of!(CullParamsGpu, occ_flags) == 364);
 
 /// Occlusion inputs for one GPU cull dispatch. `enabled` is false on the
 /// first frame after create/resize/invalidation (pyramid is cleared to 0,
-/// which never culls) and when the occlusion flag is off.
+/// which never culls) and when occlusion is off.
 #[derive(Clone, Copy)]
 pub(crate) struct OccParams {
     pub view_proj: Mat4,
@@ -2707,18 +2707,20 @@ mod tests {
         // corner indices (0 and 2) skipped the middle column.
         let uv_min = [0.9 / 64.0, 0.0];
         let uv_max = [2.4 / 64.0, 1.0 / 64.0];
-        let mip = occ_mip_for_rect(
-            [uv_max[0] - uv_min[0], uv_max[1] - uv_min[1]],
-            level0,
-            7,
-        );
+        let mip = occ_mip_for_rect([uv_max[0] - uv_min[0], uv_max[1] - uv_min[1]], level0, 7);
         assert_eq!(mip, 1);
         // Mip 1 maps that span onto texels 0 and 1, so the 2×2 gather sees
         // both (covering all three level-0 columns). A far (smaller reversed-Z)
         // occluder in mip-1 column 1 is included in occ_min.
-        let occ = occ_gather_min(uv_min, uv_max, level0, mip, |x, _y| {
-            if x == 1 { 0.1 } else { 0.9 }
-        });
+        let occ = occ_gather_min(
+            uv_min,
+            uv_max,
+            level0,
+            mip,
+            |x, _y| {
+                if x == 1 { 0.1 } else { 0.9 }
+            },
+        );
         assert!((occ - 0.1).abs() < 1e-5);
     }
 

@@ -458,8 +458,8 @@ pub struct RenderTargets {
     /// a frame actually classifies and binds the rate attachment.
     pub(crate) vrs: Option<super::vrs::Vrs>,
     /// Per-slot Hi-Z depth pyramid (half-res R32F mip chain down to 1×1).
-    /// Built after the scene pass when `RenderFlags::occlusion` is on; sampled
-    /// by the next frame's cull compute. Recreated with the targets.
+    /// Built after the scene pass when occlusion is on; sampled by the next
+    /// frame's cull compute. Recreated with the targets.
     pub(crate) hiz: [HizChain; FRAMES_IN_FLIGHT as usize],
     /// Shared cascaded shadow map (every FIF slot samples the same image).
     /// Regenerated once per `ShadowKey`; see `shadow.rs` hazard analysis.

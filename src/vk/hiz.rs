@@ -140,12 +140,12 @@ impl super::Renderer {
     }
 
     /// Cull-side occlusion params from the last pyramid build. Disabled when
-    /// the flag is off or there is no history (first frame / after resize).
+    /// occlusion is off or there is no history (first frame / after resize).
     pub(super) fn occ_params(&self, eye: super::pipeline::EyeSplit) -> super::cull::OccParams {
         let chain = &self.targets.hiz[0];
         let level0 = chain.mip_extents[0];
         let mips = chain.mip_views.len() as u32;
-        if !self.flags.occlusion {
+        if !self.occlusion {
             return super::cull::OccParams::disabled(level0, mips);
         }
         match self.hiz_history {

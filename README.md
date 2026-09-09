@@ -32,8 +32,10 @@ See the maintained [demo](src/bin/demo.rs) for a complete API example.
   (history is a second colour attachment), so TAA also up/downsamples
   `render_scale` and skipped mailbox frames do no TAA work.
 - **Settings at runtime**: borderless fullscreen, vsync (FIFO/MAILBOX/
-  IMMEDIATE), MSAA 1–8x with resolve, resizable window — all applied lazily at
-  the next frame boundary.
+  IMMEDIATE), MSAA 1–8x with resolve, resizable window, GPU face-run culling,
+  and Hi-Z occlusion culling (`Engine::set_occlusion`; default on,
+  `VOXEL_OCCLUSION=0` at create for A/B) — all applied lazily at the next
+  frame boundary.
 - **Correctness**: synchronization2 + dynamic rendering, per-swapchain-image
   present semaphores, dynamic viewport/scissor (pipelines never rebuild on
   resize), validation layer + debug messenger in debug builds

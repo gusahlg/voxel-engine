@@ -91,6 +91,8 @@ pub(crate) enum RenderCmd {
     SetFlags(crate::RenderFlags),
     /// GPU face-run culling; applied at the next cull prepare.
     SetCullFaces(bool),
+    /// GPU occlusion culling (Hi-Z pyramid + cull test).
+    SetOcclusion(bool),
     /// Pre-clamped against device caps.
     SetMsaa(u32),
     SetRenderScale(Scale),
@@ -221,6 +223,7 @@ pub(crate) struct RenderClient {
     vsync: bool,
     msaa: u32,
     cull_faces: bool,
+    occlusion: bool,
     /// The render thread's published exposure cell, cloned into `Engine`.
     exposure: super::exposure::ExposureShared,
     /// `None` once joined (shutdown is idempotent).
@@ -349,6 +352,7 @@ impl RenderClient {
             vsync: config.vsync,
             msaa,
             cull_faces: true,
+            occlusion: super::occlusion_env_on(),
             exposure: reply.exposure,
             join: Some(join),
             frames_rendered,
@@ -536,6 +540,21 @@ impl RenderClient {
 
     pub(crate) fn cull_faces(&self) -> bool {
         self.cull_faces
+    }
+
+    /// GPU occlusion culling. On by default unless `VOXEL_OCCLUSION=0` was set
+    /// at renderer creation. Ships [`RenderCmd::SetOcclusion`]; a change takes
+    /// effect at the next frame boundary and invalidates Hi-Z history.
+    pub(crate) fn set_occlusion(&mut self, on: bool) {
+        if self.occlusion == on {
+            return;
+        }
+        self.occlusion = on;
+        let _ = self.tx.send(RenderCmd::SetOcclusion(on));
+    }
+
+    pub(crate) fn occlusion(&self) -> bool {
+        self.occlusion
     }
 
     pub(crate) fn set_flags(&mut self, flags: crate::RenderFlags) {
@@ -827,6 +846,7 @@ fn render_loop(
                 RenderCmd::SetVsync(v) => renderer.set_vsync(v),
                 RenderCmd::SetFlags(f) => renderer.set_flags(f),
                 RenderCmd::SetCullFaces(on) => renderer.set_cull_faces(on),
+                RenderCmd::SetOcclusion(on) => renderer.set_occlusion(on),
                 RenderCmd::SetMsaa(m) => {
                     renderer.set_msaa(m);
                 }

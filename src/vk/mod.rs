@@ -184,6 +184,10 @@ pub(crate) struct Renderer {
 
     /// Feature flags.
     flags: crate::engine::RenderFlags,
+    /// GPU occlusion culling (Hi-Z pyramid + cull test). Independent of
+    /// [`crate::engine::RenderFlags`]; default on, `VOXEL_OCCLUSION=0` at
+    /// create turns it off.
+    occlusion: bool,
 
     /// Present copy command buffer.
     copy_cmd: vk::CommandBuffer,
@@ -532,6 +536,7 @@ impl Renderer {
             taa,
             draw_scratch: Vec::new(),
             flags,
+            occlusion: occlusion_env_on(),
             draw_commands: Vec::new(),
             draw_runs: Vec::new(),
             copy_cmd,
@@ -601,11 +606,6 @@ impl Renderer {
         if self.flags.taa != flags.taa {
             self.taa.invalidate_history();
         }
-        if self.flags.occlusion != flags.occlusion {
-            // Next cull samples a cleared-to-0 pyramid (nothing hidden) until
-            // a new reduce runs. Off skips the pass and the test.
-            self.invalidate_hiz();
-        }
         if self.flags.bloom && !flags.bloom {
             // Next presented frame must re-clear the stale pyramid to black.
             for chain in &mut self.targets.bloom {
@@ -619,6 +619,17 @@ impl Renderer {
     /// capacity and the cull-params flag always agree for a frame.
     pub fn set_cull_faces(&mut self, on: bool) {
         self.cull.set_face_cull(on);
+    }
+
+    /// GPU occlusion culling. Toggling invalidates the Hi-Z pyramid so the
+    /// next cull samples a cleared-to-0 image (nothing hidden) until a new
+    /// reduce runs. Off skips the pyramid pass and the occlusion test.
+    pub fn set_occlusion(&mut self, on: bool) {
+        if self.occlusion == on {
+            return;
+        }
+        self.occlusion = on;
+        self.invalidate_hiz();
     }
 
     /// Set render scale; returns clamped value.
@@ -815,6 +826,18 @@ impl Renderer {
             device: self.device,
         }
     }
+}
+
+/// Hi-Z occlusion default. Read once at renderer creation. Unset or any
+/// value other than `"0"` leaves occlusion on; `VOXEL_OCCLUSION=0` is an
+/// A/B kill-switch (not a public API).
+pub(crate) fn occlusion_env_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_occlusion_env(std::env::var("VOXEL_OCCLUSION").ok().as_deref()))
+}
+
+fn parse_occlusion_env(v: Option<&str>) -> bool {
+    !matches!(v, Some("0"))
 }
 
 /// Profiling experiment: `VOXEL_BENCH_EMPTY=K` (integer K ≥ 1) records K
@@ -1166,6 +1189,14 @@ fn sampleable_depth_attachment_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn occlusion_env_kill_switch_is_only_zero() {
+        assert!(parse_occlusion_env(None));
+        assert!(parse_occlusion_env(Some("1")));
+        assert!(parse_occlusion_env(Some("off")));
+        assert!(!parse_occlusion_env(Some("0")));
+    }
 
     #[test]
     fn scale_clamps_into_range() {
