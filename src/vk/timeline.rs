@@ -3,6 +3,8 @@
 //! timeline. The only surviving binary semaphores are the two the WSI
 //! mandates (acquire signal, present wait), modelled by `BinarySemaphore` so
 //! a timeline handle can never reach acquire/present.
+use std::time::{Duration, Instant};
+
 use ash::vk;
 
 // Monotonic timeline value (canonical counter for GPU sync).
@@ -75,6 +77,24 @@ impl Timeline {
                 .wait_semaphores(&info, u64::MAX)
                 .expect("timeline wait failed");
         }
+    }
+
+    /// Poll the timeline for `budget`, then fall through to a blocking wait.
+    /// Trades a spinning core for the kernel wake latency of `vkWaitSemaphores`.
+    pub unsafe fn wait_spin(&self, device: &ash::Device, value: TimelineValue, budget: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < budget {
+            let v = unsafe {
+                device
+                    .get_semaphore_counter_value(self.sem)
+                    .expect("timeline counter query failed")
+            };
+            if v >= value.raw() {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        unsafe { self.wait(device, value) };
     }
 
     /// Non-blocking probe of the current timeline value.

@@ -2,17 +2,57 @@
 
 use ash::vk;
 
+use super::buffers::FRAMES_IN_FLIGHT;
 use super::image::LayoutUse;
 use super::pass;
 use crate::genconst;
 use crate::rev::FrameSlot;
+use crate::skeleton::FrameUniformsGpu;
 
 const SKY_CLOUD_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_cloud.comp.spv"));
+
+/// LUT identity quanta. Wind is 0.02 noise/s ÷ CLOUD_NOISE_SCALE 0.0009 ≈ 22 m/s;
+/// × 1/120 s at 180 m altitude ≈ 0.06°, far below one 0.7° LUT texel. Camera xz/y
+/// is 0.25 m; sun/light/zenith are 1/1024.
+const LUT_TIME_HZ: f32 = 120.0;
+const LUT_POS_QUANTUM: f32 = 0.25;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LutKey {
+    t: i32,
+    xz: [i32; 2],
+    y: i32,
+    sun: [i32; 3],
+    light: [i32; 3],
+    zenith: [i32; 3],
+}
+
+impl LutKey {
+    fn of(u: &FrameUniformsGpu) -> Self {
+        let r = |v: f32| (v * 1024.0).round() as i32;
+        Self {
+            t: (u.anim[0] * LUT_TIME_HZ).floor() as i32,
+            xz: [
+                (u.anim[1] * genconst::ANIM_PERIOD / LUT_POS_QUANTUM).floor() as i32,
+                (u.anim[2] * genconst::ANIM_PERIOD / LUT_POS_QUANTUM).floor() as i32,
+            ],
+            y: (u.anim[3] / LUT_POS_QUANTUM).floor() as i32,
+            sun: [
+                r(u.sun_dir_elev[0]),
+                r(u.sun_dir_elev[1]),
+                r(u.sun_dir_elev[2]),
+            ],
+            light: [r(u.light[0]), r(u.light[1]), r(u.light[2])],
+            zenith: [r(u.zenith[0]), r(u.zenith[1]), r(u.zenith[2])],
+        }
+    }
+}
 
 pub(crate) struct SkyCloudState {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     set_layout: vk::DescriptorSetLayout,
+    last_key: [Option<LutKey>; FRAMES_IN_FLIGHT as usize],
 }
 
 impl SkyCloudState {
@@ -36,7 +76,12 @@ impl SkyCloudState {
             pipeline,
             layout,
             set_layout,
+            last_key: [None; FRAMES_IN_FLIGHT as usize],
         }
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.last_key = [None; FRAMES_IN_FLIGHT as usize];
     }
 
     pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
@@ -57,15 +102,23 @@ pub(crate) fn clouds_hidden(camera_y: f32) -> bool {
 impl super::Renderer {
     /// March (or zero) this slot's cloud LUT before the scene pass. Zeros the LUT
     /// when the slab is hidden so the fragment's bilinear tap composites as a no-op.
+    /// Skips when quantized inputs match the last march for this slot (the image
+    /// already rests in `SHADER_READ_ONLY_OPTIMAL`). Captures pass `force` so
+    /// goldens always get an exact LUT.
     pub(crate) fn record_sky_cloud_lut(
         &mut self,
         cmd: vk::CommandBuffer,
         slot: usize,
-        camera_y: f32,
+        u: &FrameUniformsGpu,
+        force: bool,
     ) {
+        let key = LutKey::of(u);
+        if !force && self.sky_cloud.last_key[slot] == Some(key) {
+            return;
+        }
         let device = &self.device.device;
 
-        if clouds_hidden(camera_y) {
+        if clouds_hidden(u.anim[3]) {
             let lut = &mut self.targets.sky_cloud[slot];
             lut.transition_discard(device, cmd, LayoutUse::TransferClear);
             unsafe {
@@ -78,6 +131,7 @@ impl super::Renderer {
                 );
             }
             lut.transition(device, cmd, LayoutUse::FragmentSampledAfterClear);
+            self.sky_cloud.last_key[slot] = Some(key);
             return;
         }
 
@@ -122,13 +176,15 @@ impl super::Renderer {
             device.cmd_dispatch(cmd, n.div_ceil(wg), n.div_ceil(wg), 1);
         }
         self.targets.sky_cloud[slot].transition(device, cmd, LayoutUse::SampledAfterComputeWrite);
+        self.sky_cloud.last_key[slot] = Some(key);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::clouds_hidden;
+    use super::{LutKey, clouds_hidden};
     use crate::genconst;
+    use crate::skeleton::FrameUniformsGpu;
 
     #[test]
     fn clouds_hidden_at_or_above_slab_top() {
@@ -150,6 +206,26 @@ mod tests {
         let n = [fx, 1.0 - fx.abs() - fy.abs(), fy];
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
         [n[0] / len, n[1] / len, n[2] / len]
+    }
+
+    #[test]
+    fn lut_key_quantizes_time_position_and_sun() {
+        let u = FrameUniformsGpu::full_bright();
+        let a = LutKey::of(&u);
+        assert_eq!(a, LutKey::of(&u));
+
+        let mut t = u;
+        t.anim[0] += 1.0 / 60.0;
+        assert_ne!(a, LutKey::of(&t));
+
+        let mut s = u;
+        s.sun_dir_elev[0] += 1e-5;
+        assert_eq!(a, LutKey::of(&s));
+
+        let mut y = u;
+        y.anim[3] = f32::MAX;
+        assert_ne!(a, LutKey::of(&y));
+        assert_ne!(LutKey::of(&y).y, LutKey::of(&u).y);
     }
 
     #[test]

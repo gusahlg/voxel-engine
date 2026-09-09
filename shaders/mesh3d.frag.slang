@@ -24,17 +24,13 @@ struct FragmentInput
     [[vk::location(1)]]
     float3 world; // camera-relative (camera at origin)
 
-    // rgb = light.rgb * sky_amount (vertex); w = sky_amount
+    // x = sky_amount, y = block_amount, z = ao_factor (vertex scalars)
     [[vk::location(2)]]
-    float4 sky;
-
-    // rgb = candle.rgb * block_amount (vertex); a = AO
-    [[vk::location(3)]]
-    float4 block_ao;
+    float3 light_lv;
 
     // x: layer[0:14] water[14] FLAT_COLOR[15] face[16:19] detail[20:24]
     // y: flat_rgba
-    [[vk::location(4)]]
+    [[vk::location(3)]]
     nointerpolation uint2 ids;
 };
 
@@ -196,8 +192,18 @@ float sun_shadow(float3 world, float3 N, float raw_ndl, float ndl, float dist, f
     // BACKFACE_LIT (see the golden notes in vk/shadow.rs).
     if (ndl <= 0.0)
         return lerp(BACKFACE_LIT, fallback, fade);
-    uint c = dist < cascade.splits_fade.x ? 0u : 1u;
-    float map = shadow_map_term(world, N, clamp(raw_ndl, 0.0, 1.0), c);
+    // Near/far PCF cross-fade over CASCADE_BLEND_FRAC of the near split.
+    // Branch order guarantees no divide-by-zero at FRAC=0 (the band is empty
+    // and the compiler folds it away). Near radius is split+4 so both
+    // cascades cover the band; 8 taps only inside the ring.
+    float s0 = cascade.splits_fade.x;
+    float b0 = s0 * (1.0 - CASCADE_BLEND_FRAC);
+    float ndl_c = clamp(raw_ndl, 0.0, 1.0);
+    float map;
+    if (dist < b0)       map = shadow_map_term(world, N, ndl_c, 0u);
+    else if (dist >= s0) map = shadow_map_term(world, N, ndl_c, 1u);
+    else map = lerp(shadow_map_term(world, N, ndl_c, 0u),
+                    shadow_map_term(world, N, ndl_c, 1u), (dist - b0) / (s0 - b0));
     return lerp(map, fallback, fade);
 }
 
@@ -214,7 +220,7 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     }
 #elif !defined(MESH3D_OPAQUE)
     // Blend module: mixed full-res / LOD draws share this path.
-    float scale = exp2(float((input.ids.x >> 20) & 0xFu) - float(DETAIL_GPU_BIAS));
+    float scale = detail_scale(input.ids.x >> 20);
     if (scale > 1.0 && pc.clip > 0.0) {
         bool inside_h = length(input.world.xz) < pc.clip;
         bool inside_v = pc.clip_v > 0.0 && abs(input.world.y) < pc.clip_v;
@@ -250,8 +256,9 @@ float4 fragmentMain(FragmentInput input) : SV_Target
         alpha = tex.a;
     }
 
-    float sky_amount = input.sky.w;
-    float ao = input.block_ao.a;
+    float sky_amount = input.light_lv.x;
+    float block_amount = input.light_lv.y;
+    float ao = input.light_lv.z;
     float3 N = FACE_NORMAL[face];
     float dist = length(input.world);
     float raw_ndl = dot(N, frame.sun_dir_elev.xyz);
@@ -284,9 +291,15 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // ground keeps readable, sky-proportional light instead of collapsing to
     // near-black. Fully lit surfaces are untouched (shadow*omni >= the floor),
     // and caves stay dark (the whole term still scales by sky_amount).
-    float lit = max(shadow * omni, SHADOW_SKY_AMBIENT);
-    float3 sky = input.sky.rgb * lit;
-    float3 block = input.block_ao.rgb;
+    // The floor now rides `frame.shadow_bounce` (SHADOW_SKY_AMBIENT × sun
+    // colour, optionally tinted toward luma-matched zenith). AO_DIRECT lets
+    // baked AO darken the dome/ambient/blocklight fully while only partially
+    // darkening direct sun (legacy 1.0 is bit-identical to the old `ao * max`).
+    float direct = max(shadow * omni - SHADOW_SKY_AMBIENT, 0.0);
+    float ao_direct = 1.0 - AO_DIRECT * (1.0 - ao);
+    float3 sky = frame.light.rgb * (sky_amount * direct * ao_direct)
+               + frame.shadow_bounce.rgb * (sky_amount * ao);
+    float3 block = frame.candle.rgb * block_amount;
     float3 rgb = base * light_eval(sky, block, ao, frame);
 
     // Water fragments (transparent pass) replace the flat blend with animated

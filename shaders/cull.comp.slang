@@ -6,7 +6,7 @@
 
 #include "common.slang"
 
-// Mirrors vk::buffers::MeshRecord exactly (std430).
+// Mirrors vk::buffers::MeshRecord exactly (std430, 80 bytes).
 struct MeshRecord
 {
     int3 block;
@@ -17,6 +17,8 @@ struct MeshRecord
     uint index_count;
     float3 aabb_max;
     int vertex_offset;
+    uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
+    uint flags; // bit 0 = packed face-runs valid; clear → whole-mesh draw
 };
 
 // Mirrors vk::cull::PartitionGpu (std430).
@@ -46,7 +48,7 @@ struct CullParams
     float3 cam_frac;
     uint arena_count;
     uint shadow_enabled;
-    uint pad0;
+    uint flags; // bit 0 = per-direction face-run culling
     uint pad1;
     uint pad2;
 };
@@ -163,8 +165,7 @@ void computeMain(uint3 id: SV_DispatchThreadID)
     if (pass > 1u)
         return; // Blend: CPU-sorted path
 
-    // Detail is biased; exp2 handles fractional scales for half-block levels.
-    float scale = exp2(float(rec.detail_pass & 0xFu) - float(DETAIL_GPU_BIAS));
+    float scale = detail_scale(rec.detail_pass);
     float3 offset = float3(rec.block - params.cam_block) - params.cam_frac + rec.local_off;
     float3 mn = rec.aabb_min * scale + offset;
     float3 mx = rec.aabb_max * scale + offset;
@@ -189,12 +190,80 @@ void computeMain(uint3 id: SV_DispatchThreadID)
             float dist = length(0.5 * (mn + mx));
             uint bucket = distance_bucket(dist);
             uint part = (group * params.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
-            emit(part, cmd);
-            if ((pc.flags & 1u) != 0)
+            if ((params.flags & 1u) == 0u || (rec.flags & 1u) == 0u)
             {
-                uint unused;
-                InterlockedAdd(stats[group * 2u], 1u, unused);
-                InterlockedAdd(stats[group * 2u + 1u], cmd.index_count, unused);
+                emit(part, cmd);
+                if ((pc.flags & 1u) != 0)
+                {
+                    uint unused;
+                    InterlockedAdd(stats[group * 2u], 1u, unused);
+                    InterlockedAdd(stats[group * 2u + 1u], cmd.index_count, unused);
+                }
+            }
+            else
+            {
+                // Cumulative 6*quads from packed u16 pairs (upload slots 0|1, 2|3, 4|5).
+                uint b[7];
+                b[0] = 0u;
+                [unroll]
+                for (uint i = 0u; i < 3u; i++)
+                {
+                    uint packed = rec.face_quads[i];
+                    b[i * 2u + 1u] = b[i * 2u] + 6u * (packed & 0xFFFFu);
+                    b[i * 2u + 2u] = b[i * 2u + 1u] + 6u * (packed >> 16);
+                }
+                // +axis vis iff mn[axis] < 0; −axis iff mx[axis] > 0. +Y uses the
+                // drooped AABB because mesh3d.vert lowers far vertices by
+                // min(|xz|²·CURVE_INV_2R, CURVE_MAX_DROP). −Y without droop is
+                // already conservative.
+                bool vis[6];
+                vis[0] = mn.x < 0.0;
+                float2 far = max(abs(mn.xz), abs(mx.xz));
+                float droop = min(dot(far, far) * CURVE_INV_2R, CURVE_MAX_DROP);
+                vis[1] = (mn.y - droop) < 0.0;
+                vis[2] = mn.z < 0.0;
+                vis[3] = mx.x > 0.0;
+                vis[4] = mx.y > 0.0;
+                vis[5] = mx.z > 0.0;
+                // Merge consecutive visible non-empty buckets. emit may be called
+                // ≤3 times per lane; the wave path already handles divergent callers.
+                uint start = ~0u;
+                for (uint k = 0u; k < 6u; k++)
+                {
+                    bool occ = vis[k] && (b[k + 1u] != b[k]);
+                    if (occ)
+                    {
+                        if (start == ~0u)
+                            start = k;
+                    }
+                    else if (start != ~0u)
+                    {
+                        DrawCmd run = cmd;
+                        run.first_index = b[start];
+                        run.index_count = b[k] - b[start];
+                        emit(part, run);
+                        if ((pc.flags & 1u) != 0)
+                        {
+                            uint unused;
+                            InterlockedAdd(stats[group * 2u], 1u, unused);
+                            InterlockedAdd(stats[group * 2u + 1u], run.index_count, unused);
+                        }
+                        start = ~0u;
+                    }
+                }
+                if (start != ~0u)
+                {
+                    DrawCmd run = cmd;
+                    run.first_index = b[start];
+                    run.index_count = b[6] - b[start];
+                    emit(part, run);
+                    if ((pc.flags & 1u) != 0)
+                    {
+                        uint unused;
+                        InterlockedAdd(stats[group * 2u], 1u, unused);
+                        InterlockedAdd(stats[group * 2u + 1u], run.index_count, unused);
+                    }
+                }
             }
         }
     }

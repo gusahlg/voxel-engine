@@ -269,9 +269,12 @@ impl Engine {
         self.client.max_texture_layers()
     }
 
-    /// Enables opt-in six-way face culling: each mesh submits only its
-    /// camera-facing direction buckets. Off by default (one draw per mesh);
-    /// earns its keep only under heavy vertex load.
+    /// GPU per-direction face-run culling: the cull shader emits contiguous
+    /// camera-facing quad runs instead of a whole-mesh draw.
+    ///
+    /// On by default (`Config` has no field). Safe to toggle at runtime — the
+    /// change is sent on the render-thread command stream and lands at the next
+    /// frame boundary. `false` is an explicit opt-out (whole-mesh draws).
     pub fn set_cull_faces(&mut self, on: bool) {
         self.client.set_cull_faces(on);
     }
@@ -533,7 +536,10 @@ pub fn run(config: Config, frame_callback: impl FnMut(&mut Engine) -> bool) {
     // The engine reports everything through `log`; give binaries that never
     // set up a logger a working RUST_LOG path (no-op if one exists).
     let _ = env_logger::try_init();
-    let event_loop = EventLoop::new().expect("Failed to create event loop");
+    let event_loop = EventLoop::new().expect(
+        "Failed to create event loop: set DISPLAY or WAYLAND_DISPLAY, and a \
+         windowing library must be loadable",
+    );
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = EngineApp {
         config,
@@ -542,7 +548,20 @@ pub fn run(config: Config, frame_callback: impl FnMut(&mut Engine) -> bool) {
         finished: false,
         ran_this_cycle: false,
     };
-    event_loop.run_app(&mut app).expect("Event loop failed");
+    if let Err(err) = event_loop.run_app(&mut app) {
+        log::error!(
+            "event loop failed: {err}; the windowing connection was lost — the \
+             compositor drops clients whose main thread stalls for seconds; \
+             check for long synchronous work in the frame callback"
+        );
+        // Keep `run` as `()` so `voxel_engine::run(config, |eng| ...)` callers
+        // (the game and the demo) stay source-compatible. `process::exit` skips
+        // remaining destructors, so drop the app first: `Engine`/`RenderClient`
+        // join the render thread and destroy Vulkan objects the same way a
+        // normal `finished` exit does.
+        drop(app);
+        std::process::exit(1);
+    }
 }
 
 struct EngineApp<F> {

@@ -27,6 +27,11 @@ pub(super) struct RenderPass<'a> {
     /// Whether `layout_3d` descriptors are currently live. Incompatible layouts
     /// (sky, debug, 2D) disturb them; tracking lets mesh passes skip re-pushing.
     mesh_desc_bound: std::cell::Cell<bool>,
+    /// Jittered clip matrix and eye split, computed once in `begin` when a 3D
+    /// scene is present. Shared by mesh push constants, debug view_proj, and sky.
+    scene_state: Option<(glam::Mat4, pipeline::EyeSplit)>,
+    mesh_push_bound: std::cell::Cell<bool>,
+    index_bound: std::cell::Cell<bool>,
 }
 
 impl<'a> RenderPass<'a> {
@@ -145,6 +150,13 @@ impl<'a> RenderPass<'a> {
                 },
             };
             let offscreen_view = r.targets.offscreen[slot].view();
+            // Sky triangle covers every pixel left at reversed-Z far (depth 0).
+            // Debug-flat (TerrainKey) frames carry `lists.sky == None` and still clear.
+            let color_load = if lists.scene.is_some() && r.flags.sky && lists.sky.is_some() {
+                vk::AttachmentLoadOp::DONT_CARE
+            } else {
+                vk::AttachmentLoadOp::CLEAR
+            };
             let mut color_attachment = if let Some(msaa) = &r.targets.msaa {
                 vk::RenderingAttachmentInfo::default()
                     .image_view(msaa.view())
@@ -152,14 +164,14 @@ impl<'a> RenderPass<'a> {
                     .resolve_mode(vk::ResolveModeFlags::AVERAGE)
                     .resolve_image_view(offscreen_view)
                     .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .load_op(color_load)
                     .store_op(vk::AttachmentStoreOp::DONT_CARE)
             } else {
                 // Offscreen is color target; store contents for present copy.
                 vk::RenderingAttachmentInfo::default()
                     .image_view(offscreen_view)
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .load_op(color_load)
                     .store_op(vk::AttachmentStoreOp::STORE)
             };
             color_attachment = color_attachment.clear_value(clear_color);
@@ -245,6 +257,13 @@ impl<'a> RenderPass<'a> {
             // incompatible layouts), not once here.
         }
 
+        let scene_state = lists.scene.as_ref().map(|scene| {
+            (
+                jittered_clip(scene.view_proj, scene.jitter.0, r.render_extent),
+                pipeline::EyeSplit::of(scene.eye),
+            )
+        });
+
         RenderPass {
             r,
             cmd,
@@ -254,6 +273,9 @@ impl<'a> RenderPass<'a> {
             offscreen_image,
             ended: false,
             mesh_desc_bound: std::cell::Cell::new(false),
+            scene_state,
+            mesh_push_bound: std::cell::Cell::new(false),
+            index_bound: std::cell::Cell::new(false),
         }
     }
 
@@ -263,11 +285,33 @@ impl<'a> RenderPass<'a> {
     /// pass rather than once up front, because interleaved passes bind
     /// incompatible layouts that disturb this state. Only sound when at least
     /// one mesh run exists (else the offsets SSBO can be a null buffer).
+    ///
+    /// Push-constant bytes are identical for every mesh pass (`lists.lod_clip`,
+    /// `lod_clip_v`); the quad IBO binding survives pipeline/layout changes.
+    /// Both are bound once and skipped until a foreign pass invalidates them
+    /// (push constants) — the IBO is never invalidated.
     unsafe fn bind_mesh3d_state(&self) {
         unsafe {
             self.push_mesh3d_descriptors();
-            // LOD slab extents: LOD tiles hard-discard inside the full-res volume.
-            self.push_mesh3d_constants(self.lists.lod_clip, self.lists.lod_clip_v);
+            if !self.mesh_push_bound.get() {
+                // LOD slab extents: LOD tiles hard-discard inside the full-res volume.
+                self.push_mesh3d_constants(self.lists.lod_clip, self.lists.lod_clip_v);
+                self.mesh_push_bound.set(true);
+            }
+            if !self.index_bound.get() {
+                let quad_ibo = self
+                    .r
+                    .quad_ibo
+                    .bound()
+                    .expect("a mesh pass implies the quad IBO is allocated");
+                self.r.device.device.cmd_bind_index_buffer(
+                    self.cmd,
+                    quad_ibo,
+                    0,
+                    vk::IndexType::UINT32,
+                );
+                self.index_bound.set(true);
+            }
         }
     }
 
@@ -299,21 +343,17 @@ impl<'a> RenderPass<'a> {
         self.mesh_desc_bound.set(true);
     }
 
-    /// Pushes view-proj + LOD slab extents. Pass-specific, so unconditionally
-    /// pushed per pass (unlike descriptors). Jitter packaged here as a local.
+    /// Pushes view-proj + LOD slab extents. Identical for every mesh pass, so
+    /// skipped while `mesh_push_bound`. Jitter packaged once in `begin`.
     unsafe fn push_mesh3d_constants(&self, clip: f32, clip_v: f32) {
         let r = self.r;
-        let scene = self
-            .lists
-            .scene
-            .as_ref()
-            .expect("a mesh pass implies a 3D scene");
+        let (view_proj, eye) = self.scene_state.expect("a mesh pass implies a 3D scene");
         let push = pipeline::Mesh3dPush {
-            view_proj: jittered_clip(scene.view_proj, scene.jitter.0, r.render_extent),
+            view_proj,
             clip,
             clip_v,
             _pad: [0.0; 2],
-            eye: pipeline::EyeSplit::of(scene.eye),
+            eye,
         };
         let layout = r.pipelines.layout_3d;
         unsafe {
@@ -332,6 +372,8 @@ impl<'a> RenderPass<'a> {
     /// cubes/lines/shadows, 2D), so the next `layout_3d` pass re-pushes them.
     fn invalidate_mesh_desc(&self) {
         self.mesh_desc_bound.set(false);
+        self.mesh_push_bound.set(false);
+        // Index-buffer binding survives pipeline/layout changes.
     }
 
     /// Issues indirect mesh draws for one pass, using the best available
@@ -404,15 +446,6 @@ impl<'a> RenderPass<'a> {
                 .indirect
                 .bound()
                 .expect("a draw run implies the indirect buffer is allocated");
-            // One shared quad IBO for every run: bucket-permuted vertices make each
-            // run's `first_index`/`vertex_offset` address it directly. Bound once —
-            // index-buffer binding survives the per-run pipeline rebinds below.
-            let quad_ibo = self
-                .r
-                .quad_ibo
-                .bound()
-                .expect("a draw run implies the quad IBO is allocated");
-            device.cmd_bind_index_buffer(cmd, quad_ibo, 0, vk::IndexType::UINT32);
             const STRIDE: u64 = std::mem::size_of::<DrawIndexedIndirect>() as u64;
             // Rebind only when the pass's pipeline changes.
             let mut bound: Option<vk::Pipeline> = None;
@@ -501,12 +534,6 @@ impl<'a> RenderPass<'a> {
         let device = &self.r.device.device;
         unsafe {
             device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            let quad_ibo = self
-                .r
-                .quad_ibo
-                .bound()
-                .expect("live records imply the quad IBO is allocated");
-            device.cmd_bind_index_buffer(self.cmd, quad_ibo, 0, vk::IndexType::UINT32);
             for arena in 0..frame.arena_count {
                 let first = cull::camera_part(group as usize, arena, 0, frame.arena_count);
                 if frame.partitions[first..first + cull::BUCKETS]
@@ -572,15 +599,11 @@ impl<'a> RenderPass<'a> {
     /// Done per debug pass because the mesh passes bind `layout_3d`, whose
     /// incompatible push-constant range disturbs this value.
     unsafe fn push_debug_view_proj(&self) {
-        let scene = self
-            .lists
-            .scene
-            .as_ref()
-            .expect("a debug pass implies a 3D scene");
+        let view_proj = self.scene_state.expect("a debug pass implies a 3D scene").0;
         let push = pipeline::DebugPush {
             // Match the mesh pass jitter so debug geometry doesn't shimmer against
             // jittered terrain under TAA.
-            view_proj: jittered_clip(scene.view_proj, scene.jitter.0, self.r.render_extent),
+            view_proj,
         };
         unsafe {
             self.r.device.device.cmd_push_constants(
@@ -688,16 +711,11 @@ impl<'a> RenderPass<'a> {
         let Some(desc) = self.lists.sky else {
             return;
         };
-        let scene = self
-            .lists
-            .scene
-            .as_ref()
-            .expect("a sky pass implies a 3D scene");
         let device = &self.r.device.device;
         let cmd = self.cmd;
         // Same jitter the mesh pass applies, so TAA sees a coherently jittered
         // frame (sky vs terrain silhouettes) and history reprojection is stable.
-        let jittered = jittered_clip(scene.view_proj, scene.jitter.0, self.r.render_extent);
+        let jittered = self.scene_state.expect("a sky pass implies a 3D scene").0;
         let params = pipeline::SkyParams::compose(jittered.inverse(), &desc);
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.r.pipelines.sky);
