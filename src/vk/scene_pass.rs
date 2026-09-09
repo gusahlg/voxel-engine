@@ -257,6 +257,7 @@ impl<'a> RenderPass<'a> {
             // Close the begin span (transitions + load-op clears) so the first
             // draw pass reports only its draws.
             if profiling {
+                r.gpu_timer.recorded(slot);
                 r.gpu_timer.mark(device, cmd, slot, GpuPass::Clear);
             }
 
@@ -425,6 +426,7 @@ impl<'a> RenderPass<'a> {
         if !self.r.draw_runs.iter().any(|run| run.pass == pass) {
             return;
         }
+        self.r.gpu_timer.recorded(self.slot);
         // Interleaved debug/sky/2D passes bind pipelines with layouts that are
         // not push-compatible with `layout_3d`, which per Vulkan's layout-
         // compatibility rules disturbs this layout's push constants and push
@@ -553,8 +555,8 @@ impl<'a> RenderPass<'a> {
     }
 
     /// Draws every non-empty arena partition of one cull group with `pipeline`.
-    /// Always closes the group's GPU timestamp, including empty groups, so
-    /// skipped draws do not leak into the next span.
+    /// [`GpuTimer::mark`] is a no-op when the group recorded nothing, so empty
+    /// groups account 0 instead of a BOTTOM_OF_PIPE stamp.
     unsafe fn record_group_indirect_count(&self, group: cull::Group, pipeline: vk::Pipeline) {
         self.pipe_begin_group(group);
         if let Some(frame) = &self.r.cull_frame {
@@ -564,6 +566,7 @@ impl<'a> RenderPass<'a> {
                 .iter()
                 .all(|p| p.capacity == 0)
             {
+                self.r.gpu_timer.recorded(self.slot);
                 unsafe { self.bind_mesh3d_state() };
                 let device = &self.r.device.device;
                 unsafe {
@@ -606,7 +609,8 @@ impl<'a> RenderPass<'a> {
         self.pipe_end_group(group);
     }
 
-    /// GPU timestamp closing `group`'s draws. No-op when profiling is off.
+    /// GPU timestamp closing `group`'s draws. No-op when profiling is off or
+    /// the group recorded nothing.
     fn stamp_group(&self, group: cull::Group) {
         if !crate::profile::is_enabled() {
             return;
@@ -714,6 +718,7 @@ impl<'a> RenderPass<'a> {
         let cmd = self.cmd;
         unsafe {
             if !self.lists.cube_verts.is_empty() {
+                self.r.gpu_timer.recorded(self.slot);
                 device.cmd_bind_pipeline(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -743,6 +748,7 @@ impl<'a> RenderPass<'a> {
         let cmd = self.cmd;
         unsafe {
             if !self.lists.shadow_verts.is_empty() {
+                self.r.gpu_timer.recorded(self.slot);
                 device.cmd_bind_pipeline(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -771,6 +777,7 @@ impl<'a> RenderPass<'a> {
         let cmd = self.cmd;
         unsafe {
             if !self.lists.line_verts.is_empty() {
+                self.r.gpu_timer.recorded(self.slot);
                 device.cmd_bind_pipeline(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -802,6 +809,7 @@ impl<'a> RenderPass<'a> {
         let Some(desc) = self.lists.sky else {
             return;
         };
+        self.r.gpu_timer.recorded(self.slot);
         let device = &self.r.device.device;
         let cmd = self.cmd;
         // Same jitter the mesh pass applies, so TAA sees a coherently jittered
@@ -877,6 +885,7 @@ impl<'a> RenderPass<'a> {
         let cmd = self.cmd;
         unsafe {
             device.cmd_end_rendering(cmd);
+            self.r.gpu_timer.recorded(self.slot);
 
             self.ended = true;
 

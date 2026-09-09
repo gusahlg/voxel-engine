@@ -92,9 +92,15 @@ impl MinimapTexture {
         self.version += 1;
     }
 
-    pub unsafe fn sync(&mut self, device: &ash::Device, cmd: vk::CommandBuffer, slot: usize) {
+    /// Returns whether this recorded a buffer-to-image upload.
+    pub unsafe fn sync(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+    ) -> bool {
         if self.uploaded[slot] == self.version {
-            return;
+            return false;
         }
         let img = &mut self.images[slot];
         unsafe {
@@ -127,6 +133,7 @@ impl MinimapTexture {
             img.transition(device, cmd, LayoutUse::FragmentSampledAfterTransfer);
         }
         self.uploaded[slot] = self.version;
+        true
     }
 
     pub fn push_descriptor(

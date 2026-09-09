@@ -1247,6 +1247,7 @@ impl CullState {
     /// Geometry stats fill/atomics/copy run only while profiling.
     /// A CPU-culled frame records no compute work: commands and counts were
     /// written to host-coherent memory in [`Self::prepare`] after the slot wait.
+    /// Returns whether this recorded GPU commands (fill/dispatch/barrier).
     pub unsafe fn record(
         &self,
         device: &ash::Device,
@@ -1255,9 +1256,9 @@ impl CullState {
         slot: usize,
         records: RecordBuffers,
         frame: &CullFrame,
-    ) {
+    ) -> bool {
         if frame.cpu {
-            return;
+            return false;
         }
         let stats = crate::profile::is_enabled();
         unsafe {
@@ -1373,6 +1374,7 @@ impl CullState {
                 );
             }
         }
+        true
     }
 
     pub unsafe fn destroy(&mut self, device: &ash::Device) {

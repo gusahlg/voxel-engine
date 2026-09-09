@@ -448,6 +448,7 @@ impl Renderer {
             &device.device,
             device.timestamps_supported && crate::profile::is_enabled(),
             device.timestamp_period_ns,
+            device.host_query_reset,
         );
         let pipe_stats = GpuPipeStats::new(
             &device.device,

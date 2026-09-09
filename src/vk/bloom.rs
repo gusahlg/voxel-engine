@@ -105,9 +105,9 @@ impl BloomState {
         self.black.view()
     }
 
-    fn ensure_black(&mut self, device: &ash::Device, cmd: vk::CommandBuffer) {
+    fn ensure_black(&mut self, device: &ash::Device, cmd: vk::CommandBuffer) -> bool {
         if self.black_primed {
-            return;
+            return false;
         }
         self.black.transition(device, cmd, LayoutUse::TransferClear);
         unsafe {
@@ -122,6 +122,7 @@ impl BloomState {
         self.black
             .transition(device, cmd, LayoutUse::FragmentSampledAfterClear);
         self.black_primed = true;
+        true
     }
 }
 
@@ -288,15 +289,18 @@ fn spill_to_sampled(image: vk::Image) -> vk::ImageMemoryBarrier2<'static> {
 }
 
 impl super::Renderer {
+    /// Returns whether this recorded GPU work (pyramid, spill, or a one-time
+    /// black/pyramid prime).
     pub(crate) fn record_bloom_pass(
         &mut self,
         cmd: vk::CommandBuffer,
         slot: FrameSlot,
         warp_map: WarpMap,
         godray: Godray,
-    ) {
+    ) -> bool {
         let spill_live = self.flags.bloom || godray.strength > 0.0;
         let mut spill_write_issued = false;
+        let mut worked = false;
 
         // All mip levels.
         let levels = self.targets.bloom[slot.index()].mip_views.len();
@@ -309,6 +313,7 @@ impl super::Renderer {
         };
 
         if self.flags.bloom {
+            worked = true;
             self.record_bloom_pyramid(cmd, slot, all_mips);
             // Pyramid rest + spill write-side, one barrier batch.
             let chain_image = self.targets.bloom[slot.index()].image;
@@ -335,6 +340,7 @@ impl super::Renderer {
             // skips the gather (`bloom_strength = 0`); subsequent frames reuse
             // the black pyramid. Toggling the lane back on invalidates `cleared`.
             if !self.targets.bloom[slot.index()].cleared {
+                worked = true;
                 let chain_image = self.targets.bloom[slot.index()].image;
                 let spill_image = self.targets.spill[slot.index()].image();
                 let device = &self.device.device;
@@ -390,6 +396,7 @@ impl super::Renderer {
         }
 
         if spill_live {
+            worked = true;
             if !spill_write_issued {
                 let spill_image = self.targets.spill[slot.index()].image();
                 let barriers = [spill_to_general(spill_image)];
@@ -409,9 +416,10 @@ impl super::Renderer {
                     &vk::DependencyInfo::default().image_memory_barriers(&barriers),
                 );
             }
-        } else {
-            self.bloom.ensure_black(&self.device.device, cmd);
+        } else if self.bloom.ensure_black(&self.device.device, cmd) {
+            worked = true;
         }
+        worked
     }
 
     fn record_bloom_pyramid(

@@ -1094,6 +1094,7 @@ impl Renderer {
             // Last frame's separate-queue copies: this submission is the first
             // that can draw them (see `MeshResidency::flush_copies`). This
             // frame's copies are flushed next and deferred one frame.
+            let copies_pending = self.mesh_res.has_pending() || self.mesh_res.has_deferred();
             let deferred = self.mesh_res.take_deferred_arrival(device, cmd);
             self.mesh_res.flush_copies(
                 device,
@@ -1129,8 +1130,11 @@ impl Renderer {
             };
             // Upload this slot's minimap texture (if its version is stale) on the
             // live frame command buffer, before the render pass begins.
-            self.minimap.sync(device, cmd, slot);
+            let minimap = self.minimap.sync(device, cmd, slot);
             if profiling {
+                if copies_pending || quad_wait.is_some() || minimap {
+                    self.gpu_timer.recorded(slot);
+                }
                 self.gpu_timer.mark(device, cmd, slot, GpuPass::Copies);
             }
         }
@@ -1145,7 +1149,7 @@ impl Renderer {
         {
             let _g = crate::profile::scope(crate::profile::Meter::RecCull);
             unsafe {
-                self.cull.record(
+                let cull_gpu = self.cull.record(
                     &self.device.device,
                     &self.device.push_descriptor,
                     cmd,
@@ -1154,6 +1158,9 @@ impl Renderer {
                     frame,
                 );
                 if profiling {
+                    if cull_gpu {
+                        self.gpu_timer.recorded(slot);
+                    }
                     self.gpu_timer
                         .mark(&self.device.device, cmd, slot, GpuPass::Cull);
                 }
@@ -1192,6 +1199,7 @@ impl Renderer {
                 self.record_shadow_pass(cmd, slot, &fits, scene.eye, &cfg, caster_verts);
                 if profiling {
                     unsafe {
+                        self.gpu_timer.recorded(slot);
                         self.gpu_timer
                             .mark(&self.device.device, cmd, slot, GpuPass::ShadowMap)
                     };
@@ -1331,7 +1339,8 @@ impl Renderer {
         // frames that will present (`decide_present` already ran; forced capture
         // always presents).
         let run_exposure = lists.scene.is_some() && self.flags.exposure && will_present;
-        // Overlay composited post-tonemap so warp/TAA don't affect the HUD.
+        // Overlay is drawn in the present copy (`GpuTonemap`); this scene-pass
+        // stamp stays so the report still lists overlay, and accounts 0.
         stamp(GpuPass::Overlay);
         // Finalize the offscreen to SHADER_READ_ONLY exactly once and obtain the
         // [`HdrReadable`] proof the tonemap present-copy requires. The branches
@@ -1351,6 +1360,7 @@ impl Renderer {
                 let readable = self.record_exposure_pass(cmd, FrameSlot::new(slot));
                 if profiling {
                     unsafe {
+                        self.gpu_timer.recorded(slot);
                         self.gpu_timer
                             .mark(&self.device.device, cmd, slot, GpuPass::Exposure)
                     };
@@ -1372,6 +1382,7 @@ impl Renderer {
                 // rests only when this frame samples it (classifier); a later
                 // present uses a different slot's depth.
                 unsafe { pass.end_deferred(classify_vrs) };
+                stamp(GpuPass::Resolve);
                 self.finish_vrs_classify(cmd, slot, classify_vrs, lists);
                 HdrReadable::new(slot)
             }
@@ -1380,15 +1391,21 @@ impl Renderer {
         // tonemap present-copy takes one bilinear tap of the spill. Present-only
         // — a dropped mailbox frame never samples either image. Forced capture
         // always presents, so it always gets a fresh chain. The GPU timer's
-        // `Bloom` span covers this whole tail (pyramid + spill).
-        if will_present {
-            self.record_bloom_pass(cmd, FrameSlot::new(slot), warp_map, godray);
-        }
-        // Close the tail: without this stamp the bloom/spill work recorded
-        // above ends after the last boundary and never reaches the report. (The
-        // tonemap/present copy is timed on the copy command buffer; see
+        // `Bloom` span covers this whole tail (pyramid + spill) when it ran.
+        let bloom_work = if will_present {
+            self.record_bloom_pass(cmd, FrameSlot::new(slot), warp_map, godray)
+        } else {
+            false
+        };
+        // Close the tail: without this stamp bloom/spill work recorded above
+        // ends after the last boundary and never reaches the report. Empty
+        // when bloom+godrays are off and the black/pyramid prime already ran.
+        // (The tonemap/present copy is timed on the copy command buffer; see
         // `submit_present_copy`.)
         if profiling {
+            if bloom_work {
+                self.gpu_timer.recorded(slot);
+            }
             unsafe {
                 self.gpu_timer
                     .mark(&self.device.device, cmd, slot, GpuPass::Bloom)
@@ -1441,6 +1458,7 @@ impl Renderer {
         unsafe { self.record_vrs_generate(cmd, slot, d_threshold) };
         if crate::profile::is_enabled() {
             unsafe {
+                self.gpu_timer.recorded(slot);
                 self.gpu_timer
                     .mark(&self.device.device, cmd, slot, GpuPass::Vrs)
             };

@@ -33,6 +33,8 @@ pub(super) enum GpuPass {
     Lines,
     Shadows,
     Transparent,
+    /// HUD overlay. Drawn in the present copy (`GpuTonemap`); the scene-pass
+    /// stamp accounts 0 so the report still lists this meter.
     Overlay,
     /// End of the scene pass: `cmd_end_rendering` (where the MSAA color
     /// resolve executes) and the offscreen/depth-rest finalize transitions.
@@ -135,12 +137,18 @@ pub(super) struct GpuTimer {
     pool: vk::QueryPool,
     /// Nanoseconds per tick (`limits.timestampPeriod`).
     period_ns: f32,
+    /// `hostQueryReset` (Vulkan 1.2). Host-reset after the slot fence wait;
+    /// otherwise `vkCmdResetQueryPool` outside the render pass.
+    host_reset: bool,
     /// Whether each slot holds completed timestamps to read back.
     primed: [bool; FRAMES_IN_FLIGHT as usize],
     /// Stamps written for each slot's most recent recording (incl. the start).
     count: [std::cell::Cell<u32>; FRAMES_IN_FLIGHT as usize],
     /// The pass that ended at each stamp (index `i` labels the span `i-1..i`).
     label: [[std::cell::Cell<GpuPass>; GPU_STAMPS]; FRAMES_IN_FLIGHT as usize],
+    /// Armed when the open span recorded GPU commands. [`Self::mark`] writes a
+    /// stamp only when this is set; otherwise the pass accounts 0.
+    pending: [std::cell::Cell<bool>; FRAMES_IN_FLIGHT as usize],
     /// Whether the present-copy pair holds a completed range to read back.
     copy_primed: bool,
     /// Last stamp of the previously *read* render submit (raw ticks), used to
@@ -164,7 +172,12 @@ pub(super) fn idle_gap_ms(prev_end: u64, this_start: u64, period_ns: f32) -> f64
 }
 
 impl GpuTimer {
-    pub(super) fn new(device: &ash::Device, supported: bool, period_ns: f32) -> Self {
+    pub(super) fn new(
+        device: &ash::Device,
+        supported: bool,
+        period_ns: f32,
+        host_reset: bool,
+    ) -> Self {
         let pool = if supported {
             let info = vk::QueryPoolCreateInfo::default()
                 .query_type(vk::QueryType::TIMESTAMP)
@@ -180,11 +193,13 @@ impl GpuTimer {
         Self {
             pool,
             period_ns,
+            host_reset,
             primed: [false; FRAMES_IN_FLIGHT as usize],
             count: std::array::from_fn(|_| std::cell::Cell::new(0)),
             label: std::array::from_fn(|_| {
                 std::array::from_fn(|_| std::cell::Cell::new(GpuPass::OpaqueFull))
             }),
+            pending: std::array::from_fn(|_| std::cell::Cell::new(false)),
             copy_primed: false,
             prev_end: None,
         }
@@ -244,22 +259,44 @@ impl GpuTimer {
         Some((total, gap))
     }
 
+    fn reset_queries(&self, device: &ash::Device, cmd: vk::CommandBuffer, first: u32, count: u32) {
+        unsafe {
+            if self.host_reset {
+                device.reset_query_pool(self.pool, first, count);
+            } else {
+                device.cmd_reset_query_pool(cmd, self.pool, first, count);
+            }
+        }
+    }
+
     /// Resets `slot`'s queries and writes the start timestamp. Must be recorded
-    /// outside any render pass.
+    /// outside any render pass. Host-resets the pool when the device has
+    /// `hostQueryReset`; otherwise `vkCmdResetQueryPool`.
     pub(super) unsafe fn begin(&self, device: &ash::Device, cmd: vk::CommandBuffer, slot: usize) {
         if !self.enabled() {
             return;
         }
         let base = slot as u32 * GPU_STAMPS as u32;
+        self.reset_queries(device, cmd, base, GPU_STAMPS as u32);
         unsafe {
-            device.cmd_reset_query_pool(cmd, self.pool, base, GPU_STAMPS as u32);
             device.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, self.pool, base);
         }
         self.count[slot].set(1);
+        self.pending[slot].set(false);
     }
 
-    /// Writes a boundary timestamp closing `pass` for `slot`. Recorded inside
-    /// the render pass; needs only `&self` (interior-mutable bookkeeping).
+    /// Arm the next [`Self::mark`]: the open span recorded GPU commands.
+    /// Cheap no-op when timestamps are off.
+    pub(super) fn recorded(&self, slot: usize) {
+        if self.enabled() {
+            self.pending[slot].set(true);
+        }
+    }
+
+    /// Writes a boundary timestamp closing `pass` for `slot` if the pass
+    /// recorded GPU work ([`Self::recorded`]). Otherwise a no-op: the pass
+    /// accounts 0 at readback (the sink starts at 0; `GpuPass::ALL` is still
+    /// fed so the profiler report format is unchanged).
     pub(super) unsafe fn mark(
         &self,
         device: &ash::Device,
@@ -267,7 +304,7 @@ impl GpuTimer {
         slot: usize,
         pass: GpuPass,
     ) {
-        if !self.enabled() {
+        if !self.enabled() || !self.pending[slot].replace(false) {
             return;
         }
         let i = self.count[slot].get();
@@ -315,12 +352,13 @@ impl GpuTimer {
 
     /// Resets the present-copy pair and writes its start stamp. Recorded on the
     /// copy command buffer, outside any render pass, after [`Self::read_copy`].
+    /// Host-resets when the device has `hostQueryReset`.
     pub(super) unsafe fn begin_copy(&self, device: &ash::Device, cmd: vk::CommandBuffer) {
         if !self.enabled() {
             return;
         }
+        self.reset_queries(device, cmd, COPY_STAMP_BASE, 2);
         unsafe {
-            device.cmd_reset_query_pool(cmd, self.pool, COPY_STAMP_BASE, 2);
             device.cmd_write_timestamp2(
                 cmd,
                 vk::PipelineStageFlags2::TOP_OF_PIPE,
