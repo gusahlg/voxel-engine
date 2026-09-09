@@ -2,9 +2,10 @@
 //
 // Two entry points; the pyramid is capped at BLOOM_MAX_MIPS (the spill pass
 // samples only BLOOM_SPIRAL_LOD, so threshold + that many-minus-one downsamples):
-//   * threshold: bilinear-downsamples the full-res HDR offscreen to the half-res
-//     mip 0 and keeps only the bright spill via a smoothstep soft knee on exposed
-//     luma. One bilinear tap doubles as the 2×2 average.
+//   * threshold: writes the quarter-res mip 0 from the full-res HDR offscreen
+//     and keeps only the bright spill via a smoothstep soft knee on exposed
+//     luma. Four bilinear taps (half-res-equivalent centres) average the 4×4
+//     full-res block, then the knee runs on that average.
 //   * downsample: 2×2 box from the previous (larger) mip into this one.
 //
 // No subgroup ops: a plain per-level dispatch chain is simpler and
@@ -39,9 +40,16 @@ void threshold(uint3 gid: SV_DispatchThreadID)
 {
     if (gid.x >= pc.dst_dim.x || gid.y >= pc.dst_dim.y)
         return;
-    // Half-res texel centre → one bilinear tap averages the 2×2 full-res block.
-    float2 uv = (float2(gid.xy) + 0.5) / float2(pc.dst_dim);
-    float3 hdr = hdrTex.SampleLevel(uv, 0).rgb;
+    // Four half-res-equivalent bilinear taps: the centres of the 2×2 half-res
+    // block this quarter-res texel used to average. Each tap is the same 2×2
+    // full-res footprint the old half-res threshold used; averaging them then
+    // applying the knee keeps that pass's energy without a half-res mip.
+    float2 dst = float2(pc.dst_dim);
+    float2 p = float2(gid.xy);
+    float3 hdr = (hdrTex.SampleLevel((p + float2(0.25, 0.25)) / dst, 0).rgb
+                + hdrTex.SampleLevel((p + float2(0.75, 0.25)) / dst, 0).rgb
+                + hdrTex.SampleLevel((p + float2(0.25, 0.75)) / dst, 0).rgb
+                + hdrTex.SampleLevel((p + float2(0.75, 0.75)) / dst, 0).rgb) * 0.25;
     float luma = luma709(hdr);
     float knee = smoothstep(pc.thr_lo, pc.thr_hi, luma * pc.exposure);
     dstMip[gid.xy] = float4(hdr * knee * pc.thr_scale, 1.0);

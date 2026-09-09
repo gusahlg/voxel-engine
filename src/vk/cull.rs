@@ -452,7 +452,7 @@ impl MeshAabb {
 
 /// Conservative union of live camera-group AABBs for one arena, stored relative
 /// to integer `origin`. `dirty` means a free/drain removed a contributor and
-/// the union must be rebuilt from still-live slots before it is queried.
+/// the union must be rebuilt from the arena's member list before it is queried.
 #[derive(Clone, Copy)]
 struct ArenaUnion {
     origin: [i32; 3],
@@ -564,6 +564,11 @@ pub(crate) struct ArenaDirectory {
     aabbs: Vec<MeshAabb>,
     /// Conservative union of live camera-group AABBs per arena.
     unions: Vec<ArenaUnion>,
+    /// Camera-group slots per arena (unordered). Union recompute walks these
+    /// instead of the whole slot table.
+    members: Vec<Vec<u32>>,
+    /// Position + 1 of a slot in its arena's `members` (0 = not a member).
+    member_pos: Vec<u32>,
     /// The registered Blend slots (unordered). The CPU Blend re-source walks
     /// exactly this set, so its cost scales with the transparent meshes, not
     /// with the whole slot table.
@@ -585,6 +590,8 @@ impl ArenaDirectory {
             slots: Vec::new(),
             aabbs: Vec::new(),
             unions: Vec::new(),
+            members: Vec::new(),
+            member_pos: Vec::new(),
             blend: Vec::new(),
             blend_pos: Vec::new(),
             live_end: 0,
@@ -604,8 +611,11 @@ impl ArenaDirectory {
         lod: bool,
         aabb: MeshAabb,
     ) -> u32 {
-        if let Some(Some((old_arena, _, _))) = self.slots.get(slot as usize).copied() {
+        if let Some(Some((old_arena, old_lane, _))) = self.slots.get(slot as usize).copied() {
             // Re-register without a free: drop the old box out of the union.
+            if old_lane.is_some() {
+                self.set_member(old_arena as usize, slot, false);
+            }
             self.mark_union_dirty(old_arena as usize);
         }
         let hit = (0..self.buffers.len())
@@ -615,6 +625,10 @@ impl ArenaDirectory {
                 if let Some(i) = reuse {
                     self.buffers[i] = buffer;
                     debug_assert_eq!(self.live[i], [0; LANES], "drained row kept live counts");
+                    debug_assert!(
+                        self.members[i].is_empty(),
+                        "drained row kept camera-group members"
+                    );
                     self.unions[i] = ArenaUnion::EMPTY;
                 }
                 reuse
@@ -626,6 +640,7 @@ impl ArenaDirectory {
                 self.live.push([0; LANES]);
                 self.refs.push(0);
                 self.unions.push(ArenaUnion::EMPTY);
+                self.members.push(Vec::new());
                 (self.buffers.len() - 1) as u32
             }
         };
@@ -642,6 +657,7 @@ impl ArenaDirectory {
         self.slots[slot as usize] = Some((arena, lane, generation));
         self.aabbs[slot as usize] = aabb;
         if lane.is_some() {
+            self.set_member(arena as usize, slot, true);
             self.grow_union(arena as usize, aabb);
         }
         self.set_blend(slot, pass == Pass::Blend);
@@ -665,6 +681,27 @@ impl ArenaDirectory {
             self.blend_pos[i] = 0;
             if let Some(&moved) = self.blend.get(at) {
                 self.blend_pos[moved as usize] = pos;
+            }
+        }
+    }
+
+    /// Adds `slot` to (or removes it from) `arena`'s camera-group member list;
+    /// swap-remove, same scheme as [`Self::set_blend`].
+    fn set_member(&mut self, arena: usize, slot: u32, on: bool) {
+        let i = slot as usize;
+        if self.member_pos.len() <= i {
+            self.member_pos.resize(i + 1, 0);
+        }
+        let pos = self.member_pos[i];
+        if on && pos == 0 {
+            self.members[arena].push(slot);
+            self.member_pos[i] = self.members[arena].len() as u32;
+        } else if !on && pos != 0 {
+            let at = (pos - 1) as usize;
+            self.members[arena].swap_remove(at);
+            self.member_pos[i] = 0;
+            if let Some(&moved) = self.members[arena].get(at) {
+                self.member_pos[moved as usize] = pos;
             }
         }
     }
@@ -699,6 +736,14 @@ impl ArenaDirectory {
             if let Some(Some((_, slot_lane, _))) = self.slots.get_mut(slot as usize) {
                 *slot_lane = new_lane;
             }
+            match (lane.is_some(), new_lane.is_some()) {
+                (true, false) => {
+                    self.set_member(arena as usize, slot, false);
+                    self.mark_union_dirty(arena as usize);
+                }
+                (false, true) => self.set_member(arena as usize, slot, true),
+                _ => {}
+            }
         }
         self.aabbs[slot as usize] = aabb;
         if new_lane.is_some() {
@@ -722,10 +767,11 @@ impl ArenaDirectory {
         self.refs[arena as usize] -= 1;
         if let Some(lane) = lane {
             self.live[arena as usize][lane] -= 1;
+            self.set_member(arena as usize, slot, false);
         }
-        if self.refs[arena as usize] == 0 {
+        if self.refs[arena as usize] == 0 || self.members[arena as usize].is_empty() {
             self.unions[arena as usize] = ArenaUnion::EMPTY;
-        } else {
+        } else if lane.is_some() {
             self.mark_union_dirty(arena as usize);
         }
         self.set_blend(slot, false);
@@ -769,23 +815,25 @@ impl ArenaDirectory {
     }
 
     fn grow_union(&mut self, arena: usize, aabb: MeshAabb) {
+        // Expand even when dirty: a fresh upload can sit outside the stale
+        // box (farther than, or off-axis from, the freed contributor). A
+        // later query must not zero that mesh's bucket before recompute.
+        // Restore dirty afterwards: `expand` of an invalid union goes through
+        // `from_aabb`, which writes dirty=false and would skip the member-list
+        // rebuild while other slots still contribute.
         let u = &mut self.unions[arena];
-        if u.dirty {
-            return;
-        }
+        let was_dirty = u.dirty;
         u.expand(aabb);
+        if was_dirty {
+            u.dirty = true;
+        }
     }
 
     fn recompute_union(&mut self, arena: usize) {
         let mut acc = ArenaUnion::EMPTY;
-        for (i, slot) in self.slots.iter().enumerate() {
-            let Some((a, lane, _)) = *slot else {
-                continue;
-            };
-            if a as usize != arena || lane.is_none() {
-                continue;
-            }
-            acc.expand(self.aabbs[i]);
+        for i in 0..self.members[arena].len() {
+            let slot = self.members[arena][i] as usize;
+            acc.expand(self.aabbs[slot]);
         }
         acc.dirty = false;
         self.unions[arena] = acc;
@@ -818,11 +866,6 @@ impl ArenaDirectory {
         eye: Option<EyeSplit>,
     ) -> u32 {
         let a = self.live.len();
-        for arena in 0..a {
-            if self.unions[arena].dirty {
-                self.recompute_union(arena);
-            }
-        }
         parts.clear();
         parts.reserve(partition_count(a));
         let mut offset = 0u32;
@@ -834,8 +877,18 @@ impl ArenaDirectory {
                     let capacity = match eye {
                         _ if full == 0 => 0,
                         None => full,
-                        Some(e) if self.bucket_reachable(arena, bucket, e) => full,
-                        Some(_) => 0,
+                        Some(e) => {
+                            // Dirty unions are rebuilt once per frame, and only
+                            // when a camera partition will query them.
+                            if self.unions[arena].dirty {
+                                self.recompute_union(arena);
+                            }
+                            if self.bucket_reachable(arena, bucket, e) {
+                                full
+                            } else {
+                                0
+                            }
+                        }
                     };
                     parts.push(PartitionGpu { offset, capacity });
                     offset += capacity;
@@ -2110,6 +2163,27 @@ mod tests {
         assert_eq!(opaque_caps(&parts, 0, 1), [1, 0, 0, 0]);
         assert_eq!(parts[shadow_part(0, 0, 1)].capacity, 1);
         assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn upload_after_free_in_the_same_arena_is_not_culled_by_a_stale_union() {
+        // Free dirties the union; grow_union used to no-op while dirty, so a
+        // later upload outside the remaining box could have its buckets
+        // zeroed. Recompute must walk this arena's members, including the
+        // new slot — not a full slot-table scan and not the stale box.
+        let far = MeshAabb {
+            block: [0, 0, 300],
+            min: [0.0; 3],
+            max: [1.0; 3],
+        };
+        let mut dir = ArenaDirectory::new();
+        dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL, UNIT);
+        dir.note_upload(1, G1, buf(1), Pass::Opaque, FULL, far);
+        dir.note_free(1, G1);
+        dir.note_upload(2, G1, buf(1), Pass::Opaque, FULL, far);
+        let (parts, _) = partitions_at(&mut dir, origin_eye());
+        // Two live meshes; missing the new slot would zero far buckets.
+        assert_eq!(opaque_caps(&parts, 0, 1), [2, 2, 2, 2]);
     }
 
     #[test]

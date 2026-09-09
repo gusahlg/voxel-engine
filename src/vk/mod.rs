@@ -17,6 +17,7 @@ pub(crate) mod gpu_timer;
 pub(crate) mod image;
 pub(crate) mod image_upload;
 pub(crate) mod instance;
+pub(crate) mod mesh_staging;
 pub(crate) mod minimap;
 pub(crate) mod pass;
 pub(crate) mod pipeline;
@@ -37,6 +38,7 @@ pub(crate) mod vertex_input;
 pub(crate) mod vrs;
 
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use ash::{khr, vk};
@@ -50,6 +52,7 @@ use frame_loop::{DrawEntry, DrawRun, PendingSubmit};
 use gpu_timer::{GpuPipeStats, GpuTimer};
 use image::AllocError;
 use instance::InstanceBundle;
+use mesh_staging::MeshStagingPool;
 use minimap::MinimapTexture;
 use pipeline::Pipelines;
 use render_client::{Capture, DeviceCaps, DeviceLeftovers, InitReply, RenderConfig, RenderReturn};
@@ -185,6 +188,8 @@ pub(crate) struct Renderer {
     timeline: Timeline,
     /// Transfer queue for staging copies.
     transfer_lane: TransferLane,
+    /// Worker-writable mesh staging pool (also cloned to main via InitReply).
+    mesh_staging: Arc<MeshStagingPool>,
     /// Transfer-lane value this graphics submission waits on: last frame's
     /// deferred mesh copies, this frame's quad-IBO grow, and/or in-place
     /// block-texture layer uploads. Stages are the first consumers of that
@@ -449,7 +454,7 @@ impl Renderer {
 
         let gpu_timer = GpuTimer::new(
             &device.device,
-            device.timestamps_supported && crate::profile::is_enabled(),
+            device.timestamps_supported,
             device.timestamp_period_ns,
             device.host_query_reset,
         );
@@ -467,6 +472,29 @@ impl Renderer {
         let caps = DeviceCaps {
             max_msaa: device.max_msaa(),
             max_texture_layers: device.max_image_array_layers,
+            device_name: unsafe {
+                instance
+                    .instance
+                    .get_physical_device_properties(device.physical)
+                    .device_name_as_c_str()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "<unknown>".into())
+            },
+            device_local_bytes: Device::device_local_bytes(&memory_props),
+            supports_vrs: device.fragment_shading_rate.is_some(),
+            vrs_texel_size: device
+                .fragment_shading_rate
+                .as_ref()
+                .map(|fsr| (fsr.texel_size.width, fsr.texel_size.height)),
+            supports_pipeline_stats: device.pipeline_statistics_query,
+        };
+        let mesh_staging = unsafe {
+            MeshStagingPool::new(
+                &instance.instance,
+                &device.device,
+                device.physical,
+                mesh_staging::mesh_staging_bytes(),
+            )
         };
         let reply = InitReply {
             instance: instance.instance.clone(),
@@ -475,6 +503,8 @@ impl Renderer {
             device: device.device.clone(),
             caps,
             exposure: exposure.shared(),
+            gpu_load: gpu_timer.load_shared(),
+            mesh_staging: Arc::clone(&mesh_staging),
         };
 
         let cull = cull::CullState::new(
@@ -531,6 +561,7 @@ impl Renderer {
             copy_cmd,
             timeline,
             transfer_lane,
+            mesh_staging,
             pending_transfer_wait: None,
             last_copy_value: TimelineValue::START,
             last_render_value: TimelineValue::START,
@@ -586,6 +617,9 @@ impl Renderer {
 
     /// Replace feature flags (safe mid-run).
     pub fn set_flags(&mut self, flags: crate::engine::RenderFlags) {
+        if self.flags == flags {
+            return;
+        }
         // Flag transitions reset temporal state to avoid stale cached values.
         if self.flags.exposure && !flags.exposure {
             self.exposure.reset();
@@ -668,13 +702,15 @@ impl Renderer {
 
     /// Retire a freed mesh resident.
     pub(crate) fn apply_free_mesh(&mut self, slot: u32, generation: NonZeroU32) {
-        // Pending frames may still draw this mesh; submit them so
-        // `last_render_value` covers the batch before the free is stamped.
-        self.flush_pending_submits();
+        // Pending frames may still draw this mesh, submitted or not. Stamp
+        // with `last_reserved` so the retire queue covers the newest frame
+        // that could reference it without flushing the submit batch.
+        // `RetireQueue::collect` compares against the completed counter and
+        // leaves a not-yet-signalled stamp queued.
         self.arena_dir.note_free(slot, generation);
         self.records.clear_arena(slot);
         self.mesh_res
-            .apply_free(slot, generation, self.last_render_value);
+            .apply_free(slot, generation, self.timeline.last_reserved());
     }
 
     /// Queue screenshot capture to path.
@@ -771,6 +807,10 @@ impl Renderer {
     pub fn update_minimap(&mut self, rgba: &[u8]) {
         self.minimap.update(rgba);
     }
+
+    pub fn update_minimap_rect(&mut self, x: u32, y: u32, w: u32, h: u32, rgba: &[u8]) {
+        self.minimap.update_rect(x, y, w, h, rgba);
+    }
 }
 
 impl Renderer {
@@ -807,8 +847,10 @@ impl Renderer {
             self.quad_ibo.destroy(device);
             // The residents' allocations belong to the main-owned allocator
             // (destroyed there after this returns); just drop them — no Vulkan
-            // calls, GPU already idle.
+            // calls, GPU already idle. Staging leases return to the pool ring
+            // here, then the pool buffer itself is destroyed.
             self.mesh_res.destroy_all(&mut |_a| {});
+            self.mesh_staging.destroy(device);
             for &sem in &self.present_semaphores {
                 sem.destroy(device);
             }

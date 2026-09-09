@@ -289,40 +289,56 @@ impl Pass {
     pub const COUNT: usize = Self::ALL.len();
 }
 
-/// Triangle mesh built one quad at a time, indices bucketed by face direction.
+/// GPU / [`MeshData::vertices`] order of the six [`Normal`] buckets:
+/// +X, +Y, +Z, −X, −Y, −Z. An outside camera sees ≤3 of these, and same-sign
+/// buckets are adjacent, so the GPU cull merges them into ~1.75 contiguous
+/// runs per mesh instead of 3.
+pub(crate) const FACE_UPLOAD_ORDER: [usize; 6] = [0, 2, 4, 1, 3, 5];
+
+/// Triangle mesh built one quad at a time, vertices stored per face direction.
 ///
-/// Six [`Normal`]-indexed index buckets share one vertex array; [`Self::quad`]
-/// routes each quad by its normal and emits correctly wound indices, so
-/// direction mis-sorting and winding bugs are unrepresentable at the call site.
-/// Bucket order stays [`Normal`]; the renderer may permute at upload for GPU
-/// face-run culling. Reusable as scratch: [`Self::clear`] keeps capacity.
+/// Six [`Normal`]-indexed vertex buckets; [`Self::quad`] appends the four
+/// corners to the bucket of `corners[0]`'s normal, so direction mis-sorting is
+/// unrepresentable at the call site. Winding is the four corners in CCW order
+/// as seen from outside; the shared GPU quad IBO supplies `[0,1,2,0,2,3]`.
+/// Upload concatenates buckets in [`FACE_UPLOAD_ORDER`]. Reusable as scratch:
+/// [`Self::clear`] keeps capacity.
 pub struct MeshData {
-    pub(crate) vertices: Vec<MeshVertex>,
-    /// Indices per face direction, indexed by `Normal as usize`. Each entry
-    /// references the shared `vertices`.
-    pub(crate) buckets: [Vec<u32>; 6],
+    /// Vertices per face direction, indexed by [`Normal`] as `usize`.
+    pub(crate) vertices: [Vec<MeshVertex>; 6],
     pub(crate) pass: Pass,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
 }
 
 impl MeshData {
     /// An empty mesh tagged with its draw pass.
     pub fn new(pass: Pass) -> Self {
         Self {
-            vertices: Vec::new(),
-            buckets: std::array::from_fn(|_| Vec::new()),
+            vertices: std::array::from_fn(|_| Vec::new()),
             pass,
+            aabb_min: [f32::INFINITY; 3],
+            aabb_max: [f32::NEG_INFINITY; 3],
         }
     }
 
-    /// Appends one quad: four corners wound CCW as seen from outside → four
-    /// vertices plus six indices (two triangles, `0,1,2` + `0,2,3`) routed into
-    /// the bucket for `corners[0]`'s face normal. All four corners are expected
-    /// to share that normal (greedy quads do).
+    /// Appends one quad: four corners wound CCW as seen from outside, routed
+    /// into the vertex bucket for `corners[0]`'s face normal. All four corners
+    /// are expected to share that normal (greedy quads do).
     pub fn quad(&mut self, corners: [MeshVertex; 4]) {
         let dir = corners[0].normal() as usize;
-        let base = self.vertices.len() as u32;
-        self.vertices.extend_from_slice(&corners);
-        self.buckets[dir].extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        for c in corners {
+            let p = c.local_pos();
+            for i in 0..3 {
+                self.aabb_min[i] = self.aabb_min[i].min(p[i]);
+                self.aabb_max[i] = self.aabb_max[i].max(p[i]);
+            }
+        }
+        self.vertices[dir].extend_from_slice(&corners);
+    }
+
+    pub(crate) fn aabb(&self) -> ([f32; 3], [f32; 3]) {
+        (self.aabb_min, self.aabb_max)
     }
 
     /// The mesh's draw pass.
@@ -330,34 +346,78 @@ impl MeshData {
         self.pass
     }
 
-    /// Clears all geometry but keeps every allocation (vertices and buckets)
-    /// and the pass tag, for reuse as a scratch buffer.
+    /// Clears all geometry but keeps every allocation (per-direction vertex
+    /// buckets) and the pass tag, for reuse as a scratch buffer.
     pub fn clear(&mut self) {
-        self.vertices.clear();
-        for bucket in &mut self.buckets {
+        for bucket in &mut self.vertices {
             bucket.clear();
         }
+        self.aabb_min = [f32::INFINITY; 3];
+        self.aabb_max = [f32::NEG_INFINITY; 3];
     }
 
     pub fn is_empty(&self) -> bool {
-        self.vertices.is_empty()
+        self.vertices.iter().all(|b| b.is_empty())
     }
 
-    /// The packed vertices, for tests in dependent crates that assert on emitted
-    /// geometry (greedy-mesh area vs a reference sweep, byte-identical far
-    /// chunks). `#[doc(hidden)]` and read-only — mirrors the
-    /// [`MeshHandle::from_raw_parts`] "for dependent-crate tests" precedent; NOT
-    /// a production surface (build geometry with [`Self::quad`]).
+    /// Packed vertices in [`FACE_UPLOAD_ORDER`] (direction-major: +X,+Y,+Z,−X,−Y,−Z),
+    /// concatenated. **Allocates** a new `Vec` on every call. This is GPU upload
+    /// order, **not** `quad()` insertion order: mixed-direction meshes group by
+    /// face. For tests in dependent crates that assert on emitted geometry
+    /// (greedy-mesh area vs a reference sweep, byte-identical far chunks).
+    /// `#[doc(hidden)]` — mirrors the [`MeshHandle::from_raw_parts`]
+    /// "for dependent-crate tests" precedent; NOT a production surface (build
+    /// geometry with [`Self::quad`]).
     #[doc(hidden)]
-    pub fn vertices(&self) -> &[MeshVertex] {
-        &self.vertices
+    pub fn vertices(&self) -> Vec<MeshVertex> {
+        let mut out = Vec::with_capacity(self.vertex_count());
+        for &dir in &FACE_UPLOAD_ORDER {
+            out.extend_from_slice(&self.vertices[dir]);
+        }
+        out
     }
 
-    /// The six per-direction index buckets, indexed by [`Normal`].
-    /// `#[doc(hidden)]` — dependent-crate tests only, as [`Self::vertices`].
+    /// Synthesizes the historical per-[`Normal`] index buckets over
+    /// [`Self::vertices`] order: each quad becomes `[b, b+1, b+2, b, b+2, b+3]`
+    /// so `vertices()[idx]` addressing stays consistent with the old layout.
+    ///
+    /// Compatibility shim for dependents that have not migrated to
+    /// [`Self::quad_counts`] / [`Self::vertex_bytes`]. Indices are not stored.
+    #[deprecated(note = "use quad_counts()/vertex_bytes(); indices are synthesized")]
     #[doc(hidden)]
-    pub fn buckets(&self) -> &[Vec<u32>; 6] {
-        &self.buckets
+    pub fn buckets(&self) -> [Vec<u32>; 6] {
+        let mut buckets: [Vec<u32>; 6] = std::array::from_fn(|_| Vec::new());
+        let mut base = 0u32;
+        for &dir in &FACE_UPLOAD_ORDER {
+            let n = self.vertices[dir].len() as u32;
+            debug_assert_eq!(n % 4, 0);
+            let quads = n / 4;
+            let mut idx = Vec::with_capacity(quads as usize * 6);
+            for q in 0..quads {
+                let b = base + q * 4;
+                idx.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+            }
+            buckets[dir] = idx;
+            base += n;
+        }
+        buckets
+    }
+
+    /// Quad counts per [`Normal`] (`0=+X … 5=−Z`), not [`FACE_UPLOAD_ORDER`].
+    pub fn quad_counts(&self) -> [u32; 6] {
+        std::array::from_fn(|i| {
+            debug_assert_eq!(self.vertices[i].len() % 4, 0);
+            (self.vertices[i].len() / 4) as u32
+        })
+    }
+
+    /// Byte size of the packed vertices that upload will write.
+    pub fn vertex_bytes(&self) -> usize {
+        self.vertex_count() * std::mem::size_of::<MeshVertex>()
+    }
+
+    fn vertex_count(&self) -> usize {
+        self.vertices.iter().map(Vec::len).sum()
     }
 }
 
@@ -528,40 +588,78 @@ mod tests {
     #[test]
     fn quad_routes_by_normal_with_correct_winding() {
         let mut data = MeshData::new(Pass::Opaque);
-        // Two +X quads, one -Z quad: buckets fill by Normal index; others empty.
-        data.quad(quad_for(Normal::PosX));
-        data.quad(quad_for(Normal::PosX));
-        data.quad(quad_for(Normal::NegZ));
+        let pos_x_a = quad_for(Normal::PosX);
+        let pos_x_b = quad_for(Normal::PosX);
+        let neg_z = quad_for(Normal::NegZ);
+        // Two +X quads, one -Z quad: vertex buckets fill by Normal index; others empty.
+        data.quad(pos_x_a);
+        data.quad(pos_x_b);
+        data.quad(neg_z);
 
-        assert_eq!(data.vertices.len(), 12);
-        assert_eq!(data.buckets[Normal::PosX as usize].len(), 12); // 2 quads × 6
-        assert_eq!(data.buckets[Normal::NegZ as usize].len(), 6);
-        for empty in [Normal::NegX, Normal::PosY, Normal::NegY, Normal::PosZ] {
-            assert!(data.buckets[empty as usize].is_empty());
-        }
-        // First quad: base 0, second quad: base 4 — winding preserved per quad.
-        assert_eq!(
-            &data.buckets[Normal::PosX as usize][..6],
-            &[0, 1, 2, 0, 2, 3]
-        );
-        assert_eq!(
-            &data.buckets[Normal::PosX as usize][6..],
-            &[4, 5, 6, 4, 6, 7]
-        );
-        assert_eq!(
-            &data.buckets[Normal::NegZ as usize][..],
-            &[8, 9, 10, 8, 10, 11]
-        );
+        let mut want_counts = [0u32; 6];
+        want_counts[Normal::PosX as usize] = 2;
+        want_counts[Normal::NegZ as usize] = 1;
+        assert_eq!(data.quad_counts(), want_counts);
+        assert_eq!(data.vertex_bytes(), 12 * std::mem::size_of::<MeshVertex>());
+        // Corner order (CCW) is preserved per quad; the shared IBO supplies winding.
+        assert_eq!(&data.vertices[Normal::PosX as usize][..4], &pos_x_a);
+        assert_eq!(&data.vertices[Normal::PosX as usize][4..], &pos_x_b);
+        assert_eq!(&data.vertices[Normal::NegZ as usize][..], &neg_z);
+        // vertices() is FACE_UPLOAD_ORDER (+X,+Y,+Z,−X,−Y,−Z), not insertion order.
+        let uploaded = data.vertices();
+        assert_eq!(&uploaded[..4], &pos_x_a);
+        assert_eq!(&uploaded[4..8], &pos_x_b);
+        assert_eq!(&uploaded[8..], &neg_z);
     }
 
     #[test]
-    fn clear_keeps_pass_and_empties_buckets() {
+    #[allow(deprecated)]
+    fn buckets_shim_reproduces_old_layout_for_mixed_directions() {
+        let mut data = MeshData::new(Pass::Opaque);
+        let pos_x = quad_for(Normal::PosX);
+        let pos_y = quad_for(Normal::PosY);
+        let neg_x = quad_for(Normal::NegX);
+        let neg_z = quad_for(Normal::NegZ);
+        data.quad(pos_x);
+        data.quad(pos_y);
+        data.quad(neg_x);
+        data.quad(neg_z);
+
+        // FACE_UPLOAD_ORDER = +X, +Y, +Z, −X, −Y, −Z
+        // vertex bases: +X=0, +Y=4, +Z=8 (empty), −X=8, −Y=12 (empty), −Z=12
+        let verts = data.vertices();
+        assert_eq!(verts.len(), 16);
+        assert_eq!(&verts[0..4], &pos_x);
+        assert_eq!(&verts[4..8], &pos_y);
+        assert_eq!(&verts[8..12], &neg_x);
+        assert_eq!(&verts[12..16], &neg_z);
+
+        let buckets = data.buckets();
+        assert!(buckets[Normal::PosZ as usize].is_empty());
+        assert!(buckets[Normal::NegY as usize].is_empty());
+        assert_eq!(buckets[Normal::PosX as usize], vec![0, 1, 2, 0, 2, 3]);
+        assert_eq!(buckets[Normal::PosY as usize], vec![4, 5, 6, 4, 6, 7]);
+        assert_eq!(buckets[Normal::NegX as usize], vec![8, 9, 10, 8, 10, 11]);
+        assert_eq!(buckets[Normal::NegZ as usize], vec![12, 13, 14, 12, 14, 15]);
+
+        for dir in 0..6 {
+            for &i in &buckets[dir] {
+                let _ = verts[i as usize];
+            }
+        }
+    }
+
+    #[test]
+    fn clear_keeps_pass_and_empties_geometry() {
         let mut data = MeshData::new(Pass::Blend);
         data.quad(quad_for(Normal::PosY));
+        let cap: usize = data.vertices.iter().map(Vec::capacity).sum();
         assert!(!data.is_empty());
         data.clear();
         assert!(data.is_empty());
         assert_eq!(data.pass(), Pass::Blend);
-        assert!(data.buckets.iter().all(|b| b.is_empty()));
+        assert_eq!(data.quad_counts(), [0; 6]);
+        assert_eq!(data.vertex_bytes(), 0);
+        assert!(data.vertices.iter().map(Vec::capacity).sum::<usize>() >= cap);
     }
 }

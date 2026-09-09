@@ -1011,13 +1011,13 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "BLOOM_SPIRAL_LOD",
-            doc: "Mip level the bloom spiral samples the (already downsampled) chain at — the\nwide soft blur comes from the pyramid; the spiral just spreads and de-aliases it.",
-            val: Val::Scalar(2.0),
+            doc: "Mip level the bloom spiral samples the (already downsampled) chain at — the\nwide soft blur comes from the pyramid; the spiral just spreads and de-aliases it.\nQuarter-res chain, so LOD 1 is eighth-res.",
+            val: Val::Scalar(1.0),
         },
         Def {
             name: "BLOOM_MAX_MIPS",
             doc: "Bloom pyramid mip cap. The spill pass samples only BLOOM_SPIRAL_LOD, so the\nchain stops at that level (base + LOD). CPU (vk/targets.rs) must agree.",
-            val: Val::UInt(3),
+            val: Val::UInt(2),
         },
         Def {
             name: "BLOOM_SPIRAL_RADIUS",
@@ -1333,7 +1333,7 @@ fn derived_lane_table() -> Vec<Lane> {
         },
         Lane {
             name: "shadow_bounce",
-            doc: "Engine-derived. rgb = SHADOW_SKY_AMBIENT * lerp(light.rgb, zenith.rgb *\nluma709(light)/luma709(zenith), SHADOW_BOUNCE_TINT); light.rgb when zenith\nluma is 0. w reserved 0.",
+            doc: "Engine-derived. rgb = SHADOW_SKY_AMBIENT * lerp(light.rgb, zenith.rgb *\nluma709(light)/luma709(zenith), SHADOW_BOUNCE_TINT); light.rgb when zenith\nluma is 0. w = asfloat lane-enable bits (shadows=1, blocklight=2, ambient=4).",
         },
     ]
 }
@@ -1361,7 +1361,7 @@ fn emit_rust_uniforms(public: &[Lane], derived: &[Lane]) -> String {
     s.push_str("/// Constructed ONLY via the game crate's `From<&FrameSnapshot>` impl.\n");
     s.push_str("/// Engine-derived extra lanes live on [`FrameUniformsExt`], not here.\n");
     s.push_str("#[repr(C)]\n");
-    s.push_str("#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]\n");
+    s.push_str("#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]\n");
     s.push_str("pub struct FrameUniformsGpu {\n");
     for l in public {
         doc_lines(l.doc, "    /// ", &mut s);
@@ -1383,7 +1383,7 @@ fn emit_rust_uniforms(public: &[Lane], derived: &[Lane]) -> String {
     s.push_str("/// GPU UBO: public [`FrameUniformsGpu`] plus the engine-derived tail.\n");
     s.push_str("/// The game still writes `FrameUniformsGpu`; the renderer appends the rest.\n");
     s.push_str("#[repr(C)]\n");
-    s.push_str("#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]\n");
+    s.push_str("#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]\n");
     s.push_str("pub(crate) struct FrameUniformsExt {\n");
     s.push_str("    /// Public per-frame lanes the game wrote.\n");
     s.push_str("    pub base: FrameUniformsGpu,\n");

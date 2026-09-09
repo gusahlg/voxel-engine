@@ -12,11 +12,31 @@
 use ash::vk;
 use glam::Vec3;
 
+use crate::engine::RenderFlags;
 use crate::genconst::{
     GLOW_EDGE0, GLOW_EDGE1, GLOW_POW_DAY, GLOW_POW_SUNSET, SHADOW_BOUNCE_TINT, SHADOW_SKY_AMBIENT,
 };
 use crate::rev::{FrameSlot, PerSlot};
 use crate::vk::buffers::HostBuffer;
+
+/// Packed into `shadow_bounce.w` as `f32::from_bits`; shaders `asuint` the lane.
+pub(crate) const LANE_BIT_SHADOWS: u32 = 1;
+pub(crate) const LANE_BIT_BLOCKLIGHT: u32 = 2;
+pub(crate) const LANE_BIT_AMBIENT: u32 = 4;
+
+pub(crate) fn lane_enable_bits(f: &RenderFlags) -> f32 {
+    let mut bits = 0u32;
+    if f.shadows {
+        bits |= LANE_BIT_SHADOWS;
+    }
+    if f.blocklight {
+        bits |= LANE_BIT_BLOCKLIGHT;
+    }
+    if f.ambient {
+        bits |= LANE_BIT_AMBIENT;
+    }
+    f32::from_bits(bits)
+}
 
 pub const FRAME_UNIFORMS_SET: u32 = 0;
 pub const FRAME_UNIFORMS_BINDING: u32 = 2;
@@ -77,9 +97,10 @@ fn luma709(c: Vec3) -> f32 {
 impl FrameUniformsExt {
     /// Hoist per-frame uniform-only math the shaders used to recompute every
     /// fragment: ambient floor colour, sky-halo exponent, halo tint×scale,
-    /// the shadow-fallback day factor, and the sky-dome shadow fill. Mirrors
-    /// `common.slang`.
-    pub(crate) fn derive(u: FrameUniformsGpu) -> Self {
+    /// the shadow-fallback day factor, the sky-dome shadow fill, and the
+    /// shadows/blocklight/ambient lane-enable bits in `shadow_bounce.w`.
+    /// Mirrors `common.slang`.
+    pub(crate) fn derive(u: FrameUniformsGpu, flags: RenderFlags) -> Self {
         let zenith = Vec3::new(u.zenith[0], u.zenith[1], u.zenith[2]);
         let light = Vec3::new(u.light[0], u.light[1], u.light[2]);
         let floor = u.candle[3];
@@ -103,7 +124,7 @@ impl FrameUniformsExt {
             base: u,
             ambient_glow: [ambient.x, ambient.y, ambient.z, glow_pow],
             glow_day: [glow_rgb.x, glow_rgb.y, glow_rgb.z, day],
-            shadow_bounce: [bounce.x, bounce.y, bounce.z, 0.0],
+            shadow_bounce: [bounce.x, bounce.y, bounce.z, lane_enable_bits(&flags)],
         }
     }
 }
@@ -116,6 +137,8 @@ pub const FRAME_UNIFORMS_VERSION: u32 = 6;
 /// so raw-usize slot confusion is inexpressible here.
 pub(crate) struct UboRing {
     bufs: PerSlot<HostBuffer>,
+    last: PerSlot<Option<FrameUniformsExt>>,
+    last_gpu: PerSlot<Option<(FrameUniformsGpu, RenderFlags)>>,
 }
 
 impl UboRing {
@@ -138,6 +161,8 @@ impl UboRing {
         };
         Self {
             bufs: PerSlot::new(std::array::from_fn(|_| make())),
+            last: PerSlot::new(std::array::from_fn(|_| None)),
+            last_gpu: PerSlot::new(std::array::from_fn(|_| None)),
         }
     }
 
@@ -145,9 +170,29 @@ impl UboRing {
     /// into `slot`'s mapped buffer. Coherent memory: the write is visible to
     /// the GPU with no explicit flush. `prepare_derived` runs once on the
     /// producer (begin_3d / full_bright); `FrameUniformsExt::derive` runs once
-    /// on the render thread before this write.
+    /// on the render thread before this write. Identical bytes for this slot
+    /// skip the map write.
     pub(crate) fn write(&mut self, slot: FrameSlot, ext: &FrameUniformsExt) {
+        if self.last[slot].as_ref() == Some(ext) {
+            return;
+        }
         unsafe { self.bufs[slot].write(0, bytemuck::bytes_of(ext)) };
+        self.last[slot] = Some(*ext);
+    }
+
+    /// Derive the engine tail and write, skipping both when this slot already
+    /// holds `u` (sky/lighting-dependent work independent of jittered view-proj).
+    pub(crate) fn write_from_gpu(
+        &mut self,
+        slot: FrameSlot,
+        u: FrameUniformsGpu,
+        flags: RenderFlags,
+    ) {
+        if self.last_gpu[slot] == Some((u, flags)) {
+            return;
+        }
+        self.write(slot, &FrameUniformsExt::derive(u, flags));
+        self.last_gpu[slot] = Some((u, flags));
     }
 
     /// The buffer bound at set 0, binding 2 for `slot`. The per-frame UBO is
@@ -169,6 +214,11 @@ impl UboRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::RenderFlags;
+
+    fn derive_default(u: FrameUniformsGpu) -> FrameUniformsExt {
+        FrameUniformsExt::derive(u, RenderFlags::default())
+    }
 
     #[test]
     fn prepare_derived_normalizes_sun_and_fills_glow() {
@@ -216,7 +266,7 @@ mod tests {
         u.light = [1.25, 1.15, 1.0, 1.0];
         u.sun_dir_elev[3] = 0.2;
 
-        let ext = FrameUniformsExt::derive(u);
+        let ext = derive_default(u);
         let luma = luma709(Vec3::new(0.09, 0.22, 0.45));
         let scale = 0.30 / luma;
         for i in 0..3 {
@@ -247,7 +297,36 @@ mod tests {
                 "shadow_bounce[{i}]"
             );
         }
-        assert_eq!(ext.shadow_bounce[3], 0.0);
+        assert_eq!(
+            ext.shadow_bounce[3].to_bits(),
+            lane_enable_bits(&RenderFlags::default()).to_bits()
+        );
+    }
+
+    #[test]
+    fn lane_enable_bits_pack_shadows_blocklight_ambient() {
+        let mut f = RenderFlags::default();
+        f.shadows = false;
+        f.blocklight = false;
+        f.ambient = false;
+        assert_eq!(lane_enable_bits(&f).to_bits(), 0);
+        f.shadows = true;
+        assert_eq!(lane_enable_bits(&f).to_bits(), LANE_BIT_SHADOWS);
+        f.blocklight = true;
+        assert_eq!(
+            lane_enable_bits(&f).to_bits(),
+            LANE_BIT_SHADOWS | LANE_BIT_BLOCKLIGHT
+        );
+        f.ambient = true;
+        assert_eq!(
+            lane_enable_bits(&f).to_bits(),
+            LANE_BIT_SHADOWS | LANE_BIT_BLOCKLIGHT | LANE_BIT_AMBIENT
+        );
+        let ext = FrameUniformsExt::derive(FrameUniformsGpu::full_bright(), f);
+        assert_eq!(
+            ext.shadow_bounce[3].to_bits(),
+            lane_enable_bits(&f).to_bits()
+        );
     }
 
     /// `SHADOW_BOUNCE_TINT == 0` ⇒ lane is `SHADOW_SKY_AMBIENT * light.rgb`.
@@ -260,21 +339,24 @@ mod tests {
         let mut u = FrameUniformsGpu::full_bright();
         u.light = [1.25, 1.15, 1.0, 1.0];
         u.zenith = [0.09, 0.22, 0.45, 2.0];
-        let ext = FrameUniformsExt::derive(u);
+        let ext = derive_default(u);
         for i in 0..3 {
             assert!(
                 (ext.shadow_bounce[i] - u.light[i] * SHADOW_SKY_AMBIENT).abs() < 1e-6,
                 "shadow_bounce[{i}]"
             );
         }
-        assert_eq!(ext.shadow_bounce[3], 0.0);
+        assert_eq!(
+            ext.shadow_bounce[3].to_bits(),
+            lane_enable_bits(&RenderFlags::default()).to_bits()
+        );
     }
 
     #[test]
     fn derived_ambient_falls_back_when_zenith_is_black() {
         let u = FrameUniformsGpu::full_bright();
         // full_bright leaves zenith at zero, candle.w = 1.
-        let ext = FrameUniformsExt::derive(u);
+        let ext = derive_default(u);
         assert_eq!(&ext.ambient_glow[..3], &[1.0, 1.0, 1.0]);
     }
 
@@ -282,19 +364,19 @@ mod tests {
     fn derived_day_factor_tracks_night_and_noon() {
         let mut u = FrameUniformsGpu::full_bright();
         u.light[3] = 0.0;
-        assert!((FrameUniformsExt::derive(u).glow_day[3] - 1.0).abs() < 1e-7);
+        assert!((derive_default(u).glow_day[3] - 1.0).abs() < 1e-7);
         u.light[3] = 0.5;
-        assert!(FrameUniformsExt::derive(u).glow_day[3].abs() < 1e-7);
+        assert!(derive_default(u).glow_day[3].abs() < 1e-7);
         u.light[3] = 1.0;
-        assert!((FrameUniformsExt::derive(u).glow_day[3] - 1.0).abs() < 1e-7);
+        assert!((derive_default(u).glow_day[3] - 1.0).abs() < 1e-7);
     }
 
     #[test]
     fn derived_glow_pow_is_sunset_below_edge0_and_day_above_edge1() {
         let mut u = FrameUniformsGpu::full_bright();
         u.sun_dir_elev[3] = GLOW_EDGE0 - 1.0;
-        assert!((FrameUniformsExt::derive(u).ambient_glow[3] - GLOW_POW_SUNSET).abs() < 1e-6);
+        assert!((derive_default(u).ambient_glow[3] - GLOW_POW_SUNSET).abs() < 1e-6);
         u.sun_dir_elev[3] = GLOW_EDGE1 + 1.0;
-        assert!((FrameUniformsExt::derive(u).ambient_glow[3] - GLOW_POW_DAY).abs() < 1e-6);
+        assert!((derive_default(u).ambient_glow[3] - GLOW_POW_DAY).abs() < 1e-6);
     }
 }

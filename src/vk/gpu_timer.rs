@@ -2,6 +2,9 @@
 //! Split out of `mod.rs` so later work can touch profiling without opening
 //! the renderer setup.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
 use ash::vk;
 
 use super::buffers::FRAMES_IN_FLIGHT;
@@ -117,7 +120,79 @@ const GPU_STAMPS: usize = GpuPass::COUNT + 1;
 /// One pair suffices: a new copy is only recorded once the previous one has
 /// retired (`decide_present` probes/waits it), so its stamps are read first.
 const COPY_STAMP_BASE: u32 = (GPU_STAMPS * FRAMES_IN_FLIGHT as usize) as u32;
-const QUERY_COUNT: u32 = COPY_STAMP_BASE + 2;
+/// Two frame-boundary stamps per slot (TOP / BOTTOM), after the copy pair.
+/// Recorded only after [`crate::Engine::enable_gpu_load`]; the profiler
+/// stamps (`VOXEL_PROFILE`) use a separate range and are unaffected.
+const LOAD_STAMP_BASE: u32 = COPY_STAMP_BASE + 2;
+const LOAD_STAMPS: u32 = 2;
+const QUERY_COUNT: u32 = LOAD_STAMP_BASE + LOAD_STAMPS * FRAMES_IN_FLIGHT as u32;
+
+fn load_query(slot: usize, i: u32) -> u32 {
+    LOAD_STAMP_BASE + slot as u32 * LOAD_STAMPS + i
+}
+
+/// Last completed frame's GPU busy time and idle gap before that submit.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuLoad {
+    pub frame_ms: f32,
+    pub gap_ms: f32,
+}
+
+/// Published by the render thread, read by [`crate::Engine::gpu_load`].
+/// Two `f32` bit-patterns, same pattern as [`super::exposure::ExposureShared`].
+/// Recording is off until [`crate::Engine::enable_gpu_load`]; `load` is `None`
+/// while disabled even if a previous enable left values in the atomics.
+#[derive(Clone)]
+pub struct GpuLoadShared {
+    frame: Arc<AtomicU32>,
+    gap: Arc<AtomicU32>,
+    ready: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+}
+
+impl GpuLoadShared {
+    fn new() -> Self {
+        Self {
+            frame: Arc::new(AtomicU32::new(0)),
+            gap: Arc::new(AtomicU32::new(0)),
+            ready: Arc::new(AtomicBool::new(false)),
+            enabled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Release);
+        if !on {
+            self.ready.store(false, Ordering::Release);
+        }
+    }
+
+    fn store(&self, frame_ms: f32, gap_ms: f32) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.frame.store(frame_ms.to_bits(), Ordering::Relaxed);
+        self.gap.store(gap_ms.to_bits(), Ordering::Relaxed);
+        self.ready.store(true, Ordering::Release);
+    }
+
+    pub fn load(&self) -> Option<GpuLoad> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        if !self.ready.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(GpuLoad {
+            frame_ms: f32::from_bits(self.frame.load(Ordering::Relaxed)),
+            gap_ms: f32::from_bits(self.gap.load(Ordering::Relaxed)),
+        })
+    }
+}
 
 /// Per-pass GPU timing via a timestamp query pool: a start timestamp plus one
 /// after each recorded pass. Only the passes that actually run write a stamp,
@@ -155,6 +230,12 @@ pub(super) struct GpuTimer {
     /// compute the idle gap before the next readable frame. Cleared when a
     /// readback is unavailable so a later start is not compared across a hole.
     prev_end: Option<u64>,
+    load_primed: [bool; FRAMES_IN_FLIGHT as usize],
+    /// `begin_load` actually wrote this slot's TOP stamp; `end_load` must
+    /// close that pair even if the setter flips mid-record.
+    load_open: [std::cell::Cell<bool>; FRAMES_IN_FLIGHT as usize],
+    load_prev_end: Option<u64>,
+    load: GpuLoadShared,
 }
 
 /// Device-time gap (ms) from the previous render submit's last stamp to this
@@ -202,7 +283,15 @@ impl GpuTimer {
             pending: std::array::from_fn(|_| std::cell::Cell::new(false)),
             copy_primed: false,
             prev_end: None,
+            load_primed: [false; FRAMES_IN_FLIGHT as usize],
+            load_open: std::array::from_fn(|_| std::cell::Cell::new(false)),
+            load_prev_end: None,
+            load: GpuLoadShared::new(),
         }
+    }
+
+    pub(super) fn load_shared(&self) -> GpuLoadShared {
+        self.load.clone()
     }
 
     fn enabled(&self) -> bool {
@@ -321,6 +410,90 @@ impl GpuTimer {
         }
         self.label[slot][i as usize].set(pass);
         self.count[slot].set(i + 1);
+    }
+
+    /// Reads this slot's previous load pair (TOP/BOTTOM) after its fence wait
+    /// and publishes [`GpuLoadShared`]. `None` until the first successful
+    /// readback; a hole drops `load_prev_end` so the next gap is not invented.
+    /// Skipped while [`crate::Engine::enable_gpu_load`] is off (drops a primed
+    /// unread pair so a later enable does not publish a stale sample).
+    pub(super) unsafe fn read_load(&mut self, device: &ash::Device, slot: usize) {
+        if !self.enabled() || !self.load_primed[slot] {
+            return;
+        }
+        if !self.load.is_enabled() {
+            self.load_primed[slot] = false;
+            self.load_prev_end = None;
+            return;
+        }
+        let mut ts = [0u64; 2];
+        let read = unsafe {
+            device.get_query_pool_results(
+                self.pool,
+                load_query(slot, 0),
+                &mut ts,
+                vk::QueryResultFlags::TYPE_64,
+            )
+        };
+        if read.is_err() {
+            self.load_prev_end = None;
+            return;
+        }
+        let frame_ms = ts[1].wrapping_sub(ts[0]) as f64 * self.period_ns as f64 / 1.0e6;
+        let gap_ms = self
+            .load_prev_end
+            .map(|end| idle_gap_ms(end, ts[0], self.period_ns))
+            .unwrap_or(0.0);
+        self.load_prev_end = Some(ts[1]);
+        self.load.store(frame_ms as f32, gap_ms as f32);
+    }
+
+    /// Resets the load pair and writes TOP_OF_PIPE. Recorded only when
+    /// [`crate::Engine::enable_gpu_load`] is on — two stamps, host query reset
+    /// when available. The profiler's own stamps are a separate range.
+    pub(super) unsafe fn begin_load(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+    ) {
+        if !self.enabled() || !self.load.is_enabled() {
+            return;
+        }
+        self.reset_queries(device, cmd, load_query(slot, 0), LOAD_STAMPS);
+        unsafe {
+            device.cmd_write_timestamp2(
+                cmd,
+                vk::PipelineStageFlags2::TOP_OF_PIPE,
+                self.pool,
+                load_query(slot, 0),
+            );
+        }
+        self.load_open[slot].set(true);
+    }
+
+    /// Writes BOTTOM_OF_PIPE and marks the pair readable next cycle.
+    /// Closes a pair `begin_load` actually opened, even if the setter flipped
+    /// off mid-record (an unmatched TOP would leave the query incomplete).
+    pub(super) unsafe fn end_load(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+    ) {
+        if !self.enabled() || !self.load_open[slot].get() {
+            return;
+        }
+        unsafe {
+            device.cmd_write_timestamp2(
+                cmd,
+                vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                self.pool,
+                load_query(slot, 1),
+            );
+        }
+        self.load_open[slot].set(false);
+        self.load_primed[slot] = true;
     }
 
     /// Marks `slot` readable next cycle. Call after the render pass ends.
@@ -589,7 +762,7 @@ mod tests {
         assert_eq!(GPU_STAMPS, GpuPass::COUNT + 1);
         assert_eq!(
             QUERY_COUNT as usize,
-            GPU_STAMPS * FRAMES_IN_FLIGHT as usize + 2
+            GPU_STAMPS * FRAMES_IN_FLIGHT as usize + 2 + 2 * FRAMES_IN_FLIGHT as usize
         );
         // Opaque split: stamped after each camera group, in draw order
         // (full-res, coarse LOD, then cutout). Combined `opaque` is summed
@@ -610,6 +783,31 @@ mod tests {
         passes[GpuPass::OpaqueLod as usize] = 0.05;
         passes[GpuPass::Cutout as usize] = 0.01;
         assert!((GpuPass::opaque_ms(&passes) - 0.09).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gpu_load_disabled_by_default() {
+        let shared = GpuLoadShared::new();
+        assert!(!shared.is_enabled());
+        assert!(shared.load().is_none());
+        shared.store(1.5, 0.25);
+        assert!(
+            shared.load().is_none(),
+            "store must not publish while disabled"
+        );
+        shared.set_enabled(true);
+        assert!(shared.load().is_none(), "enabling does not invent a sample");
+        shared.store(1.5, 0.25);
+        let g = shared.load().expect("enabled + stored");
+        assert_eq!(g.frame_ms, 1.5);
+        assert_eq!(g.gap_ms, 0.25);
+        shared.set_enabled(false);
+        assert!(shared.load().is_none());
+        shared.set_enabled(true);
+        assert!(
+            shared.load().is_none(),
+            "disable clears ready; re-enable waits for a fresh store"
+        );
     }
 
     #[test]

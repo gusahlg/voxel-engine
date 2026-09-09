@@ -29,22 +29,30 @@ use winit::window::Window;
 
 use super::alloc::{Allocation, DEVICE_SHRINK_SETTLE_TICKS, GpuAllocator};
 use super::buffers::{
-    DrawDyn, GpuResident, MeshHandles, MeshRecord, PlacementState, build_mesh_resident,
+    DrawDyn, GpuResident, MeshHandles, MeshMeta, MeshRecord, PlacementState, build_mesh_resident,
+    build_mesh_resident_staged,
 };
 use super::device::{Device, MemoryBudget};
 use super::image::{AllocError, render_target_oom_message};
 use super::instance::InstanceBundle;
+use super::mesh_staging::{MeshStager, MeshStaging, MeshStagingPool};
 use super::{Renderer, Scale, clamp_msaa, display_refresh_interval};
 use crate::engine::Config;
 use crate::frame::DrawLists;
-use crate::mesh::{Detail, MeshData, MeshHandle, MeshPlacement};
+use crate::mesh::{Detail, MeshData, MeshHandle, MeshPlacement, Pass};
 
-/// Device capabilities cached on main for local clamp.
-#[derive(Clone, Copy)]
+/// Device capabilities cached on main for local clamp and [`crate::GpuCaps`].
+#[derive(Clone)]
 pub(crate) struct DeviceCaps {
     pub max_msaa: u32,
     /// Block-texture array layer ceiling (`limits.maxImageArrayLayers`).
     pub max_texture_layers: u32,
+    pub device_name: String,
+    pub device_local_bytes: u64,
+    pub supports_vrs: bool,
+    /// Attachment shading-rate texel size when VRS is available.
+    pub vrs_texel_size: Option<(u32, u32)>,
+    pub supports_pipeline_stats: bool,
 }
 
 /// Ordered command stream from main to render thread.
@@ -87,6 +95,13 @@ pub(crate) enum RenderCmd {
         layers: Box<[Vec<u8>]>,
     },
     UpdateMinimap(Box<[u8]>),
+    UpdateMinimapRect {
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        pixels: Box<[u8]>,
+    },
     Capture(Capture),
     Resize(PhysicalSize<u32>),
     SetVsync(bool),
@@ -127,6 +142,10 @@ pub(crate) struct InitReply {
     pub caps: DeviceCaps,
     /// Render thread's published exposure cell for Engine's compose().
     pub exposure: super::exposure::ExposureShared,
+    /// Last completed frame GPU busy / inter-submit gap.
+    pub gpu_load: super::gpu_timer::GpuLoadShared,
+    /// Shared with the render thread; workers clone [`MeshStager`] from it.
+    pub mesh_staging: Arc<MeshStagingPool>,
 }
 
 /// Render-thread build parameters.
@@ -217,6 +236,7 @@ pub(crate) struct RenderClient {
     visible: Vec<u32>,
     visible_dirty: std::collections::BTreeSet<u32>,
     mesh_alloc: GpuAllocator,
+    mesh_staging: Arc<MeshStagingPool>,
     device: ash::Device,
     caps: DeviceCaps,
     size: PhysicalSize<u32>,
@@ -226,6 +246,7 @@ pub(crate) struct RenderClient {
     cull_faces: bool,
     /// The render thread's published exposure cell, cloned into `Engine`.
     exposure: super::exposure::ExposureShared,
+    gpu_load: super::gpu_timer::GpuLoadShared,
     /// `None` once joined (shutdown is idempotent).
     join: Option<JoinHandle<Option<DeviceLeftovers>>>,
     /// Render-thread completed `draw_frame` calls (monotonic).
@@ -345,6 +366,7 @@ impl RenderClient {
             visible: Vec::new(),
             visible_dirty: std::collections::BTreeSet::new(),
             mesh_alloc,
+            mesh_staging: reply.mesh_staging,
             device: reply.device,
             caps: reply.caps,
             size,
@@ -353,6 +375,7 @@ impl RenderClient {
             msaa,
             cull_faces: true,
             exposure: reply.exposure,
+            gpu_load: reply.gpu_load,
             join: Some(join),
             frames_rendered,
             frames_coalesced,
@@ -365,7 +388,16 @@ impl RenderClient {
         self.exposure.clone()
     }
 
+    pub(crate) fn gpu_load(&self) -> super::gpu_timer::GpuLoadShared {
+        self.gpu_load.clone()
+    }
+
     // ---- meshes ----
+
+    /// Cheap `Clone` handle workers use to acquire staging regions.
+    pub(crate) fn mesh_stager(&self) -> MeshStager {
+        self.mesh_staging.stager()
+    }
 
     /// Legacy upload: placement is recovered from each draw's offset
     /// ([`PlacementState::Tracked`]). Movers and demo geometry.
@@ -383,9 +415,46 @@ impl RenderClient {
         self.upload(data, Some(placement))
     }
 
+    /// Install a worker-written staging region as a placed mesh.
+    pub(crate) fn upload_mesh_staged(
+        &mut self,
+        staging: MeshStaging,
+        quads: [u32; 6],
+        pass: Pass,
+        placement: MeshPlacement,
+    ) -> Option<MeshHandle> {
+        let (meta, resident) = unsafe {
+            build_mesh_resident_staged(
+                &self.device,
+                &mut self.mesh_alloc,
+                &self.mesh_staging,
+                staging,
+                quads,
+                pass,
+            )
+        }?;
+        self.install(meta, resident, Some(placement))
+    }
+
+    /// Explicit release of a stale staging region; same as drop.
+    pub(crate) fn release_mesh_staging(&self, staging: MeshStaging) {
+        staging.release();
+    }
+
     fn upload(&mut self, data: &MeshData, placement: Option<MeshPlacement>) -> Option<MeshHandle> {
-        let (mut meta, resident) =
-            unsafe { build_mesh_resident(&self.device, &mut self.mesh_alloc, data) }?;
+        // Legacy CPU-side MeshData never uses the staging ring: workers that
+        // already wrote into a region go through `upload_mesh_staged`.
+        let (meta, resident) =
+            unsafe { build_mesh_resident(&self.device, &mut self.mesh_alloc, data)? };
+        self.install(meta, resident, placement)
+    }
+
+    fn install(
+        &mut self,
+        mut meta: MeshMeta,
+        resident: GpuResident,
+        placement: Option<MeshPlacement>,
+    ) -> Option<MeshHandle> {
         if placement.is_some() {
             meta.placement = PlacementState::Pinned;
         }
@@ -495,6 +564,25 @@ impl RenderClient {
             .send(RenderCmd::UpdateMinimap(rgba.to_vec().into_boxed_slice()));
     }
 
+    pub(crate) fn update_minimap_owned(&mut self, rgba: Box<[u8]>) {
+        let _ = self.tx.send(RenderCmd::UpdateMinimap(rgba));
+    }
+
+    pub(crate) fn update_minimap_rect(&mut self, x: u32, y: u32, w: u32, h: u32, rgba: &[u8]) {
+        let _ = self.tx.send(RenderCmd::UpdateMinimapRect {
+            x,
+            y,
+            w,
+            h,
+            pixels: rgba.to_vec().into_boxed_slice(),
+        });
+    }
+
+    pub(crate) fn minimap_size(&self) -> (u32, u32) {
+        let n = super::MINIMAP_SIZE;
+        (n, n)
+    }
+
     pub(crate) fn request_capture(&mut self, capture: Capture) {
         let _ = self.tx.send(RenderCmd::Capture(capture));
     }
@@ -515,6 +603,9 @@ impl RenderClient {
 
     pub(crate) fn set_msaa(&mut self, samples: u32) -> u32 {
         let resolved = clamp_msaa(samples, self.caps.max_msaa);
+        if self.msaa == resolved {
+            return resolved;
+        }
         self.msaa = resolved;
         let _ = self.tx.send(RenderCmd::SetMsaa(resolved));
         resolved
@@ -524,12 +615,36 @@ impl RenderClient {
         self.msaa
     }
 
+    /// Attachment shading-rate texel size, if the device has one.
+    pub(crate) fn vrs_texel_size(&self) -> Option<(u32, u32)> {
+        self.caps.vrs_texel_size
+    }
+
+    /// Offscreen pixel count after render scale (same formula as `scaled_extent`).
+    pub(crate) fn render_pixels(&self) -> u32 {
+        let scale = self.render_scale.get();
+        let w = ((self.size.width as f32 * scale) as u32).max(1);
+        let h = ((self.size.height as f32 * scale) as u32).max(1);
+        w.saturating_mul(h)
+    }
+
     pub(crate) fn max_msaa(&self) -> u32 {
         self.caps.max_msaa
     }
 
     pub(crate) fn max_texture_layers(&self) -> u32 {
         self.caps.max_texture_layers
+    }
+
+    pub(crate) fn gpu_caps(&self) -> crate::GpuCaps {
+        crate::GpuCaps {
+            device_name: self.caps.device_name.clone(),
+            device_local_bytes: self.caps.device_local_bytes,
+            max_texture_array_layers: self.caps.max_texture_layers,
+            max_msaa: self.caps.max_msaa,
+            supports_vrs: self.caps.supports_vrs,
+            supports_pipeline_stats: self.caps.supports_pipeline_stats,
+        }
     }
 
     /// GPU face-run culling. On by default; `false` is an explicit opt-out.
@@ -553,6 +668,9 @@ impl RenderClient {
 
     pub(crate) fn set_render_scale(&mut self, scale: f32) -> f32 {
         let s = Scale::new(scale);
+        if self.render_scale == s {
+            return s.get();
+        }
         self.render_scale = s;
         let _ = self.tx.send(RenderCmd::SetRenderScale(s));
         s.get()
@@ -834,6 +952,9 @@ fn render_loop(
                     renderer.append_block_textures(&layers)
                 }
                 RenderCmd::UpdateMinimap(px) => renderer.update_minimap(&px),
+                RenderCmd::UpdateMinimapRect { x, y, w, h, pixels } => {
+                    renderer.update_minimap_rect(x, y, w, h, &pixels)
+                }
                 RenderCmd::Capture(capture) => renderer.request_capture(capture),
                 RenderCmd::Resize(size) => renderer.on_resize(size),
                 RenderCmd::SetVsync(v) => renderer.set_vsync(v),

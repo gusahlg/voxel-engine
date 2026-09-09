@@ -18,7 +18,7 @@ use crate::vk::uniforms::FrameUniformsGpu;
 /// `FrameUniforms` UBO, the SAME linear source the terrain fog reads, so the two
 /// can never diverge (one source of truth for sky data). The engine adds the inverse
 /// view-projection at record time, so the app never touches a matrix.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct SkyDesc {
     pub sun_dir: Vec3,
     /// Linear disc/glow tint (no OETF on this path); the analytic sun disc adds
@@ -30,7 +30,7 @@ pub struct SkyDesc {
 }
 
 /// Full-res coverage slab. Use the same value for both streaming and LOD culling.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct CoverageVolume {
     pub radius: f32,
     pub half_height: f32,
@@ -135,6 +135,8 @@ pub(crate) struct Scene3D {
     /// — the sole injection point. `view_proj` above stays CLEAN so culling
     /// and TAA reprojection never see the jitter.
     pub jitter: JitterOffset,
+    /// Key light for oriented debug boxes, derived once per `begin_3d`.
+    pub(crate) key_light: KeyLight,
 }
 
 /// CPU-side draw lists for one frame. Vec capacities persist across frames.
@@ -255,8 +257,33 @@ impl<'e> Frame<'e> {
             JitterOffset::ZERO
         };
         let frame_uniforms = match light {
-            Lighting::Composed(u) => gate_uniforms(&self.eng.flags, u),
-            Lighting::FullBright => FrameUniformsGpu::full_bright(),
+            Lighting::Composed(u) => {
+                if self.eng.last_composed == Some(u) && self.eng.last_gate_flags == self.eng.flags {
+                    self.eng
+                        .last_gated
+                        .expect("gated uniforms cached with last_composed")
+                } else {
+                    let gated = gate_uniforms(&self.eng.flags, u);
+                    self.eng.last_composed = Some(u);
+                    self.eng.last_gate_flags = self.eng.flags;
+                    self.eng.last_gated = Some(gated);
+                    gated
+                }
+            }
+            Lighting::FullBright => {
+                if self.eng.last_composed.is_none()
+                    && self.eng.last_gated.is_some()
+                    && self.eng.last_gate_flags == self.eng.flags
+                {
+                    self.eng.last_gated.expect("full-bright uniforms cached")
+                } else {
+                    let gated = FrameUniformsGpu::full_bright();
+                    self.eng.last_composed = None;
+                    self.eng.last_gate_flags = self.eng.flags;
+                    self.eng.last_gated = Some(gated);
+                    gated
+                }
+            }
         };
         self.eng.lists.scene = Some(Scene3D {
             view_proj,
@@ -267,6 +294,7 @@ impl<'e> Frame<'e> {
             fovy_tan_half: (cam.fovy.to_radians() * 0.5).tan(),
             warp_map,
             jitter,
+            key_light: KeyLight::from_uniforms(frame_uniforms),
         });
         Frame3D { frame: self }
     }
@@ -389,8 +417,14 @@ pub struct Frame3D<'f, 'e> {
 impl Frame3D<'_, '_> {
     /// Sets chunk→LOD slab extents. Must equal the streamed full-res volume.
     pub fn set_lod_clip(&mut self, v: CoverageVolume) {
-        self.frame.eng.lists.lod_clip = v.radius.max(0.0);
-        self.frame.eng.lists.lod_clip_v = v.half_height.max(0.0);
+        let radius = v.radius.max(0.0);
+        let half_height = v.half_height.max(0.0);
+        if self.frame.eng.lists.lod_clip == radius && self.frame.eng.lists.lod_clip_v == half_height
+        {
+            return;
+        }
+        self.frame.eng.lists.lod_clip = radius;
+        self.frame.eng.lists.lod_clip_v = half_height;
     }
 
     /// Sets the procedural sky drawn behind this frame's geometry. The
@@ -398,6 +432,9 @@ impl Frame3D<'_, '_> {
     /// reversed-Z depth trick), so it is near-free. Call once inside the
     /// `begin_3d` scope; leaving it unset shows the flat clear colour.
     pub fn set_sky(&mut self, desc: SkyDesc) {
+        if self.frame.eng.lists.sky == Some(desc) {
+            return;
+        }
         self.frame.eng.lists.sky = Some(desc);
     }
 
@@ -431,7 +468,18 @@ impl Frame3D<'_, '_> {
     /// sky key light (the same source terrain uses, see [`KeyLight`]) baked into
     /// the vertex colour, so limbs read as 3D and track the time of day.
     pub fn draw_box(&mut self, center: Vec3, half: Vec3, rot: Mat3, color: Color) {
-        let key = KeyLight::from_lists(&self.frame.eng.lists);
+        let key = self
+            .frame
+            .eng
+            .lists
+            .scene
+            .as_ref()
+            .expect("draw_box is inside a begin_3d scope")
+            .key_light;
+        debug_assert!(
+            (key.dir.length_squared() - 1.0).abs() < 1e-4,
+            "KeyLight::dir is unit length (normalized once in begin_3d)"
+        );
         // Local-space corner layout and per-face normals share the cube ordering.
         let faces = cube_faces(-half, half);
         const NORMALS: [Vec3; 6] = [
@@ -444,7 +492,7 @@ impl Frame3D<'_, '_> {
         ];
         let verts = &mut self.frame.eng.lists.cube_verts;
         for (face, local_n) in faces.iter().zip(NORMALS) {
-            let n = (rot * local_n).normalize_or_zero();
+            let n = rot * local_n;
             let lit = key.ambient + key.sun * n.dot(key.dir).max(0.0);
             let shaded = |v: u8, chan: f32| (v as f32 * chan).round().clamp(0.0, 255.0) as u8;
             let c = [
@@ -633,7 +681,8 @@ fn cube_faces(min: Vec3, max: Vec3) -> [[[f32; 3]; 4]; 6] {
 /// UBO (`frame_uniforms`) — the SAME lighting truth the terrain reads — so
 /// a peer and the terrain around it can never be lit inconsistently. `sun`/
 /// `ambient` are per-channel RGB multipliers; `dir` points toward the light.
-struct KeyLight {
+#[derive(Clone, Copy)]
+pub(crate) struct KeyLight {
     dir: Vec3,
     sun: Vec3,
     ambient: Vec3,
@@ -655,27 +704,24 @@ impl KeyLight {
     /// `Rgb::to_srgb8_legacy` exit, which truncated linear values to 8-bit with
     /// NO sRGB curve (so the retarget is pixel-identical up to ±1/255). With no
     /// uniforms set (e.g. `bin/demo.rs`) fall back to [`KeyLight::DEFAULT`].
-    fn from_lists(lists: &DrawLists) -> Self {
-        match lists.scene.as_ref().map(|s| s.frame_uniforms) {
-            Some(u) => {
-                let sun =
-                    Vec3::new(u.light[0], u.light[1], u.light[2]).clamp(Vec3::ZERO, Vec3::ONE);
-                let zenith = Vec3::new(u.zenith[0], u.zenith[1], u.zenith[2]);
-                let ambient_floor = u.candle[3];
-                let luma = 0.2126 * zenith.x + 0.7152 * zenith.y + 0.0722 * zenith.z;
-                let ambient = if luma > 0.0 {
-                    zenith * (ambient_floor / luma)
-                } else {
-                    zenith
-                };
-                let dir = Vec3::new(u.sun_dir_elev[0], u.sun_dir_elev[1], u.sun_dir_elev[2]);
-                KeyLight {
-                    dir: dir.normalize_or(Self::DEFAULT.dir),
-                    sun,
-                    ambient: ambient.clamp(Vec3::ZERO, Vec3::ONE),
-                }
-            }
-            None => Self::DEFAULT,
+    fn from_uniforms(u: FrameUniformsGpu) -> Self {
+        let sun = Vec3::new(u.light[0], u.light[1], u.light[2]).clamp(Vec3::ZERO, Vec3::ONE);
+        let zenith = Vec3::new(u.zenith[0], u.zenith[1], u.zenith[2]);
+        let ambient_floor = u.candle[3];
+        let luma = 0.2126 * zenith.x + 0.7152 * zenith.y + 0.0722 * zenith.z;
+        let ambient = if luma > 0.0 {
+            zenith * (ambient_floor / luma)
+        } else {
+            zenith
+        };
+        let dir = Vec3::new(u.sun_dir_elev[0], u.sun_dir_elev[1], u.sun_dir_elev[2]);
+        KeyLight {
+            dir: dir
+                .try_normalize()
+                .or_else(|| Self::DEFAULT.dir.try_normalize())
+                .unwrap_or(Vec3::Y),
+            sun,
+            ambient: ambient.clamp(Vec3::ZERO, Vec3::ONE),
         }
     }
 }

@@ -2,9 +2,9 @@
 //!
 //! One compute pipeline per bloom stage (`threshold`, `downsample`, both entry
 //! points of `bloom.comp.slang`) fills the per-slot [`BloomChain`] mip pyramid
-//! owned by `RenderTargets`. The `threshold` dispatch bilinear-downsamples the
-//! finalized HDR offscreen into mip 0 keeping only the exposed bright spill; a
-//! chain of `downsample` dispatches builds the rest.
+//! owned by `RenderTargets`. The `threshold` dispatch writes quarter-res mip 0
+//! from 2×2 bilinear taps of the finalized HDR offscreen, keeping only the
+//! exposed bright spill; a chain of `downsample` dispatches builds the rest.
 //!
 //! A third compute dispatch (`spill.comp.slang`) then writes a quarter-res
 //! RGBA16F image: the same 6-tap golden-angle gather over the bloom mip at
@@ -493,6 +493,7 @@ impl super::Renderer {
                 0,
                 &writes,
             );
+            // mip 0 is quarter-res; threshold writes it from 2×2 bilinear HDR taps.
             let mip0 = chain.mip_extents[0];
             let push = BloomPush {
                 dst_dim: [mip0.width, mip0.height],
@@ -591,6 +592,7 @@ impl super::Renderer {
 
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, bloom.spill);
+            // Quarter-res chain; the shader gathers at BLOOM_SPIRAL_LOD (eighth-res).
             let bloom_info = [vk::DescriptorImageInfo::default()
                 .sampler(bloom.composite_sampler)
                 .image_view(self.targets.bloom[slot.index()].sample_view)

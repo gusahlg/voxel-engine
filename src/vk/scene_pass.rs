@@ -34,6 +34,10 @@ pub(super) struct RenderPass<'a> {
     index_bound: std::cell::Cell<bool>,
     /// A later pass this frame samples the sampleable depth (VRS / spill / TAA).
     sample_depth: bool,
+    /// Water-absorption Blend draws this frame: depth lives in
+    /// `RENDERING_LOCAL_READ` and the absorb input-attachment mapping is live
+    /// for that pass. Water-free frames keep `DEPTH_ATTACHMENT_OPTIMAL`.
+    absorb_this_frame: bool,
 }
 
 impl<'a> RenderPass<'a> {
@@ -48,6 +52,7 @@ impl<'a> RenderPass<'a> {
         do_vrs: bool,
         sample_depth: bool,
         store_color: bool,
+        absorb_this_frame: bool,
     ) -> RenderPass<'a> {
         let device = &r.device.device;
         let extent = r.render_extent;
@@ -100,7 +105,7 @@ impl<'a> RenderPass<'a> {
                         | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
                 )
                 .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(r.depth_pass_layout())
+                .new_layout(super::Renderer::depth_pass_layout(absorb_this_frame))
                 .image(r.targets.depth[slot].image())
                 .subresource_range(depth_range());
             barrier_count += 1;
@@ -217,7 +222,7 @@ impl<'a> RenderPass<'a> {
             };
             let mut depth_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(r.targets.depth[slot].view())
-                .image_layout(r.depth_pass_layout())
+                .image_layout(super::Renderer::depth_pass_layout(absorb_this_frame))
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(depth_store)
                 .clear_value(vk::ClearValue {
@@ -306,6 +311,7 @@ impl<'a> RenderPass<'a> {
             mesh_push_bound: std::cell::Cell::new(false),
             index_bound: std::cell::Cell::new(false),
             sample_depth,
+            absorb_this_frame,
         }
     }
 
@@ -438,7 +444,7 @@ impl<'a> RenderPass<'a> {
         // attachment (set 0 binding 5). Layered on top of the 0-4 push above
         // (same layout ⇒ those writes stay live); pushed only for Blend when the
         // absorb pipeline is active, and consumed only inside the water branch.
-        let absorb_active = self.r.pipelines.mesh3d_transparent_absorb.is_some();
+        let absorb_active = self.absorb_this_frame;
         if pass == Pass::Blend && absorb_active {
             let layout = self.r.pipelines.layout_3d;
             buffers::push_depth_input_attachment(
@@ -920,7 +926,9 @@ impl<'a> RenderPass<'a> {
             // Sampleable depth rest: see `sampleable_depth_rest_barrier`.
             // Skipped when nothing samples; the next begin is UNDEFINED.
             if self.sample_depth {
-                images[n] = self.r.sampleable_depth_rest_barrier(self.slot);
+                images[n] = self
+                    .r
+                    .sampleable_depth_rest_barrier(self.slot, self.absorb_this_frame);
                 n += 1;
             }
             if classify_vrs {

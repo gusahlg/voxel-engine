@@ -255,6 +255,17 @@ impl Renderer {
         let slot = self.slot;
         use crate::profile::{Meter, scope};
         crate::profile::count(crate::profile::Counter::Rendered);
+        self.mesh_res.note_frame();
+        crate::profile::gauge(
+            crate::profile::Gauge::PoolAcquires,
+            super::mesh_staging::take_acquire_count(),
+        );
+        crate::profile::gauge(
+            crate::profile::Gauge::PoolAabbFallback,
+            super::mesh_staging::take_aabb_fallback_count(),
+        );
+        crate::profile::gauge(crate::profile::Gauge::PoolCopies, 0);
+        crate::profile::gauge(crate::profile::Gauge::PoolArrivalFrames, 0);
 
         let sun = sun_dir(lists);
         let camera_eye = lists.scene.as_ref().map(|scene| {
@@ -325,10 +336,8 @@ impl Renderer {
                     1.0,
                 ];
             }
-            self.ubo_ring.write(
-                FrameSlot::new(slot),
-                &super::uniforms::FrameUniformsExt::derive(u),
-            );
+            self.ubo_ring
+                .write_from_gpu(FrameSlot::new(slot), u, self.flags);
         }
         let warp_map = lists
             .scene
@@ -476,19 +485,21 @@ impl Renderer {
 
     /// The layout the scene-pass *attachment* (MS depth, or the single-sample
     /// depth when not multisampled) lives in *during* the pass. With the
-    /// water-absorption path active it is `RENDERING_LOCAL_READ` — the one
-    /// layout valid simultaneously as depth attachment and as the blend pass's
-    /// input attachment (mid-pass transitions are illegal, so a single
-    /// in-pass layout is the only coherent design). Every in-pass depth
-    /// barrier and attachment info reads this ONE function, so the two
-    /// configurations cannot drift apart.
+    /// water-absorption path *this frame* (`absorb`) it is `RENDERING_LOCAL_READ`
+    /// — the one layout valid simultaneously as depth attachment and as the
+    /// blend pass's input attachment (mid-pass transitions are illegal, so a
+    /// single in-pass layout is the only coherent design). Frames that have
+    /// the absorb pipeline but no Blend draw use `DEPTH_ATTACHMENT_OPTIMAL`
+    /// and the plain depth barriers. Every in-pass depth barrier and
+    /// attachment info reads this ONE function, so the two configurations
+    /// cannot drift apart.
     ///
     /// After `RenderPass::end`, if a later pass this frame samples it, the
     /// *sampleable* single-sample image leaves this layout and rests in
     /// [`SAMPLEABLE_DEPTH_REST_LAYOUT`]. The next scene pass of this slot
     /// begins from `UNDEFINED` either way.
-    pub(super) fn depth_pass_layout(&self) -> vk::ImageLayout {
-        if self.pipelines.mesh3d_transparent_absorb.is_some() {
+    pub(super) fn depth_pass_layout(absorb: bool) -> vk::ImageLayout {
+        if absorb {
             vk::ImageLayout::RENDERING_LOCAL_READ_KHR
         } else {
             vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
@@ -505,8 +516,9 @@ impl Renderer {
     /// the contract.
     pub(super) fn sampleable_depth_attachment_state(
         &self,
+        absorb: bool,
     ) -> (vk::ImageLayout, vk::PipelineStageFlags2, vk::AccessFlags2) {
-        sampleable_depth_attachment_state(self.targets.samples, self.depth_pass_layout())
+        sampleable_depth_attachment_state(self.targets.samples, Self::depth_pass_layout(absorb))
     }
 
     /// Scene-pass → rest: sampleable depth becomes [`SAMPLEABLE_DEPTH_REST_LAYOUT`].
@@ -517,8 +529,12 @@ impl Renderer {
     /// without a further transition: VRS compute, the quarter-res spill compute
     /// (godrays), and the present-time tonemap fragment (fused TAA). The present
     /// copy is a later submit that waits on the render timeline.
-    pub(super) fn sampleable_depth_rest_barrier(&self, slot: usize) -> vk::ImageMemoryBarrier2<'_> {
-        let (src_layout, src_stage, src_access) = self.sampleable_depth_attachment_state();
+    pub(super) fn sampleable_depth_rest_barrier(
+        &self,
+        slot: usize,
+        absorb: bool,
+    ) -> vk::ImageMemoryBarrier2<'_> {
+        let (src_layout, src_stage, src_access) = self.sampleable_depth_attachment_state(absorb);
         vk::ImageMemoryBarrier2::default()
             .src_stage_mask(src_stage)
             .src_access_mask(src_access)
@@ -575,6 +591,13 @@ impl Renderer {
             }
             self.publish_vrs_mix(slot);
             self.publish_cull_stats(slot);
+            // Staging-pool reclaim is once per frame even when the allocator
+            // retire queues are empty: stale worker builds never touch those.
+            let transfer_current = self.transfer_lane.counter(device);
+            self.mesh_staging.reclaim(
+                self.slots[FrameSlot::new(wait_slot)].render_value,
+                transfer_current,
+            );
             // Nothing retired (the steady state): skip the two counter reads
             // and the queue drains, which would find nothing to reclaim.
             if !self.mesh_res.has_garbage()
@@ -602,7 +625,7 @@ impl Renderer {
             // reclaimed against the LANE's own timeline, not the render
             // one — a non-blocking probe (never waited: nothing here may
             // stall this reclaim pass on the transfer queue's progress).
-            if let Some(transfer_current) = self.transfer_lane.counter(device) {
+            if let Some(transfer_current) = transfer_current {
                 self.mesh_res.collect_transfer(transfer_current, &mut |a| {
                     drop(ret.send(RenderReturn::FreeAlloc(a)))
                 });
@@ -1066,6 +1089,9 @@ impl Renderer {
         // Read the prior render-pass GPU time for this slot before its queries
         // are reset below (the slot's fence was already waited this frame).
         let profiling = crate::profile::is_enabled();
+        unsafe {
+            self.gpu_timer.read_load(&self.device.device, slot);
+        }
         if profiling {
             let mut passes = [0.0f64; GpuPass::COUNT];
             if let Some((total, gap)) = unsafe {
@@ -1111,6 +1137,7 @@ impl Renderer {
                 .expect("begin command buffer failed");
             // Start timing before the staged copies so the whole buffer is
             // attributed (the `Copies` stamp closes this first span).
+            self.gpu_timer.begin_load(device, cmd, slot);
             if profiling {
                 self.gpu_timer.begin(device, cmd, slot);
                 self.pipe_stats.prepare(device, cmd, slot);
@@ -1293,6 +1320,12 @@ impl Renderer {
         let spill_live = self.flags.bloom || godray.strength > 0.0;
         let sample_depth =
             sampleable_depth_consumed(will_present, self.flags.taa, spill_live, classify_vrs);
+        // Absorb (water depth-input) needs RENDERING_LOCAL_READ for the whole
+        // scene pass. Only frames that actually draw Blend pay that layout;
+        // otherwise depth stays DEPTH_ATTACHMENT_OPTIMAL. Known here because
+        // `prepare_blend_draws` already filled `draw_runs`.
+        let absorb_this_frame = self.pipelines.mesh3d_transparent_absorb.is_some()
+            && self.draw_runs.iter().any(|run| run.pass == Pass::Blend);
         // HDR colour is only read by bloom/exposure/spill/tonemap, all of which
         // run on presented frames. Minimap is a separate texture; screenshots
         // copy the swapchain after tonemap; VRS classify reads depth not colour.
@@ -1315,6 +1348,7 @@ impl Renderer {
                     do_vrs,
                     sample_depth,
                     will_present,
+                    absorb_this_frame,
                 )
             }
         };
@@ -1467,6 +1501,7 @@ impl Renderer {
             }
         }
         unsafe {
+            self.gpu_timer.end_load(&self.device.device, cmd, slot);
             self.device
                 .device
                 .end_command_buffer(cmd)

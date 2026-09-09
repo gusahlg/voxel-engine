@@ -45,6 +45,7 @@ float3 bloomSpill(float2 uv, float2 pix)
         float t = (float(i) + 0.5) / BLOOM_SPIRAL_SAMPLES;
         float a = rot + float(i) * GOLDEN_ANGLE;
         float2 off = float2(cos(a), sin(a)) * (t * BLOOM_SPIRAL_RADIUS);
+        // Chain base is quarter-res; BLOOM_SPIRAL_LOD (1) is the eighth-res blur.
         acc += bloomTex.SampleLevel(uv + off, BLOOM_SPIRAL_LOD).rgb;
     }
     return acc / BLOOM_SPIRAL_SAMPLES;

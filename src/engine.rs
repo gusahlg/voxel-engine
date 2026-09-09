@@ -17,8 +17,11 @@ use crate::color::LinearRgb;
 use crate::font;
 use crate::frame::{DrawLists, Frame};
 use crate::input::{InputState, Key, MouseButton};
-use crate::mesh::{MeshData, MeshHandle};
+use crate::mesh::{MeshData, MeshHandle, MeshPlacement, Pass};
+use crate::vk::mesh_staging::{MeshStager, MeshStaging};
 use crate::vk::render_client::{Capture, RenderClient};
+
+pub use crate::vk::gpu_timer::GpuLoad;
 
 #[derive(Clone)]
 pub struct Config {
@@ -67,7 +70,7 @@ impl Default for Config {
 /// are CPU-side: they neutralize a `FrameUniforms` lane (`frame::gate_uniforms`,
 /// applied to `Lighting::Composed`) or skip a pass's work (vk/mod.rs,
 /// vk/shadow.rs) — no shader variants.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RenderFlags {
     /// Camera jitter + TAA resolve at present time (output/swapchain
     /// resolution). Always coupled: jitter is injected every rendered frame;
@@ -115,6 +118,34 @@ pub struct RenderFlags {
     pub stars: bool,
 }
 
+/// Device capabilities sampled at renderer init. Device selection needs a
+/// window surface, so there is no headless [`probe_gpu_caps`]; read these
+/// from [`Engine::gpu_caps`] after [`run`] constructs the engine.
+#[derive(Clone, Debug)]
+pub struct GpuCaps {
+    pub device_name: String,
+    pub device_local_bytes: u64,
+    pub max_texture_array_layers: u32,
+    pub max_msaa: u32,
+    pub supports_vrs: bool,
+    pub supports_pipeline_stats: bool,
+}
+
+/// Inputs for [`Engine::estimate_render_targets`]: window size, scale, and
+/// the feature bits that change which targets exist. `frames_in_flight`
+/// should match the engine slot ring the game will run against.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderTargetConfig {
+    pub width: u32,
+    pub height: u32,
+    pub render_scale: f32,
+    pub msaa: u32,
+    pub taa: bool,
+    pub bloom: bool,
+    pub vrs: bool,
+    pub frames_in_flight: u32,
+}
+
 impl Default for RenderFlags {
     /// The shipped defaults (formerly the `WATT_*` unset-defaults).
     fn default() -> Self {
@@ -142,6 +173,8 @@ pub struct Engine {
     /// The render thread's published exposure, read by
     /// [`Engine::exposure_for_compose`] each frame.
     pub(crate) exposure_shared: crate::vk::exposure::ExposureShared,
+    /// Last completed frame GPU busy / inter-submit gap (slot-delayed).
+    pub(crate) gpu_load: crate::vk::gpu_timer::GpuLoadShared,
     /// The window lives on the main thread; only the `Renderer` moved to the
     /// render thread. Window-touching methods read this directly.
     pub(crate) window: winit::window::Window,
@@ -152,6 +185,9 @@ pub struct Engine {
     /// `gate_uniforms`; `taa` gates jitter injection). The render thread holds its
     /// own copy on `Renderer`. Both are set from `Config::flags` at construction.
     pub(crate) flags: RenderFlags,
+    pub(crate) last_composed: Option<crate::vk::uniforms::FrameUniformsGpu>,
+    pub(crate) last_gated: Option<crate::vk::uniforms::FrameUniformsGpu>,
+    pub(crate) last_gate_flags: RenderFlags,
 
     target_fps: u32,
     frame_start: Instant,
@@ -168,13 +204,18 @@ impl Engine {
         let (window, mut client) = RenderClient::spawn(event_loop, config)?;
         let lists = client.take_frame(!config.vsync && config.target_fps == 0);
         let exposure_shared = client.exposure();
+        let gpu_load = client.gpu_load();
         Ok(Self {
             client,
             exposure_shared,
+            gpu_load,
             window,
             input: InputState::new(),
             lists,
             flags: config.flags,
+            last_composed: None,
+            last_gated: None,
+            last_gate_flags: config.flags,
             target_fps: config.target_fps,
             frame_start: Instant::now(),
             dt: 0.0,
@@ -220,6 +261,29 @@ impl Engine {
         self.client.frames_coalesced()
     }
 
+    /// GPU busy time of the last completed render submit and the idle gap
+    /// before it (`start(N) - end(N-1)`). Slot-delayed: the values are from
+    /// the slot whose fence was waited this frame. `None` until the first
+    /// timestamp readback, when the device has no timestamps, or while
+    /// [`Self::enable_gpu_load`] is off (the default).
+    ///
+    /// The two extra timestamps cost ~1.5% at the game's Minimum preset, so
+    /// they are recorded only after `enable_gpu_load(true)`. The profiler's
+    /// own stamps and `VOXEL_PROFILE` are unaffected.
+    pub fn gpu_load(&self) -> Option<GpuLoad> {
+        self.gpu_load.load()
+    }
+
+    /// Record the two extra per-frame timestamps that feed [`Self::gpu_load`].
+    /// Off by default. No-op when `on` matches the current state. The
+    /// profiler's own stamps and `VOXEL_PROFILE` are unaffected.
+    pub fn enable_gpu_load(&mut self, on: bool) {
+        if on == self.gpu_load.is_enabled() {
+            return;
+        }
+        self.gpu_load.set_enabled(on);
+    }
+
     pub fn set_target_fps(&mut self, fps: u32) {
         self.target_fps = fps;
     }
@@ -260,6 +324,9 @@ impl Engine {
     /// command stream, the render thread's — so the change lands atomically at
     /// the next frame boundary.
     pub fn set_flags(&mut self, flags: RenderFlags) {
+        if self.flags == flags {
+            return;
+        }
         self.flags = flags;
         self.client.set_flags(flags);
     }
@@ -278,8 +345,45 @@ impl Engine {
         self.client.msaa()
     }
 
+    /// Hint: enable VRS when the current render extent is large enough that
+    /// coarse shading pays for the classify pass.
+    ///
+    /// Formula: recommend when `render_pixels > texel_width * texel_height * 32768`.
+    /// On desktop parts with 16×16 attachment texels that threshold is 8_388_608
+    /// pixels (~8 Mpx), below which VRS was measured as a net loss. Returns
+    /// `false` when the device has no attachment shading rate.
+    ///
+    /// This is a hint. [`RenderFlags::vrs`] (the user override) always wins:
+    /// the engine enables VRS only from that flag, never from this method.
+    pub fn vrs_recommended(&self) -> bool {
+        match self.vrs_useful_above_pixels() {
+            None => false,
+            Some(min) => self.client.render_pixels() > min,
+        }
+    }
+
+    /// Pixel count above which [`Self::vrs_recommended`] becomes true, or
+    /// `None` when the device has no attachment fragment shading rate.
+    pub fn vrs_useful_above_pixels(&self) -> Option<u32> {
+        let (w, h) = self.client.vrs_texel_size()?;
+        Some(vrs_useful_above_pixels(w, h))
+    }
+
     pub fn max_msaa(&self) -> u32 {
         self.client.max_msaa()
+    }
+
+    /// GPU limits and optional features discovered at device selection.
+    /// Requires a live engine (instance/device pick needs a window surface).
+    pub fn gpu_caps(&self) -> GpuCaps {
+        self.client.gpu_caps()
+    }
+
+    /// Device-local bytes the renderer would allocate for this settings combo,
+    /// using the engine's real formats and per-slot duplication. Lets the game
+    /// size MSAA / scale / TAA / bloom / VRS without mirroring those formats.
+    pub fn estimate_render_targets(&self, config: &RenderTargetConfig) -> u64 {
+        crate::vk::targets::estimate_render_targets(config)
     }
 
     /// The device's block-texture array layer ceiling
@@ -369,6 +473,13 @@ impl Engine {
 
     // ---- meshes ----
 
+    /// Cheap `Clone` handle workers use to acquire staging regions.
+    /// Pool size is 32 MiB (`MESH_STAGING_BYTES`), overridable once at
+    /// renderer creation by `VOXEL_MESH_STAGING_MB`.
+    pub fn mesh_stager(&self) -> MeshStager {
+        self.client.mesh_stager()
+    }
+
     /// Upload a tracked mesh; placement recovered from draw offset (movers).
     /// Static geometry should use [`upload_mesh_placed`](Self::upload_mesh_placed).
     pub fn upload_mesh(&mut self, data: &MeshData) -> Option<MeshHandle> {
@@ -379,9 +490,31 @@ impl Engine {
     pub fn upload_mesh_placed(
         &mut self,
         data: &MeshData,
-        placement: crate::mesh::MeshPlacement,
+        placement: MeshPlacement,
     ) -> Option<MeshHandle> {
         self.client.upload_mesh_placed(data, placement)
+    }
+
+    /// Install a worker-written staging region as a placed mesh.
+    ///
+    /// The AABB is taken from the region ([`MeshStaging::write_vertices`],
+    /// [`MeshStaging::vertex_writer`], or [`MeshStaging::set_aabb`]). A
+    /// raw [`MeshStaging::bytes`] fill without `set_aabb` scans the ring
+    /// as a documented fallback.
+    pub fn upload_mesh_staged(
+        &mut self,
+        staging: MeshStaging,
+        quads: [u32; 6],
+        pass: Pass,
+        placement: MeshPlacement,
+    ) -> Option<MeshHandle> {
+        self.client
+            .upload_mesh_staged(staging, quads, pass, placement)
+    }
+
+    /// Explicit release of a stale staging region; same as drop.
+    pub fn release_mesh_staging(&self, staging: MeshStaging) {
+        self.client.release_mesh_staging(staging);
     }
 
     /// Frees a mesh. Safe while the GPU still uses it (deferred internally).
@@ -468,9 +601,24 @@ impl Engine {
         self.client.append_block_textures(layers);
     }
 
-    /// Uploads minimap pixels (synced per-slot, version-gated).
+    /// Uploads minimap pixels (synced per-slot, version-gated). Copies `rgba`.
     pub fn update_minimap(&mut self, rgba: &[u8]) {
         self.client.update_minimap(rgba);
+    }
+
+    /// Same as [`Self::update_minimap`] without an extra copy of `rgba`.
+    pub fn update_minimap_owned(&mut self, rgba: Box<[u8]>) {
+        self.client.update_minimap_owned(rgba);
+    }
+
+    /// Uploads a tightly packed `w*h` RGBA8 subrect. Only that region is
+    /// copied to the GPU (buffer-to-image transfer).
+    pub fn update_minimap_rect(&mut self, x: u32, y: u32, w: u32, h: u32, rgba: &[u8]) {
+        self.client.update_minimap_rect(x, y, w, h, rgba);
+    }
+
+    pub fn minimap_size(&self) -> (u32, u32) {
+        self.client.minimap_size()
     }
 
     // ---- text / math ----
@@ -738,5 +886,23 @@ impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
             self.ran_this_cycle = false;
             self.run_frame(event_loop);
         }
+    }
+}
+
+/// Pixel count above which VRS is recommended: `texel_area * 32768`.
+/// 16×16 texels → 8_388_608 (~8 Mpx), the desktop crossover from measurements.
+fn vrs_useful_above_pixels(texel_w: u32, texel_h: u32) -> u32 {
+    texel_w.saturating_mul(texel_h).saturating_mul(32768)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vrs_useful_above_pixels;
+
+    #[test]
+    fn vrs_threshold_is_texel_area_times_32768() {
+        assert_eq!(vrs_useful_above_pixels(16, 16), 16 * 16 * 32768);
+        assert_eq!(vrs_useful_above_pixels(16, 16), 8_388_608);
+        assert_eq!(vrs_useful_above_pixels(8, 8), 8 * 8 * 32768);
     }
 }

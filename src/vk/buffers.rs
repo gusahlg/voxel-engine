@@ -15,9 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::alloc::{Allocation, GpuAllocator, find_memory_type, try_find_memory_type};
 use super::cull::ArenaDirectory;
+use super::mesh_staging::{MeshStaging, MeshStagingPool, StagingLease, Stamp};
 use super::timeline::TimelineValue;
 use super::transfer::TransferLane;
-use crate::mesh::{Detail, MeshData, MeshHandle, Pass};
+use crate::mesh::{Detail, FACE_UPLOAD_ORDER, MeshData, MeshHandle, Pass};
 
 /// Mesh-copy staging budget per frame; amortizes bursty uploads.
 const TRANSFER_BUDGET_BYTES_PER_FRAME: u64 = 8 * 1024 * 1024;
@@ -70,6 +71,10 @@ impl<T> RetireQueue<T> {
     }
 
     /// Drains entries whose GPU use has completed, calling `f` on each.
+    ///
+    /// `current` is the completed (signalled) timeline counter. A stamp that
+    /// is reserved but not yet signalled compares greater than `current` and
+    /// stays queued; this never waits.
     pub fn collect(&mut self, current: TimelineValue, mut f: impl FnMut(T)) {
         while let Some((stamp, _)) = self.entries.front() {
             if *stamp > current {
@@ -390,17 +395,27 @@ struct DeferredArrival {
     acquires: Vec<vk::BufferMemoryBarrier2<'static>>,
 }
 
+/// What to reclaim after a staged host→device copy completes.
+enum CopySource {
+    Alloc(Allocation),
+    Pool(StagingLease),
+}
+
 struct PendingCopy {
-    staging: Allocation,
+    src_buffer: vk::Buffer,
+    src_offset: u64,
     dst_buffer: vk::Buffer,
     dst_offset: u64,
     size: u64,
+    source: CopySource,
 }
 
 /// Render-owned GPU residency for one mesh: the device buffer plus its
 /// deferred staging copy. `Send` because [`Allocation`] is now `Send`.
 pub(crate) struct GpuResident {
-    alloc: Allocation,
+    buffer: vk::Buffer,
+    /// Device-arena suballocation to return to [`GpuAllocator`].
+    arena: Allocation,
     copy: Option<PendingCopy>,
     /// Timeline value ordering copy before reads; `None` while budget-deferred.
     arrived_at: Option<TimelineValue>,
@@ -409,14 +424,41 @@ pub(crate) struct GpuResident {
 impl GpuResident {
     /// Get the device buffer.
     pub fn buffer(&self) -> vk::Buffer {
-        self.alloc.buffer
+        self.buffer
     }
 }
 
-/// Upload order of the six [`crate::mesh::Normal`] buckets: +X,+Y,+Z,−X,−Y,−Z.
-/// An outside camera sees ≤3 of these, and same-sign buckets are adjacent, so
-/// the GPU cull merges them into ~1.75 contiguous runs per mesh instead of 3.
-pub(crate) const FACE_UPLOAD_ORDER: [usize; 6] = [0, 2, 4, 1, 3, 5];
+/// Copies each direction's vertices into `dst` in [`FACE_UPLOAD_ORDER`], one
+/// `copy_nonoverlapping` per direction. Returns bytes written.
+///
+/// # Safety
+/// `dst` must be valid for `data.vertex_bytes()` writes.
+unsafe fn write_vertices_upload_order(data: &MeshData, dst: *mut u8) -> usize {
+    let mut cursor = 0usize;
+    for &dir in &FACE_UPLOAD_ORDER {
+        let bytes: &[u8] = bytemuck::cast_slice(&data.vertices[dir]);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(cursor), bytes.len());
+        }
+        cursor += bytes.len();
+    }
+    debug_assert_eq!(
+        cursor,
+        data.vertex_bytes(),
+        "upload must cover every vertex"
+    );
+    cursor
+}
+
+/// Local index boundaries into the shared quad IBO from per-[`crate::mesh::Normal`]
+/// quad counts: `bounds[k]..bounds[k+1]` is upload-order face `k` (`6*quads`).
+fn index_bounds_from_quad_counts(counts: [u32; 6]) -> [u32; 7] {
+    let mut bounds = [0u32; 7];
+    for (k, &dir) in FACE_UPLOAD_ORDER.iter().enumerate() {
+        bounds[k + 1] = bounds[k] + counts[dir] * 6;
+    }
+    bounds
+}
 
 /// Allocates a device buffer for `data`, writes/stages its bytes, and returns
 /// the main-owned [`MeshMeta`] plus render-owned [`GpuResident`]. Main-thread
@@ -428,46 +470,27 @@ pub(crate) unsafe fn build_mesh_resident(
     allocator: &mut GpuAllocator,
     data: &MeshData,
 ) -> Option<(MeshMeta, GpuResident)> {
-    let total_indices: usize = data.buckets.iter().map(Vec::len).sum();
-    if total_indices == 0 || data.vertices.is_empty() {
+    if data.is_empty() {
         return None;
     }
 
-    // Permuted pool holds the same vertices reordered by bucket then quad; every
-    // vertex belongs to exactly one quad, so its length equals `data.vertices`.
-    let vertex_bytes_len = data.vertices.len() * VERTEX_STRIDE as usize;
+    let vertex_bytes_len = data.vertex_bytes();
     let total = vertex_bytes_len as u64;
+    let bounds = index_bounds_from_quad_counts(data.quad_counts());
+    debug_assert_eq!(
+        bounds[6] as usize / 6 * 4,
+        vertex_bytes_len / VERTEX_STRIDE as usize,
+        "vertex count stays 4 * quads"
+    );
 
     let alloc = unsafe { allocator.alloc_device(device, total, MESH_ALIGN) }
         .map_err(|err| log::error!("mesh allocation failed: {err:?}"))
         .ok()?;
 
-    let write_into = |dst: *mut u8| unsafe {
-        let mut cursor = 0usize;
-        for &dir in &FACE_UPLOAD_ORDER {
-            let bucket = &data.buckets[dir];
-            debug_assert_eq!(bucket.len() % 6, 0, "each quad contributes 6 indices");
-            for quad in bucket.chunks_exact(6) {
-                let b = quad[0];
-                debug_assert_eq!(
-                    *quad,
-                    [b, b + 1, b + 2, b, b + 2, b + 3],
-                    "non-pattern quad indices break the shared-IBO permutation"
-                );
-                let verts: &[u8] = bytemuck::cast_slice(&data.vertices[b as usize..b as usize + 4]);
-                std::ptr::copy_nonoverlapping(verts.as_ptr(), dst.add(cursor), verts.len());
-                cursor += verts.len();
-            }
-        }
-        debug_assert_eq!(
-            cursor, vertex_bytes_len,
-            "permutation must cover every vertex"
-        );
-    };
-
     let copy = if let Some(mapped) = alloc.mapped {
         // Unified memory: write straight into the device-local block.
-        write_into(mapped.as_ptr());
+        let written = unsafe { write_vertices_upload_order(data, mapped.as_ptr()) };
+        debug_assert_eq!(written, vertex_bytes_len);
         None
     } else {
         let staging = match unsafe { allocator.alloc_staging(device, total, 4) } {
@@ -481,37 +504,38 @@ pub(crate) unsafe fn build_mesh_resident(
         let mapped = staging
             .mapped
             .expect("staging memory is always host-visible");
-        write_into(mapped.as_ptr());
+        let written = unsafe { write_vertices_upload_order(data, mapped.as_ptr()) };
+        debug_assert_eq!(written, vertex_bytes_len);
         Some(PendingCopy {
+            src_buffer: staging.buffer,
+            src_offset: staging.offset,
             dst_buffer: alloc.buffer,
             dst_offset: alloc.offset,
             size: total,
-            staging,
+            source: CopySource::Alloc(staging),
         })
     };
 
-    let mut aabb_min = Vec3::splat(f32::INFINITY);
-    let mut aabb_max = Vec3::splat(f32::NEG_INFINITY);
-    for v in &data.vertices {
-        let p = Vec3::from_array(v.local_pos());
-        aabb_min = aabb_min.min(p);
-        aabb_max = aabb_max.max(p);
-    }
+    let (aabb_min, aabb_max) = data.aabb();
+    let aabb_min = Vec3::from_array(aabb_min);
+    let aabb_max = Vec3::from_array(aabb_max);
+    debug_assert!({
+        let mut scan_min = Vec3::splat(f32::INFINITY);
+        let mut scan_max = Vec3::splat(f32::NEG_INFINITY);
+        for bucket in &data.vertices {
+            for v in bucket {
+                let p = Vec3::from_array(v.local_pos());
+                scan_min = scan_min.min(p);
+                scan_max = scan_max.max(p);
+            }
+        }
+        scan_min == aabb_min && scan_max == aabb_max
+    });
 
     const _: () =
         assert!(MESH_ALIGN.is_multiple_of(VERTEX_STRIDE) && MESH_ALIGN.is_multiple_of(256));
     debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
     let vertex_offset = (alloc.offset / VERTEX_STRIDE) as i32;
-
-    // Local, 0-based index boundaries into the shared quad IBO: `bounds[k]` is
-    // the cumulative `6*quads` before upload-order face `k`. The IBO's index
-    // value at position `6j` is `4j`, and quad `j` sits at vertices `4j..4j+4`, so
-    // adding the unchanged `vertex_offset` base reproduces the old vertex fetches.
-    let mut bounds = [0u32; 7];
-    for (k, &dir) in FACE_UPLOAD_ORDER.iter().enumerate() {
-        bounds[k + 1] = bounds[k] + data.buckets[dir].len() as u32;
-    }
-    debug_assert_eq!(bounds[6], total_indices as u32);
 
     let meta = MeshMeta {
         aabb_min,
@@ -529,7 +553,106 @@ pub(crate) unsafe fn build_mesh_resident(
     Some((
         meta,
         GpuResident {
-            alloc,
+            buffer: alloc.buffer,
+            arena: alloc,
+            copy,
+            arrived_at,
+        },
+    ))
+}
+
+/// Installs a worker-written staging region as a mesh: always one device-arena
+/// allocation. When the arena is host-mapped (unified / ReBAR) the vertex bytes
+/// are copied with one `copy_nonoverlapping` and the region is stamped
+/// `Stamp::Render(0)` so the next reclaim frees it. Otherwise one pending
+/// `vkCmdCopyBuffer` is batched with the rest of the frame by
+/// [`MeshResidency::flush_copies`] and the region is stamped with the transfer
+/// timeline (`Stamp::Transfer` on a separate queue, `Stamp::Render` on the
+/// fallback). The staging ring is transient in both modes.
+///
+/// The AABB comes from the region (tracked as vertices were written). This
+/// function does not scan staging memory except as a documented fallback
+/// when no AABB was recorded.
+pub(crate) unsafe fn build_mesh_resident_staged(
+    device: &ash::Device,
+    allocator: &mut GpuAllocator,
+    pool: &MeshStagingPool,
+    staging: MeshStaging,
+    quads: [u32; 6],
+    pass: Pass,
+) -> Option<(MeshMeta, GpuResident)> {
+    let vertex_count: usize = quads.iter().map(|&q| q as usize * 4).sum();
+    if vertex_count == 0 {
+        return None;
+    }
+    let vertex_bytes_len = vertex_count * VERTEX_STRIDE as usize;
+    if staging.requested_bytes() < vertex_bytes_len {
+        log::error!(
+            "mesh staging region ({} bytes) smaller than vertex payload ({vertex_bytes_len})",
+            staging.requested_bytes()
+        );
+        return None;
+    }
+    let (min, max) = staging.aabb_for_upload(vertex_bytes_len);
+    let (aabb_min, aabb_max) = (Vec3::from_array(min), Vec3::from_array(max));
+    let bounds = index_bounds_from_quad_counts(quads);
+    debug_assert_eq!(
+        bounds[6] as usize / 6 * 4,
+        vertex_count,
+        "vertex count stays 4 * quads"
+    );
+
+    let total = vertex_bytes_len as u64;
+    let alloc = match unsafe { allocator.alloc_device(device, total, MESH_ALIGN) } {
+        Ok(alloc) => alloc,
+        Err(err) => {
+            log::error!("mesh allocation failed: {err:?}");
+            return None;
+        }
+    };
+    debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
+
+    let copy = if let Some(mapped) = alloc.mapped {
+        // Unified / ReBAR: both the ring region and the arena block are
+        // host-mapped (~5 KB per chunk). One memcpy, then free the region
+        // at the next reclaim — the FIFO must not pin live meshes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                staging.as_bytes().as_ptr(),
+                mapped.as_ptr(),
+                vertex_bytes_len,
+            );
+        }
+        staging.into_lease().stamp(Stamp::Render(0));
+        None
+    } else {
+        let lease = staging.into_lease();
+        Some(PendingCopy {
+            src_buffer: pool.buffer(),
+            src_offset: lease.offset(),
+            dst_buffer: alloc.buffer,
+            dst_offset: alloc.offset,
+            size: total,
+            source: CopySource::Pool(lease),
+        })
+    };
+
+    let arrived_at = copy.is_none().then_some(TimelineValue::START);
+    let vertex_offset = (alloc.offset / VERTEX_STRIDE) as i32;
+    let meta = MeshMeta {
+        aabb_min,
+        aabb_max,
+        bounds,
+        vertex_offset,
+        pass,
+        placement: PlacementState::Tracked(None),
+        dyn_lane: DrawDyn::resting(),
+    };
+    Some((
+        meta,
+        GpuResident {
+            buffer: alloc.buffer,
+            arena: alloc,
             copy,
             arrived_at,
         },
@@ -543,7 +666,9 @@ pub(crate) unsafe fn build_mesh_resident(
 pub(crate) struct MeshResidency {
     slots: Vec<Option<GpuResident>>,
     generations: Vec<NonZeroU32>,
-    pending: Vec<u32>,
+    /// `(slot, frame)` queued at [`Self::apply_upload`]; `frame` is
+    /// [`Self::frame`] at apply so arrival delay is host-testable.
+    pending: Vec<(u32, u64)>,
     /// Device buffers and same-queue staging (render-Rev).
     retire: RetireQueue<Allocation>,
     /// Staging for separate transfer queue (lane-Rev).
@@ -554,6 +679,11 @@ pub(crate) struct MeshResidency {
     /// The last separate-queue batch's wait value + ACQUIRE barriers, owed
     /// to the next graphics submission (see [`Self::flush_copies`]).
     deferred: Option<DeferredArrival>,
+    /// Bumped once per render-loop iteration ([`Self::note_frame`]) before
+    /// flush, so a copy applied in the preceding drain has delay 1.
+    frame: u64,
+    /// Last flush's max pending-to-arrived delay in frames (pooled copies).
+    last_pool_arrival_frames: u64,
 }
 
 impl MeshResidency {
@@ -567,7 +697,16 @@ impl MeshResidency {
             live: 0,
             arrived_since_flush: Vec::new(),
             deferred: None,
+            frame: 0,
+            last_pool_arrival_frames: 0,
         }
+    }
+
+    /// Advance the arrival-delay clock. Call once per render-loop iteration
+    /// after the command drain (so apply sees the previous value) and before
+    /// [`Self::flush_copies`].
+    pub fn note_frame(&mut self) {
+        self.frame = self.frame.saturating_add(1);
     }
 
     /// Check if slot's bytes are visible to the cull dispatch.
@@ -596,7 +735,7 @@ impl MeshResidency {
         let i = slot as usize;
         self.ensure_slot(i);
         if resident.copy.is_some() {
-            self.pending.push(slot);
+            self.pending.push((slot, self.frame));
         }
         if self.slots[i].is_none() {
             self.live += 1;
@@ -613,9 +752,12 @@ impl MeshResidency {
             return;
         }
         if let Some(res) = self.slots.get_mut(i).and_then(Option::take) {
-            self.retire.push(done_at, res.alloc);
+            self.retire.push(done_at, res.arena);
             if let Some(copy) = res.copy {
-                self.retire.push(done_at, copy.staging);
+                match copy.source {
+                    CopySource::Alloc(alloc) => self.retire.push(done_at, alloc),
+                    CopySource::Pool(lease) => lease.stamp(Stamp::Render(done_at.raw())),
+                }
             }
             self.live -= 1;
         }
@@ -630,6 +772,10 @@ impl MeshResidency {
     /// Copies are issued as one `vkCmdCopyBuffer` per (staging block, arena)
     /// pair and the barriers cover coalesced destination runs (see
     /// [`coalesce_ranges`]), so a burst of N meshes costs O(arenas) commands.
+    /// Pooled copies share this path with per-mesh staging allocs: same lane
+    /// batch, same coalesced barrier, same `arrived_at`. Regions stamp
+    /// [`Stamp::Transfer`] on the separate-queue tier and [`Stamp::Render`]
+    /// on the fallback tier.
     ///
     /// # Cross-queue hazard analysis (why the wait is deferred one frame)
     ///
@@ -680,7 +826,7 @@ impl MeshResidency {
         // Take first item unconditionally, then more while under budget.
         let mut budget = TRANSFER_BUDGET_BYTES_PER_FRAME;
         let mut take = 0;
-        for (i, &slot) in self.pending.iter().enumerate() {
+        for (i, &(slot, _)) in self.pending.iter().enumerate() {
             let size = self
                 .slots
                 .get(slot as usize)
@@ -707,8 +853,11 @@ impl MeshResidency {
         let mut copies: Vec<(vk::Buffer, vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
         let mut written: Vec<BufferRange> = Vec::with_capacity(batch.len());
         let mut copied_slots: Vec<u32> = Vec::with_capacity(batch.len());
-        let mut staging: Vec<Allocation> = Vec::with_capacity(batch.len());
-        for slot in batch {
+        let mut staging_allocs: Vec<Allocation> = Vec::with_capacity(batch.len());
+        let mut staging_leases: Vec<StagingLease> = Vec::new();
+        let mut pool_n = 0u64;
+        let mut max_pool_delay = 0u64;
+        for (slot, queued_at) in batch {
             let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) else {
                 continue;
             };
@@ -716,15 +865,15 @@ impl MeshResidency {
                 continue;
             };
             let region = vk::BufferCopy::default()
-                .src_offset(copy.staging.offset)
+                .src_offset(copy.src_offset)
                 .dst_offset(copy.dst_offset)
                 .size(copy.size);
             match copies
                 .iter_mut()
-                .find(|(src, dst, _)| *src == copy.staging.buffer && *dst == copy.dst_buffer)
+                .find(|(src, dst, _)| *src == copy.src_buffer && *dst == copy.dst_buffer)
             {
                 Some((_, _, regions)) => regions.push(region),
-                None => copies.push((copy.staging.buffer, copy.dst_buffer, vec![region])),
+                None => copies.push((copy.src_buffer, copy.dst_buffer, vec![region])),
             }
             written.push(BufferRange {
                 buffer: copy.dst_buffer,
@@ -732,7 +881,14 @@ impl MeshResidency {
                 size: copy.size,
             });
             bytes += copy.size;
-            staging.push(copy.staging);
+            match copy.source {
+                CopySource::Alloc(alloc) => staging_allocs.push(alloc),
+                CopySource::Pool(lease) => {
+                    staging_leases.push(lease);
+                    pool_n += 1;
+                    max_pool_delay = max_pool_delay.max(self.frame.saturating_sub(queued_at));
+                }
+            }
             copied_slots.push(slot);
         }
 
@@ -806,8 +962,16 @@ impl MeshResidency {
         } else {
             &mut self.retire
         };
-        for alloc in staging {
+        for alloc in staging_allocs {
             staging_queue.push(arrived_at, alloc);
+        }
+        let pool_stamp = if separate_queue {
+            Stamp::Transfer(arrived_at.raw())
+        } else {
+            Stamp::Render(arrived_at.raw())
+        };
+        for lease in staging_leases {
+            lease.stamp(pool_stamp);
         }
         for slot in copied_slots {
             if let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) {
@@ -815,6 +979,49 @@ impl MeshResidency {
                 self.arrived_since_flush.push(slot);
             }
         }
+        self.last_pool_arrival_frames = max_pool_delay;
+        crate::profile::gauge(crate::profile::Gauge::PoolCopies, pool_n);
+        crate::profile::gauge(crate::profile::Gauge::PoolArrivalFrames, max_pool_delay);
+    }
+
+    /// Host-only flush of pending pooled copies: marks them arrived and
+    /// stamps leases the way [`Self::flush_copies`] does on the separate-
+    /// queue lane (`Stamp::Transfer`, graphics wait deferred one frame).
+    /// Used to unit-test arrival latency without Vulkan.
+    #[cfg(test)]
+    pub(crate) fn complete_pooled_copies_for_test(&mut self, arrived_at: TimelineValue) {
+        let batch = std::mem::take(&mut self.pending);
+        let mut max_delay = 0u64;
+        let mut n = 0u64;
+        for (slot, queued_at) in batch {
+            let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) else {
+                continue;
+            };
+            let Some(copy) = res.copy.take() else {
+                continue;
+            };
+            match copy.source {
+                CopySource::Pool(lease) => {
+                    lease.stamp(Stamp::Transfer(arrived_at.raw()));
+                    n += 1;
+                    max_delay = max_delay.max(self.frame.saturating_sub(queued_at));
+                }
+                CopySource::Alloc(_) => {}
+            }
+            res.arrived_at = Some(arrived_at);
+            self.arrived_since_flush.push(slot);
+        }
+        if n > 0 {
+            self.defer_arrival(arrived_at, Vec::new());
+        }
+        self.last_pool_arrival_frames = max_delay;
+        crate::profile::gauge(crate::profile::Gauge::PoolCopies, n);
+        crate::profile::gauge(crate::profile::Gauge::PoolArrivalFrames, max_delay);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_pool_arrival_frames(&self) -> u64 {
+        self.last_pool_arrival_frames
     }
 
     /// Stashes a submitted lane batch's graphics-side half. Folds into any
@@ -899,9 +1106,12 @@ impl MeshResidency {
     pub fn destroy_all(&mut self, recycle: &mut impl FnMut(Allocation)) {
         for slot in self.slots.iter_mut() {
             if let Some(res) = slot.take() {
-                recycle(res.alloc);
+                recycle(res.arena);
                 if let Some(copy) = res.copy {
-                    recycle(copy.staging);
+                    match copy.source {
+                        CopySource::Alloc(alloc) => recycle(alloc),
+                        CopySource::Pool(lease) => drop(lease),
+                    }
                 }
             }
         }
@@ -926,11 +1136,11 @@ const HOST_BAR_CAP: u64 = 64 << 20;
 /// a discrete GPU's small BAR window.
 const SMALL_BAR_HEAP: u64 = 1 << 30;
 /// Bytes currently charged against [`HOST_BAR_CAP`] (small-BAR devices only).
-static HOST_BAR_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HOST_BAR_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Host-visible, host-coherent — the property set every [`HostBuffer`] write
 /// relies on (persistent mapping, no explicit flush).
-const HOST_COHERENT: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::from_raw(
+pub(crate) const HOST_COHERENT: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::from_raw(
     vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw()
         | vk::MemoryPropertyFlags::HOST_COHERENT.as_raw(),
 );
@@ -948,7 +1158,7 @@ fn heap_size(memory_props: &vk::PhysicalDeviceMemoryProperties, type_index: u32)
 /// The `bool` is whether the pick *is* the BAR type (allocation failure then
 /// falls back to system memory). Charging the cap is a separate decision at
 /// allocate time: only small BAR heaps consume [`HOST_BAR_BYTES`].
-fn host_buffer_memory_type(
+pub(crate) fn host_buffer_memory_type(
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     type_filter: u32,
     size: u64,
@@ -967,7 +1177,7 @@ fn host_buffer_memory_type(
     try_find_memory_type(memory_props, type_filter, HOST_COHERENT).map(|i| (i, false))
 }
 
-fn bar_charge(
+pub(crate) fn bar_charge(
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     type_index: u32,
     size: u64,
@@ -1981,6 +2191,34 @@ mod tests {
         assert!(q.is_empty());
     }
 
+    #[test]
+    fn retire_queue_holds_a_reserved_but_unsubmitted_stamp() {
+        // A free stamped at last_reserved (frame reserved, not yet submitted)
+        // must not reclaim until the completed counter reaches that value.
+        // collect only compares; it must not wait.
+        let v = TimelineValue::from_raw_for_test;
+        let mut q: RetireQueue<u32> = RetireQueue::new();
+        let reserved = v(5);
+        q.push(reserved, 42);
+
+        let mut freed = Vec::new();
+        q.collect(v(3), |x| freed.push(x));
+        assert_eq!(freed, Vec::<u32>::new(), "unsubmitted stamp is not done");
+        assert!(!q.is_empty());
+
+        let mut freed = Vec::new();
+        q.collect(v(4), |x| freed.push(x));
+        assert!(
+            freed.is_empty(),
+            "still waiting for the reserved value itself"
+        );
+
+        let mut freed = Vec::new();
+        q.collect(reserved, |x| freed.push(x));
+        assert_eq!(freed, vec![42]);
+        assert!(q.is_empty());
+    }
+
     fn props(
         types: &[(vk::MemoryPropertyFlags, u32)],
         heap_sizes: &[u64],
@@ -2122,14 +2360,20 @@ mod tests {
 
     #[test]
     fn compose_clears_face_runs_when_a_bucket_exceeds_u16() {
-        use super::{DrawDyn, MESH_FLAG_FACE_RUNS, MeshMeta, MeshRecord, PlacementState};
-        use crate::mesh::{Detail, MeshPlacement};
-        let huge = (u32::from(u16::MAX) + 1) * 6;
-        // Upload slot 2 overflows; the other five buckets are empty.
+        use super::{
+            DrawDyn, MESH_FLAG_FACE_RUNS, MeshMeta, MeshRecord, PlacementState,
+            index_bounds_from_quad_counts,
+        };
+        use crate::mesh::{Detail, FACE_UPLOAD_ORDER, MeshPlacement};
+        let mut counts = [0u32; 6];
+        // Upload slot 2 overflows; the other five directions are empty.
+        counts[FACE_UPLOAD_ORDER[2]] = u32::from(u16::MAX) + 1;
+        let bounds = index_bounds_from_quad_counts(counts);
+        let huge = counts[FACE_UPLOAD_ORDER[2]] * 6;
         let meta = MeshMeta {
             aabb_min: glam::Vec3::ZERO,
             aabb_max: glam::Vec3::ONE,
-            bounds: [0, 0, 0, huge, huge, huge, huge],
+            bounds,
             vertex_offset: 12,
             pass: crate::mesh::Pass::Opaque,
             placement: PlacementState::Pinned,
@@ -2149,5 +2393,172 @@ mod tests {
             "index range stays whole-mesh (bounds[0]..bounds[6])"
         );
         assert_eq!(rec.vertex_offset, 12);
+    }
+
+    /// Old upload: vertices in insertion order, six index buckets of the
+    /// shared-IBO pattern `[b, b+1, b+2, b, b+2, b+3]`, then one 4-vertex copy
+    /// per quad in [`super::FACE_UPLOAD_ORDER`].
+    fn permute_old(quads: &[[crate::mesh::MeshVertex; 4]]) -> Vec<crate::mesh::MeshVertex> {
+        use super::FACE_UPLOAD_ORDER;
+        let mut vertices = Vec::new();
+        let mut buckets: [Vec<u32>; 6] = std::array::from_fn(|_| Vec::new());
+        for corners in quads {
+            let dir = corners[0].normal() as usize;
+            let base = vertices.len() as u32;
+            vertices.extend_from_slice(corners);
+            buckets[dir].extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        let mut out = Vec::new();
+        for &dir in &FACE_UPLOAD_ORDER {
+            for quad in buckets[dir].chunks_exact(6) {
+                let b = quad[0];
+                assert_eq!(
+                    *quad,
+                    [b, b + 1, b + 2, b, b + 2, b + 3],
+                    "reference permuter assumes the shared-IBO pattern"
+                );
+                out.extend_from_slice(&vertices[b as usize..b as usize + 4]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn upload_layout_matches_old_index_permutation() {
+        use super::{
+            FACE_UPLOAD_ORDER, MESH_FLAG_FACE_RUNS, MeshRecord, index_bounds_from_quad_counts,
+            write_vertices_upload_order,
+        };
+        use crate::mesh::{Ao, Light, MeshData, MeshVertex, Normal, Pass};
+
+        fn tagged_quad(normal: Normal, tag: u8) -> [MeshVertex; 4] {
+            std::array::from_fn(|i| {
+                MeshVertex::new(
+                    [i as u8, tag, 0],
+                    normal,
+                    u16::from(tag),
+                    Ao::NONE,
+                    Light::FULL,
+                    false,
+                )
+            })
+        }
+
+        // Mixed directions, one empty (NegX), two PosX quads so within-bucket
+        // order is visible. Insertion order is not upload order.
+        let quads = [
+            tagged_quad(Normal::NegY, 1),
+            tagged_quad(Normal::PosX, 2),
+            tagged_quad(Normal::PosZ, 3),
+            tagged_quad(Normal::PosX, 4),
+            tagged_quad(Normal::PosY, 5),
+            tagged_quad(Normal::NegZ, 6),
+        ];
+        let mut data = MeshData::new(Pass::Opaque);
+        for q in quads {
+            data.quad(q);
+        }
+
+        let expected = permute_old(&quads);
+        assert_eq!(
+            expected.len(),
+            4 * data.quad_counts().iter().sum::<u32>() as usize,
+            "vertex count stays 4 * quads"
+        );
+        assert_eq!(data.vertices(), expected);
+
+        let mut buf = vec![0u8; data.vertex_bytes()];
+        let written = unsafe { write_vertices_upload_order(&data, buf.as_mut_ptr()) };
+        assert_eq!(written, data.vertex_bytes());
+        let got: &[MeshVertex] = bytemuck::cast_slice(&buf);
+        assert_eq!(got, expected.as_slice());
+
+        let counts = data.quad_counts();
+        assert_eq!(counts[Normal::PosX as usize], 2);
+        assert_eq!(counts[Normal::NegX as usize], 0);
+        assert_eq!(counts[Normal::PosY as usize], 1);
+        assert_eq!(counts[Normal::NegY as usize], 1);
+        assert_eq!(counts[Normal::PosZ as usize], 1);
+        assert_eq!(counts[Normal::NegZ as usize], 1);
+
+        let bounds = index_bounds_from_quad_counts(counts);
+        // FACE_UPLOAD_ORDER: +X,+Y,+Z,−X,−Y,−Z → 2,1,1,0,1,1 quads.
+        assert_eq!(bounds, [0, 12, 18, 24, 24, 30, 36]);
+        let (face_quads, flags) = MeshRecord::pack_face_quads(&bounds);
+        assert_eq!(flags, MESH_FLAG_FACE_RUNS);
+        assert_eq!(
+            face_quads,
+            [
+                counts[FACE_UPLOAD_ORDER[0]] | (counts[FACE_UPLOAD_ORDER[1]] << 16),
+                counts[FACE_UPLOAD_ORDER[2]] | (counts[FACE_UPLOAD_ORDER[3]] << 16),
+                counts[FACE_UPLOAD_ORDER[4]] | (counts[FACE_UPLOAD_ORDER[5]] << 16),
+            ]
+        );
+    }
+
+    #[test]
+    fn pooled_mesh_arrives_one_frame_later_with_a_fake_timeline() {
+        use super::super::alloc::Allocation;
+        use super::super::mesh_staging::MeshStagingPool;
+        use super::{CopySource, GpuResident, MeshResidency, PendingCopy};
+        use std::num::NonZeroU32;
+
+        let pool = MeshStagingPool::new_host(8);
+        let staging = pool.stager().acquire(8).expect("host pool");
+        let lease = staging.into_lease();
+
+        let mut res = MeshResidency::new();
+        res.apply_upload(
+            0,
+            NonZeroU32::MIN,
+            GpuResident {
+                buffer: vk::Buffer::null(),
+                arena: Allocation::dummy(),
+                copy: Some(PendingCopy {
+                    src_buffer: vk::Buffer::null(),
+                    src_offset: 0,
+                    dst_buffer: vk::Buffer::null(),
+                    dst_offset: 0,
+                    size: 8,
+                    source: CopySource::Pool(lease),
+                }),
+                arrived_at: None,
+            },
+        );
+        assert!(!res.is_arrived(0), "pending copy is not arrived at apply");
+        assert!(
+            !res.has_deferred(),
+            "the lane wait is not armed until flush"
+        );
+
+        // Drain then draw: note_frame then flush. Delay == 1; the graphics
+        // wait is deferred (no same-frame wait).
+        res.note_frame();
+        let done = TimelineValue::from_raw_for_test(1);
+        res.complete_pooled_copies_for_test(done);
+        assert!(res.is_arrived(0));
+        assert_eq!(res.last_pool_arrival_frames(), 1);
+        assert_eq!(res.take_arrived(), vec![0]);
+        assert!(
+            res.has_deferred(),
+            "lane wait is deferred to the next graphics submit"
+        );
+
+        // Stamp::Transfer(1): reclaim needs the transfer timeline.
+        pool.reclaim(TimelineValue::START, None);
+        assert!(
+            pool.stager().acquire(8).is_none(),
+            "region waits for the fake transfer timeline"
+        );
+        pool.reclaim(done, None);
+        assert!(
+            pool.stager().acquire(8).is_none(),
+            "a render counter does not free a Transfer stamp"
+        );
+        pool.reclaim(TimelineValue::START, Some(done));
+        assert!(
+            pool.stager().acquire(8).is_some(),
+            "reclaimed one deferred frame later, no GPU wait"
+        );
     }
 }

@@ -16,6 +16,8 @@ pub(crate) struct MinimapTexture {
     pixels: Vec<u8>,
     version: u64,
     uploaded: [u64; FRAMES_IN_FLIGHT as usize],
+    /// Texel subrect to upload for the current `version` (`w==size && h==size` is full).
+    dirty: (u32, u32, u32, u32),
 }
 
 impl MinimapTexture {
@@ -83,6 +85,7 @@ impl MinimapTexture {
             pixels,
             version: 1,
             uploaded: [0; FRAMES_IN_FLIGHT as usize],
+            dirty: (0, 0, size, size),
         }
     }
 
@@ -90,6 +93,23 @@ impl MinimapTexture {
         assert_eq!(rgba.len(), (self.size * self.size * 4) as usize);
         self.pixels.copy_from_slice(rgba);
         self.version += 1;
+        self.dirty = (0, 0, self.size, self.size);
+    }
+
+    pub fn update_rect(&mut self, x: u32, y: u32, w: u32, h: u32, rgba: &[u8]) {
+        assert!(
+            x.saturating_add(w) <= self.size && y.saturating_add(h) <= self.size,
+            "minimap rect out of bounds"
+        );
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+        for row in 0..h {
+            let dst = (((y + row) * self.size + x) * 4) as usize;
+            let src = (row * w * 4) as usize;
+            let n = (w * 4) as usize;
+            self.pixels[dst..dst + n].copy_from_slice(&rgba[src..src + n]);
+        }
+        self.version += 1;
+        self.dirty = union_rect(self.dirty, (x, y, w, h));
     }
 
     /// Returns whether this recorded a buffer-to-image upload.
@@ -103,21 +123,44 @@ impl MinimapTexture {
             return false;
         }
         let img = &mut self.images[slot];
+        let (x, y, w, h) = self.dirty;
         unsafe {
-            self.staging[slot].write(0, &self.pixels);
+            // Tightly packed dirty rect into staging; bufferRowLength is the
+            // rect width so the GPU reads packed rows (transfer copy, not a
+            // full 256 KiB rewrite).
+            let packed_len = (w * h * 4) as usize;
+            if w == self.size && h == self.size && x == 0 && y == 0 {
+                self.staging[slot].write(0, &self.pixels);
+            } else {
+                let mut packed = vec![0u8; packed_len];
+                for row in 0..h {
+                    let src = (((y + row) * self.size + x) * 4) as usize;
+                    let dst = (row * w * 4) as usize;
+                    let n = (w * 4) as usize;
+                    packed[dst..dst + n].copy_from_slice(&self.pixels[src..src + n]);
+                }
+                self.staging[slot].write(0, &packed);
+            }
 
             img.transition(device, cmd, LayoutUse::TransferDst);
 
             let region = [vk::BufferImageCopy::default()
+                .buffer_row_length(w)
+                .buffer_image_height(h)
                 .image_subresource(vk::ImageSubresourceLayers {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     mip_level: 0,
                     base_array_layer: 0,
                     layer_count: 1,
                 })
+                .image_offset(vk::Offset3D {
+                    x: x as i32,
+                    y: y as i32,
+                    z: 0,
+                })
                 .image_extent(vk::Extent3D {
-                    width: self.size,
-                    height: self.size,
+                    width: w,
+                    height: h,
                     depth: 1,
                 })];
             device.cmd_copy_buffer_to_image(
@@ -161,4 +204,20 @@ impl MinimapTexture {
             }
         }
     }
+}
+
+fn union_rect(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+    let (ax, ay, aw, ah) = a;
+    let (bx, by, bw, bh) = b;
+    if aw == 0 || ah == 0 {
+        return b;
+    }
+    if bw == 0 || bh == 0 {
+        return a;
+    }
+    let x = ax.min(bx);
+    let y = ay.min(by);
+    let x2 = (ax + aw).max(bx + bw);
+    let y2 = (ay + ah).max(by + bh);
+    (x, y, x2 - x, y2 - y)
 }
