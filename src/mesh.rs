@@ -344,12 +344,13 @@ impl MeshData {
     }
 
     /// Packed vertices in [`FACE_UPLOAD_ORDER`] (direction-major: +X,+Y,+Z,−X,−Y,−Z),
-    /// concatenated. This is GPU upload order, **not** `quad()` insertion order:
-    /// mixed-direction meshes group by face. For tests in dependent crates that
-    /// assert on emitted geometry (greedy-mesh area vs a reference sweep,
-    /// byte-identical far chunks). `#[doc(hidden)]` — mirrors the
-    /// [`MeshHandle::from_raw_parts`] "for dependent-crate tests" precedent; NOT
-    /// a production surface (build geometry with [`Self::quad`]).
+    /// concatenated. **Allocates** a new `Vec` on every call. This is GPU upload
+    /// order, **not** `quad()` insertion order: mixed-direction meshes group by
+    /// face. For tests in dependent crates that assert on emitted geometry
+    /// (greedy-mesh area vs a reference sweep, byte-identical far chunks).
+    /// `#[doc(hidden)]` — mirrors the [`MeshHandle::from_raw_parts`]
+    /// "for dependent-crate tests" precedent; NOT a production surface (build
+    /// geometry with [`Self::quad`]).
     #[doc(hidden)]
     pub fn vertices(&self) -> Vec<MeshVertex> {
         let mut out = Vec::with_capacity(self.vertex_count());
@@ -357,6 +358,32 @@ impl MeshData {
             out.extend_from_slice(&self.vertices[dir]);
         }
         out
+    }
+
+    /// Synthesizes the historical per-[`Normal`] index buckets over
+    /// [`Self::vertices`] order: each quad becomes `[b, b+1, b+2, b, b+2, b+3]`
+    /// so `vertices()[idx]` addressing stays consistent with the old layout.
+    ///
+    /// Compatibility shim for dependents that have not migrated to
+    /// [`Self::quad_counts`] / [`Self::vertex_bytes`]. Indices are not stored.
+    #[deprecated(note = "use quad_counts()/vertex_bytes(); indices are synthesized")]
+    #[doc(hidden)]
+    pub fn buckets(&self) -> [Vec<u32>; 6] {
+        let mut buckets: [Vec<u32>; 6] = std::array::from_fn(|_| Vec::new());
+        let mut base = 0u32;
+        for &dir in &FACE_UPLOAD_ORDER {
+            let n = self.vertices[dir].len() as u32;
+            debug_assert_eq!(n % 4, 0);
+            let quads = n / 4;
+            let mut idx = Vec::with_capacity(quads as usize * 6);
+            for q in 0..quads {
+                let b = base + q * 4;
+                idx.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+            }
+            buckets[dir] = idx;
+            base += n;
+        }
+        buckets
     }
 
     /// Quad counts per [`Normal`] (`0=+X … 5=−Z`), not [`FACE_UPLOAD_ORDER`].
@@ -566,6 +593,43 @@ mod tests {
         assert_eq!(&uploaded[..4], &pos_x_a);
         assert_eq!(&uploaded[4..8], &pos_x_b);
         assert_eq!(&uploaded[8..], &neg_z);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn buckets_shim_reproduces_old_layout_for_mixed_directions() {
+        let mut data = MeshData::new(Pass::Opaque);
+        let pos_x = quad_for(Normal::PosX);
+        let pos_y = quad_for(Normal::PosY);
+        let neg_x = quad_for(Normal::NegX);
+        let neg_z = quad_for(Normal::NegZ);
+        data.quad(pos_x);
+        data.quad(pos_y);
+        data.quad(neg_x);
+        data.quad(neg_z);
+
+        // FACE_UPLOAD_ORDER = +X, +Y, +Z, −X, −Y, −Z
+        // vertex bases: +X=0, +Y=4, +Z=8 (empty), −X=8, −Y=12 (empty), −Z=12
+        let verts = data.vertices();
+        assert_eq!(verts.len(), 16);
+        assert_eq!(&verts[0..4], &pos_x);
+        assert_eq!(&verts[4..8], &pos_y);
+        assert_eq!(&verts[8..12], &neg_x);
+        assert_eq!(&verts[12..16], &neg_z);
+
+        let buckets = data.buckets();
+        assert!(buckets[Normal::PosZ as usize].is_empty());
+        assert!(buckets[Normal::NegY as usize].is_empty());
+        assert_eq!(buckets[Normal::PosX as usize], vec![0, 1, 2, 0, 2, 3]);
+        assert_eq!(buckets[Normal::PosY as usize], vec![4, 5, 6, 4, 6, 7]);
+        assert_eq!(buckets[Normal::NegX as usize], vec![8, 9, 10, 8, 10, 11]);
+        assert_eq!(buckets[Normal::NegZ as usize], vec![12, 13, 14, 12, 14, 15]);
+
+        for dir in 0..6 {
+            for &i in &buckets[dir] {
+                let _ = verts[i as usize];
+            }
+        }
     }
 
     #[test]
