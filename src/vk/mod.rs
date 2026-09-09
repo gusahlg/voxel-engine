@@ -211,8 +211,12 @@ pub(crate) struct Renderer {
     last_present: std::time::Instant,
     present_interval: std::time::Duration,
     gpu_timer: GpuTimer,
-    /// `VOXEL_BENCH_EMPTY=1`: empty command-buffer submit, no present.
-    empty_submit: bool,
+    /// `VOXEL_BENCH_EMPTY=K` (K ≥ 1): that many empty command buffers per
+    /// frame in one submit, no present. Zero disables the experiment.
+    empty_submit: u32,
+    /// Extra primary CBs for `empty_submit` > 1: `(K-1) * FRAMES_IN_FLIGHT`,
+    /// indexed `slot * (K-1) + i`. The slot's usual `cmd` is the first of K.
+    empty_extra: Box<[vk::CommandBuffer]>,
 }
 
 impl Renderer {
@@ -385,6 +389,23 @@ impl Renderer {
                 .expect("Failed to allocate command buffers")
         };
         let copy_cmd = cmds.pop().expect("command buffer allocation");
+        let empty_submit = empty_submit_count();
+        let empty_extra = if empty_submit > 1 {
+            let n = (empty_submit - 1) * FRAMES_IN_FLIGHT as u32;
+            let info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(device.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(n);
+            unsafe {
+                device
+                    .device
+                    .allocate_command_buffers(&info)
+                    .expect("Failed to allocate empty-submit command buffers")
+            }
+            .into_boxed_slice()
+        } else {
+            Box::from([])
+        };
         let timeline = unsafe { Timeline::new(&device.device) };
         let mut cmds = cmds.into_iter();
         let slots = PerSlot::new(std::array::from_fn(|_| SlotState {
@@ -505,7 +526,8 @@ impl Renderer {
             last_present: std::time::Instant::now(),
             present_interval,
             gpu_timer,
-            empty_submit: empty_submit_requested(),
+            empty_submit,
+            empty_extra,
         };
         Ok((renderer, reply))
     }
@@ -748,13 +770,21 @@ impl Renderer {
     }
 }
 
-/// Profiling experiment: `VOXEL_BENCH_EMPTY=1` records an empty command buffer
-/// per frame (begin/end only), still submits/signals/waits on the usual
-/// timeline, and skips present. Measures the per-submission floor of the
-/// driver + our sync. Read once at renderer creation. Not a public API.
-fn empty_submit_requested() -> bool {
-    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *REQUESTED.get_or_init(|| std::env::var("VOXEL_BENCH_EMPTY").is_ok_and(|v| v != "0"))
+/// Profiling experiment: `VOXEL_BENCH_EMPTY=K` (integer K ≥ 1) records K
+/// distinct empty command buffers per frame (begin/end only; re-recording one
+/// primary K times is not valid), submits them in **one** `vkQueueSubmit2`
+/// (one `VkSubmitInfo2` with K `VkCommandBufferSubmitInfo`s and the usual
+/// single timeline signal), and skips present. Isolates whether the ~21 µs
+/// per-submission floor is per submit or per command buffer. Unset / `0` /
+/// non-integer disables. Read once at renderer creation. Not a public API.
+fn empty_submit_count() -> u32 {
+    static COUNT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let Ok(v) = std::env::var("VOXEL_BENCH_EMPTY") else {
+            return 0;
+        };
+        v.parse::<u32>().ok().filter(|&k| k >= 1).unwrap_or(0)
+    })
 }
 
 /// Clamp range for render-resolution scale (0.25x to 2.0x). Re-exported from

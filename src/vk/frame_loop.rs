@@ -177,7 +177,7 @@ impl Renderer {
             }
         }
 
-        if self.empty_submit {
+        if self.empty_submit > 0 {
             self.draw_empty_submit();
             return;
         }
@@ -327,34 +327,59 @@ impl Renderer {
         self.slot = (self.slot + 1) % FRAMES_IN_FLIGHT as usize;
     }
 
-    /// Empty command-buffer submit used by `VOXEL_BENCH_EMPTY`: wait the slot,
-    /// begin/end with no work or timestamps, submit on the usual timeline, skip
-    /// present. Slot wait + timeline signal keep shutdown and FIF reuse intact.
+    /// Empty command-buffer submit used by `VOXEL_BENCH_EMPTY=K`: wait the slot,
+    /// record K distinct empty primaries (begin/end only), one `vkQueueSubmit2`
+    /// with K command buffers and the usual single timeline signal, skip present.
+    /// Slot wait + timeline signal keep shutdown and FIF reuse intact.
     fn draw_empty_submit(&mut self) {
         let slot = self.slot;
         crate::profile::count(crate::profile::Counter::Rendered);
         self.wait_slot_and_reclaim(slot);
-        let cmd = self.slots[FrameSlot::new(slot)].cmd;
-        let rs = self.timeline.begin_render(cmd);
+        let k = self.empty_submit.max(1) as usize;
+        let primary = self.slots[FrameSlot::new(slot)].cmd;
+        let extra_n = k - 1;
+        let extra_base = slot * extra_n;
+        let mut cmds = Vec::with_capacity(k);
+        cmds.push(primary);
+        if extra_n > 0 {
+            cmds.extend_from_slice(&self.empty_extra[extra_base..extra_base + extra_n]);
+        }
         unsafe {
             let device = &self.device.device;
-            device
-                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
-                .expect("command buffer reset failed");
-            device
-                .begin_command_buffer(
-                    cmd,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .expect("begin command buffer failed");
-            device
-                .end_command_buffer(cmd)
-                .expect("end command buffer failed");
+            for &cmd in &cmds {
+                device
+                    .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                    .expect("command buffer reset failed");
+                device
+                    .begin_command_buffer(
+                        cmd,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .expect("begin command buffer failed");
+                device
+                    .end_command_buffer(cmd)
+                    .expect("end command buffer failed");
+            }
         }
+        let rs = self.timeline.begin_render(cmds[0]);
         {
             let _p = crate::profile::scope(crate::profile::Meter::Submit);
-            self.submit_render(rs, slot);
+            let extra_wait = self
+                .pending_transfer_wait
+                .take()
+                .map(|value| (self.transfer_lane.semaphore(), value, MESH_CONSUMER_STAGES));
+            let completion = unsafe {
+                rs.submit_bufs(
+                    &self.device.device,
+                    self.device.graphics_queue,
+                    &self.timeline,
+                    &cmds,
+                    extra_wait,
+                )
+            };
+            self.slots[FrameSlot::new(slot)].render_value = completion.value();
+            self.last_render_value = completion.value();
         }
         self.slot = (self.slot + 1) % FRAMES_IN_FLIGHT as usize;
     }

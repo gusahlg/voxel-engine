@@ -150,11 +150,28 @@ impl RenderSubmit {
         timeline: &Timeline,
         extra_wait: Option<(vk::Semaphore, TimelineValue, vk::PipelineStageFlags2)>,
     ) -> RenderCompletion {
+        let cmd = self.cmd;
+        unsafe { self.submit_bufs(device, queue, timeline, &[cmd], extra_wait) }
+    }
+
+    /// One `vkQueueSubmit2` / one timeline signal, with `cmds.len()` command
+    /// buffers (`VkCommandBufferSubmitInfo`s). Used by `VOXEL_BENCH_EMPTY=K`.
+    pub unsafe fn submit_bufs(
+        self,
+        device: &ash::Device,
+        queue: vk::Queue,
+        timeline: &Timeline,
+        cmds: &[vk::CommandBuffer],
+        extra_wait: Option<(vk::Semaphore, TimelineValue, vk::PipelineStageFlags2)>,
+    ) -> RenderCompletion {
         let signal = [vk::SemaphoreSubmitInfo::default()
             .semaphore(timeline.sem)
             .value(self.value.raw())
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-        let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(self.cmd)];
+        let cmd_infos: Vec<vk::CommandBufferSubmitInfo<'_>> = cmds
+            .iter()
+            .map(|&c| vk::CommandBufferSubmitInfo::default().command_buffer(c))
+            .collect();
         let waits = extra_wait.map(|(sem, value, stages)| {
             [vk::SemaphoreSubmitInfo::default()
                 .semaphore(sem)
@@ -162,7 +179,7 @@ impl RenderSubmit {
                 .stage_mask(stages)]
         });
         let mut submit = vk::SubmitInfo2::default()
-            .command_buffer_infos(&cmds)
+            .command_buffer_infos(&cmd_infos)
             .signal_semaphore_infos(&signal);
         if let Some(waits) = &waits {
             submit = submit.wait_semaphore_infos(waits);
