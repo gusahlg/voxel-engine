@@ -810,6 +810,8 @@ impl Renderer {
                         camera,
                         shadow_frusta.as_ref(),
                         *eye,
+                        lists.lod_clip,
+                        lists.lod_clip_v,
                         &self.visible_mask[..need],
                         recycled,
                     )
