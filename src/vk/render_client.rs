@@ -140,6 +140,10 @@ pub(crate) struct InitReply {
     pub memory_budget: Option<MemoryBudget>,
     pub device: ash::Device,
     pub caps: DeviceCaps,
+    /// Sample count actually allocated (may be below the request on OOM).
+    pub msaa: u32,
+    /// Render scale actually allocated (may be below the request on OOM).
+    pub render_scale: f32,
     /// Render thread's published exposure cell for Engine's compose().
     pub exposure: super::exposure::ExposureShared,
     /// Last completed frame GPU busy / inter-submit gap.
@@ -354,8 +358,6 @@ impl RenderClient {
         if mesh_alloc.unified_memory() {
             log::info!("Unified memory detected: mesh uploads bypass staging");
         }
-        let msaa = clamp_msaa(config.msaa, reply.caps.max_msaa);
-
         let client = RenderClient {
             tx: cmd_tx,
             ret_rx,
@@ -370,9 +372,9 @@ impl RenderClient {
             device: reply.device,
             caps: reply.caps,
             size,
-            render_scale: Scale::new(config.render_scale),
+            render_scale: Scale::new(reply.render_scale),
             vsync: config.vsync,
-            msaa,
+            msaa: reply.msaa,
             cull_faces: true,
             exposure: reply.exposure,
             gpu_load: reply.gpu_load,

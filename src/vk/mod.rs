@@ -50,14 +50,14 @@ use buffers::{DrawIndexedIndirect, FRAMES_IN_FLIGHT, GpuResident, HostBuffer, Me
 use device::Device;
 use frame_loop::{DrawEntry, DrawRun, PendingSubmit};
 use gpu_timer::{GpuPipeStats, GpuTimer};
-use image::AllocError;
+use image::{AllocError, render_target_oom_message};
 use instance::InstanceBundle;
 use mesh_staging::MeshStagingPool;
 use minimap::MinimapTexture;
 use pipeline::Pipelines;
 use render_client::{Capture, DeviceCaps, DeviceLeftovers, InitReply, RenderConfig, RenderReturn};
 use swapchain::Swapchain;
-use targets::RenderTargets;
+use targets::{RenderTargets, next_lower};
 use texture::FontAtlas;
 use timeline::{BinarySemaphore, Timeline, TimelineValue};
 use transfer::TransferLane;
@@ -254,7 +254,7 @@ impl Renderer {
             present_interval,
             flags,
         } = cfg;
-        let render_scale = Scale::new(render_scale).as_f32();
+        let mut render_scale = Scale::new(render_scale).as_f32();
 
         let device = Device::new(
             &instance.entry,
@@ -291,8 +291,10 @@ impl Renderer {
             vk::SwapchainKHR::null(),
         );
 
-        let msaa = resolve_msaa(msaa, device.max_msaa(), "requested");
-        let render_extent = scaled_extent(swapchain.extent, render_scale);
+        let requested_msaa = resolve_msaa(msaa, device.max_msaa(), "requested");
+        let requested_scale = render_scale;
+        let mut msaa = requested_msaa;
+        let mut render_extent = scaled_extent(swapchain.extent, render_scale);
         let memory_props = unsafe {
             instance
                 .instance
@@ -308,17 +310,53 @@ impl Renderer {
         ) {
             Ok(targets) => targets,
             Err(err) => {
-                abort_build(
-                    instance,
-                    surface_loader,
-                    surface,
-                    device,
-                    transfer_lane,
-                    swapchain,
-                    None,
-                    None,
-                );
-                return Err(err);
+                log::warn!("{}", render_target_oom_message(&err));
+                let original = err;
+                let mut applied = None;
+                while let Some((next_msaa, next_scale)) = next_lower(msaa, render_scale) {
+                    msaa = next_msaa;
+                    render_scale = next_scale;
+                    render_extent = scaled_extent(swapchain.extent, render_scale);
+                    match RenderTargets::new(
+                        &instance.instance,
+                        &device.device,
+                        device.physical,
+                        render_extent,
+                        msaa,
+                        device.fragment_shading_rate.as_ref(),
+                    ) {
+                        Ok(targets) => {
+                            log::warn!(
+                                "renderer: render targets fell back to MSAA {} / render scale {} (requested {} / {})",
+                                msaa.as_u32(),
+                                render_scale,
+                                requested_msaa.as_u32(),
+                                requested_scale,
+                            );
+                            applied = Some(targets);
+                            break;
+                        }
+                        Err(err) => {
+                            log::warn!("{}", render_target_oom_message(&err));
+                        }
+                    }
+                }
+                match applied {
+                    Some(targets) => targets,
+                    None => {
+                        abort_build(
+                            instance,
+                            surface_loader,
+                            surface,
+                            device,
+                            transfer_lane,
+                            swapchain,
+                            None,
+                            None,
+                        );
+                        return Err(original);
+                    }
+                }
             }
         };
         let taa = match taa::TaaState::new(&device.device, &memory_props, swapchain.extent) {
@@ -502,6 +540,8 @@ impl Renderer {
             memory_budget: device.memory_budget,
             device: device.device.clone(),
             caps,
+            msaa: msaa.as_u32(),
+            render_scale,
             exposure: exposure.shared(),
             gpu_load: gpu_timer.load_shared(),
             mesh_staging: Arc::clone(&mesh_staging),
