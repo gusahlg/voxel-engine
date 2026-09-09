@@ -464,6 +464,17 @@ impl Renderer {
         let caps = DeviceCaps {
             max_msaa: device.max_msaa(),
             max_texture_layers: device.max_image_array_layers,
+            device_name: unsafe {
+                instance
+                    .instance
+                    .get_physical_device_properties(device.physical)
+                    .device_name_as_c_str()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "<unknown>".into())
+            },
+            device_local_bytes: Device::device_local_bytes(&memory_props),
+            supports_vrs: device.fragment_shading_rate.is_some(),
+            supports_pipeline_stats: device.pipeline_statistics_query,
         };
         let reply = InitReply {
             instance: instance.instance.clone(),
@@ -583,6 +594,9 @@ impl Renderer {
 
     /// Replace feature flags (safe mid-run).
     pub fn set_flags(&mut self, flags: crate::engine::RenderFlags) {
+        if self.flags == flags {
+            return;
+        }
         // Flag transitions reset temporal state to avoid stale cached values.
         if self.flags.exposure && !flags.exposure {
             self.exposure.reset();
@@ -741,6 +755,10 @@ impl Renderer {
     /// Uploads minimap pixels to staging buffer (synced per-slot).
     pub fn update_minimap(&mut self, rgba: &[u8]) {
         self.minimap.update(rgba);
+    }
+
+    pub fn update_minimap_rect(&mut self, x: u32, y: u32, w: u32, h: u32, rgba: &[u8]) {
+        self.minimap.update_rect(x, y, w, h, rgba);
     }
 }
 

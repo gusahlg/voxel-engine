@@ -67,7 +67,7 @@ impl Default for Config {
 /// are CPU-side: they neutralize a `FrameUniforms` lane (`frame::gate_uniforms`,
 /// applied to `Lighting::Composed`) or skip a pass's work (vk/mod.rs,
 /// vk/shadow.rs) — no shader variants.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RenderFlags {
     /// Camera jitter + TAA resolve at present time (output/swapchain
     /// resolution). Always coupled: jitter is injected every rendered frame;
@@ -115,6 +115,34 @@ pub struct RenderFlags {
     pub stars: bool,
 }
 
+/// Device capabilities sampled at renderer init. Device selection needs a
+/// window surface, so there is no headless [`probe_gpu_caps`]; read these
+/// from [`Engine::gpu_caps`] after [`run`] constructs the engine.
+#[derive(Clone, Debug)]
+pub struct GpuCaps {
+    pub device_name: String,
+    pub device_local_bytes: u64,
+    pub max_texture_array_layers: u32,
+    pub max_msaa: u32,
+    pub supports_vrs: bool,
+    pub supports_pipeline_stats: bool,
+}
+
+/// Inputs for [`Engine::estimate_render_targets`]: window size, scale, and
+/// the feature bits that change which targets exist. `frames_in_flight`
+/// should match the engine slot ring the game will run against.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderTargetConfig {
+    pub width: u32,
+    pub height: u32,
+    pub render_scale: f32,
+    pub msaa: u32,
+    pub taa: bool,
+    pub bloom: bool,
+    pub vrs: bool,
+    pub frames_in_flight: u32,
+}
+
 impl Default for RenderFlags {
     /// The shipped defaults (formerly the `WATT_*` unset-defaults).
     fn default() -> Self {
@@ -152,6 +180,9 @@ pub struct Engine {
     /// `gate_uniforms`; `taa` gates jitter injection). The render thread holds its
     /// own copy on `Renderer`. Both are set from `Config::flags` at construction.
     pub(crate) flags: RenderFlags,
+    pub(crate) last_composed: Option<crate::vk::uniforms::FrameUniformsGpu>,
+    pub(crate) last_gated: Option<crate::vk::uniforms::FrameUniformsGpu>,
+    pub(crate) last_gate_flags: RenderFlags,
 
     target_fps: u32,
     frame_start: Instant,
@@ -175,6 +206,9 @@ impl Engine {
             input: InputState::new(),
             lists,
             flags: config.flags,
+            last_composed: None,
+            last_gated: None,
+            last_gate_flags: config.flags,
             target_fps: config.target_fps,
             frame_start: Instant::now(),
             dt: 0.0,
@@ -260,6 +294,9 @@ impl Engine {
     /// command stream, the render thread's — so the change lands atomically at
     /// the next frame boundary.
     pub fn set_flags(&mut self, flags: RenderFlags) {
+        if self.flags == flags {
+            return;
+        }
         self.flags = flags;
         self.client.set_flags(flags);
     }
@@ -280,6 +317,19 @@ impl Engine {
 
     pub fn max_msaa(&self) -> u32 {
         self.client.max_msaa()
+    }
+
+    /// GPU limits and optional features discovered at device selection.
+    /// Requires a live engine (instance/device pick needs a window surface).
+    pub fn gpu_caps(&self) -> GpuCaps {
+        self.client.gpu_caps()
+    }
+
+    /// Device-local bytes the renderer would allocate for this settings combo,
+    /// using the engine's real formats and per-slot duplication. Lets the game
+    /// size MSAA / scale / TAA / bloom / VRS without mirroring those formats.
+    pub fn estimate_render_targets(&self, config: &RenderTargetConfig) -> u64 {
+        crate::vk::targets::estimate_render_targets(config)
     }
 
     /// The device's block-texture array layer ceiling
@@ -451,9 +501,24 @@ impl Engine {
         self.client.set_block_textures(size, layers);
     }
 
-    /// Uploads minimap pixels (synced per-slot, version-gated).
+    /// Uploads minimap pixels (synced per-slot, version-gated). Copies `rgba`.
     pub fn update_minimap(&mut self, rgba: &[u8]) {
         self.client.update_minimap(rgba);
+    }
+
+    /// Same as [`Self::update_minimap`] without an extra copy of `rgba`.
+    pub fn update_minimap_owned(&mut self, rgba: Box<[u8]>) {
+        self.client.update_minimap_owned(rgba);
+    }
+
+    /// Uploads a tightly packed `w*h` RGBA8 subrect. Only that region is
+    /// copied to the GPU (buffer-to-image transfer).
+    pub fn update_minimap_rect(&mut self, x: u32, y: u32, w: u32, h: u32, rgba: &[u8]) {
+        self.client.update_minimap_rect(x, y, w, h, rgba);
+    }
+
+    pub fn minimap_size(&self) -> (u32, u32) {
+        self.client.minimap_size()
     }
 
     // ---- text / math ----

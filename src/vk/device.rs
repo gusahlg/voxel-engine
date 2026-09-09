@@ -356,6 +356,20 @@ impl Device {
         }
     }
 
+    /// Sum of `DEVICE_LOCAL` heap sizes on this physical device.
+    pub fn device_local_bytes(memory_props: &vk::PhysicalDeviceMemoryProperties) -> u64 {
+        (0..memory_props.memory_heap_count as usize)
+            .map(|i| {
+                let heap = memory_props.memory_heaps[i];
+                if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                    heap.size
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
     pub fn max_msaa(&self) -> u32 {
         for (flag, n) in [
             (vk::SampleCountFlags::TYPE_8, 8),

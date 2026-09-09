@@ -39,12 +39,16 @@ use crate::engine::Config;
 use crate::frame::DrawLists;
 use crate::mesh::{Detail, MeshData, MeshHandle, MeshPlacement};
 
-/// Device capabilities cached on main for local clamp.
-#[derive(Clone, Copy)]
+/// Device capabilities cached on main for local clamp and [`crate::GpuCaps`].
+#[derive(Clone)]
 pub(crate) struct DeviceCaps {
     pub max_msaa: u32,
     /// Block-texture array layer ceiling (`limits.maxImageArrayLayers`).
     pub max_texture_layers: u32,
+    pub device_name: String,
+    pub device_local_bytes: u64,
+    pub supports_vrs: bool,
+    pub supports_pipeline_stats: bool,
 }
 
 /// Ordered command stream from main to render thread.
@@ -84,6 +88,13 @@ pub(crate) enum RenderCmd {
         layers: Box<[Vec<u8>]>,
     },
     UpdateMinimap(Box<[u8]>),
+    UpdateMinimapRect {
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        pixels: Box<[u8]>,
+    },
     Capture(Capture),
     Resize(PhysicalSize<u32>),
     SetVsync(bool),
@@ -486,6 +497,25 @@ impl RenderClient {
             .send(RenderCmd::UpdateMinimap(rgba.to_vec().into_boxed_slice()));
     }
 
+    pub(crate) fn update_minimap_owned(&mut self, rgba: Box<[u8]>) {
+        let _ = self.tx.send(RenderCmd::UpdateMinimap(rgba));
+    }
+
+    pub(crate) fn update_minimap_rect(&mut self, x: u32, y: u32, w: u32, h: u32, rgba: &[u8]) {
+        let _ = self.tx.send(RenderCmd::UpdateMinimapRect {
+            x,
+            y,
+            w,
+            h,
+            pixels: rgba.to_vec().into_boxed_slice(),
+        });
+    }
+
+    pub(crate) fn minimap_size(&self) -> (u32, u32) {
+        let n = super::MINIMAP_SIZE;
+        (n, n)
+    }
+
     pub(crate) fn request_capture(&mut self, capture: Capture) {
         let _ = self.tx.send(RenderCmd::Capture(capture));
     }
@@ -506,6 +536,9 @@ impl RenderClient {
 
     pub(crate) fn set_msaa(&mut self, samples: u32) -> u32 {
         let resolved = clamp_msaa(samples, self.caps.max_msaa);
+        if self.msaa == resolved {
+            return resolved;
+        }
         self.msaa = resolved;
         let _ = self.tx.send(RenderCmd::SetMsaa(resolved));
         resolved
@@ -521,6 +554,17 @@ impl RenderClient {
 
     pub(crate) fn max_texture_layers(&self) -> u32 {
         self.caps.max_texture_layers
+    }
+
+    pub(crate) fn gpu_caps(&self) -> crate::GpuCaps {
+        crate::GpuCaps {
+            device_name: self.caps.device_name.clone(),
+            device_local_bytes: self.caps.device_local_bytes,
+            max_texture_array_layers: self.caps.max_texture_layers,
+            max_msaa: self.caps.max_msaa,
+            supports_vrs: self.caps.supports_vrs,
+            supports_pipeline_stats: self.caps.supports_pipeline_stats,
+        }
     }
 
     /// GPU face-run culling. On by default; `false` is an explicit opt-out.
@@ -544,6 +588,9 @@ impl RenderClient {
 
     pub(crate) fn set_render_scale(&mut self, scale: f32) -> f32 {
         let s = Scale::new(scale);
+        if self.render_scale == s {
+            return s.get();
+        }
         self.render_scale = s;
         let _ = self.tx.send(RenderCmd::SetRenderScale(s));
         s.get()
@@ -822,6 +869,9 @@ fn render_loop(
                     renderer.set_block_textures(size, &layers)
                 }
                 RenderCmd::UpdateMinimap(px) => renderer.update_minimap(&px),
+                RenderCmd::UpdateMinimapRect { x, y, w, h, pixels } => {
+                    renderer.update_minimap_rect(x, y, w, h, &pixels)
+                }
                 RenderCmd::Capture(capture) => renderer.request_capture(capture),
                 RenderCmd::Resize(size) => renderer.on_resize(size),
                 RenderCmd::SetVsync(v) => renderer.set_vsync(v),

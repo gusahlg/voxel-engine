@@ -748,6 +748,105 @@ fn first_depth_format(
     Err(missing)
 }
 
+/// Bytes per texel for the HDR offscreen (`R16G16B16A16_SFLOAT`).
+const HDR_BPP: u64 = 8;
+/// Bytes per texel for scene depth (`D32_SFLOAT` is the usual pick).
+const DEPTH_BPP: u64 = 4;
+/// TAA history is the same 16-bit HDR format as the offscreen.
+const TAA_BPP: u64 = 8;
+/// Minimap is `R8G8B8A8_UNORM`.
+const MINIMAP_BPP: u64 = 4;
+/// VRS rate/history images are `R8_UINT`.
+const VRS_BPP: u64 = 1;
+/// Conservative attachment-rate texel size when the device is unknown.
+const DEFAULT_VRS_TEXEL: u32 = 8;
+
+fn plane_bytes(w: u32, h: u32, bpp: u64, samples: u32, layers: u32) -> u64 {
+    w as u64 * h as u64 * bpp * samples.max(1) as u64 * layers.max(1) as u64
+}
+
+fn bloom_chain_bytes(render_w: u32, render_h: u32) -> u64 {
+    let mut e = (render_w.div_ceil(2).max(1), render_h.div_ceil(2).max(1));
+    let mut bytes = 0u64;
+    let mut levels = 0u32;
+    loop {
+        bytes += plane_bytes(e.0, e.1, HDR_BPP, 1, 1);
+        levels += 1;
+        if levels >= BLOOM_MAX_MIPS || (e.0 == 1 && e.1 == 1) {
+            break;
+        }
+        e = (e.0.div_ceil(2).max(1), e.1.div_ceil(2).max(1));
+    }
+    bytes
+}
+
+/// Device-local bytes the engine would allocate for this settings combo:
+/// HDR colour + depth (and MSAA colour / resolved depth), TAA history pair,
+/// bloom mip chain, quarter-res spill, sky-cloud LUT, VRS rate+history,
+/// minimap, and two shadow cascades. Duplicated per `frames_in_flight` where
+/// the live renderer owns a slot ring.
+pub fn estimate_render_targets(cfg: &crate::engine::RenderTargetConfig) -> u64 {
+    let scale = cfg.render_scale.clamp(
+        *crate::vk::RENDER_SCALE_RANGE.start(),
+        *crate::vk::RENDER_SCALE_RANGE.end(),
+    );
+    let win_w = cfg.width.max(1);
+    let win_h = cfg.height.max(1);
+    let rw = ((win_w as f32 * scale) as u32).max(1);
+    let rh = ((win_h as f32 * scale) as u32).max(1);
+    let fif = cfg.frames_in_flight.max(1);
+    let msaa = cfg.msaa.max(1);
+
+    let mut bytes = 0u64;
+    // Per-slot HDR offscreen (single-sample).
+    bytes += fif as u64 * plane_bytes(rw, rh, HDR_BPP, 1, 1);
+    // Per-slot scene depth at the raster sample count.
+    bytes += fif as u64 * plane_bytes(rw, rh, DEPTH_BPP, msaa, 1);
+    if msaa > 1 {
+        // One transient MSAA colour target (not duplicated per slot).
+        bytes += plane_bytes(rw, rh, HDR_BPP, msaa, 1);
+        // Per-slot single-sample depth resolve.
+        bytes += fif as u64 * plane_bytes(rw, rh, DEPTH_BPP, 1, 1);
+    }
+    if cfg.taa {
+        // History pair is swapchain-sized, not render-scaled.
+        bytes += 2 * plane_bytes(win_w, win_h, TAA_BPP, 1, 1);
+    }
+    if cfg.bloom {
+        bytes += fif as u64 * bloom_chain_bytes(rw, rh);
+    }
+    // Spill is always allocated with the targets.
+    let spill = spill_extent(ash::vk::Extent2D {
+        width: rw,
+        height: rh,
+    });
+    bytes += fif as u64 * plane_bytes(spill.width, spill.height, HDR_BPP, 1, 1);
+    let lut = crate::genconst::SKY_CLOUD_LUT_SIZE;
+    bytes += fif as u64 * plane_bytes(lut, lut, HDR_BPP, 1, 1);
+    if cfg.vrs {
+        let tw = rw.div_ceil(DEFAULT_VRS_TEXEL).max(1);
+        let th = rh.div_ceil(DEFAULT_VRS_TEXEL).max(1);
+        // Rate image + history, per slot.
+        bytes += fif as u64 * 2 * plane_bytes(tw, th, VRS_BPP, 1, 1);
+    }
+    bytes += fif as u64
+        * plane_bytes(
+            crate::vk::MINIMAP_SIZE,
+            crate::vk::MINIMAP_SIZE,
+            MINIMAP_BPP,
+            1,
+            1,
+        );
+    bytes += plane_bytes(
+        SHADOW_RESOLUTION,
+        SHADOW_RESOLUTION,
+        DEPTH_BPP,
+        1,
+        SHADOW_CASCADES,
+    );
+    bytes
+}
+
 /// Pick a depth format the engine can render into **and** sample.
 ///
 /// Vulkan requires `DEPTH_STENCIL_ATTACHMENT` for `D16_UNORM` and for (at
@@ -863,5 +962,43 @@ mod tests {
         assert!(!color_format_has_alpha(HDR_11BIT_FORMAT));
         assert!(color_format_has_alpha(HDR_COLOR_FORMAT));
         assert!(color_format_has_alpha(vk::Format::B8G8R8A8_UNORM));
+    }
+
+    #[test]
+    fn estimate_matches_hand_computation() {
+        let cfg = crate::engine::RenderTargetConfig {
+            width: 1280,
+            height: 720,
+            render_scale: 1.0,
+            msaa: 1,
+            taa: true,
+            bloom: true,
+            vrs: false,
+            frames_in_flight: 3,
+        };
+        let px = |w: u32, h: u32, bpp: u64, n: u32| w as u64 * h as u64 * bpp * n as u64;
+        let mut want = 0u64;
+        want += px(1280, 720, HDR_BPP, 3); // HDR offscreen
+        want += px(1280, 720, DEPTH_BPP, 3); // depth
+        want += px(1280, 720, TAA_BPP, 2); // history pair
+        // Bloom: half-res mip chain, capped at BLOOM_MAX_MIPS.
+        let mut e = (640u32, 360u32);
+        let mut bloom = 0u64;
+        let mut levels = 0u32;
+        loop {
+            bloom += px(e.0, e.1, HDR_BPP, 1);
+            levels += 1;
+            if levels >= BLOOM_MAX_MIPS || (e.0 == 1 && e.1 == 1) {
+                break;
+            }
+            e = (e.0.div_ceil(2).max(1), e.1.div_ceil(2).max(1));
+        }
+        want += bloom * 3;
+        want += px(320, 180, HDR_BPP, 3); // spill
+        let lut = crate::genconst::SKY_CLOUD_LUT_SIZE;
+        want += px(lut, lut, HDR_BPP, 3);
+        want += px(256, 256, MINIMAP_BPP, 3);
+        want += px(2048, 2048, DEPTH_BPP, 2); // shadow cascades
+        assert_eq!(estimate_render_targets(&cfg), want);
     }
 }
