@@ -10,9 +10,11 @@
 // RGBA16F history. Raster jitter means render texel t (centre t+0.5) holds
 // the unjittered scene at s_t = t + 0.5 - jitter_px; each output pixel is
 // reconstructed from a 3×3 of those texels (Gaussian σ = 0.47·max(1, ratio)
-// render pixels) and blended with presented-space history, so render_scale < 1
-// converges sharp instead of bilinear-upsampling a blur. The off variant has
-// no second attachment and no TAA ALU.
+// render pixels) and blended with presented-space history sampled with a
+// 5-tap Catmull-Rom (Jimenez 2016 Filmic SMAA) plus velocity-weighted
+// current-frame feedback (Karis 2014), so render_scale < 1 converges sharp
+// under motion instead of accumulating bilinear-resample blur. The off
+// variant has no second attachment and no TAA ALU.
 
 #include "common.slang"
 
@@ -109,10 +111,49 @@ float2 ndc_to_uv(float2 ndc) { return float2(ndc.x * 0.5 + 0.5, (1.0 - ndc.y) * 
 float3 rgb_to_ycocg(float3 c) { return float3(0.25*c.r + 0.5*c.g + 0.25*c.b, 0.5*(c.r - c.b), -0.25*c.r + 0.5*c.g - 0.25*c.b); }
 float3 ycocg_to_rgb(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
 
+// 5-tap Catmull-Rom (Jimenez 2016 Filmic SMAA): 16-tap cubic → 9 bilinear
+// taps at texel-centre offsets; drop the four corners and renormalise.
+// History is swapchain-sized (`pc.output_extent`); linear sampler. Negative
+// lobes can overshoot — the caller neighbourhood-clamps in YCoCg.
+float3 historyCatmullRom(float2 uv)
+{
+    float2 texel = 1.0 / pc.output_extent;
+    float2 samplePos = uv * pc.output_extent;
+    float2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    float2 f = samplePos - texPos1;
+
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+
+    float2 w12 = w1 + w2;
+    float2 offset12 = w2 / w12;
+
+    float2 texPos0 = (texPos1 - 1.0) * texel;
+    float2 texPos3 = (texPos1 + 2.0) * texel;
+    float2 texPos12 = (texPos1 + offset12) * texel;
+
+    float wT = w12.x * w0.y;
+    float wL = w0.x * w12.y;
+    float wC = w12.x * w12.y;
+    float wR = w3.x * w12.y;
+    float wB = w12.x * w3.y;
+
+    float3 result = 0.0;
+    result += historyTex.SampleLevel(float2(texPos12.x, texPos0.y), 0).rgb * wT;
+    result += historyTex.SampleLevel(float2(texPos0.x, texPos12.y), 0).rgb * wL;
+    result += historyTex.SampleLevel(float2(texPos12.x, texPos12.y), 0).rgb * wC;
+    result += historyTex.SampleLevel(float2(texPos3.x, texPos12.y), 0).rgb * wR;
+    result += historyTex.SampleLevel(float2(texPos12.x, texPos3.y), 0).rgb * wB;
+    return result / (wT + wL + wC + wR + wB);
+}
+
 // 3×3 Gaussian reconstruction + unweighted YCoCg variance clamp + depth-aware
 // reprojection. `source_uv` is in render/HDR space (after warpSampleUv);
-// history is in presented space.
-float3 taaResolve(float2 source_uv)
+// `presented_uv` is swapchain uv (input.uv). History is Catmull-Rom sampled
+// in presented space; current-frame weight rises with pixel-space velocity.
+float3 taaResolve(float2 source_uv, float2 presented_uv)
 {
     float2 p = source_uv * pc.render_extent;
     float2 scale = pc.render_extent / pc.output_extent;
@@ -168,9 +209,13 @@ float3 taaResolve(float2 source_uv)
             float2 prevPresentedUv = unwarpSampleUv(prevSourceUv, pc.s, pc.atan_s);
             if (all(prevPresentedUv >= 0.0) && all(prevPresentedUv <= 1.0))
             {
-                float3 hist = rgb_to_ycocg(historyTex.Sample(prevPresentedUv).rgb);
+                float3 hist = rgb_to_ycocg(historyCatmullRom(prevPresentedUv));
                 hist = clamp(hist, nmin, nmax);
-                resolved = lerp(hist, cur, (1.0 - pc.blend) * w_max);
+                float2 hp = prevPresentedUv * pc.output_extent;
+                float v = length(hp - presented_uv * pc.output_extent);
+                float cur_w = (1.0 - pc.blend) * w_max;
+                cur_w = lerp(cur_w, min(1.0, cur_w * TAA_MOTION_BOOST), saturate(v / TAA_MOTION_PX));
+                resolved = lerp(hist, cur, cur_w);
             }
         }
     }
@@ -187,7 +232,7 @@ struct TaaFragmentOutput
 TaaFragmentOutput fragmentMain(FragmentInput input)
 {
     float2 source_uv = warpSampleUv(input.uv, pc.s, pc.atan_s);
-    float3 resolved = taaResolve(source_uv);
+    float3 resolved = taaResolve(source_uv, input.uv);
     // Spill is pre-exposure; sample at UNwarped output uv so this tap matches
     // the spill texel's outUv.
     float3 hdr = (resolved + spillTex.Sample(input.uv).rgb) * pc.exposure;

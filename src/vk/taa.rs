@@ -7,10 +7,11 @@
 //! `s_t = t + 0.5 - jitter_px`. The fused present-time tonemap (`-DTAA_FUSED`)
 //! reconstructs each output pixel from a 3×3 of those texels with a Gaussian
 //! whose σ is 0.47 render pixels (widened when supersampling), neighbourhood-
-//! clamps in YCoCg, reprojects the previous *presented* frame, and blends with
-//! a history weight scaled by the peak reconstruction weight so `render_scale < 1`
-//! converges to a sharp swapchain-res image over the 16-frame sequence instead
-//! of a bilinear upsample.
+//! clamps in YCoCg, reprojects the previous *presented* frame with 5-tap
+//! Catmull-Rom history (Jimenez 2016), and blends with a current-frame weight
+//! scaled by the peak reconstruction weight and by pixel-space velocity (Karis
+//! 2014) so `render_scale < 1` converges sharp — a static camera keeps the long
+//! history; motion refreshes faster instead of accumulating bilinear blur.
 //!
 //! No full-resolution TAA compute pass runs per rendered frame. TAA work happens
 //! only on presented frames (mailbox drops skip it). History at swapchain extent
@@ -422,5 +423,53 @@ mod tests {
         let w = (-k * d2).exp();
         assert!((w - (-2.29f32 * 0.125).exp()).abs() < 1e-2);
         assert!(w > 0.0 && w <= 1.0);
+    }
+
+    /// 1D Catmull-Rom (Keys cubic, a = −0.5), matching `historyCatmullRom`.
+    fn catmull_rom_w(f: f32) -> [f32; 4] {
+        [
+            f * (-0.5 + f * (1.0 - 0.5 * f)),
+            1.0 + f * f * (-2.5 + 1.5 * f),
+            f * (0.5 + f * (2.0 - 1.5 * f)),
+            f * f * (-0.5 + 0.5 * f),
+        ]
+    }
+
+    /// 5-tap (drop corners, renormalise) at a texel centre is the identity;
+    /// remaining weights after dropping corners still sum near 1.
+    #[test]
+    fn catmull_rom_5tap_texel_centre_is_identity() {
+        let [w0, w1, w2, w3] = catmull_rom_w(0.0);
+        assert!((w1 - 1.0).abs() < 1e-6);
+        assert!(w0.abs() < 1e-6 && w2.abs() < 1e-6 && w3.abs() < 1e-6);
+
+        let [wx0, wx1, wx2, wx3] = catmull_rom_w(0.5);
+        let [wy0, wy1, wy2, wy3] = catmull_rom_w(0.5);
+        let w12x = wx1 + wx2;
+        let w12y = wy1 + wy2;
+        let taps = [w12x * wy0, wx0 * w12y, w12x * w12y, wx3 * w12y, w12x * wy3];
+        let sum: f32 = taps.iter().sum();
+        assert!(sum > 0.9 && sum < 1.0);
+        let renorm: f32 = taps.iter().map(|w| w / sum).sum();
+        assert!((renorm - 1.0).abs() < 1e-5);
+    }
+
+    /// Karis 2014 velocity-weighted feedback: v = 0 keeps the long history;
+    /// v ≥ TAA_MOTION_PX refreshes ~TAA_MOTION_BOOST× faster (clamped to 1).
+    #[test]
+    fn velocity_weighted_feedback_static_vs_moving() {
+        let cur_w = 1.0 - crate::genconst::HISTORY_BLEND;
+        let boost = crate::genconst::TAA_MOTION_BOOST;
+        let px = crate::genconst::TAA_MOTION_PX;
+        let apply = |v: f32| {
+            let t = (v / px).clamp(0.0, 1.0);
+            let boosted = (cur_w * boost).min(1.0);
+            cur_w * (1.0 - t) + boosted * t
+        };
+        assert!((apply(0.0) - cur_w).abs() < 1e-6);
+        assert!((apply(px) - (cur_w * boost).min(1.0)).abs() < 1e-6);
+        assert!(apply(px) > apply(0.0));
+        assert!(apply(px) <= 1.0);
+        assert!((boost - 4.0).abs() < 1e-6 && (px - 8.0).abs() < 1e-6);
     }
 }

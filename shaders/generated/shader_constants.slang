@@ -76,6 +76,16 @@ static const float HISTORY_BLEND = 0.92f;
 // steadier (less crawl) but more ghosting. Read by tonemap.frag (TAA_FUSED).
 static const float VARIANCE_GAMMA = 1.25f;
 
+// TAA velocity-weighted current-frame boost. A static camera keeps the long
+// history and converges sharp; an 8+ px/present motion refreshes ~4x faster.
+// Karis 2014 velocity-weighted feedback. Read by tonemap.frag (TAA_FUSED).
+static const float TAA_MOTION_BOOST = 4.0f;
+
+// TAA motion-feedback saturation distance in output pixels. Pixel-space velocity
+// v = length(history sample pos - this pixel centre); saturate(v / this) lerps
+// cur_w toward min(1, cur_w * TAA_MOTION_BOOST). Read by tonemap.frag (TAA_FUSED).
+static const float TAA_MOTION_PX = 8.0f;
+
 // Blocklight candle curve: candle = x*sqrt(x) + (CANDLE_HIGH_MUL*x)^CANDLE_HIGH_POW,
 // clamped to CANDLE_CLAMP. x = block light level in [0,1].
 static const float CANDLE_HIGH_MUL = 1.17f;
