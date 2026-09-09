@@ -13,6 +13,8 @@
 //!   the thread — never moved to it — because its `HostBuffer`s hold a raw
 //!   `*mut u8` that is `!Send`.
 use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -220,6 +222,10 @@ pub(crate) struct RenderClient {
     exposure: super::exposure::ExposureShared,
     /// `None` once joined (shutdown is idempotent).
     join: Option<JoinHandle<Option<DeviceLeftovers>>>,
+    /// Render-thread completed `draw_frame` calls (monotonic).
+    frames_rendered: Arc<AtomicU64>,
+    /// Frames dropped by render-loop coalescing (monotonic).
+    frames_coalesced: Arc<AtomicU64>,
 }
 
 impl RenderClient {
@@ -275,13 +281,23 @@ impl RenderClient {
         let (ret_tx, ret_rx) = channel::<RenderReturn>();
         let (init_tx, init_rx) = channel::<Result<InitReply, AllocError>>();
         let ret_for_renderer = ret_tx.clone();
+        let frames_rendered = Arc::new(AtomicU64::new(0));
+        let frames_coalesced = Arc::new(AtomicU64::new(0));
+        let rendered_for_loop = Arc::clone(&frames_rendered);
+        let coalesced_for_loop = Arc::clone(&frames_coalesced);
         let join = std::thread::Builder::new()
             .name("render".into())
             .spawn(move || {
                 match Renderer::build(instance, surface_loader, surface, cfg, ret_for_renderer) {
                     Ok((renderer, reply)) => {
                         let _ = init_tx.send(Ok(reply));
-                        Some(render_loop(renderer, cmd_rx, ret_tx))
+                        Some(render_loop(
+                            renderer,
+                            cmd_rx,
+                            ret_tx,
+                            rendered_for_loop,
+                            coalesced_for_loop,
+                        ))
                     }
                     Err(err) => {
                         let _ = init_tx.send(Err(err));
@@ -332,6 +348,8 @@ impl RenderClient {
             cull_faces: true,
             exposure: reply.exposure,
             join: Some(join),
+            frames_rendered,
+            frames_coalesced,
         };
         Ok((window, client))
     }
@@ -539,6 +557,14 @@ impl RenderClient {
         let _ = self.tx.send(RenderCmd::Resize(size));
     }
 
+    pub(crate) fn frames_rendered(&self) -> u64 {
+        self.frames_rendered.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn frames_coalesced(&self) -> u64 {
+        self.frames_coalesced.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn screen_width(&self) -> i32 {
         self.size.width as i32
     }
@@ -690,6 +716,8 @@ fn render_loop(
     mut renderer: Renderer,
     rx: Receiver<RenderCmd>,
     ret: Sender<RenderReturn>,
+    frames_rendered: Arc<AtomicU64>,
+    frames_coalesced: Arc<AtomicU64>,
 ) -> DeviceLeftovers {
     while let Ok(first) = rx.recv() {
         let mut latest_frame: Option<Box<DrawLists>> = None;
@@ -699,6 +727,8 @@ fn render_loop(
                 RenderCmd::Frame(f) => {
                     // Coalesce: keep only the newest, recycle the dropped one.
                     if let Some(old) = latest_frame.replace(f) {
+                        frames_coalesced.fetch_add(1, Ordering::Relaxed);
+                        crate::profile::count(crate::profile::Counter::Coalesced);
                         let _ = ret.send(RenderReturn::Frame(old));
                     }
                 }
@@ -737,6 +767,7 @@ fn render_loop(
         }
         if let Some(frame) = latest_frame {
             renderer.draw_frame(&frame);
+            frames_rendered.fetch_add(1, Ordering::Relaxed);
             let _ = ret.send(RenderReturn::Frame(frame));
         }
     }

@@ -426,10 +426,12 @@ pub enum Counter {
     Rendered,
     /// Frames that reached a present copy + `vkQueuePresentKHR`.
     Presented,
+    /// Queued game frames dropped by the render loop (kept only the newest).
+    Coalesced,
 }
 
 impl Counter {
-    const COUNT: usize = 2;
+    const COUNT: usize = 3;
 }
 
 static COUNTERS: [AtomicU64; Counter::COUNT] = [const { AtomicU64::new(0) }; Counter::COUNT];
@@ -631,6 +633,7 @@ fn report(frames: u64) {
     let f = frames as f64;
     let rendered = COUNTERS[Counter::Rendered as usize].swap(0, Ordering::Relaxed);
     let presented = COUNTERS[Counter::Presented as usize].swap(0, Ordering::Relaxed);
+    let coalesced = COUNTERS[Counter::Coalesced as usize].swap(0, Ordering::Relaxed);
     // GPU meters are per RENDERED frame (the render thread may coalesce);
     // without a rendered count (no timestamps, minimized) fall back to frames.
     let gpu_f = if rendered > 0 { rendered as f64 } else { f };
@@ -701,7 +704,7 @@ fn report(frames: u64) {
         header.push_str(&format!(" idle {:.0}%", idle * 100.0));
     }
     header.push_str(&format!(
-        " work {:.2} | rendered {rendered} presented {presented}",
+        " work {:.2} | rendered {rendered} coalesced {coalesced} presented {presented}",
         tier_total(Tier::Workers),
     ));
     // `eprintln!`, not `log::info!`: `VOXEL_PROFILE` is an explicit opt-in, so

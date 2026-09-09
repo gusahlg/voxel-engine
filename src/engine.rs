@@ -205,6 +205,21 @@ impl Engine {
         self.fps_cached
     }
 
+    /// Frames the render thread completed (`draw_frame` returned). Monotonic.
+    ///
+    /// A benchmark must count rendered frames, not game frames: the render loop
+    /// coalesces queued snapshots to the newest, so the game FPS counter can
+    /// run ahead of what actually reached the GPU.
+    pub fn frames_rendered(&self) -> u64 {
+        self.client.frames_rendered()
+    }
+
+    /// Frames dropped by render-loop coalescing (kept only the newest queued
+    /// `RenderCmd::Frame`). Monotonic.
+    pub fn frames_coalesced(&self) -> u64 {
+        self.client.frames_coalesced()
+    }
+
     pub fn set_target_fps(&mut self, fps: u32) {
         self.target_fps = fps;
     }
