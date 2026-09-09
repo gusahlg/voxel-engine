@@ -19,8 +19,6 @@ pub(super) enum GpuPass {
     Cull,
     /// The cascaded shadow-map pass (stamped only on regenerating frames).
     ShadowMap,
-    /// The VRS classify dispatch (stamped only when it runs).
-    Vrs,
     /// Scene-pass begin: attachment transitions + `cmd_begin_rendering` clears.
     Clear,
     Opaque,
@@ -31,8 +29,11 @@ pub(super) enum GpuPass {
     Transparent,
     Overlay,
     /// End of the scene pass: `cmd_end_rendering` (where the MSAA color
-    /// resolve executes) and the offscreen finalize transitions.
+    /// resolve executes) and the offscreen/depth-rest finalize transitions.
     Resolve,
+    /// The VRS classify dispatch (end of frame, after depth rests; stamped
+    /// only when it runs).
+    Vrs,
     /// The TAA resolve compute (stamped only when it runs).
     Taa,
     /// Exposure metering reduce + finalize (stamped only when it runs).
@@ -47,7 +48,6 @@ impl GpuPass {
         GpuPass::Copies,
         GpuPass::Cull,
         GpuPass::ShadowMap,
-        GpuPass::Vrs,
         GpuPass::Clear,
         GpuPass::Opaque,
         GpuPass::Sky,
@@ -57,6 +57,7 @@ impl GpuPass {
         GpuPass::Transparent,
         GpuPass::Overlay,
         GpuPass::Resolve,
+        GpuPass::Vrs,
         GpuPass::Taa,
         GpuPass::Exposure,
         GpuPass::Bloom,
@@ -69,7 +70,6 @@ impl GpuPass {
             GpuPass::Copies => Meter::GpuCopies,
             GpuPass::Cull => Meter::GpuCull,
             GpuPass::ShadowMap => Meter::GpuShadowMap,
-            GpuPass::Vrs => Meter::GpuVrs,
             GpuPass::Clear => Meter::GpuClear,
             GpuPass::Opaque => Meter::GpuOpaque,
             GpuPass::Sky => Meter::GpuSky,
@@ -79,6 +79,7 @@ impl GpuPass {
             GpuPass::Transparent => Meter::GpuTransparent,
             GpuPass::Overlay => Meter::GpuOverlay,
             GpuPass::Resolve => Meter::GpuResolve,
+            GpuPass::Vrs => Meter::GpuVrs,
             GpuPass::Taa => Meter::GpuTaa,
             GpuPass::Exposure => Meter::GpuExposure,
             GpuPass::Bloom => Meter::GpuBloom,
@@ -98,7 +99,11 @@ const QUERY_COUNT: u32 = COPY_STAMP_BASE + 2;
 /// after each recorded pass. Only the passes that actually run write a stamp,
 /// and the label written alongside each stamp keeps deltas attributable even
 /// when a frame skips passes (no 3D, VRS off). A slot's results are read one
-/// cycle later, after its fence is waited, so the read never stalls.
+/// cycle later, after its fence is waited, so the read never stalls — and
+/// because that wait is in render order, consecutive `read_into` calls are
+/// consecutive rendered frames (possibly different slots). Their timestamps
+/// share the device clock, so `start(N) - end(N-1)` is the idle gap before
+/// this submit.
 ///
 /// `count`/`label` are [`Cell`]s so a mark needs only `&self`: the render pass
 /// holds an immutable `&Renderer` while recording, and all timer state is
@@ -116,6 +121,24 @@ pub(super) struct GpuTimer {
     label: [[std::cell::Cell<GpuPass>; GPU_STAMPS]; FRAMES_IN_FLIGHT as usize],
     /// Whether the present-copy pair holds a completed range to read back.
     copy_primed: bool,
+    /// Last stamp of the previously *read* render submit (raw ticks), used to
+    /// compute the idle gap before the next readable frame. Cleared when a
+    /// readback is unavailable so a later start is not compared across a hole.
+    prev_end: Option<u64>,
+}
+
+/// Device-time gap (ms) from the previous render submit's last stamp to this
+/// submit's first stamp. `period_ns` is `VkPhysicalDeviceLimits::timestampPeriod`.
+///
+/// A start that precedes the previous end is GPU overlap (the next command
+/// buffer began before the last one drained) — zero idle, not a 64-bit wrap.
+/// Session-length 64-bit timestamp clocks do not wrap.
+pub(super) fn idle_gap_ms(prev_end: u64, this_start: u64, period_ns: f32) -> f64 {
+    if this_start <= prev_end {
+        0.0
+    } else {
+        this_start.wrapping_sub(prev_end) as f64 * period_ns as f64 / 1.0e6
+    }
 }
 
 impl GpuTimer {
@@ -141,6 +164,7 @@ impl GpuTimer {
                 std::array::from_fn(|_| std::cell::Cell::new(GpuPass::Opaque))
             }),
             copy_primed: false,
+            prev_end: None,
         }
     }
 
@@ -150,37 +174,52 @@ impl GpuTimer {
 
     /// Reads `slot`'s prior render-pass per-pass durations (ms), adding each to
     /// `sink`. The caller must have waited `slot`'s fence, so the result is
-    /// ready without a GPU stall. Returns the summed render-pass time (ms).
+    /// ready without a GPU stall. Returns the summed render-pass time and the
+    /// idle gap before this submit (`None` on the first readable frame).
+    ///
+    /// Reuses the timestamps already fetched for the per-pass spans — no extra
+    /// query readback. An unavailable result (too few stamps, or the pool
+    /// read failing) drops the stored previous end so the next successful
+    /// frame does not treat skipped GPU work as idle.
     pub(super) unsafe fn read_into(
-        &self,
+        &mut self,
         device: &ash::Device,
         slot: usize,
         sink: &mut [f64],
-    ) -> Option<f64> {
+    ) -> Option<(f64, Option<f64>)> {
         if !self.enabled() || !self.primed[slot] {
             return None;
         }
         let n = self.count[slot].get() as usize;
         if n < 2 {
+            self.prev_end = None;
             return None;
         }
         let mut ts = [0u64; GPU_STAMPS];
-        unsafe {
+        let read = unsafe {
             device.get_query_pool_results(
                 self.pool,
                 slot as u32 * GPU_STAMPS as u32,
                 &mut ts[..n],
                 vk::QueryResultFlags::TYPE_64,
             )
+        };
+        if read.is_err() {
+            self.prev_end = None;
+            return None;
         }
-        .ok()?;
         let mut total = 0.0;
         for i in 1..n {
             let ms = ts[i].wrapping_sub(ts[i - 1]) as f64 * self.period_ns as f64 / 1.0e6;
             sink[self.label[slot][i].get() as usize] += ms;
             total += ms;
         }
-        Some(total)
+        // `ts[0]` is the TOP_OF_PIPE `begin`; `ts[n-1]` is the last BOTTOM_OF_PIPE `mark`.
+        let gap = self
+            .prev_end
+            .map(|end| idle_gap_ms(end, ts[0], self.period_ns));
+        self.prev_end = Some(ts[n - 1]);
+        Some((total, gap))
     }
 
     /// Resets `slot`'s queries and writes the start timestamp. Must be recorded
@@ -315,5 +354,17 @@ mod tests {
             QUERY_COUNT as usize,
             GPU_STAMPS * FRAMES_IN_FLIGHT as usize + 2
         );
+    }
+
+    #[test]
+    fn idle_gap_ms_converts_ticks_via_period() {
+        // 1 ns/tick: 1_000_000 ticks = 1 ms.
+        assert!((idle_gap_ms(10, 10 + 1_000_000, 1.0) - 1.0).abs() < 1e-12);
+        // 1000 ns/tick (1 µs): 1000 ticks = 1 ms.
+        assert!((idle_gap_ms(0, 1000, 1000.0) - 1.0).abs() < 1e-12);
+        // Back-to-back stamps: zero idle.
+        assert_eq!(idle_gap_ms(42, 42, 1.0), 0.0);
+        // This submit started before the previous end (GPU overlap): zero idle.
+        assert_eq!(idle_gap_ms(100, 50, 1.0), 0.0);
     }
 }

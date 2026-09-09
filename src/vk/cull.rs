@@ -13,7 +13,7 @@ use std::num::NonZeroU32;
 
 use ash::vk;
 
-use super::alloc::find_memory_type;
+use super::alloc::{find_memory_type, try_find_memory_type};
 use super::buffers::{FRAMES_IN_FLIGHT, HostBuffer, RecordBuffers};
 use super::pass;
 use crate::camera::Frustum;
@@ -43,6 +43,10 @@ const LANES: usize = CAMERA_GROUPS;
 /// Size of VkDrawIndexedIndirectCommand.
 pub(crate) const CMD_STRIDE: u64 = 20;
 const WORKGROUP: u32 = crate::genconst::CULL_WORKGROUP;
+/// Profiling-only geometry histogram: per camera group `[draws, index_count]`.
+const STATS_COUNT: usize = CAMERA_GROUPS * 2;
+const STATS_BYTES: u64 = (STATS_COUNT * size_of::<u32>()) as u64;
+const FLAG_STATS: u32 = 1;
 
 static CULL_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cull.comp.spv"));
 static CULL_COMP_WAVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cull_wave.comp.spv"));
@@ -450,13 +454,29 @@ pub(crate) struct CullState {
     visible: [HostBuffer; SLOTS],
     commands: [DeviceBuffer; SLOTS],
     counts: [DeviceBuffer; SLOTS],
+    stats: [StatsReadback; SLOTS],
     /// Recycled partition table when [`Self::prepare`] returns `None`, so a
     /// frame with nothing to cull does not drop last frame's allocation.
     spare_parts: Vec<PartitionGpu>,
 }
 
+/// Host-visible copy of the per-slot geometry histogram, fence-safe to read
+/// after the slot's timeline wait. Same mechanism as the VRS mix buffer.
+struct StatsReadback {
+    gpu: vk::Buffer,
+    gpu_memory: vk::DeviceMemory,
+    cpu: vk::Buffer,
+    cpu_memory: vk::DeviceMemory,
+    mapped: *mut u32,
+}
+
 impl CullState {
-    pub fn new(device: &ash::Device, cache: vk::PipelineCache, wave_atomics: bool) -> Self {
+    pub fn new(
+        device: &ash::Device,
+        memory_props: &vk::PhysicalDeviceMemoryProperties,
+        cache: vk::PipelineCache,
+        wave_atomics: bool,
+    ) -> Self {
         // Bindings match cull.comp.slang.
         let storage = |binding: u32| {
             vk::DescriptorSetLayoutBinding::default()
@@ -477,6 +497,7 @@ impl CullState {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             storage(6),
+            storage(7),
         ];
         let set_layout = unsafe {
             device
@@ -489,10 +510,16 @@ impl CullState {
                 .expect("create cull set layout")
         };
         let set_layouts = [set_layout];
+        let push = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(4)];
         let layout = unsafe {
             device
                 .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&set_layouts)
+                        .push_constant_ranges(&push),
                     None,
                 )
                 .expect("create cull pipeline layout")
@@ -528,8 +555,22 @@ impl CullState {
                         | vk::BufferUsageFlags::TRANSFER_DST,
                 )
             }),
+            stats: std::array::from_fn(|_| StatsReadback::new(device, memory_props)),
             spare_parts: Vec::new(),
         }
+    }
+
+    /// Last completed histogram for `slot`: `[draws0, idx0, draws1, idx1, draws2, idx2]`.
+    pub fn stats(&self, slot: usize) -> [u32; STATS_COUNT] {
+        unsafe {
+            let p = self.stats[slot].mapped;
+            std::array::from_fn(|i| *p.add(i))
+        }
+    }
+
+    /// CPU-zero the mapped histogram so a skipped cull publishes zeros.
+    pub fn clear_stats_cpu(&self, slot: usize) {
+        unsafe { std::ptr::write_bytes(self.stats[slot].mapped, 0, STATS_COUNT) };
     }
 
     /// Prepare buffers and params for cull dispatch. Safe after fence is waited.
@@ -610,6 +651,7 @@ impl CullState {
     }
 
     /// Record cull dispatch (zeros counts, executes cull, fences writes).
+    /// Geometry stats fill/atomics/copy run only while profiling.
     pub unsafe fn record(
         &self,
         device: &ash::Device,
@@ -619,8 +661,14 @@ impl CullState {
         records: RecordBuffers,
         frame: &CullFrame,
     ) {
+        let stats = crate::profile::is_enabled();
         unsafe {
             device.cmd_fill_buffer(cmd, frame.counts, 0, vk::WHOLE_SIZE, 0);
+            if stats {
+                device.cmd_fill_buffer(cmd, self.stats[slot].gpu, 0, STATS_BYTES, 0);
+            }
+            // CLEAR / TRANSFER_WRITE → COMPUTE / SHADER_STORAGE_{READ,WRITE}
+            // covers the counts fill and, when profiling, the stats fill.
             let to_compute = [vk::MemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
@@ -657,8 +705,9 @@ impl CullState {
                         .bound()
                         .expect("visibility was just written"),
                 ),
+                info(self.stats[slot].gpu),
             ];
-            let writes: [vk::WriteDescriptorSet; 7] = std::array::from_fn(|i| {
+            let writes: [vk::WriteDescriptorSet; 8] = std::array::from_fn(|i| {
                 vk::WriteDescriptorSet::default()
                     .dst_binding(i as u32)
                     .descriptor_type(if i == 5 {
@@ -675,18 +724,56 @@ impl CullState {
                 0,
                 &writes,
             );
+            let flags = if stats { FLAG_STATS } else { 0 };
+            device.cmd_push_constants(
+                cmd,
+                self.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&flags),
+            );
             device.cmd_dispatch(cmd, frame.slot_count.div_ceil(WORKGROUP), 1, 1);
 
-            // Fence writes for DRAW_INDIRECT consumers.
+            // COMPUTE / SHADER_STORAGE_WRITE → DRAW_INDIRECT / INDIRECT_COMMAND_READ,
+            // and when profiling also COPY / TRANSFER_READ for the stats copy.
+            let mut dst_stage = vk::PipelineStageFlags2::DRAW_INDIRECT;
+            let mut dst_access = vk::AccessFlags2::INDIRECT_COMMAND_READ;
+            if stats {
+                dst_stage |= vk::PipelineStageFlags2::COPY;
+                dst_access |= vk::AccessFlags2::TRANSFER_READ;
+            }
             let to_draws = [vk::MemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::DRAW_INDIRECT)
-                .dst_access_mask(vk::AccessFlags2::INDIRECT_COMMAND_READ)];
+                .dst_stage_mask(dst_stage)
+                .dst_access_mask(dst_access)];
             device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().memory_barriers(&to_draws),
             );
+            if stats {
+                device.cmd_copy_buffer(
+                    cmd,
+                    self.stats[slot].gpu,
+                    self.stats[slot].cpu,
+                    &[vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: 0,
+                        size: STATS_BYTES,
+                    }],
+                );
+                // COPY / TRANSFER_WRITE → HOST / HOST_READ. Mapped read is after
+                // this slot's timeline wait (one cycle later).
+                let copy_to_host = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                    .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().memory_barriers(&copy_to_host),
+                );
+            }
         }
     }
 
@@ -706,8 +793,137 @@ impl CullState {
             for b in self.commands.iter_mut().chain(&mut self.counts) {
                 b.destroy(device);
             }
+            for s in &self.stats {
+                s.destroy(device);
+            }
         }
     }
+}
+
+impl StatsReadback {
+    fn new(device: &ash::Device, memory_props: &vk::PhysicalDeviceMemoryProperties) -> Self {
+        let gpu = create_buffer(
+            device,
+            memory_props,
+            STATS_BYTES,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+        let (cpu, cpu_memory, mapped) = create_mapped_buffer(
+            device,
+            memory_props,
+            STATS_BYTES,
+            vk::BufferUsageFlags::TRANSFER_DST,
+        );
+        Self {
+            gpu: gpu.0,
+            gpu_memory: gpu.1,
+            cpu,
+            cpu_memory,
+            mapped,
+        }
+    }
+
+    unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.unmap_memory(self.cpu_memory);
+            device.destroy_buffer(self.cpu, None);
+            device.free_memory(self.cpu_memory, None);
+            device.destroy_buffer(self.gpu, None);
+            device.free_memory(self.gpu_memory, None);
+        }
+    }
+}
+
+fn create_buffer(
+    device: &ash::Device,
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+    usage: vk::BufferUsageFlags,
+    props: vk::MemoryPropertyFlags,
+) -> (vk::Buffer, vk::DeviceMemory) {
+    let buffer = unsafe {
+        device
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(usage)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+            .expect("create cull stats buffer")
+    };
+    let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let memory = unsafe {
+        device
+            .allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(reqs.size)
+                    .memory_type_index(find_memory_type(
+                        memory_props,
+                        reqs.memory_type_bits,
+                        props,
+                    )),
+                None,
+            )
+            .expect("allocate cull stats buffer")
+    };
+    unsafe {
+        device
+            .bind_buffer_memory(buffer, memory, 0)
+            .expect("bind cull stats buffer");
+    }
+    (buffer, memory)
+}
+
+fn create_mapped_buffer(
+    device: &ash::Device,
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+    usage: vk::BufferUsageFlags,
+) -> (vk::Buffer, vk::DeviceMemory, *mut u32) {
+    let buffer = unsafe {
+        device
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(usage)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+            .expect("create cull stats readback")
+    };
+    let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let cached = vk::MemoryPropertyFlags::HOST_VISIBLE
+        | vk::MemoryPropertyFlags::HOST_COHERENT
+        | vk::MemoryPropertyFlags::HOST_CACHED;
+    let plain = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let type_index = try_find_memory_type(memory_props, reqs.memory_type_bits, cached)
+        .unwrap_or_else(|| find_memory_type(memory_props, reqs.memory_type_bits, plain));
+    let memory = unsafe {
+        device
+            .allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(reqs.size)
+                    .memory_type_index(type_index),
+                None,
+            )
+            .expect("allocate cull stats readback")
+    };
+    unsafe {
+        device
+            .bind_buffer_memory(buffer, memory, 0)
+            .expect("bind cull stats readback");
+    }
+    let mapped = unsafe {
+        device
+            .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            .expect("map cull stats readback") as *mut u32
+    };
+    unsafe { std::ptr::write_bytes(mapped, 0, STATS_COUNT) };
+    (buffer, memory, mapped)
 }
 
 #[cfg(test)]
@@ -1053,6 +1269,13 @@ mod tests {
             assert_eq!(*g as usize, i);
         }
         assert_eq!(CAMERA_GROUPS, Group::ALL.len());
+    }
+
+    #[test]
+    fn stats_histogram_is_two_u32s_per_camera_group() {
+        assert_eq!(STATS_COUNT, 6);
+        assert_eq!(STATS_BYTES, 24);
+        assert_eq!(FLAG_STATS, 1);
     }
 
     #[test]

@@ -152,7 +152,9 @@ impl Renderer {
 
             // Offscreen images recreated; clear copy tracking.
             self.clear_copy();
-            // Depth images recreated (layout UNDEFINED): VRS must re-prime.
+            // Depth and rate images recreated (layout UNDEFINED): skip VRS until
+            // a classify at the end of the first post-recreate use primes the
+            // rate image. Sampleable depth begins from UNDEFINED regardless.
             for slot in 0..FRAMES_IN_FLIGHT as usize {
                 let s = &mut self.slots[FrameSlot::new(slot)];
                 s.vrs_ready = false;

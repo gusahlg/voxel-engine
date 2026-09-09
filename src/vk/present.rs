@@ -10,7 +10,7 @@ use super::alloc;
 use super::image_upload;
 use super::render_client::Capture;
 use super::timeline::{RenderCompletion, queue_present};
-use super::{Env, Renderer, color_range, depth_range};
+use super::{Env, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, color_range};
 
 /// Witness that HDR image is ready for present.
 #[must_use = "the offscreen HDR must be finalized to SHADER_READ before present"]
@@ -212,28 +212,12 @@ impl Renderer {
                 &vk::DependencyInfo::default().image_memory_barriers(&to_color),
             );
 
-            // Transition the sampleable depth for godray sampling, restore after
-            // draw. Under MSAA this is the single-sample resolve target; the MS
-            // `depth` is never touched here. Always bound: the tonemap layout
-            // declares the depth sampler even when godrays are off (strength 0).
-            let depth_image = self.targets.sampleable_depth(slot).image();
-            let (depth_layout, depth_stage, depth_access) =
-                self.sampleable_depth_attachment_state();
-            {
-                let depth_to_read = [vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(depth_stage)
-                    .src_access_mask(depth_access)
-                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .old_layout(depth_layout)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .image(depth_image)
-                    .subresource_range(depth_range())];
-                device.cmd_pipeline_barrier2(
-                    self.copy_cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&depth_to_read),
-                );
-            }
+            // Sampleable depth already rests in SAMPLEABLE_DEPTH_REST_LAYOUT
+            // from RenderPass::end; the render→present semaphore is the
+            // execution dependency. Under MSAA this is the single-sample
+            // resolve target; the MS `depth` is never touched here. Always
+            // bound: the tonemap layout declares the depth sampler even when
+            // godrays are off (strength 0).
 
             let color_attachment = [vk::RenderingAttachmentInfo::default()
                 .image_view(swap_view)
@@ -300,7 +284,7 @@ impl Renderer {
             let depth_info = [vk::DescriptorImageInfo::default()
                 .sampler(self.pipelines.tonemap_depth_sampler)
                 .image_view(depth_view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                .image_layout(SAMPLEABLE_DEPTH_REST_LAYOUT)];
             let post_writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_binding(1)
@@ -344,25 +328,6 @@ impl Renderer {
             );
             self.record_overlay_present(self.copy_cmd, slot, overlay, extent);
             device.cmd_end_rendering(self.copy_cmd);
-
-            // Restore the sampled depth so the next 3D pass / VRS classifier
-            // finds the layout it expects (DEPTH_ATTACHMENT_OPTIMAL under MSAA,
-            // where this is the resolve target, not the MS depth).
-            {
-                let depth_to_attach = [vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .dst_stage_mask(depth_stage)
-                    .dst_access_mask(depth_access)
-                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .new_layout(depth_layout)
-                    .image(depth_image)
-                    .subresource_range(depth_range())];
-                device.cmd_pipeline_barrier2(
-                    self.copy_cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&depth_to_attach),
-                );
-            }
 
             // When capturing, detour through TRANSFER_SRC to copy the finished
             // image into the host buffer, then continue to PRESENT.

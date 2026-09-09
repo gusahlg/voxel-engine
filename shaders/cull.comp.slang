@@ -75,6 +75,18 @@ ConstantBuffer<CullParams> params;
 [[vk::binding(6, 0)]]
 StructuredBuffer<uint> visible;
 
+// Per camera group (0 full-res opaque, 1 cutout, 2 coarse LOD):
+// [draws0, index_count0, draws1, index_count1, draws2, index_count2].
+// Written only when the stats push flag is set (profiling).
+[[vk::binding(7, 0)]]
+RWStructuredBuffer<uint> stats;
+
+struct Push
+{
+    uint flags; // bit0 = accumulate geometry stats
+};
+[[vk::push_constant]] Push pc;
+
 // P-vertex test: same as camera.rs Frustum::intersects_aabb.
 bool outside_plane(float4 plane, float3 mn, float3 mx)
 {
@@ -178,6 +190,12 @@ void computeMain(uint3 id: SV_DispatchThreadID)
             uint bucket = distance_bucket(dist);
             uint part = (group * params.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
             emit(part, cmd);
+            if ((pc.flags & 1u) != 0)
+            {
+                uint unused;
+                InterlockedAdd(stats[group * 2u], 1u, unused);
+                InterlockedAdd(stats[group * 2u + 1u], cmd.index_count, unused);
+            }
         }
     }
 

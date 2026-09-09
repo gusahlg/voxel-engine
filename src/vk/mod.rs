@@ -95,7 +95,9 @@ struct SlotState {
     copy_value: TimelineValue,
     imm: HostBuffer,
     indirect: HostBuffer,
-    /// This slot has stored depth at the current extent; VRS may classify it.
+    /// This slot's rate image was classified at the end of a previous use
+    /// (layout GENERAL) and may be bound as a shading-rate attachment. False
+    /// after create/recreate so the first scene pass of a slot skips VRS.
     vrs_ready: bool,
     /// History image holds a raw classification from a previous VRS dispatch.
     vrs_history: bool,
@@ -400,7 +402,12 @@ impl Renderer {
             exposure: exposure.shared(),
         };
 
-        let cull = cull::CullState::new(&device.device, pipeline_cache, device.cull_wave_atomics);
+        let cull = cull::CullState::new(
+            &device.device,
+            &memory_props,
+            pipeline_cache,
+            device.cull_wave_atomics,
+        );
         // GPU-driven emission: opaque/cutout/shadow draws are always emitted
         // by the cull dispatch, so the device must support drawIndirectCount.
         // Device selection enforces this; this assert makes mis-selection fail
@@ -929,7 +936,23 @@ fn depth_range() -> vk::ImageSubresourceRange {
     }
 }
 
-/// Synchronization state of the depth image sampled by post-processing.
+/// Resting layout of the single-sample sampleable depth after the scene pass.
+///
+/// Contract: [`scene_pass::RenderPass::end`] transitions that image (the MSAA
+/// resolve target when multisampled, else the depth image) from the scene-pass
+/// write scope ([`sampleable_depth_attachment_state`]) to this layout in the
+/// same `vkCmdPipelineBarrier2` as the offscreen HDR finalize, with dst stages
+/// `COMPUTE_SHADER | FRAGMENT_SHADER` and access `SHADER_SAMPLED_READ`. From
+/// then on it RESTS here: TAA, the tonemap present copy (godray sampler), and
+/// the VRS classifier all sample it with no further transition. The next scene
+/// pass of this slot begins the image from `UNDEFINED` (contents are cleared
+/// every frame, so the discard is free). The multisampled `depth` attachment
+/// is unchanged: it still begins from UNDEFINED and is never sampled.
+pub(super) const SAMPLEABLE_DEPTH_REST_LAYOUT: vk::ImageLayout =
+    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+
+/// Synchronization state of the depth image sampled by post-processing *during
+/// the scene pass* (the source scope of the rest-layout barrier).
 /// Multisampled rendering writes that image through a resolve operation, whose
 /// synchronization scope is COLOR_ATTACHMENT_OUTPUT/COLOR_ATTACHMENT_WRITE.
 fn sampleable_depth_attachment_state(
@@ -1006,6 +1029,14 @@ mod tests {
         assert!(stage.contains(vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS));
         assert!(stage.contains(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS));
         assert!(access.contains(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE));
+    }
+
+    #[test]
+    fn sampleable_depth_rests_in_shader_read_only() {
+        assert_eq!(
+            SAMPLEABLE_DEPTH_REST_LAYOUT,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        );
     }
 
     #[test]

@@ -16,7 +16,10 @@ use super::render_client::RenderReturn;
 use super::scene_pass::RenderPass;
 use super::shadow;
 use super::timeline::{RenderSubmit, acquire_next_image};
-use super::{Env, HdrSource, Renderer, color_range, sampleable_depth_attachment_state};
+use super::{
+    Env, HdrSource, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, color_range, depth_range,
+    sampleable_depth_attachment_state,
+};
 
 /// Token returned by `acquire_slot` proving the slot is safe to render into
 /// (its copy hazard is resolved).
@@ -278,16 +281,18 @@ impl Renderer {
         self.copy_slot = None;
     }
 
-    /// Waits until the slot's last render has completed (GPU is done with its
-    /// command buffer and immediate buffer), then reclaims retired GPU memory
-    /// whose last possible use the timeline has reached.
-    /// The layout the scene-pass depth image lives in for the WHOLE frame.
-    /// With the water-absorption path active it is `RENDERING_LOCAL_READ` —
-    /// the one layout valid simultaneously as depth attachment and as the
-    /// blend pass's input attachment (mid-pass transitions are illegal, so a
-    /// single frame-wide layout is the only coherent design). Every depth
+    /// The layout the scene-pass *attachment* (MS depth, or the single-sample
+    /// depth when not multisampled) lives in *during* the pass. With the
+    /// water-absorption path active it is `RENDERING_LOCAL_READ` — the one
+    /// layout valid simultaneously as depth attachment and as the blend pass's
+    /// input attachment (mid-pass transitions are illegal, so a single
+    /// in-pass layout is the only coherent design). Every in-pass depth
     /// barrier and attachment info reads this ONE function, so the two
     /// configurations cannot drift apart.
+    ///
+    /// After `RenderPass::end` the *sampleable* single-sample image leaves this
+    /// layout and rests in [`SAMPLEABLE_DEPTH_REST_LAYOUT`] until the next
+    /// scene pass of this slot begins from `UNDEFINED`.
     pub(super) fn depth_pass_layout(&self) -> vk::ImageLayout {
         if self.pipelines.mesh3d_transparent_absorb.is_some() {
             vk::ImageLayout::RENDERING_LOCAL_READ_KHR
@@ -296,17 +301,44 @@ impl Renderer {
         }
     }
 
-    /// Layout and write scope of the single-sample depth image consumed by
-    /// VRS/TAA/godrays. With MSAA this is a resolve attachment: Vulkan executes
-    /// dynamic-rendering resolves at COLOR_ATTACHMENT_OUTPUT, even for depth.
-    /// Treating it as an ordinary depth-test write leaves the resolve unordered
-    /// on drivers that implement those stages independently.
+    /// Layout and write scope of the single-sample depth image *during the
+    /// scene pass* — the source of the rest-layout barrier in `RenderPass::end`.
+    /// With MSAA this is a resolve attachment: Vulkan executes dynamic-rendering
+    /// resolves at COLOR_ATTACHMENT_OUTPUT, even for depth. Treating it as an
+    /// ordinary depth-test write leaves the resolve unordered on drivers that
+    /// implement those stages independently. After that barrier the image rests
+    /// in [`SAMPLEABLE_DEPTH_REST_LAYOUT`]; see that const for the contract.
     pub(super) fn sampleable_depth_attachment_state(
         &self,
     ) -> (vk::ImageLayout, vk::PipelineStageFlags2, vk::AccessFlags2) {
         sampleable_depth_attachment_state(self.targets.samples, self.depth_pass_layout())
     }
 
+    /// Scene-pass → rest: sampleable depth becomes [`SAMPLEABLE_DEPTH_REST_LAYOUT`].
+    ///
+    /// Src is the attachment-write scope (depth tests, or COLOR_ATTACHMENT_OUTPUT
+    /// for the MSAA SAMPLE_ZERO resolve). Dst covers every consumer that samples
+    /// it without a further transition: VRS compute, TAA compute, and the
+    /// tonemap present-copy fragment (godrays).
+    pub(super) fn sampleable_depth_rest_barrier(&self, slot: usize) -> vk::ImageMemoryBarrier2<'_> {
+        let (src_layout, src_stage, src_access) = self.sampleable_depth_attachment_state();
+        vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(src_stage)
+            .src_access_mask(src_access)
+            .dst_stage_mask(
+                vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            )
+            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+            .old_layout(src_layout)
+            .new_layout(SAMPLEABLE_DEPTH_REST_LAYOUT)
+            .image(self.targets.sampleable_depth(slot).image())
+            .subresource_range(depth_range())
+    }
+
+    /// Waits until the slot's last render has completed (GPU is done with its
+    /// command buffer and immediate buffer), then reclaims retired GPU memory
+    /// whose last possible use the timeline has reached. Publishes the
+    /// one-cycle-late VRS mix and cull geometry gauges after the wait.
     fn wait_slot_and_reclaim(&mut self, slot: usize) {
         let device = &self.device.device;
         unsafe {
@@ -315,6 +347,8 @@ impl Renderer {
                 self.timeline
                     .wait(device, self.slots[FrameSlot::new(slot)].render_value);
             }
+            self.publish_vrs_mix(slot);
+            self.publish_cull_stats(slot);
             // Nothing retired (the steady state): skip the two counter reads
             // and the queue drains, which would find nothing to reclaim.
             if !self.mesh_res.has_garbage()
@@ -347,7 +381,6 @@ impl Renderer {
                 self.quad_ibo.collect_transfer(device, transfer_current);
             }
         }
-        self.publish_vrs_mix(slot);
     }
 
     /// Last completed VRS histogram for this slot (2-frame delayed). Zeroed
@@ -365,6 +398,18 @@ impl Renderer {
             crate::profile::gauge(crate::profile::Gauge::Vrs2x2, 0);
             crate::profile::gauge(crate::profile::Gauge::Vrs4x4, 0);
         }
+    }
+
+    /// Last completed cull geometry stats for this slot (2-frame delayed).
+    /// `draws.full` / `tris.full` are camera group 0 (full-res opaque);
+    /// `draws.lod` / `tris.lod` are group 2 (coarse LOD). Cutout (group 1) is
+    /// accumulated on the GPU but not published here.
+    fn publish_cull_stats(&self, slot: usize) {
+        let [d0, i0, _d1, _i1, d2, i2] = self.cull.stats(slot);
+        crate::profile::gauge(crate::profile::Gauge::DrawsFull, d0 as u64);
+        crate::profile::gauge(crate::profile::Gauge::DrawsLod, d2 as u64);
+        crate::profile::gauge(crate::profile::Gauge::TrisFull, u64::from(i0 / 3));
+        crate::profile::gauge(crate::profile::Gauge::TrisLod, u64::from(i2 / 3));
     }
 
     /// Resolves the copy hazard on `slot` before it is rendered into: the
@@ -753,7 +798,7 @@ impl Renderer {
         let profiling = crate::profile::is_enabled();
         if profiling {
             let mut passes = [0.0f64; GpuPass::COUNT];
-            if let Some(total) = unsafe {
+            if let Some((total, gap)) = unsafe {
                 self.gpu_timer
                     .read_into(&self.device.device, slot, &mut passes)
             } {
@@ -761,6 +806,9 @@ impl Renderer {
                     crate::profile::add_ms(pass.meter(), passes[pass as usize]);
                 }
                 crate::profile::gpu_frame_ms(total);
+                if let Some(gap) = gap {
+                    crate::profile::gpu_gap_ms(gap, total);
+                }
             }
         }
         // Begin render submission; this gets the timeline value to stamp mesh copies.
@@ -847,6 +895,10 @@ impl Renderer {
                         .mark(&self.device.device, cmd, slot, GpuPass::Cull);
                 }
             }
+        } else if profiling {
+            // No dispatch this slot: CPU-zero so the one-cycle-late publish
+            // does not report a stale histogram.
+            self.cull.clear_stats_cpu(slot);
         }
 
         // Cascaded shadows: on a miss, fit both cascades, publish binding-3
@@ -895,13 +947,14 @@ impl Renderer {
             self.record_sky_cloud_lut(cmd, slot, scene.frame_uniforms.anim[3]);
         }
 
-        // Classify from this slot's previous depth as long as it has been
-        // written once at this extent. One-frame-stale is OK: the classifier
-        // dilates full-rate tiles and never coarsens a tile that was near.
-        let do_vrs = lists.scene.is_some()
-            && self.flags.vrs
-            && self.targets.vrs.is_some()
-            && self.slots[FrameSlot::new(slot)].vrs_ready;
+        // Bind the rate image classified at the end of this slot's previous
+        // use (two frames ago at 2FIF) — the same staleness the old
+        // begin-of-frame classify accepted. First scene pass after
+        // create/recreate skips VRS (`vrs_ready` is false); we still classify
+        // at end so the next use is primed.
+        let vrs_on = lists.scene.is_some() && self.flags.vrs && self.targets.vrs.is_some();
+        let do_vrs = vrs_on && self.slots[FrameSlot::new(slot)].vrs_ready;
+        let classify_vrs = vrs_on;
 
         let device = &self.device.device;
         let stamp = |p| {
@@ -992,10 +1045,11 @@ impl Renderer {
         let readable: HdrReadable = {
             let _g = crate::profile::scope(crate::profile::Meter::RecTransitions);
             if deferred {
-                unsafe { pass.end_deferred() };
+                unsafe { pass.end_deferred(classify_vrs) };
                 // Close the end-rendering/MSAA-resolve span before the deferred
                 // writers, so TAA and exposure report apart from it.
                 stamp(GpuPass::Resolve);
+                self.finish_vrs_classify(cmd, slot, classify_vrs, lists);
                 // TAA resolve runs AFTER the HDR resolve and BEFORE exposure, so
                 // exposure meters the stabilized image. It reads the current HDR +
                 // reprojected history, writes the resolved HDR back, and leaves it
@@ -1048,7 +1102,7 @@ impl Renderer {
                 }
             } else if will_present {
                 // Common path (TAA + exposure both off): the render pass finalizes.
-                let readable = unsafe { pass.end_sampled() };
+                let readable = unsafe { pass.end_sampled(classify_vrs) };
                 // Close the resolve/finalize segment (MSAA resolve + transitions)
                 // before bloom records, so the report splits them.
                 if profiling {
@@ -1057,11 +1111,15 @@ impl Renderer {
                             .mark(&self.device.device, cmd, slot, GpuPass::Resolve)
                     };
                 }
+                self.finish_vrs_classify(cmd, slot, classify_vrs, lists);
                 readable
             } else {
                 // Unpresented, no later HDR writer: skip the sampled transition;
-                // the next begin discards the offscreen from UNDEFINED.
-                unsafe { pass.end_deferred() };
+                // the next begin discards the offscreen from UNDEFINED. Depth
+                // still rests so the classifier (and a later present of a
+                // different slot) can sample it.
+                unsafe { pass.end_deferred(classify_vrs) };
+                self.finish_vrs_classify(cmd, slot, classify_vrs, lists);
                 HdrReadable::new(slot)
             }
         };
@@ -1083,14 +1141,6 @@ impl Renderer {
             };
             self.gpu_timer.finish(slot);
         }
-        // The main pass just wrote (and stored) this slot's depth, so a later
-        // cycle reusing this slot may classify it. A classify this frame also
-        // leaves a raw-rate history image for the next reuse.
-        self.slots[FrameSlot::new(slot)].vrs_ready = true;
-        if do_vrs {
-            self.slots[FrameSlot::new(slot)].vrs_history = true;
-        }
-
         unsafe {
             self.device
                 .device
@@ -1109,6 +1159,38 @@ impl Renderer {
             ),
             HdrSource::TaaHistory(i) => self.taa.history_image(i),
         }
+    }
+
+    /// End-of-frame classify: this slot's just-written depth, for the next use
+    /// of the slot (two frames later). Depth already rests in
+    /// [`SAMPLEABLE_DEPTH_REST_LAYOUT`]; rate/history → GENERAL joined the
+    /// post-scene barrier. Sets `vrs_ready` / `vrs_history` so the next scene
+    /// pass of this slot can bind the rate image.
+    fn finish_vrs_classify(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        classify: bool,
+        lists: &DrawLists,
+    ) {
+        if !classify {
+            return;
+        }
+        let scene = lists
+            .scene
+            .as_ref()
+            .expect("classify_vrs implies a 3D scene");
+        let focal_px = 0.5 * self.render_extent.height as f32 / scene.fovy_tan_half.max(1e-4);
+        let d_threshold = crate::camera::Z_NEAR / focal_px;
+        unsafe { self.record_vrs_generate(cmd, slot, d_threshold) };
+        if crate::profile::is_enabled() {
+            unsafe {
+                self.gpu_timer
+                    .mark(&self.device.device, cmd, slot, GpuPass::Vrs)
+            };
+        }
+        self.slots[FrameSlot::new(slot)].vrs_ready = true;
+        self.slots[FrameSlot::new(slot)].vrs_history = true;
     }
 
     /// Transitions slot `slot`'s offscreen HDR from `COLOR_ATTACHMENT_OPTIMAL` to
