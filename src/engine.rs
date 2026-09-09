@@ -18,7 +18,7 @@ use crate::font;
 use crate::frame::{DrawLists, Frame};
 use crate::input::{InputState, Key, MouseButton};
 use crate::mesh::{MeshData, MeshHandle, MeshPlacement, Pass};
-use crate::vk::mesh_staging::{DEFAULT_MESH_STAGING_BYTES, MeshStager, MeshStaging};
+use crate::vk::mesh_staging::{MeshStager, MeshStaging};
 use crate::vk::render_client::{Capture, RenderClient};
 
 #[derive(Clone)]
@@ -43,9 +43,6 @@ pub struct Config {
     pub fullscreen: bool,
     /// CPU-side render feature flags (app is the single source; see [`RenderFlags`]).
     pub flags: RenderFlags,
-    /// Host-visible mesh staging pool size in bytes. Workers write vertices
-    /// here; `0` disables the pool. Default 32 MiB.
-    pub mesh_staging_bytes: u64,
 }
 
 impl Default for Config {
@@ -61,7 +58,6 @@ impl Default for Config {
             resizable: true,
             fullscreen: false,
             flags: RenderFlags::default(),
-            mesh_staging_bytes: DEFAULT_MESH_STAGING_BYTES,
         }
     }
 }
@@ -425,6 +421,8 @@ impl Engine {
     // ---- meshes ----
 
     /// Cheap `Clone` handle workers use to acquire staging regions.
+    /// Pool size is 32 MiB (`MESH_STAGING_BYTES`), overridable once at
+    /// renderer creation by `VOXEL_MESH_STAGING_MB`.
     pub fn mesh_stager(&self) -> MeshStager {
         self.client.mesh_stager()
     }

@@ -251,7 +251,6 @@ impl Renderer {
             size: win_size,
             present_interval,
             flags,
-            mesh_staging_bytes,
         } = cfg;
         let render_scale = Scale::new(render_scale).as_f32();
 
@@ -487,7 +486,7 @@ impl Renderer {
                 &instance.instance,
                 &device.device,
                 device.physical,
-                mesh_staging_bytes,
+                mesh_staging::mesh_staging_bytes(),
             )
         };
         let reply = InitReply {

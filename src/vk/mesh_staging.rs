@@ -23,9 +23,33 @@ use super::buffers::{HOST_BAR_BYTES, HOST_COHERENT, bar_charge, host_buffer_memo
 use super::timeline::TimelineValue;
 use crate::mesh::{FACE_UPLOAD_ORDER, MeshVertex};
 
-/// Default pool size: a full chunk mesh is median 5 KB / p95 12 KB / max 28 KB;
-/// ~100 in-flight chunks is ~0.5 MB, and 32 MB is ~3× the whole rd12 box.
-pub(crate) const DEFAULT_MESH_STAGING_BYTES: u64 = 32 << 20;
+/// Default host-visible mesh staging ring size (32 MiB).
+///
+/// A full chunk mesh is median ~5 KB / p95 ~12 KB / max ~28 KB; ~100 in-flight
+/// chunks is ~0.5 MB, and 32 MB is ~3× the whole rd12 box. Override once at
+/// renderer creation with `VOXEL_MESH_STAGING_MB` (integer MiB; `0` disables).
+pub const MESH_STAGING_BYTES: u64 = 32 << 20;
+
+const MESH_STAGING_ENV: &str = "VOXEL_MESH_STAGING_MB";
+
+/// Ring size used at renderer creation. Reads `VOXEL_MESH_STAGING_MB` once.
+pub(crate) fn mesh_staging_bytes() -> u64 {
+    match std::env::var(MESH_STAGING_ENV) {
+        Ok(s) => parse_mesh_staging_mb(&s).unwrap_or_else(|| {
+            log::warn!(
+                "invalid {MESH_STAGING_ENV}={s:?}; using {} MiB",
+                MESH_STAGING_BYTES / (1 << 20)
+            );
+            MESH_STAGING_BYTES
+        }),
+        Err(_) => MESH_STAGING_BYTES,
+    }
+}
+
+fn parse_mesh_staging_mb(s: &str) -> Option<u64> {
+    let mb: u64 = s.trim().parse().ok()?;
+    Some(mb.saturating_mul(1 << 20))
+}
 
 /// Same 1 GiB cutoff [`super::alloc`] uses to tell ReBAR / unified from a
 /// discrete GPU's small BAR window.
@@ -99,6 +123,10 @@ impl StagingRing {
             epoch: AtomicU64::new(1),
             live: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub(crate) fn capacity(&self) -> u64 {
+        self.capacity
     }
 
     fn lock_live(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Live>> {
@@ -276,6 +304,11 @@ impl MeshStager {
     /// the pool is exhausted (the job retries next frame).
     pub fn acquire(&self, bytes: usize) -> Option<MeshStaging> {
         MeshStagingPool::acquire(&self.pool, bytes)
+    }
+
+    /// Ring capacity in bytes (aligned down to the vertex stride).
+    pub fn capacity_bytes(&self) -> u64 {
+        self.pool.ring.capacity()
     }
 }
 
@@ -699,6 +732,23 @@ mod tests {
         );
         pool.reclaim(TimelineValue::from_raw_for_test(2), None);
         assert!(stager.acquire(32).is_some());
+    }
+
+    #[test]
+    fn parse_mesh_staging_mb_env() {
+        assert_eq!(parse_mesh_staging_mb("32"), Some(32 << 20));
+        assert_eq!(parse_mesh_staging_mb(" 0 "), Some(0));
+        assert_eq!(parse_mesh_staging_mb("1"), Some(1 << 20));
+        assert_eq!(parse_mesh_staging_mb(""), None);
+        assert_eq!(parse_mesh_staging_mb("nope"), None);
+    }
+
+    #[test]
+    fn stager_reports_capacity() {
+        let pool = MeshStagingPool::new_host(64);
+        assert_eq!(pool.stager().capacity_bytes(), 64);
+        let disabled = Arc::new(MeshStagingPool::disabled());
+        assert_eq!(disabled.stager().capacity_bytes(), 0);
     }
 
     #[test]

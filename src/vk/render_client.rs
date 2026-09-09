@@ -150,8 +150,6 @@ pub(crate) struct RenderConfig {
     pub present_interval: Duration,
     /// CPU-side feature flags for the render thread (see [`crate::RenderFlags`]).
     pub flags: crate::RenderFlags,
-    /// Mesh staging pool size in bytes (`0` disables the pool).
-    pub mesh_staging_bytes: u64,
 }
 
 /// The device/instance/surface handed back from the render thread at shutdown so
@@ -296,7 +294,6 @@ impl RenderClient {
             size,
             present_interval,
             flags: config.flags,
-            mesh_staging_bytes: config.mesh_staging_bytes,
         };
 
         let (cmd_tx, cmd_rx) = sync_channel::<RenderCmd>(1024);
