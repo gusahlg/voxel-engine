@@ -123,6 +123,12 @@ const MESH3D_OPAQUE_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_opaque.frag.spv"));
 /// Coarse-LOD opaque variant: the slab-clip `discard`, no cascade sampling.
 const MESH3D_LOD_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_lod.frag.spv"));
+/// Full-res opaque with every optional lane compiled out (`MESH3D_LEAN`).
+const MESH3D_OPAQUE_LEAN_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_opaque_lean.frag.spv"));
+/// Coarse-LOD opaque + the same lane-off diet.
+const MESH3D_LOD_LEAN_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_lod_lean.frag.spv"));
 /// Shader variant with depth input attachment for water absorption; built
 /// when dynamic_rendering_local_read is available and MSAA is off.
 const MESH3D_WATER_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_water.frag.spv"));
@@ -161,6 +167,10 @@ pub struct Pipelines {
     /// Coarse-LOD opaque terrain (`cull::Group::OpaqueLod`): same state as
     /// `mesh3d` with the slab-clip `discard` fragment variant.
     pub mesh3d_lod: vk::Pipeline,
+    /// `mesh3d` fragment with `MESH3D_LEAN` (no cascade/candle/ambient/fog).
+    pub mesh3d_lean: vk::Pipeline,
+    /// `mesh3d_lod` fragment with `MESH3D_LEAN`. Same layout as `mesh3d`.
+    pub mesh3d_lod_lean: vk::Pipeline,
     /// The full fragment module with `layout_3d`, alpha blended, reads (never
     /// writes) depth. Selected for [`Pass::Blend`].
     pub mesh3d_transparent: vk::Pipeline,
@@ -435,6 +445,13 @@ impl Pipelines {
         let mesh_opaque_frag =
             pass::shader_module(device, MESH3D_OPAQUE_FRAG, "mesh3d opaque fragment");
         let mesh_lod_frag = pass::shader_module(device, MESH3D_LOD_FRAG, "mesh3d lod fragment");
+        let mesh_opaque_lean_frag = pass::shader_module(
+            device,
+            MESH3D_OPAQUE_LEAN_FRAG,
+            "mesh3d opaque lean fragment",
+        );
+        let mesh_lod_lean_frag =
+            pass::shader_module(device, MESH3D_LOD_LEAN_FRAG, "mesh3d lod lean fragment");
         let debug_vert = pass::shader_module(device, DEBUG_VERT, "debug vertex");
         let debug_frag = pass::shader_module(device, DEBUG_FRAG, "debug fragment");
         let tri2d_vert = pass::shader_module(device, TRIS2D_VERT, "2d vertex");
@@ -473,6 +490,22 @@ impl Pipelines {
         let mesh3d_lod = builder.build(
             mesh_vert,
             mesh_lod_frag,
+            &bindings_3d,
+            attributes_3d,
+            layout_3d,
+            opaque_config(),
+        );
+        let mesh3d_lean = builder.build(
+            mesh_vert,
+            mesh_opaque_lean_frag,
+            &bindings_3d,
+            attributes_3d,
+            layout_3d,
+            opaque_config(),
+        );
+        let mesh3d_lod_lean = builder.build(
+            mesh_vert,
+            mesh_lod_lean_frag,
             &bindings_3d,
             attributes_3d,
             layout_3d,
@@ -739,6 +772,8 @@ impl Pipelines {
             device.destroy_shader_module(mesh_frag, None);
             device.destroy_shader_module(mesh_opaque_frag, None);
             device.destroy_shader_module(mesh_lod_frag, None);
+            device.destroy_shader_module(mesh_opaque_lean_frag, None);
+            device.destroy_shader_module(mesh_lod_lean_frag, None);
             if let Some(m) = mesh3d_water_frag {
                 device.destroy_shader_module(m, None);
             }
@@ -760,6 +795,8 @@ impl Pipelines {
             layout_2d,
             mesh3d,
             mesh3d_lod,
+            mesh3d_lean,
+            mesh3d_lod_lean,
             mesh3d_transparent,
             mesh3d_transparent_absorb,
             debug_tris,
@@ -783,6 +820,16 @@ impl Pipelines {
             tonemap_depth_sampler,
             tris2d_present_taa,
             tris2d_tex_present_taa,
+        }
+    }
+
+    /// Full-res and coarse-LOD opaque pipelines. `lean` selects the compile-time
+    /// lane-off fragment variants (no cascade taps, no candle, no ambient, no fog).
+    pub fn opaque_pipelines(&self, lean: bool) -> (vk::Pipeline, vk::Pipeline) {
+        if lean {
+            (self.mesh3d_lean, self.mesh3d_lod_lean)
+        } else {
+            (self.mesh3d, self.mesh3d_lod)
         }
     }
 
@@ -817,6 +864,8 @@ impl Pipelines {
             }
             device.destroy_pipeline(self.mesh3d, None);
             device.destroy_pipeline(self.mesh3d_lod, None);
+            device.destroy_pipeline(self.mesh3d_lean, None);
+            device.destroy_pipeline(self.mesh3d_lod_lean, None);
             device.destroy_pipeline(self.mesh3d_transparent, None);
             if let Some(p) = self.mesh3d_transparent_absorb {
                 device.destroy_pipeline(p, None);
@@ -1210,11 +1259,15 @@ mod tests {
 
     #[test]
     fn opaque_frag_has_no_discard() {
-        assert!(
-            !spirv_has_opcode(super::MESH3D_OPAQUE_FRAG, OP_KILL)
-                && !spirv_has_opcode(super::MESH3D_OPAQUE_FRAG, OP_DEMOTE),
-            "MESH3D_OPAQUE must not OpKill/OpDemote (early depth write)"
-        );
+        for (name, bytes) in [
+            ("MESH3D_OPAQUE", super::MESH3D_OPAQUE_FRAG),
+            ("MESH3D_OPAQUE_LEAN", super::MESH3D_OPAQUE_LEAN_FRAG),
+        ] {
+            assert!(
+                !spirv_has_opcode(bytes, OP_KILL) && !spirv_has_opcode(bytes, OP_DEMOTE),
+                "{name} must not OpKill/OpDemote (early depth write)"
+            );
+        }
     }
 
     #[test]
@@ -1223,6 +1276,11 @@ mod tests {
             spirv_has_opcode(super::MESH3D_LOD_FRAG, OP_KILL)
                 || spirv_has_opcode(super::MESH3D_LOD_FRAG, OP_DEMOTE),
             "MESH3D_LOD must keep the slab-clip discard"
+        );
+        assert!(
+            spirv_has_opcode(super::MESH3D_LOD_LEAN_FRAG, OP_KILL)
+                || spirv_has_opcode(super::MESH3D_LOD_LEAN_FRAG, OP_DEMOTE),
+            "MESH3D_LOD_LEAN must keep the slab-clip discard"
         );
         assert!(
             spirv_has_opcode(super::MESH3D_FRAG, OP_KILL)
