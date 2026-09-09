@@ -154,9 +154,10 @@ pub(crate) struct DeviceLeftovers {
 /// starves, plus the box it is recording into and [`FramePool::last_drawn`].
 /// Hence 3, independent of `FRAMES_IN_FLIGHT`.
 ///
-/// A larger pool lets main run more than one frame ahead. The render loop then
-/// coalesces (`RenderCmd::Frame` keeps only the newest queued snapshot) whenever
-/// the game is uncapped and faster than the GPU, silently dropping game frames.
+/// A larger pool lets main run more than one frame ahead. With vsync on, the
+/// render loop coalesces queued [`RenderCmd::Frame`]s to the newest so a slow
+/// present path skips stale snapshots. Vsync off is treated as uncapped (the
+/// render thread does not know a game FPS cap) and does not coalesce.
 const FRAME_POOL_SIZE: usize = 3;
 
 /// Pooled [`DrawLists`] boxes plus the most recently completed snapshot, used
@@ -714,8 +715,48 @@ impl Drop for RenderClient {
     }
 }
 
-/// The render thread's loop: block when idle, greedily drain the command stream
-/// applying resource commands in order and coalescing frames to the latest, draw
+/// Outcome of one drain of the command stream.
+enum Drain {
+    Shutdown,
+    Frame(Option<Box<DrawLists>>),
+}
+
+/// Drain `first` plus whatever `try_next` yields.
+///
+/// Non-frame commands are applied in order. With `coalesce` (vsync on), queued
+/// [`RenderCmd::Frame`]s collapse to the newest and `recycle` returns dropped
+/// snapshots. Without it (vsync off / uncapped), stop at the first `Frame` so
+/// later frames stay in the channel for the next iteration — otherwise a faster
+/// main thread drops every other game frame. Vsync-off is treated as uncapped
+/// because the render thread cannot see a game FPS cap.
+fn drain_cmds(
+    first: RenderCmd,
+    mut try_next: impl FnMut() -> Option<RenderCmd>,
+    coalesce: bool,
+    mut apply: impl FnMut(RenderCmd),
+    mut recycle: impl FnMut(Box<DrawLists>),
+) -> Drain {
+    let mut latest_frame: Option<Box<DrawLists>> = None;
+    let mut cmd = Some(first);
+    while let Some(c) = cmd.take().or_else(&mut try_next) {
+        match c {
+            RenderCmd::Frame(f) => {
+                if let Some(old) = latest_frame.replace(f) {
+                    recycle(old);
+                }
+                if !coalesce {
+                    break;
+                }
+            }
+            RenderCmd::Shutdown => return Drain::Shutdown,
+            other => apply(other),
+        }
+    }
+    Drain::Frame(latest_frame)
+}
+
+/// The render thread's loop: block when idle, drain the command stream applying
+/// resource commands in order (coalescing frames only when vsync is on), draw
 /// once, then recycle retired allocations. Returns the device leftovers for
 /// main to finish teardown.
 /// Same idea as [`super::timeline::Timeline::wait_spin`] / `FENCE_SPIN_BUDGET`
@@ -755,19 +796,13 @@ fn render_loop(
         let Ok(first) = recv_spin(&rx, spin) else {
             break;
         };
-        let mut latest_frame: Option<Box<DrawLists>> = None;
-        let mut cmd = Some(first);
-        while let Some(c) = cmd.take().or_else(|| rx.try_recv().ok()) {
-            match c {
-                RenderCmd::Frame(f) => {
-                    // Coalesce: keep only the newest, recycle the dropped one.
-                    if let Some(old) = latest_frame.replace(f) {
-                        frames_coalesced.fetch_add(1, Ordering::Relaxed);
-                        crate::profile::count(crate::profile::Counter::Coalesced);
-                        let _ = ret.send(RenderReturn::Frame(old));
-                    }
-                }
-                RenderCmd::Shutdown => return renderer.teardown(),
+        // Vsync-off: render every queued Frame. Vsync-on: coalesce to newest.
+        let coalesce = renderer.vsync.effective();
+        match drain_cmds(
+            first,
+            || rx.try_recv().ok(),
+            coalesce,
+            |c| match c {
                 RenderCmd::UploadMesh {
                     slot,
                     generation,
@@ -798,12 +833,21 @@ fn render_loop(
                 RenderCmd::SetRenderScale(s) => {
                     renderer.set_render_scale(s.get());
                 }
+                RenderCmd::Frame(_) | RenderCmd::Shutdown => unreachable!(),
+            },
+            |old| {
+                frames_coalesced.fetch_add(1, Ordering::Relaxed);
+                crate::profile::count(crate::profile::Counter::Coalesced);
+                let _ = ret.send(RenderReturn::Frame(old));
+            },
+        ) {
+            Drain::Shutdown => return renderer.teardown(),
+            Drain::Frame(Some(frame)) => {
+                renderer.draw_frame(&frame);
+                frames_rendered.fetch_add(1, Ordering::Relaxed);
+                let _ = ret.send(RenderReturn::Frame(frame));
             }
-        }
-        if let Some(frame) = latest_frame {
-            renderer.draw_frame(&frame);
-            frames_rendered.fetch_add(1, Ordering::Relaxed);
-            let _ = ret.send(RenderReturn::Frame(frame));
+            Drain::Frame(None) => {}
         }
     }
     // Sender dropped without a Shutdown (main gone): tear down anyway.
@@ -813,15 +857,17 @@ fn render_loop(
 #[cfg(test)]
 mod tests {
     use super::super::buffers::FRAMES_IN_FLIGHT;
-    use super::{CHANNEL_SPIN_BUDGET, FRAME_POOL_SIZE, FramePool, recv_spin};
+    use super::{
+        CHANNEL_SPIN_BUDGET, Drain, FRAME_POOL_SIZE, FramePool, RenderCmd, drain_cmds, recv_spin,
+    };
     use std::time::{Duration, Instant};
 
     #[test]
     fn frame_pool_keeps_main_at_most_one_ahead() {
         assert_eq!(FRAME_POOL_SIZE, 3);
         // Recording + one queued/being-rendered + last_drawn. Must not grow
-        // with FRAMES_IN_FLIGHT: extra slack lets main queue ahead of render
-        // and coalesces under uncapped pacing.
+        // with FRAMES_IN_FLIGHT: extra slack lets main queue ahead of render.
+        // Vsync coalesces; vsync-off leaves later Frames in the channel.
         assert_ne!(FRAME_POOL_SIZE, FRAMES_IN_FLIGHT as usize + 1);
     }
 
@@ -865,5 +911,68 @@ mod tests {
             start.elapsed() >= CHANNEL_SPIN_BUDGET,
             "empty channel must spin the budget then block until the value arrives"
         );
+    }
+
+    fn flag_cmd() -> RenderCmd {
+        RenderCmd::SetFlags(crate::engine::RenderFlags::default())
+    }
+
+    #[test]
+    fn uncapped_drain_stops_at_the_first_frame() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(flag_cmd()).unwrap();
+        tx.send(RenderCmd::Frame(Box::new(super::DrawLists::new())))
+            .unwrap();
+        tx.send(RenderCmd::Frame(Box::new(super::DrawLists::new())))
+            .unwrap();
+        let first = rx.recv().unwrap();
+        let mut applied = 0u32;
+        let mut recycled = 0u32;
+        let Drain::Frame(frame) = drain_cmds(
+            first,
+            || rx.try_recv().ok(),
+            false,
+            |_| applied += 1,
+            |_| recycled += 1,
+        ) else {
+            panic!("expected a frame drain");
+        };
+        assert!(frame.is_some());
+        assert_eq!(applied, 1, "non-frame cmds before the first Frame apply");
+        assert_eq!(
+            recycled, 0,
+            "uncapped must not coalesce; frames_coalesced stays 0"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(RenderCmd::Frame(_))),
+            "later Frames stay in the channel"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn vsync_drain_coalesces_queued_frames() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(RenderCmd::Frame(Box::new(super::DrawLists::new())))
+            .unwrap();
+        tx.send(flag_cmd()).unwrap();
+        tx.send(RenderCmd::Frame(Box::new(super::DrawLists::new())))
+            .unwrap();
+        let first = rx.recv().unwrap();
+        let mut applied = 0u32;
+        let mut recycled = 0u32;
+        let Drain::Frame(frame) = drain_cmds(
+            first,
+            || rx.try_recv().ok(),
+            true,
+            |_| applied += 1,
+            |_| recycled += 1,
+        ) else {
+            panic!("expected a frame drain");
+        };
+        assert!(frame.is_some());
+        assert_eq!(applied, 1);
+        assert_eq!(recycled, 1);
+        assert!(rx.try_recv().is_err());
     }
 }
