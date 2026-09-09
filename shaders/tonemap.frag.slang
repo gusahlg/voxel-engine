@@ -5,9 +5,14 @@
 // spill pass (`spill.comp.slang`); this fragment is HDR + one bilinear spill
 // tap + sigmoid + vignette.
 //
-// `-DTAA_FUSED` compiles the present-time TAA resolve into this same pass:
+// `-DTAA_FUSED` compiles the present-time TAAU resolve into this same pass:
 // attachment 0 is the LDR swapchain, attachment 1 is the swapchain-sized
-// RGBA16F history. The off variant has no second attachment and no TAA ALU.
+// RGBA16F history. Raster jitter means render texel t (centre t+0.5) holds
+// the unjittered scene at s_t = t + 0.5 - jitter_px; each output pixel is
+// reconstructed from a 3×3 of those texels (Gaussian σ = 0.47·max(1, ratio)
+// render pixels) and blended with presented-space history, so render_scale < 1
+// converges sharp instead of bilinear-upsampling a blur. The off variant has
+// no second attachment and no TAA ALU.
 
 #include "common.slang"
 
@@ -23,6 +28,7 @@ struct PushConstants
     float4x4 reproj;      // f64-composed prev_view_proj * inv(cur_view_proj)
     float2 render_extent; // HDR/depth size in texels (may differ from swapchain)
     float2 jitter_px;     // raster jitter this presented frame
+    float2 output_extent; // swapchain / history size in texels
     float exposure;
     float s;
     float atan_s;
@@ -103,36 +109,59 @@ float2 ndc_to_uv(float2 ndc) { return float2(ndc.x * 0.5 + 0.5, (1.0 - ndc.y) * 
 float3 rgb_to_ycocg(float3 c) { return float3(0.25*c.r + 0.5*c.g + 0.25*c.b, 0.5*(c.r - c.b), -0.25*c.r + 0.5*c.g - 0.25*c.b); }
 float3 ycocg_to_rgb(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
 
-// 5-tap YCoCg variance clamp + depth-aware reprojection. `source_uv` is in
-// render/HDR space (after warpSampleUv); history is in presented space.
-float3 taaResolve(float2 source_uv, float3 current)
+// 3×3 Gaussian reconstruction + unweighted YCoCg variance clamp + depth-aware
+// reprojection. `source_uv` is in render/HDR space (after warpSampleUv);
+// history is in presented space.
+float3 taaResolve(float2 source_uv)
 {
-    float2 texel = 1.0 / pc.render_extent;
-    float3 c0 = rgb_to_ycocg(current);
-    float3 cn = rgb_to_ycocg(hdrTex.Sample(source_uv + float2(0.0, -texel.y)).rgb);
-    float3 cs = rgb_to_ycocg(hdrTex.Sample(source_uv + float2(0.0, texel.y)).rgb);
-    float3 cw = rgb_to_ycocg(hdrTex.Sample(source_uv + float2(-texel.x, 0.0)).rgb);
-    float3 ce = rgb_to_ycocg(hdrTex.Sample(source_uv + float2(texel.x, 0.0)).rgb);
-    float3 m1 = c0 + cn + cs + cw + ce;
-    float3 m2 = c0 * c0 + cn * cn + cs * cs + cw * cw + ce * ce;
-    float3 mean = m1 / 5.0;
-    float3 sigma = sqrt(max(m2 / 5.0 - mean * mean, 0.0));
-    float3 nmin = mean - VARIANCE_GAMMA * sigma;
-    float3 nmax = mean + VARIANCE_GAMMA * sigma;
+    float2 p = source_uv * pc.render_extent;
+    float2 scale = pc.render_extent / pc.output_extent;
+    float ratio = max(scale.x, scale.y);
+    float sigma = 0.47 * max(1.0, ratio);
+    float k = 0.5 / (sigma * sigma);
 
-    float3 resolved = current;
+    // Nearest texel whose unjittered sample s_t ≈ p. Identical to the old
+    // depth rule `dp = floor(px + jitter + 0.5)` with `px = p - 0.5`.
+    int2 tc = int2(floor(p + pc.jitter_px));
+    int2 tmin = int2(0, 0);
+    int2 tmax = int2(pc.render_extent) - 1;
+
+    float3 acc = 0.0;
+    float w_sum = 0.0;
+    float w_max = 0.0;
+    float3 m1 = 0.0;
+    float3 m2 = 0.0;
+    for (int dy = -1; dy <= 1; dy++)
+    {
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            int2 t = clamp(tc + int2(dx, dy), tmin, tmax);
+            // Texel-centre sample: one texel, not a bilinear mix of neighbours.
+            float2 uv = (float2(t) + 0.5) / pc.render_extent;
+            float3 c = rgb_to_ycocg(hdrTex.SampleLevel(uv, 0).rgb);
+            float2 d = (float2(t) + 0.5 - pc.jitter_px) - p;
+            float w = exp(-k * dot(d, d));
+            acc += w * c;
+            w_sum += w;
+            w_max = max(w_max, w);
+            m1 += c;
+            m2 += c * c;
+        }
+    }
+    float3 cur = acc / w_sum;
+    float3 mean = m1 / 9.0;
+    float3 nsigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
+    float3 nmin = mean - VARIANCE_GAMMA * nsigma;
+    float3 nmax = mean + VARIANCE_GAMMA * nsigma;
+
+    float3 resolved = cur;
     if (pc.history_valid != 0)
     {
         float2 ndc = uv_to_ndc(source_uv);
-        // Point depth at the jittered pixel (clean ray is offset by jitter/dim).
-        // Same rule as the retired compute resolve: `dp = floor(px + jitter + 0.5)`
-        // with `px` the render-res pixel whose centre is `source_uv`.
-        float2 px = source_uv * pc.render_extent - 0.5;
-        int2 dp = int2(floor(px + pc.jitter_px + 0.5));
-        dp = clamp(dp, int2(0, 0), int2(pc.render_extent) - 1);
+        int2 dp = clamp(tc, tmin, tmax);
         float2 depth_uv = (float2(dp) + 0.5) / pc.render_extent;
-        float d = pc.depth_valid != 0 ? depthTex.Sample(depth_uv).x : 0.0;
-        float4 prevClip = mul(pc.reproj, float4(ndc, d, 1.0));
+        float z = pc.depth_valid != 0 ? depthTex.Sample(depth_uv).x : 0.0;
+        float4 prevClip = mul(pc.reproj, float4(ndc, z, 1.0));
         if (prevClip.w > 0.0)
         {
             float2 prevSourceUv = ndc_to_uv(prevClip.xy / prevClip.w);
@@ -141,11 +170,11 @@ float3 taaResolve(float2 source_uv, float3 current)
             {
                 float3 hist = rgb_to_ycocg(historyTex.Sample(prevPresentedUv).rgb);
                 hist = clamp(hist, nmin, nmax);
-                resolved = lerp(current, ycocg_to_rgb(hist), pc.blend);
+                resolved = lerp(hist, cur, (1.0 - pc.blend) * w_max);
             }
         }
     }
-    return resolved;
+    return ycocg_to_rgb(resolved);
 }
 
 struct TaaFragmentOutput
@@ -158,8 +187,7 @@ struct TaaFragmentOutput
 TaaFragmentOutput fragmentMain(FragmentInput input)
 {
     float2 source_uv = warpSampleUv(input.uv, pc.s, pc.atan_s);
-    float3 current = hdrTex.Sample(source_uv).rgb;
-    float3 resolved = taaResolve(source_uv, current);
+    float3 resolved = taaResolve(source_uv);
     // Spill is pre-exposure; sample at UNwarped output uv so this tap matches
     // the spill texel's outUv.
     float3 hdr = (resolved + spillTex.Sample(input.uv).rgb) * pc.exposure;

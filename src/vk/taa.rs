@@ -1,11 +1,16 @@
-//! Temporal anti-aliasing: history images, reprojection, and present-time resolve.
+//! Temporal anti-aliasing / upsampling: history images, reprojection, present resolve.
 //!
 //! The scene is rendered with a per-frame sub-pixel jitter (Halton(2,3), applied
 //! ONLY to the mesh view-proj at push-constant packing — [`super::jittered_clip`]).
-//! The present-time tonemap (`-DTAA_FUSED`) integrates jittered frames into a
-//! stable image at **swapchain resolution**: it reprojects the previous
-//! *presented* frame, neighbourhood-clamps in YCoCg, blends, writes the new
-//! history as a second colour attachment, and tonemaps the resolved colour.
+//! Raster pixel = clean position + `jitter_px` (pixel-y-down), so render texel
+//! `t` (centre `t+0.5`) holds the scene at the unjittered position
+//! `s_t = t + 0.5 - jitter_px`. The fused present-time tonemap (`-DTAA_FUSED`)
+//! reconstructs each output pixel from a 3×3 of those texels with a Gaussian
+//! whose σ is 0.47 render pixels (widened when supersampling), neighbourhood-
+//! clamps in YCoCg, reprojects the previous *presented* frame, and blends with
+//! a history weight scaled by the peak reconstruction weight so `render_scale < 1`
+//! converges to a sharp swapchain-res image over the 16-frame sequence instead
+//! of a bilinear upsample.
 //!
 //! No full-resolution TAA compute pass runs per rendered frame. TAA work happens
 //! only on presented frames (mailbox drops skip it). History at swapchain extent
@@ -100,6 +105,7 @@ pub(crate) struct TonemapTaaPush {
     pub reproj: [[f32; 4]; 4],
     pub render_extent: [f32; 2],
     pub jitter_px: [f32; 2],
+    pub output_extent: [f32; 2],
     pub exposure: f32,
     pub s: f32,
     pub atan_s: f32,
@@ -111,7 +117,8 @@ pub(crate) struct TonemapTaaPush {
 }
 
 const _: () = assert!(size_of::<TonemapTaaPush>() <= 128);
-const _: () = assert!(size_of::<TonemapTaaPush>() == 112);
+const _: () = assert!(size_of::<TonemapTaaPush>() == 120);
+const _: () = assert!(std::mem::offset_of!(TonemapTaaPush, output_extent) == 80);
 
 fn create_history_image(
     device: &ash::Device,
@@ -141,10 +148,14 @@ fn create_history_image(
 ///   `valid` and `prev`; the next present is a first-present.
 /// - **Resize / swapchain recreate**: history is rebuilt at the new swapchain
 ///   extent and invalidated (contents discarded; reconverges).
+/// - **Render-scale change**: history stays swapchain-sized so the images are
+///   kept; [`TaaState::invalidate_history`] still drops temporal state so the
+///   new reconstruction kernel does not mix with the previous sample grid.
 /// - **MSAA on**: depth is the SAMPLE_ZERO resolve target, already resting in
 ///   [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]; sampled with no further transition.
 /// - **`render_scale != 1`**: history is swapchain-sized, current/depth are
-///   render-sized; `source_uv = warpSampleUv(uv_out)` maps the two spaces.
+///   render-sized; `source_uv = warpSampleUv(uv_out)` maps the two spaces, and
+///   the 3×3 Gaussian reconstructs (or downsamples) at the output pixel.
 /// - **Wide FOV**: history is stored in presented space, so a reprojected
 ///   source uv is converted with `unwarpSampleUv` before the history tap.
 pub(crate) struct TaaState {
@@ -182,22 +193,27 @@ impl TaaState {
     }
 
     /// Rebuild history images after swapchain recreate/resize (contents
-    /// discarded, reconverges).
+    /// discarded, reconverges). Same swapchain extent (render-scale-only
+    /// apply) keeps the images and only invalidates temporal state.
     pub(crate) fn recreate(
         &mut self,
         device: &ash::Device,
         memory_props: &vk::PhysicalDeviceMemoryProperties,
         swapchain_extent: vk::Extent2D,
     ) {
-        for h in &self.history {
-            unsafe { h.destroy(device) };
+        if self.extent.width != swapchain_extent.width
+            || self.extent.height != swapchain_extent.height
+        {
+            for h in &self.history {
+                unsafe { h.destroy(device) };
+            }
+            self.history = std::array::from_fn(|_| {
+                create_history_image(device, memory_props, swapchain_extent)
+            });
+            self.read_idx = 0;
+            self.extent = swapchain_extent;
         }
-        self.history =
-            std::array::from_fn(|_| create_history_image(device, memory_props, swapchain_extent));
-        self.read_idx = 0;
-        self.extent = swapchain_extent;
-        self.valid = false;
-        self.prev = None;
+        self.invalidate_history();
     }
 
     /// Reset temporal state (called on TAA toggle to prevent history ghosting).
@@ -284,11 +300,13 @@ impl super::Renderer {
         warp: crate::camera::WarpPush,
     ) -> TonemapTaaPush {
         let reproj = self.taa.reprojection(taa.view_proj, taa.eye);
-        let extent = self.render_extent;
+        let render = self.render_extent;
+        let output = self.swapchain.extent;
         TonemapTaaPush {
             reproj: reproj.to_cols_array_2d(),
-            render_extent: [extent.width as f32, extent.height as f32],
+            render_extent: [render.width as f32, render.height as f32],
             jitter_px: taa.jitter.to_array(),
+            output_extent: [output.width as f32, output.height as f32],
             exposure: warp.exposure,
             s: warp.s,
             atan_s: warp.atan_s,
@@ -356,5 +374,34 @@ mod tests {
     #[test]
     fn fused_push_fits_vulkan_minimum() {
         assert!(size_of::<TonemapTaaPush>() <= 128);
+        assert_eq!(size_of::<TonemapTaaPush>(), 120);
+    }
+
+    /// Raster texel `t` holds `s_t = t + 0.5 - jitter_px`. Nearest texel of
+    /// continuous render-space `p` is `tc = floor(p + jitter_px)`, and the
+    /// reconstruction weight is `exp(-k |s_t - p|²)` with
+    /// `k = 0.5 / (0.47 · max(1, ratio))²` (UE's ≈2.29 at ratio 1).
+    #[test]
+    fn taau_reconstruction_nearest_texel_and_weight() {
+        let p = Vec2::new(10.5, 10.5);
+        let jitter = Vec2::new(0.25, -0.25);
+        let tc = (p + jitter).floor();
+        assert_eq!(tc, Vec2::new(10.0, 10.0));
+        // Same rule as the depth tap: `dp = floor((p - 0.5) + jitter + 0.5)`.
+        let px = p - Vec2::splat(0.5);
+        let dp = (px + jitter + Vec2::splat(0.5)).floor();
+        assert_eq!(dp, tc);
+
+        let s_t = tc + Vec2::splat(0.5) - jitter;
+        let d2 = (s_t - p).dot(s_t - p);
+        assert!((d2 - 0.125).abs() < 1e-6);
+
+        let sigma = 0.47 * 1.0f32.max(1.0);
+        let k = 0.5 / (sigma * sigma);
+        // UE documents exp(-2.29 d²); 0.5 / 0.47² is that constant.
+        assert!((k - 2.29).abs() < 0.03);
+        let w = (-k * d2).exp();
+        assert!((w - (-2.29f32 * 0.125).exp()).abs() < 1e-2);
+        assert!(w > 0.0 && w <= 1.0);
     }
 }

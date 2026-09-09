@@ -815,7 +815,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "VARIANCE_GAMMA",
-            doc: "TAA neighbourhood variance-clamp width in std-devs: history is clamped to\nYCoCg mean +/- VARIANCE_GAMMA*stddev of the 5-tap cross current taps. Wider =\nsteadier (less crawl) but more ghosting. Read by tonemap.frag (TAA_FUSED).",
+            doc: "TAA neighbourhood variance-clamp width in std-devs: history is clamped to\nYCoCg mean +/- VARIANCE_GAMMA*stddev of the unweighted 3x3 current taps. Wider =\nsteadier (less crawl) but more ghosting. Read by tonemap.frag (TAA_FUSED).",
             val: Val::Scalar(1.25),
         },
         Def {
