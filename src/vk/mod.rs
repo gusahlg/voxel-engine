@@ -279,6 +279,7 @@ impl Renderer {
             msaa,
             device.fragment_shading_rate.as_ref(),
         );
+        log::info!("HDR color format: {:?}", targets.color_format);
 
         let atlas = FontAtlas::new(
             &instance.instance,

@@ -981,9 +981,10 @@ impl PipelineBuilder<'_> {
         let multisampling =
             vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(self.samples);
 
+        let write_mask = color_write_mask(self.color_format);
         let color_attachment = if blend {
             vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .color_write_mask(write_mask)
                 .blend_enable(true)
                 .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
                 .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
@@ -993,7 +994,7 @@ impl PipelineBuilder<'_> {
                 .alpha_blend_op(vk::BlendOp::ADD)
         } else {
             vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .color_write_mask(write_mask)
                 .blend_enable(false)
         };
         let second_blend = self.second_color.map(|(_, mask)| {
@@ -1154,8 +1155,21 @@ fn create_vrs_compute(device: &ash::Device, cache: vk::PipelineCache) -> VrsComp
     }
 }
 
+/// Color write mask for a pipeline's first attachment. Packed 11-bit HDR has
+/// no alpha; `A` in the mask is ignored by the spec but we omit it so blend
+/// state does not assume a channel the format does not have.
+fn color_write_mask(format: vk::Format) -> vk::ColorComponentFlags {
+    if super::targets::color_format_has_alpha(format) {
+        vk::ColorComponentFlags::RGBA
+    } else {
+        vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use ash::vk;
+
     /// Scan a SPIR-V module for an opcode (low 16 bits of each instruction word).
     fn spirv_has_opcode(bytes: &[u8], opcode: u32) -> bool {
         assert!(bytes.len() >= 20 && bytes.len().is_multiple_of(4));
@@ -1181,6 +1195,18 @@ mod tests {
 
     const OP_KILL: u32 = 252;
     const OP_DEMOTE: u32 = 5380;
+
+    #[test]
+    fn packed_11bit_hdr_write_mask_has_no_alpha() {
+        assert_eq!(
+            super::color_write_mask(vk::Format::B10G11R11_UFLOAT_PACK32),
+            vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B
+        );
+        assert_eq!(
+            super::color_write_mask(vk::Format::R16G16B16A16_SFLOAT),
+            vk::ColorComponentFlags::RGBA
+        );
+    }
 
     #[test]
     fn opaque_frag_has_no_discard() {

@@ -9,12 +9,17 @@ use super::alloc::find_memory_type;
 use super::buffers::FRAMES_IN_FLIGHT;
 use super::image::{ImageDesc, ImageResource};
 
-/// Linear-HDR format for the offscreen/MSAA color targets. Rendering,
-/// lighting, and fog all happen here in linear space at float precision; a
-/// later tonemap pass encodes to the LDR swapchain. `R16G16B16A16_SFLOAT` is a
-/// mandatory-supported color-attachment + sampled + blit format in core Vulkan,
-/// so this needs no capability query and no fallback.
+/// Mandatory linear-HDR format (`R16G16B16A16_SFLOAT`) for the bloom pyramid,
+/// quarter-res spill, sky-cloud LUT, and the 1×1 black bloom fallback.
+/// Color-attachment + sampled + storage + blit are required of this format in
+/// core Vulkan, so those images need no capability query. The offscreen/MSAA
+/// color target uses [`RenderTargets::color_format`], which is this format
+/// unless the experimental `VOXEL_HDR_11BIT=1` switch selects packed 11-bit.
 pub const HDR_COLOR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
+/// Packed RGB-only 11-bit unsigned float. Experimental HDR offscreen/MSAA
+/// format behind `VOXEL_HDR_11BIT=1`; no alpha channel.
+pub(crate) const HDR_11BIT_FORMAT: vk::Format = vk::Format::B10G11R11_UFLOAT_PACK32;
 
 /// Cascaded-shadow-map depth format and per-cascade resolution. `D32_SFLOAT` is
 /// a mandatory-supported depth-attachment + sampled format, so no capability
@@ -334,7 +339,8 @@ pub struct RenderTargets {
     pub(crate) offscreen: [ImageResource; FRAMES_IN_FLIGHT as usize],
     pub samples: vk::SampleCountFlags,
     /// The HDR format shared by `msaa` + `offscreen`; the geometry pipelines
-    /// must be built with this same format. Never the swapchain format.
+    /// must be built with this same format. Never the swapchain format. Default
+    /// [`HDR_COLOR_FORMAT`]; packed 11-bit when `VOXEL_HDR_11BIT=1` is accepted.
     pub color_format: vk::Format,
     /// `Some` when the device supports attachment VRS. Owns the per-slot rate
     /// images, history, and mix readback. `RenderFlags::vrs` decides whether
@@ -365,7 +371,7 @@ impl RenderTargets {
         samples: super::SampleCount,
         fsr: Option<&super::device::FragmentShadingRate>,
     ) -> Self {
-        let color_format = HDR_COLOR_FORMAT;
+        let color_format = pick_hdr_color_format(instance, physical);
         let samples = samples.as_flags();
         let depth_format = pick_depth_format(instance, physical);
         // Queried once and shared by every render-target image below.
@@ -545,22 +551,222 @@ impl RenderTargets {
     }
 }
 
-fn pick_depth_format(instance: &ash::Instance, physical: vk::PhysicalDevice) -> vk::Format {
-    for format in [
-        vk::Format::D32_SFLOAT,
-        vk::Format::X8_D24_UNORM_PACK32,
-        vk::Format::D24_UNORM_S8_UINT,
-        vk::Format::D16_UNORM,
-    ] {
-        let props = unsafe { instance.get_physical_device_format_properties(physical, format) };
-        if props
-            .optimal_tiling_features
-            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
-        {
-            return format;
+/// Optimal-tiling features the scene depth image actually uses.
+///
+/// Geometry writes it as a depth attachment (and MSAA `SAMPLE_ZERO` resolve
+/// still needs `DEPTH_STENCIL_ATTACHMENT`). TAA reprojection, the quarter-res
+/// spill/godray pass, and VRS classify sample it (`SAMPLED` usage;
+/// [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]). Water's depth input attachment is
+/// covered by `DEPTH_STENCIL_ATTACHMENT`. There is no transfer or blit of
+/// scene depth.
+/// Experimental `VOXEL_HDR_11BIT=1` switch. Read once at renderer creation
+/// (first [`RenderTargets::new`]); not a public API. Any value other than
+/// `"0"` enables the packed 11-bit offscreen attempt.
+fn hdr_11bit_requested() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| std::env::var("VOXEL_HDR_11BIT").is_ok_and(|v| v != "0"))
+}
+
+/// Optimal-tiling features the HDR offscreen (and MSAA color, when present)
+/// actually use: rendered into, blended (transparent/water/debug/HUD), and
+/// sampled with a linear filter (tonemap, bloom threshold, exposure).
+///
+/// Bloom/spill/VRS storage images are separate RGBA16F (or R8 rate) targets —
+/// no pass binds the HDR offscreen as a storage image, so `STORAGE_IMAGE` is
+/// not required (and would reject 11-bit on many devices).
+fn hdr_offscreen_features() -> vk::FormatFeatureFlags {
+    vk::FormatFeatureFlags::COLOR_ATTACHMENT
+        | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+}
+
+/// Choose the HDR offscreen format. `Ok` is the format to use; `Err` is the
+/// 11-bit bits that were missing (caller logs and falls back).
+fn choose_hdr_color_format(
+    want_11bit: bool,
+    eleven_features: vk::FormatFeatureFlags,
+) -> Result<vk::Format, vk::FormatFeatureFlags> {
+    if !want_11bit {
+        return Ok(HDR_COLOR_FORMAT);
+    }
+    let required = hdr_offscreen_features();
+    if eleven_features.contains(required) {
+        Ok(HDR_11BIT_FORMAT)
+    } else {
+        Err(required & !eleven_features)
+    }
+}
+
+/// Experimental packed 11-bit HDR offscreen (`VOXEL_HDR_11BIT=1`). Not a public
+/// API. Falls back to [`HDR_COLOR_FORMAT`] when the device is missing a
+/// required optimal-tiling feature.
+fn pick_hdr_color_format(instance: &ash::Instance, physical: vk::PhysicalDevice) -> vk::Format {
+    if !hdr_11bit_requested() {
+        return HDR_COLOR_FORMAT;
+    }
+    let props =
+        unsafe { instance.get_physical_device_format_properties(physical, HDR_11BIT_FORMAT) };
+    match choose_hdr_color_format(true, props.optimal_tiling_features) {
+        Ok(format) => format,
+        Err(missing) => {
+            log::info!(
+                "VOXEL_HDR_11BIT: {HDR_11BIT_FORMAT:?} missing {missing:?}; using {HDR_COLOR_FORMAT:?}"
+            );
+            HDR_COLOR_FORMAT
         }
     }
-    // Unreachable: Vulkan guarantees D16_UNORM (last candidate) supports
-    // DEPTH_STENCIL_ATTACHMENT on every implementation.
-    unreachable!("no depth format despite spec-guaranteed D16_UNORM support");
+}
+
+/// Whether a color attachment format has an alpha channel. Packed 11-bit HDR
+/// is RGB-only; blend write masks must not include `A`.
+pub(crate) fn color_format_has_alpha(format: vk::Format) -> bool {
+    format != HDR_11BIT_FORMAT
+}
+
+fn depth_format_features() -> vk::FormatFeatureFlags {
+    vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT | vk::FormatFeatureFlags::SAMPLED_IMAGE
+}
+
+/// Candidate order: D32 first (reversed-Z precision), then packed D24, then
+/// the spec-guaranteed D16 fallback.
+const DEPTH_FORMAT_CANDIDATES: [vk::Format; 4] = [
+    vk::Format::D32_SFLOAT,
+    vk::Format::X8_D24_UNORM_PACK32,
+    vk::Format::D24_UNORM_S8_UINT,
+    vk::Format::D16_UNORM,
+];
+
+/// First candidate whose features contain [`depth_format_features`].
+/// `Err` is the bits the last candidate was missing (D16 is last).
+fn first_depth_format(
+    candidates: impl IntoIterator<Item = (vk::Format, vk::FormatFeatureFlags)>,
+) -> Result<vk::Format, vk::FormatFeatureFlags> {
+    let required = depth_format_features();
+    let mut missing = required;
+    for (format, features) in candidates {
+        if features.contains(required) {
+            return Ok(format);
+        }
+        missing = required & !features;
+    }
+    Err(missing)
+}
+
+/// Pick a depth format the engine can render into **and** sample.
+///
+/// Vulkan requires `DEPTH_STENCIL_ATTACHMENT` for `D16_UNORM` and for (at
+/// least one of) packed D24 / `D32_SFLOAT`, but `SAMPLED_IMAGE` is **not**
+/// mandatory for `X8_D24_UNORM_PACK32` or `D24_UNORM_S8_UINT`. The depth
+/// image is sampled (TAA, spill, VRS; see [`depth_format_features`]), so the
+/// picker requires that full set. `D16_UNORM` is spec-guaranteed to provide
+/// both bits, so falling through the list is unreachable; a driver that still
+/// fails it panics naming the missing feature.
+fn pick_depth_format(instance: &ash::Instance, physical: vk::PhysicalDevice) -> vk::Format {
+    let queried = DEPTH_FORMAT_CANDIDATES.map(|format| {
+        let props = unsafe { instance.get_physical_device_format_properties(physical, format) };
+        (format, props.optimal_tiling_features)
+    });
+    match first_depth_format(queried) {
+        Ok(format) => format,
+        Err(missing) if missing.is_empty() => {
+            // D16 reported the required set, so the loop must have returned it.
+            unreachable!(
+                "D16_UNORM reported {:?} but was not selected",
+                depth_format_features()
+            )
+        }
+        Err(missing) => panic!(
+            "no depth format with {:?}; D16_UNORM is missing {missing:?}",
+            depth_format_features()
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn depth_picker_requires_sampled_not_just_attachment() {
+        let att = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT;
+        let both = att | vk::FormatFeatureFlags::SAMPLED_IMAGE;
+        assert_eq!(
+            first_depth_format([(vk::Format::D32_SFLOAT, att)]),
+            Err(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+        );
+        assert_eq!(
+            first_depth_format([(vk::Format::D32_SFLOAT, both)]),
+            Ok(vk::Format::D32_SFLOAT)
+        );
+    }
+
+    #[test]
+    fn depth_picker_keeps_d32_first() {
+        let both = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE;
+        let att = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT;
+        // D32 lacks sampled, later D16 has both → D16.
+        assert_eq!(
+            first_depth_format([
+                (vk::Format::D32_SFLOAT, att),
+                (vk::Format::X8_D24_UNORM_PACK32, att),
+                (vk::Format::D24_UNORM_S8_UINT, att),
+                (vk::Format::D16_UNORM, both),
+            ]),
+            Ok(vk::Format::D16_UNORM)
+        );
+        // Every candidate has the set → D32 wins (candidate order).
+        assert_eq!(
+            first_depth_format(DEPTH_FORMAT_CANDIDATES.map(|f| (f, both))),
+            Ok(vk::Format::D32_SFLOAT)
+        );
+    }
+
+    #[test]
+    fn depth_picker_names_missing_sampled_on_d16() {
+        let att = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT;
+        assert_eq!(
+            first_depth_format(DEPTH_FORMAT_CANDIDATES.map(|f| (f, att))),
+            Err(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+        );
+    }
+
+    #[test]
+    fn hdr_11bit_stays_rgba16f_when_not_requested() {
+        let none = vk::FormatFeatureFlags::empty();
+        let all = hdr_offscreen_features();
+        assert_eq!(choose_hdr_color_format(false, all), Ok(HDR_COLOR_FORMAT));
+        assert_eq!(choose_hdr_color_format(false, none), Ok(HDR_COLOR_FORMAT));
+    }
+
+    #[test]
+    fn hdr_11bit_requires_blend_and_sampled() {
+        let all = hdr_offscreen_features();
+        assert_eq!(choose_hdr_color_format(true, all), Ok(HDR_11BIT_FORMAT));
+        let no_blend = all & !vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND;
+        assert_eq!(
+            choose_hdr_color_format(true, no_blend),
+            Err(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND)
+        );
+        let no_sampled = all & !vk::FormatFeatureFlags::SAMPLED_IMAGE;
+        assert_eq!(
+            choose_hdr_color_format(true, no_sampled),
+            Err(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+        );
+        // Storage is not required of the offscreen (bloom/spill/VRS storage
+        // images are separate).
+        let no_storage = all & !vk::FormatFeatureFlags::STORAGE_IMAGE;
+        assert_eq!(
+            choose_hdr_color_format(true, no_storage),
+            Ok(HDR_11BIT_FORMAT)
+        );
+    }
+
+    #[test]
+    fn packed_11bit_has_no_alpha() {
+        assert!(!color_format_has_alpha(HDR_11BIT_FORMAT));
+        assert!(color_format_has_alpha(HDR_COLOR_FORMAT));
+        assert!(color_format_has_alpha(vk::Format::B8G8R8A8_UNORM));
+    }
 }
