@@ -22,8 +22,9 @@ pub const PUSH_BYTES_DEBUG: u32 = size_of::<DebugPush>() as u32;
 pub const PUSH_BYTES_2D: u32 = size_of::<[f32; 2]>() as u32; // pixels_to_ndc
 pub const PUSH_BYTES_SKY: u32 = size_of::<SkyParams>() as u32; // inv_view_proj + disc cosines
 const _: () = assert!(size_of::<SkyParams>() <= 128);
-// exposure + wide-FOV remap coefficients (s, atan_s); see camera::WarpPush.
+// exposure + wide-FOV remap coefficients (s, atan_s) + vignette; see camera::WarpPush.
 pub const PUSH_BYTES_TONEMAP: u32 = size_of::<crate::camera::WarpPush>() as u32;
+pub const PUSH_BYTES_TONEMAP_TAA: u32 = size_of::<super::taa::TonemapTaaPush>() as u32;
 
 /// Frame camera eye split: exact integer block + fractional part.
 #[repr(C)]
@@ -135,6 +136,7 @@ const SKY_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.vert.spv")
 const SKY_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv"));
 const TONEMAP_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.vert.spv"));
 const TONEMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
+const TONEMAP_TAA_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap_taa.frag.spv"));
 const VRS_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vrs.comp.spv"));
 
 /// The VRS classifier compute pipeline plus the depth sampler it reads through.
@@ -187,15 +189,32 @@ pub struct Pipelines {
     pub sky_set_layout: vk::DescriptorSetLayout,
     /// Linear-clamp sampler pushed with the octahedral cloud LUT.
     pub sky_lut_sampler: vk::Sampler,
-    /// Fullscreen AgX tonemap: samples the HDR offscreen (set 0 push descriptor,
-    /// `tonemap_set_layout`) and writes the LDR swapchain image.
+    /// Fullscreen tonemap: samples the HDR offscreen and the quarter-res spill
+    /// (set 0 push descriptor, `tonemap_set_layout`) and writes the LDR swapchain.
+    /// TAA-off path: one color attachment, no TAA ALU (`tonemap.frag` without
+    /// `-DTAA_FUSED`).
     pub tonemap: vk::Pipeline,
     pub layout_tonemap: vk::PipelineLayout,
     pub tonemap_set_layout: vk::DescriptorSetLayout,
-    /// Linear-clamp sampler pushed with the HDR image for the tonemap draw.
+    /// Linear-clamp sampler pushed with the HDR image, the spill image, and
+    /// (when TAA is on) the read-history image.
     pub tonemap_sampler: vk::Sampler,
-    /// Point-clamp sampler pushed with the scene depth for the godray sky mask.
+    /// Fused TAA tonemap (`-DTAA_FUSED`): two color attachments (swapchain +
+    /// RGBA16F history). Own layout: extra history/depth bindings and the
+    /// larger push block. Off path keeps `tonemap` so TAA-off costs nothing.
+    pub tonemap_taa: vk::Pipeline,
+    pub layout_tonemap_taa: vk::PipelineLayout,
+    pub tonemap_taa_set_layout: vk::DescriptorSetLayout,
+    /// Nearest-clamp sampler for the render-res depth tap (reversed-Z).
     pub tonemap_depth_sampler: vk::Sampler,
+    /// Overlay variants with a second (history) color attachment, write-mask
+    /// empty on attachment 1, so they can draw in the same rendering as the
+    /// fused tonemap. Attachment 1 is not written: HUD stays out of history.
+    /// `Some` only when `independentBlend` is enabled (distinct per-attachment
+    /// blend states). Without it the present path draws overlay in a second
+    /// one-attachment rendering using `tris2d_present` / `tris2d_tex_present`.
+    pub tris2d_present_taa: Option<vk::Pipeline>,
+    pub tris2d_tex_present_taa: Option<vk::Pipeline>,
     /// `Some` exactly when attachment VRS is enabled (`fsr.is_some()`).
     pub vrs_compute: Option<VrsCompute>,
 }
@@ -213,6 +232,7 @@ impl Pipelines {
         mesh3d_set_layout: vk::DescriptorSetLayout,
         fsr: Option<&FragmentShadingRate>,
         local_read: bool,
+        independent_blend: bool,
     ) -> Self {
         // 3D set 0: binding 0 = offsets SSBO (vertex), binding 1 = texture
         // array (fragment) — one push set (Vulkan allows at most one per
@@ -299,9 +319,9 @@ impl Pipelines {
                 .expect("Failed to create 2D pipeline layout")
         };
 
-        // Tonemap: set 0 binding 0 = the HDR offscreen, binding 1 = the bloom mip
-        // pyramid, both combined image samplers pushed at record time. Plus
-        // the tonemap push constant.
+        // Tonemap: set 0 binding 0 = the HDR offscreen, binding 1 = the
+        // quarter-res spill (bloom composite + godrays). Both combined image
+        // samplers pushed at record time. Plus the tonemap push constant.
         let tonemap_binding = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -310,12 +330,6 @@ impl Pipelines {
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            // Binding 2: scene depth for the godray sky mask.
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(2)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
@@ -343,21 +357,6 @@ impl Pipelines {
                 )
                 .expect("Failed to create tonemap sampler")
         };
-        // NEAREST for depth; D32 linear isn't guaranteed, and threshold tests need
-        // no interpolation.
-        let tonemap_depth_sampler = unsafe {
-            device
-                .create_sampler(
-                    &vk::SamplerCreateInfo::default()
-                        .mag_filter(vk::Filter::NEAREST)
-                        .min_filter(vk::Filter::NEAREST)
-                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
-                    None,
-                )
-                .expect("Failed to create tonemap depth sampler")
-        };
         let push_tonemap = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
@@ -370,6 +369,54 @@ impl Pipelines {
             device
                 .create_pipeline_layout(&layout_tonemap_info, None)
                 .expect("Failed to create tonemap pipeline layout")
+        };
+
+        // Fused TAA tonemap: HDR + spill + history + depth, larger push.
+        let tonemap_taa_binding = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(super::taa::TONEMAP_TAA_HDR_BINDING)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(super::taa::TONEMAP_TAA_SPILL_BINDING)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(super::taa::TONEMAP_TAA_HISTORY_BINDING)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(super::taa::TONEMAP_TAA_DEPTH_BINDING)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let tonemap_taa_set_layout = unsafe {
+            device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+                        .bindings(&tonemap_taa_binding),
+                    None,
+                )
+                .expect("Failed to create tonemap TAA set layout")
+        };
+        let tonemap_depth_sampler = pass::nearest_clamp_sampler(device, "tonemap depth");
+        let push_tonemap_taa = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(PUSH_BYTES_TONEMAP_TAA)];
+        let set_layouts_tonemap_taa = [tonemap_taa_set_layout];
+        let layout_tonemap_taa_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts_tonemap_taa)
+            .push_constant_ranges(&push_tonemap_taa);
+        let layout_tonemap_taa = unsafe {
+            device
+                .create_pipeline_layout(&layout_tonemap_taa_info, None)
+                .expect("Failed to create tonemap TAA pipeline layout")
         };
 
         // Vertex layouts derived from struct fields (see vertex_input).
@@ -403,6 +450,7 @@ impl Pipelines {
             depth_format,
             samples,
             fsr_enabled: fsr.is_some(),
+            second_color: None,
         };
 
         // Depth: reversed-Z, so GREATER_OR_EQUAL and clear to 0.0.
@@ -582,6 +630,7 @@ impl Pipelines {
             depth_format: vk::Format::UNDEFINED,
             samples: vk::SampleCountFlags::TYPE_1,
             fsr_enabled: false,
+            second_color: None,
         };
         let tonemap = tonemap_builder.build(
             tonemap_vert,
@@ -599,6 +648,30 @@ impl Pipelines {
             },
         );
 
+        let tonemap_taa_frag =
+            pass::shader_module(device, TONEMAP_TAA_FRAG, "tonemap TAA fragment");
+        let tonemap_taa_builder = PipelineBuilder {
+            second_color: Some((
+                super::taa::TAA_HISTORY_FORMAT,
+                vk::ColorComponentFlags::RGBA,
+            )),
+            ..tonemap_builder
+        };
+        let tonemap_taa = tonemap_taa_builder.build(
+            tonemap_vert,
+            tonemap_taa_frag,
+            &[],
+            &[],
+            layout_tonemap_taa,
+            PipelineConfig {
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                depth: DepthMode::Disabled,
+                cull: vk::CullModeFlags::NONE,
+                blend: false,
+                vrs: false,
+                depth_bias: None,
+            },
+        );
         // Overlay variants at present format / single-sample (same modules, layout,
         // and blend as tris2d/tris2d_tex) for the post-tonemap swapchain draw.
         let overlay_2d_config = || PipelineConfig {
@@ -625,10 +698,43 @@ impl Pipelines {
             layout_2d,
             overlay_2d_config(),
         );
+        // Distinct blend states (att0 alpha-blend, att1 empty write mask) are
+        // legal only with independentBlend. Without it these pipelines are
+        // omitted and present.rs draws overlay in a second one-attachment scope.
+        let (tris2d_present_taa, tris2d_tex_present_taa) = if independent_blend {
+            let overlay_taa_builder = PipelineBuilder {
+                second_color: Some((
+                    super::taa::TAA_HISTORY_FORMAT,
+                    vk::ColorComponentFlags::empty(),
+                )),
+                ..tonemap_builder
+            };
+            (
+                Some(overlay_taa_builder.build(
+                    tri2d_vert,
+                    tri2d_frag,
+                    &bindings_2d,
+                    attributes_2d,
+                    layout_2d,
+                    overlay_2d_config(),
+                )),
+                Some(overlay_taa_builder.build(
+                    tri2d_vert,
+                    tri2d_tex_frag,
+                    &bindings_2d,
+                    attributes_2d,
+                    layout_2d,
+                    overlay_2d_config(),
+                )),
+            )
+        } else {
+            (None, None)
+        };
 
         unsafe {
             device.destroy_shader_module(tonemap_vert, None);
             device.destroy_shader_module(tonemap_frag, None);
+            device.destroy_shader_module(tonemap_taa_frag, None);
             device.destroy_shader_module(mesh_vert, None);
             device.destroy_shader_module(mesh_frag, None);
             device.destroy_shader_module(mesh_opaque_frag, None);
@@ -671,7 +777,12 @@ impl Pipelines {
             layout_tonemap,
             tonemap_set_layout,
             tonemap_sampler,
+            tonemap_taa,
+            layout_tonemap_taa,
+            tonemap_taa_set_layout,
             tonemap_depth_sampler,
+            tris2d_present_taa,
+            tris2d_tex_present_taa,
         }
     }
 
@@ -717,8 +828,15 @@ impl Pipelines {
             device.destroy_pipeline(self.tris2d_tex, None);
             device.destroy_pipeline(self.tris2d_present, None);
             device.destroy_pipeline(self.tris2d_tex_present, None);
+            if let Some(p) = self.tris2d_present_taa {
+                device.destroy_pipeline(p, None);
+            }
+            if let Some(p) = self.tris2d_tex_present_taa {
+                device.destroy_pipeline(p, None);
+            }
             device.destroy_pipeline(self.sky, None);
             device.destroy_pipeline(self.tonemap, None);
+            device.destroy_pipeline(self.tonemap_taa, None);
             device.destroy_pipeline_layout(self.layout_3d, None);
             device.destroy_pipeline_layout(self.layout_debug, None);
             device.destroy_pipeline_layout(self.layout_2d, None);
@@ -728,6 +846,8 @@ impl Pipelines {
             device.destroy_pipeline_layout(self.layout_tonemap, None);
             device.destroy_descriptor_set_layout(self.tonemap_set_layout, None);
             device.destroy_sampler(self.tonemap_sampler, None);
+            device.destroy_pipeline_layout(self.layout_tonemap_taa, None);
+            device.destroy_descriptor_set_layout(self.tonemap_taa_set_layout, None);
             device.destroy_sampler(self.tonemap_depth_sampler, None);
         }
     }
@@ -740,6 +860,7 @@ enum DepthMode {
     Disabled,
 }
 
+#[derive(Clone, Copy)]
 struct PipelineBuilder<'a> {
     device: &'a ash::Device,
     /// Renderer-owned, disk-backed cache; null is valid (no caching).
@@ -750,6 +871,11 @@ struct PipelineBuilder<'a> {
     /// Whether attachment VRS is enabled; when true, `vrs` configs chain the
     /// shading-rate state so the rate attachment drives coarse shading.
     fsr_enabled: bool,
+    /// Optional second color attachment (fused TAA history). The write mask
+    /// is RGBA for the tonemap write, empty for overlay variants that must
+    /// match the 2-attachment rendering without touching history. Overlay
+    /// variants with a distinct empty mask require `independentBlend`.
+    second_color: Option<(vk::Format, vk::ColorComponentFlags)>,
 }
 
 /// Per-pipeline knobs for `PipelineBuilder::build`, named at each call site
@@ -855,9 +981,10 @@ impl PipelineBuilder<'_> {
         let multisampling =
             vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(self.samples);
 
+        let write_mask = color_write_mask(self.color_format);
         let color_attachment = if blend {
             vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .color_write_mask(write_mask)
                 .blend_enable(true)
                 .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
                 .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
@@ -867,12 +994,24 @@ impl PipelineBuilder<'_> {
                 .alpha_blend_op(vk::BlendOp::ADD)
         } else {
             vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .color_write_mask(write_mask)
                 .blend_enable(false)
         };
-        let color_attachments = [color_attachment];
+        let second_blend = self.second_color.map(|(_, mask)| {
+            vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(mask)
+                .blend_enable(false)
+        });
+        let color_attachments_1 = [color_attachment];
+        let color_attachments_2 = [color_attachment, second_blend.unwrap_or_default()];
+        let color_attachments: &[vk::PipelineColorBlendAttachmentState] =
+            if self.second_color.is_some() {
+                &color_attachments_2
+            } else {
+                &color_attachments_1
+            };
         let color_blending =
-            vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_attachments);
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(color_attachments);
 
         let depth_stencil = match depth {
             DepthMode::ReadWrite => vk::PipelineDepthStencilStateCreateInfo::default()
@@ -886,9 +1025,20 @@ impl PipelineBuilder<'_> {
             DepthMode::Disabled => vk::PipelineDepthStencilStateCreateInfo::default(),
         };
 
-        let color_formats = [self.color_format];
+        let color_formats_1 = [self.color_format];
+        let color_formats_2 = [
+            self.color_format,
+            self.second_color
+                .map(|(f, _)| f)
+                .unwrap_or(vk::Format::UNDEFINED),
+        ];
+        let color_formats: &[vk::Format] = if self.second_color.is_some() {
+            &color_formats_2
+        } else {
+            &color_formats_1
+        };
         let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_formats)
+            .color_attachment_formats(color_formats)
             .depth_attachment_format(self.depth_format);
 
         let mut fsr_state = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
@@ -1005,8 +1155,21 @@ fn create_vrs_compute(device: &ash::Device, cache: vk::PipelineCache) -> VrsComp
     }
 }
 
+/// Color write mask for a pipeline's first attachment. Packed 11-bit HDR has
+/// no alpha; `A` in the mask is ignored by the spec but we omit it so blend
+/// state does not assume a channel the format does not have.
+fn color_write_mask(format: vk::Format) -> vk::ColorComponentFlags {
+    if super::targets::color_format_has_alpha(format) {
+        vk::ColorComponentFlags::RGBA
+    } else {
+        vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use ash::vk;
+
     /// Scan a SPIR-V module for an opcode (low 16 bits of each instruction word).
     fn spirv_has_opcode(bytes: &[u8], opcode: u32) -> bool {
         assert!(bytes.len() >= 20 && bytes.len().is_multiple_of(4));
@@ -1032,6 +1195,18 @@ mod tests {
 
     const OP_KILL: u32 = 252;
     const OP_DEMOTE: u32 = 5380;
+
+    #[test]
+    fn packed_11bit_hdr_write_mask_has_no_alpha() {
+        assert_eq!(
+            super::color_write_mask(vk::Format::B10G11R11_UFLOAT_PACK32),
+            vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B
+        );
+        assert_eq!(
+            super::color_write_mask(vk::Format::R16G16B16A16_SFLOAT),
+            vk::ColorComponentFlags::RGBA
+        );
+    }
 
     #[test]
     fn opaque_frag_has_no_discard() {

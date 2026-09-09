@@ -13,9 +13,13 @@
 //!   the thread — never moved to it — because its `HostBuffer`s hold a raw
 //!   `*mut u8` that is `!Send`.
 use std::num::NonZeroU32;
-use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{
+    Receiver, RecvError, Sender, SyncSender, TryRecvError, channel, sync_channel,
+};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ash::{khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -25,10 +29,10 @@ use winit::window::Window;
 
 use super::alloc::{Allocation, DEVICE_SHRINK_SETTLE_TICKS, GpuAllocator};
 use super::buffers::{
-    DrawDyn, FRAMES_IN_FLIGHT, GpuResident, MeshHandles, MeshRecord, PlacementState,
-    build_mesh_resident,
+    DrawDyn, GpuResident, MeshHandles, MeshRecord, PlacementState, build_mesh_resident,
 };
 use super::device::{Device, MemoryBudget};
+use super::image::{AllocError, render_target_oom_message};
 use super::instance::InstanceBundle;
 use super::{Renderer, Scale, clamp_msaa, display_refresh_interval};
 use crate::engine::Config;
@@ -85,6 +89,8 @@ pub(crate) enum RenderCmd {
     SetVsync(bool),
     /// Replaces the render thread's feature-flag copy (see [`crate::RenderFlags`]).
     SetFlags(crate::RenderFlags),
+    /// GPU face-run culling; applied at the next cull prepare.
+    SetCullFaces(bool),
     /// Pre-clamped against device caps.
     SetMsaa(u32),
     SetRenderScale(Scale),
@@ -141,10 +147,18 @@ pub(crate) struct DeviceLeftovers {
     pub device: Device,
 }
 
-/// Recording snapshots in circulation. GPU frames-in-flight is
-/// [`FRAMES_IN_FLIGHT`] (2); the extra box means [`RenderClient::take_frame`]
-/// rarely parks waiting for the render thread to recycle one.
-const FRAME_POOL_SIZE: usize = FRAMES_IN_FLIGHT as usize + 1;
+/// Recording snapshots in circulation between main and the render thread.
+///
+/// The render thread's own slot ring ([`FRAMES_IN_FLIGHT`]) is what keeps the
+/// GPU fed. Main only needs **one** queued frame so the render thread never
+/// starves, plus the box it is recording into and [`FramePool::last_drawn`].
+/// Hence 3, independent of `FRAMES_IN_FLIGHT`.
+///
+/// A larger pool lets main run more than one frame ahead. With vsync on, the
+/// render loop coalesces queued [`RenderCmd::Frame`]s to the newest so a slow
+/// present path skips stale snapshots. Vsync off is treated as uncapped (the
+/// render thread does not know a game FPS cap) and does not coalesce.
+const FRAME_POOL_SIZE: usize = 3;
 
 /// Pooled [`DrawLists`] boxes plus the most recently completed snapshot, used
 /// so a blocking capture can re-present the last scene without cloning it
@@ -210,12 +224,22 @@ pub(crate) struct RenderClient {
     /// The render thread's published exposure cell, cloned into `Engine`.
     exposure: super::exposure::ExposureShared,
     /// `None` once joined (shutdown is idempotent).
-    join: Option<JoinHandle<DeviceLeftovers>>,
+    join: Option<JoinHandle<Option<DeviceLeftovers>>>,
+    /// Render-thread completed `draw_frame` calls (monotonic).
+    frames_rendered: Arc<AtomicU64>,
+    /// Frames dropped by render-loop coalescing (monotonic).
+    frames_coalesced: Arc<AtomicU64>,
 }
 
 impl RenderClient {
     /// Create window, spawn render thread, build main-side allocator.
-    pub(crate) fn spawn(event_loop: &ActiveEventLoop, config: &Config) -> (Window, RenderClient) {
+    ///
+    /// Render-target allocation failure is an `Err` with a readable message
+    /// (logged here) rather than a render-thread panic + `RecvError`.
+    pub(crate) fn spawn(
+        event_loop: &ActiveEventLoop,
+        config: &Config,
+    ) -> Result<(Window, RenderClient), String> {
         let mut attrs = winit::window::WindowAttributes::default()
             .with_title(&config.title)
             .with_inner_size(winit::dpi::LogicalSize::new(config.width, config.height))
@@ -258,19 +282,49 @@ impl RenderClient {
 
         let (cmd_tx, cmd_rx) = sync_channel::<RenderCmd>(1024);
         let (ret_tx, ret_rx) = channel::<RenderReturn>();
-        let (init_tx, init_rx) = channel::<InitReply>();
+        let (init_tx, init_rx) = channel::<Result<InitReply, AllocError>>();
         let ret_for_renderer = ret_tx.clone();
+        let frames_rendered = Arc::new(AtomicU64::new(0));
+        let frames_coalesced = Arc::new(AtomicU64::new(0));
+        let rendered_for_loop = Arc::clone(&frames_rendered);
+        let coalesced_for_loop = Arc::clone(&frames_coalesced);
         let join = std::thread::Builder::new()
             .name("render".into())
             .spawn(move || {
-                let (renderer, reply) =
-                    Renderer::build(instance, surface_loader, surface, cfg, ret_for_renderer);
-                let _ = init_tx.send(reply);
-                render_loop(renderer, cmd_rx, ret_tx)
+                match Renderer::build(instance, surface_loader, surface, cfg, ret_for_renderer) {
+                    Ok((renderer, reply)) => {
+                        let _ = init_tx.send(Ok(reply));
+                        Some(render_loop(
+                            renderer,
+                            cmd_rx,
+                            ret_tx,
+                            rendered_for_loop,
+                            coalesced_for_loop,
+                        ))
+                    }
+                    Err(err) => {
+                        let _ = init_tx.send(Err(err));
+                        None
+                    }
+                }
             })
             .expect("Failed to spawn render thread");
 
-        let reply = init_rx.recv().expect("render thread init failed");
+        let reply = match init_rx.recv() {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(err)) => {
+                let msg = render_target_oom_message(&err);
+                log::error!("{msg}");
+                let _ = join.join();
+                return Err(msg);
+            }
+            Err(_) => {
+                let msg = "renderer: render thread failed during initialization".to_string();
+                log::error!("{msg}");
+                let _ = join.join();
+                return Err(msg);
+            }
+        };
         let mesh_alloc =
             unsafe { GpuAllocator::new(&reply.instance, reply.physical, reply.memory_budget) };
         if mesh_alloc.unified_memory() {
@@ -294,11 +348,13 @@ impl RenderClient {
             render_scale: Scale::new(config.render_scale),
             vsync: config.vsync,
             msaa,
-            cull_faces: false,
+            cull_faces: true,
             exposure: reply.exposure,
             join: Some(join),
+            frames_rendered,
+            frames_coalesced,
         };
-        (window, client)
+        Ok((window, client))
     }
 
     /// The render thread's published exposure cell, for `Engine`'s compose path.
@@ -467,13 +523,15 @@ impl RenderClient {
         self.caps.max_texture_layers
     }
 
-    /// Cached-only since the GPU cull became unconditional: both the
-    /// GPU opaque/cutout emission and the CPU Blend re-source draw whole-mesh
-    /// index ranges, so per-face splitting has no live consumer. Retained so
-    /// the app's settings toggle still round-trips; INERT until per-face
-    /// partitioning is taught to the cull shader (or the setting is retired).
+    /// GPU face-run culling. On by default; `false` is an explicit opt-out.
+    /// Ships [`RenderCmd::SetCullFaces`] so the render thread follows; a change
+    /// takes effect at the next frame boundary.
     pub(crate) fn set_cull_faces(&mut self, on: bool) {
+        if self.cull_faces == on {
+            return;
+        }
         self.cull_faces = on;
+        let _ = self.tx.send(RenderCmd::SetCullFaces(on));
     }
 
     pub(crate) fn cull_faces(&self) -> bool {
@@ -500,6 +558,14 @@ impl RenderClient {
     pub(crate) fn resize(&mut self, size: PhysicalSize<u32>) {
         self.size = size;
         let _ = self.tx.send(RenderCmd::Resize(size));
+    }
+
+    pub(crate) fn frames_rendered(&self) -> u64 {
+        self.frames_rendered.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn frames_coalesced(&self) -> u64 {
+        self.frames_coalesced.load(Ordering::Relaxed)
     }
 
     pub(crate) fn screen_width(&self) -> i32 {
@@ -569,7 +635,11 @@ impl RenderClient {
     /// returns a buffer only after it has consumed one). Never takes
     /// [`FramePool::last_drawn`]: that box still holds the last completed
     /// scene for [`Self::wait_last_drawn`].
-    pub(crate) fn take_frame(&mut self) -> Box<DrawLists> {
+    ///
+    /// `spin` is true only when the engine is uncapped (vsync off and no FPS
+    /// cap): poll the return channel briefly before parking so a 20 µs frame
+    /// does not pay a futex wake every hand-off.
+    pub(crate) fn take_frame(&mut self, spin: bool) -> Box<DrawLists> {
         loop {
             if let Some(b) = self.frames.pop_idle() {
                 return b;
@@ -583,7 +653,7 @@ impl RenderClient {
             // main-thread work; the non-blocking pop above is not a wait.
             let r = {
                 let _p = crate::profile::scope(crate::profile::Meter::WaitFrame);
-                self.ret_rx.recv()
+                recv_spin(&self.ret_rx, spin)
             };
             match r {
                 Ok(r) => self.handle_return(r),
@@ -624,16 +694,16 @@ impl RenderClient {
     /// correct order (allocator buffers first). Idempotent via `join.take()`.
     pub(crate) fn shutdown(&mut self) {
         let _ = self.tx.send(RenderCmd::Shutdown);
-        if let Some(join) = self.join.take() {
-            if let Ok(mut lo) = join.join() {
-                log::debug!("GPU memory at shutdown: {:?}", self.mesh_alloc.stats());
-                unsafe {
-                    // GPU is idle (the thread's teardown waited it) and stopped.
-                    self.mesh_alloc.destroy(&lo.device.device);
-                    lo.device.destroy();
-                    lo.surface_loader.destroy_surface(lo.surface, None);
-                    lo.instance.destroy();
-                }
+        if let Some(join) = self.join.take()
+            && let Ok(Some(mut lo)) = join.join()
+        {
+            log::debug!("GPU memory at shutdown: {:?}", self.mesh_alloc.stats());
+            unsafe {
+                // GPU is idle (the thread's teardown waited it) and stopped.
+                self.mesh_alloc.destroy(&lo.device.device);
+                lo.device.destroy();
+                lo.surface_loader.destroy_surface(lo.surface, None);
+                lo.instance.destroy();
             }
         }
     }
@@ -645,27 +715,94 @@ impl Drop for RenderClient {
     }
 }
 
-/// The render thread's loop: block when idle, greedily drain the command stream
-/// applying resource commands in order and coalescing frames to the latest, draw
+/// Outcome of one drain of the command stream.
+enum Drain {
+    Shutdown,
+    Frame(Option<Box<DrawLists>>),
+}
+
+/// Drain `first` plus whatever `try_next` yields.
+///
+/// Non-frame commands are applied in order. With `coalesce` (vsync on), queued
+/// [`RenderCmd::Frame`]s collapse to the newest and `recycle` returns dropped
+/// snapshots. Without it (vsync off / uncapped), stop at the first `Frame` so
+/// later frames stay in the channel for the next iteration — otherwise a faster
+/// main thread drops every other game frame. Vsync-off is treated as uncapped
+/// because the render thread cannot see a game FPS cap.
+fn drain_cmds(
+    first: RenderCmd,
+    mut try_next: impl FnMut() -> Option<RenderCmd>,
+    coalesce: bool,
+    mut apply: impl FnMut(RenderCmd),
+    mut recycle: impl FnMut(Box<DrawLists>),
+) -> Drain {
+    let mut latest_frame: Option<Box<DrawLists>> = None;
+    let mut cmd = Some(first);
+    while let Some(c) = cmd.take().or_else(&mut try_next) {
+        match c {
+            RenderCmd::Frame(f) => {
+                if let Some(old) = latest_frame.replace(f) {
+                    recycle(old);
+                }
+                if !coalesce {
+                    break;
+                }
+            }
+            RenderCmd::Shutdown => return Drain::Shutdown,
+            other => apply(other),
+        }
+    }
+    Drain::Frame(latest_frame)
+}
+
+/// The render thread's loop: block when idle, drain the command stream applying
+/// resource commands in order (coalescing frames only when vsync is on), draw
 /// once, then recycle retired allocations. Returns the device leftovers for
 /// main to finish teardown.
+/// Same idea as [`super::timeline::Timeline::wait_spin`] / `FENCE_SPIN_BUDGET`
+/// in `frame_loop`: spin a short, bounded window so a producer that is already
+/// on the way does not pay a futex park. Never spin when vsync or an FPS cap
+/// is pacing the loop — there the sleep is the point.
+const CHANNEL_SPIN_BUDGET: Duration = Duration::from_micros(50);
+
+fn recv_spin<T>(rx: &Receiver<T>, spin: bool) -> Result<T, RecvError> {
+    if spin {
+        let start = Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok(v) => return Ok(v),
+                Err(TryRecvError::Disconnected) => return Err(RecvError),
+                Err(TryRecvError::Empty) => {
+                    if start.elapsed() >= CHANNEL_SPIN_BUDGET {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+    rx.recv()
+}
+
 fn render_loop(
     mut renderer: Renderer,
     rx: Receiver<RenderCmd>,
     ret: Sender<RenderReturn>,
+    frames_rendered: Arc<AtomicU64>,
+    frames_coalesced: Arc<AtomicU64>,
 ) -> DeviceLeftovers {
-    while let Ok(first) = rx.recv() {
-        let mut latest_frame: Option<Box<DrawLists>> = None;
-        let mut cmd = Some(first);
-        while let Some(c) = cmd.take().or_else(|| rx.try_recv().ok()) {
-            match c {
-                RenderCmd::Frame(f) => {
-                    // Coalesce: keep only the newest, recycle the dropped one.
-                    if let Some(old) = latest_frame.replace(f) {
-                        let _ = ret.send(RenderReturn::Frame(old));
-                    }
-                }
-                RenderCmd::Shutdown => return renderer.teardown(),
+    loop {
+        let spin = !renderer.vsync.effective();
+        let Ok(first) = recv_spin(&rx, spin) else {
+            break;
+        };
+        // Vsync-off: render every queued Frame. Vsync-on: coalesce to newest.
+        let coalesce = renderer.vsync.effective();
+        match drain_cmds(
+            first,
+            || rx.try_recv().ok(),
+            coalesce,
+            |c| match c {
                 RenderCmd::UploadMesh {
                     slot,
                     generation,
@@ -689,17 +826,28 @@ fn render_loop(
                 RenderCmd::Resize(size) => renderer.on_resize(size),
                 RenderCmd::SetVsync(v) => renderer.set_vsync(v),
                 RenderCmd::SetFlags(f) => renderer.set_flags(f),
+                RenderCmd::SetCullFaces(on) => renderer.set_cull_faces(on),
                 RenderCmd::SetMsaa(m) => {
                     renderer.set_msaa(m);
                 }
                 RenderCmd::SetRenderScale(s) => {
                     renderer.set_render_scale(s.get());
                 }
+                RenderCmd::Frame(_) | RenderCmd::Shutdown => unreachable!(),
+            },
+            |old| {
+                frames_coalesced.fetch_add(1, Ordering::Relaxed);
+                crate::profile::count(crate::profile::Counter::Coalesced);
+                let _ = ret.send(RenderReturn::Frame(old));
+            },
+        ) {
+            Drain::Shutdown => return renderer.teardown(),
+            Drain::Frame(Some(frame)) => {
+                renderer.draw_frame(&frame);
+                frames_rendered.fetch_add(1, Ordering::Relaxed);
+                let _ = ret.send(RenderReturn::Frame(frame));
             }
-        }
-        if let Some(frame) = latest_frame {
-            renderer.draw_frame(&frame);
-            let _ = ret.send(RenderReturn::Frame(frame));
+            Drain::Frame(None) => {}
         }
     }
     // Sender dropped without a Shutdown (main gone): tear down anyway.
@@ -708,12 +856,19 @@ fn render_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{FRAME_POOL_SIZE, FRAMES_IN_FLIGHT, FramePool};
+    use super::super::buffers::FRAMES_IN_FLIGHT;
+    use super::{
+        CHANNEL_SPIN_BUDGET, Drain, FRAME_POOL_SIZE, FramePool, RenderCmd, drain_cmds, recv_spin,
+    };
+    use std::time::{Duration, Instant};
 
     #[test]
-    fn frame_pool_is_one_ahead_of_gpu_slots() {
-        assert_eq!(FRAME_POOL_SIZE, FRAMES_IN_FLIGHT as usize + 1);
+    fn frame_pool_keeps_main_at_most_one_ahead() {
         assert_eq!(FRAME_POOL_SIZE, 3);
+        // Recording + one queued/being-rendered + last_drawn. Must not grow
+        // with FRAMES_IN_FLIGHT: extra slack lets main queue ahead of render.
+        // Vsync coalesces; vsync-off leaves later Frames in the channel.
+        assert_ne!(FRAME_POOL_SIZE, FRAMES_IN_FLIGHT as usize + 1);
     }
 
     #[test]
@@ -729,5 +884,95 @@ mod tests {
         assert!(p.pop_idle().is_some());
         assert!(p.pop_idle().is_none());
         assert!(p.last_drawn.take().is_some());
+    }
+
+    #[test]
+    fn recv_spin_returns_immediately_when_queued() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(7).unwrap();
+        let start = Instant::now();
+        assert_eq!(recv_spin(&rx, true).unwrap(), 7);
+        assert!(
+            start.elapsed() < CHANNEL_SPIN_BUDGET,
+            "already-queued value must not wait out the spin budget"
+        );
+    }
+
+    #[test]
+    fn recv_spin_falls_back_to_blocking_after_budget() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(CHANNEL_SPIN_BUDGET + Duration::from_millis(2));
+            tx.send(1).unwrap();
+        });
+        let start = Instant::now();
+        assert_eq!(recv_spin(&rx, true).unwrap(), 1);
+        assert!(
+            start.elapsed() >= CHANNEL_SPIN_BUDGET,
+            "empty channel must spin the budget then block until the value arrives"
+        );
+    }
+
+    fn flag_cmd() -> RenderCmd {
+        RenderCmd::SetFlags(crate::engine::RenderFlags::default())
+    }
+
+    #[test]
+    fn uncapped_drain_stops_at_the_first_frame() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(flag_cmd()).unwrap();
+        tx.send(RenderCmd::Frame(Box::new(super::DrawLists::new())))
+            .unwrap();
+        tx.send(RenderCmd::Frame(Box::new(super::DrawLists::new())))
+            .unwrap();
+        let first = rx.recv().unwrap();
+        let mut applied = 0u32;
+        let mut recycled = 0u32;
+        let Drain::Frame(frame) = drain_cmds(
+            first,
+            || rx.try_recv().ok(),
+            false,
+            |_| applied += 1,
+            |_| recycled += 1,
+        ) else {
+            panic!("expected a frame drain");
+        };
+        assert!(frame.is_some());
+        assert_eq!(applied, 1, "non-frame cmds before the first Frame apply");
+        assert_eq!(
+            recycled, 0,
+            "uncapped must not coalesce; frames_coalesced stays 0"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(RenderCmd::Frame(_))),
+            "later Frames stay in the channel"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn vsync_drain_coalesces_queued_frames() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(RenderCmd::Frame(Box::new(super::DrawLists::new())))
+            .unwrap();
+        tx.send(flag_cmd()).unwrap();
+        tx.send(RenderCmd::Frame(Box::new(super::DrawLists::new())))
+            .unwrap();
+        let first = rx.recv().unwrap();
+        let mut applied = 0u32;
+        let mut recycled = 0u32;
+        let Drain::Frame(frame) = drain_cmds(
+            first,
+            || rx.try_recv().ok(),
+            true,
+            |_| applied += 1,
+            |_| recycled += 1,
+        ) else {
+            panic!("expected a frame drain");
+        };
+        assert!(frame.is_some());
+        assert_eq!(applied, 1);
+        assert_eq!(recycled, 1);
+        assert!(rx.try_recv().is_err());
     }
 }

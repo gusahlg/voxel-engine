@@ -246,7 +246,9 @@ impl<'e> Frame<'e> {
         let source_aspect = Aspect(w / h).source(&warp_map);
         let view_proj = cam.view_proj(source_aspect.get());
         let seq = JITTER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Jitter and TAA resolve are coupled — toggling one breaks temporal stability.
+        // Jitter and TAA resolve are coupled — toggling one breaks temporal
+        // stability. Jitter is applied every rendered frame; the resolve runs
+        // at present time at output resolution.
         let jitter = if self.eng.flags.taa {
             crate::skeleton::jitter_at(seq)
         } else {

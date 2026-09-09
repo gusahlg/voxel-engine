@@ -65,15 +65,15 @@ static const float2 HALTON_23[16] = {
 };
 
 // TAA history feedback weight: fraction of the (reprojected, variance-clamped)
-// history kept each frame. Higher = steadier but slower to react. Read by vk/taa.rs.
-// Reduced 0.95→0.92: animated water waves and clouds demand faster per-frame
-// reactivity. 0.92 (~8% new sample) reduces ghosting while maintaining temporal
-// coherence. Range [0.85–0.98].
+// history kept each present. Higher = steadier but slower to react. Read by vk/taa.rs
+// and pushed into the fused tonemap. Reduced 0.95→0.92: animated water waves and
+// clouds demand faster per-frame reactivity. 0.92 (~8% new sample) reduces ghosting
+// while maintaining temporal coherence. Range [0.85–0.98].
 static const float HISTORY_BLEND = 0.92f;
 
 // TAA neighbourhood variance-clamp width in std-devs: history is clamped to
-// YCoCg mean +/- VARIANCE_GAMMA*stddev of the 5-tap cross current taps. Wider =
-// steadier (less crawl) but more ghosting. Read by taa_resolve.comp.
+// YCoCg mean +/- VARIANCE_GAMMA*stddev of the unweighted 3x3 current taps. Wider =
+// steadier (less crawl) but more ghosting. Read by tonemap.frag (TAA_FUSED).
 static const float VARIANCE_GAMMA = 1.25f;
 
 // Blocklight candle curve: candle = x*sqrt(x) + (CANDLE_HIGH_MUL*x)^CANDLE_HIGH_POW,
@@ -103,6 +103,25 @@ static const float SHADOW_FALLBACK_POW = 10.0f;
 // all material detail in shadowed cliffs. Scales with sky_amount, so caves
 // (sky_amount 0) stay dark; only outdoor shadow gains the floor.
 static const float SHADOW_SKY_AMBIENT = 0.22f;
+
+// Fraction of the near split over which near/far PCF cross-fade; 0 = hard
+// switch. New look 0.15; VOXEL_LIGHT_LEGACY=1 keeps the hard 64 m cut.
+static const float CASCADE_BLEND_FRAC = 0.15f;
+
+// How far the sun-shadow fill tints from sun colour toward luma-matched
+// zenith colour. 0 = fill is SHADOW_SKY_AMBIENT × sun colour (legacy);
+// 0.75 pulls the fill toward sky-blue so shadowed ground is sky-lit, not warm.
+static const float SHADOW_BOUNCE_TINT = 0.75f;
+
+// Fraction of baked AO applied to the direct sun term. Dome/ambient/blocklight
+// keep full AO. 1.0 = AO darkens direct sun as much as ambient (legacy,
+// double-darkens creases the cascade already shades); 0.5 is the new look.
+static const float AO_DIRECT = 0.5f;
+
+// Lower clamp of the far cascade split when fitted to DrawLists::lod_clip.
+// 96 >= 64·1.15 + 16 m fade band, so the blend band and SHADOW_LIMIT fade
+// never overlap the near split. Legacy 256 keeps the fixed far radius.
+static const float SHADOW_FAR_MIN_RADIUS = 96.0f;
 
 // Cascade shadow map edge in texels. Mirror of vk/targets.rs (asserted equal
 // there); lets the PCF derive texel size without a per-fragment GetDimensions.
@@ -134,8 +153,8 @@ static const float CULL_BUCKET_SPLIT_2 = 256.0f;
 // (vk/exposure.rs) are ceil(hdr_dim / EXPOSURE_TILE) and must agree.
 static const uint EXPOSURE_TILE = 16;
 
-// TAA resolve workgroup edge in texels (groupshared tile + 1-pixel apron).
-// CPU dispatch (vk/taa.rs) must divide by the same value.
+// Retired TAA compute workgroup edge; the resolve now runs in the present-time
+// tonemap fragment (no groupshared tile). Kept so generated constants stay stable.
 static const uint TAA_TILE = 16;
 
 // Sun-disc soft rim (fade-to-zero edge) as a multiple of the sun angular radius.
@@ -198,13 +217,21 @@ static const float BLOOM_SPIRAL_SAMPLES = 6.0f;
 // wide soft blur comes from the pyramid; the spiral just spreads and de-aliases it.
 static const float BLOOM_SPIRAL_LOD = 2.0f;
 
-// Bloom pyramid mip cap. Tonemap samples only BLOOM_SPIRAL_LOD, so the chain
-// stops at that level (base + LOD). CPU (vk/targets.rs) must agree.
+// Bloom pyramid mip cap. The spill pass samples only BLOOM_SPIRAL_LOD, so the
+// chain stops at that level (base + LOD). CPU (vk/targets.rs) must agree.
 static const uint BLOOM_MAX_MIPS = 3;
 
 // Bloom spiral radius in output uv (isotropic). Small — the mip chain already
 // carries the wide blur, so this only softens the seams between taps.
 static const float BLOOM_SPIRAL_RADIUS = 0.08f;
+
+// Spill image is 1/SPILL_FACTOR of the render extent on each axis (quarter-res
+// at 4). CPU image create (vk/targets.rs) and the spill dispatch must agree.
+static const uint SPILL_FACTOR = 4;
+
+// Spill compute workgroup edge. CPU dispatch divides the spill extent by this;
+// the shader's [numthreads] uses the same value.
+static const uint SPILL_WG = 8;
 
 // March taps from each pixel toward the sun's screen position. Low (4); a
 // fixed half-step start-offset centres the first sample.
@@ -214,7 +241,7 @@ static const float GODRAY_SAMPLES = 4.0f;
 // Sunward falloff exponent. Higher tightens rays around sun.
 static const float GODRAY_GLOW_EXP = 6.0f;
 
-// Godray veil composite weight before tonemap sigmoid (after bloom).
+// Godray veil composite weight in the quarter-res spill (before tonemap sigmoid).
 static const float GODRAY_STRENGTH = 0.6f;
 
 // Max march length AND sunward falloff radius, in output uv (does double duty:

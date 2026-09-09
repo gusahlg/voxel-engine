@@ -1,8 +1,130 @@
 //! Shared creation and layout tracking for single-mip GPU images.
 
+use std::fmt;
+
 use ash::vk;
 
 use super::alloc::find_memory_type;
+
+/// GPU image memory allocation failed for a named render target.
+#[derive(Debug, Clone)]
+pub(crate) struct AllocError {
+    size: u64,
+    purpose: String,
+    result: vk::Result,
+}
+
+impl AllocError {
+    pub(crate) fn new(size: u64, purpose: impl Into<String>, result: vk::Result) -> Self {
+        Self {
+            size,
+            purpose: purpose.into(),
+            result,
+        }
+    }
+
+    /// Allocation size in whole mebibytes (floored).
+    pub(crate) fn size_mb(&self) -> u64 {
+        self.size / (1024 * 1024)
+    }
+}
+
+impl fmt::Display for AllocError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} ({} MB): {:?}",
+            self.purpose,
+            self.size_mb(),
+            self.result
+        )
+    }
+}
+
+impl std::error::Error for AllocError {}
+
+/// Actionable message for a render-target allocation failure.
+pub(crate) fn render_target_oom_message(err: &AllocError) -> String {
+    format!(
+        "renderer: could not allocate render targets ({} MB): {:?} — lower MSAA or render scale",
+        err.size_mb(),
+        err.result
+    )
+}
+
+/// Human-readable target name, e.g. `HDR colour 6880x2880 8x MSAA`.
+pub(crate) fn image_purpose(
+    name: &str,
+    extent: vk::Extent2D,
+    samples: vk::SampleCountFlags,
+) -> String {
+    match sample_count(samples) {
+        1 => format!("{name} {}x{}", extent.width, extent.height),
+        n => format!("{name} {}x{} {n}x MSAA", extent.width, extent.height),
+    }
+}
+
+fn sample_count(samples: vk::SampleCountFlags) -> u32 {
+    if samples == vk::SampleCountFlags::TYPE_8 {
+        8
+    } else if samples == vk::SampleCountFlags::TYPE_4 {
+        4
+    } else if samples == vk::SampleCountFlags::TYPE_2 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Device-local memory for `image`, named in any allocation error.
+pub(crate) fn allocate_and_bind_image(
+    device: &ash::Device,
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    image: vk::Image,
+    purpose: &str,
+) -> Result<vk::DeviceMemory, AllocError> {
+    let requirements = unsafe { device.get_image_memory_requirements(image) };
+    let memory_type = find_memory_type(
+        memory_props,
+        requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    );
+    let memory = unsafe {
+        device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type),
+            None,
+        )
+    }
+    .map_err(|result| AllocError::new(requirements.size, purpose, result))?;
+    unsafe {
+        device
+            .bind_image_memory(image, memory, 0)
+            .expect("Failed to bind image memory");
+    }
+    Ok(memory)
+}
+
+/// Create `N` images, destroying any already-created on the first failure.
+pub(crate) fn create_image_array<const N: usize>(
+    device: &ash::Device,
+    mut make: impl FnMut() -> Result<ImageResource, AllocError>,
+) -> Result<[ImageResource; N], AllocError> {
+    let mut acc: [Option<ImageResource>; N] = std::array::from_fn(|_| None);
+    for slot in &mut acc {
+        match make() {
+            Ok(img) => *slot = Some(img),
+            Err(err) => {
+                for img in acc.iter().flatten() {
+                    unsafe { img.destroy(device) };
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(acc.map(|img| img.expect("image array filled")))
+}
 
 /// Description of a single-mip 2D image with one full-range view.
 pub(crate) struct ImageDesc {
@@ -15,29 +137,32 @@ pub(crate) struct ImageDesc {
 }
 
 /// A destination this image is being transitioned TO. Variants are the
-/// distinct (layout, stage, access) triples actually used at the two sites
-/// wired through `transition` (minimap upload, TAA history ping-pong) — not
-/// a speculative catalogue of every Vulkan layout use.
+/// distinct (layout, stage, access) triples actually used at the sites
+/// wired through `transition` (minimap upload, sky LUT, TAA history ping-pong)
+/// — not a speculative catalogue of every Vulkan layout use.
 pub(crate) enum LayoutUse {
     /// Upload target (minimap): copy destination.
     TransferDst,
     /// Sampled by the fragment shader right after a transfer write (minimap:
     /// RAW, waits on the copy's TRANSFER_WRITE).
     FragmentSampledAfterTransfer,
-    /// Sampled by compute; the prior use was itself a sampled read or the
-    /// image is fresh (TAA history read side: order-only, nothing to wait on
-    /// since the write that produced it was already made visible on entry).
-    ComputeSampledRead,
-    /// Written by compute as storage; same order-only prior-use as above
-    /// (TAA history write side).
+    /// Written by compute as storage; order-only prior-use (sky-cloud LUT
+    /// write side).
     ComputeStorageWrite,
-    /// Sampled by compute+fragment right after a compute storage write (TAA
-    /// history publish: RAW, waits on SHADER_STORAGE_WRITE).
+    /// Sampled by compute+fragment right after a compute storage write
+    /// (sky-cloud LUT publish: RAW, waits on SHADER_STORAGE_WRITE).
     SampledAfterComputeWrite,
     /// Color-clear destination (`vkCmdClearColorImage`; sky-cloud LUT skip).
     TransferClear,
     /// Sampled by the fragment shader right after a color clear (LUT skip path).
     FragmentSampledAfterClear,
+    /// Written as a color attachment (fused TAA history). Prior use is a
+    /// fragment sampled read (last present's history) or UNDEFINED.
+    ColorAttachmentWrite,
+    /// Sampled by the fragment shader. Used to (a) publish a just-written TAA
+    /// history (src color-attachment write) and (b) promote a fresh UNDEFINED
+    /// history to SHADER_READ so the first present's unused read side is valid.
+    FragmentSampled,
 }
 
 impl LayoutUse {
@@ -48,11 +173,6 @@ impl LayoutUse {
             LayoutUse::FragmentSampledAfterTransfer => (
                 L::SHADER_READ_ONLY_OPTIMAL,
                 S::FRAGMENT_SHADER,
-                A::SHADER_SAMPLED_READ,
-            ),
-            LayoutUse::ComputeSampledRead => (
-                L::SHADER_READ_ONLY_OPTIMAL,
-                S::COMPUTE_SHADER,
                 A::SHADER_SAMPLED_READ,
             ),
             LayoutUse::ComputeStorageWrite => {
@@ -69,6 +189,16 @@ impl LayoutUse {
                 S::FRAGMENT_SHADER,
                 A::SHADER_SAMPLED_READ,
             ),
+            LayoutUse::ColorAttachmentWrite => (
+                L::COLOR_ATTACHMENT_OPTIMAL,
+                S::COLOR_ATTACHMENT_OUTPUT,
+                A::COLOR_ATTACHMENT_WRITE,
+            ),
+            LayoutUse::FragmentSampled => (
+                L::SHADER_READ_ONLY_OPTIMAL,
+                S::FRAGMENT_SHADER,
+                A::SHADER_SAMPLED_READ,
+            ),
         }
     }
 
@@ -81,12 +211,12 @@ impl LayoutUse {
         match self {
             LayoutUse::TransferDst => (S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ),
             LayoutUse::FragmentSampledAfterTransfer => (S::COPY, A::TRANSFER_WRITE),
-            LayoutUse::ComputeSampledRead | LayoutUse::ComputeStorageWrite => {
-                (S::COMPUTE_SHADER | S::FRAGMENT_SHADER, A::NONE)
-            }
+            LayoutUse::ComputeStorageWrite => (S::COMPUTE_SHADER | S::FRAGMENT_SHADER, A::NONE),
             LayoutUse::SampledAfterComputeWrite => (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE),
             LayoutUse::TransferClear => (S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ),
             LayoutUse::FragmentSampledAfterClear => (S::CLEAR, A::TRANSFER_WRITE),
+            LayoutUse::ColorAttachmentWrite => (S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ),
+            LayoutUse::FragmentSampled => (S::COLOR_ATTACHMENT_OUTPUT, A::COLOR_ATTACHMENT_WRITE),
         }
     }
 }
@@ -105,7 +235,8 @@ impl ImageResource {
         device: &ash::Device,
         memory_props: &vk::PhysicalDeviceMemoryProperties,
         desc: &ImageDesc,
-    ) -> Self {
+        purpose: &str,
+    ) -> Result<Self, AllocError> {
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(desc.format)
@@ -127,27 +258,13 @@ impl ImageResource {
                 .expect("Failed to create image")
         };
 
-        let requirements = unsafe { device.get_image_memory_requirements(image) };
-        let memory_type = find_memory_type(
-            memory_props,
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
-        let memory = unsafe {
-            device
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(requirements.size)
-                        .memory_type_index(memory_type),
-                    None,
-                )
-                .expect("Failed to allocate image memory")
+        let memory = match allocate_and_bind_image(device, memory_props, image, purpose) {
+            Ok(memory) => memory,
+            Err(err) => {
+                unsafe { device.destroy_image(image, None) };
+                return Err(err);
+            }
         };
-        unsafe {
-            device
-                .bind_image_memory(image, memory, 0)
-                .expect("Failed to bind image memory");
-        }
 
         let subresource = vk::ImageSubresourceRange {
             aspect_mask: desc.aspect,
@@ -174,13 +291,13 @@ impl ImageResource {
                 .expect("Failed to create image view")
         };
 
-        ImageResource {
+        Ok(ImageResource {
             image,
             memory,
             view,
             layout: vk::ImageLayout::UNDEFINED,
             subresource,
-        }
+        })
     }
 
     pub(crate) fn image(&self) -> vk::Image {
@@ -189,6 +306,10 @@ impl ImageResource {
 
     pub(crate) fn view(&self) -> vk::ImageView {
         self.view
+    }
+
+    pub(crate) fn layout(&self) -> vk::ImageLayout {
+        self.layout
     }
 
     pub(crate) fn subresource_range(&self) -> vk::ImageSubresourceRange {
@@ -300,7 +421,7 @@ mod tests {
             )
         );
         assert_eq!(
-            LayoutUse::ComputeSampledRead.src_when_used(),
+            LayoutUse::ComputeStorageWrite.src_when_used(),
             (
                 vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
                 vk::AccessFlags2::NONE
@@ -327,6 +448,20 @@ mod tests {
                 vk::AccessFlags2::TRANSFER_WRITE
             )
         );
+        assert_eq!(
+            LayoutUse::ColorAttachmentWrite.src_when_used(),
+            (
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ
+            )
+        );
+        assert_eq!(
+            LayoutUse::FragmentSampled.src_when_used(),
+            (
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+            )
+        );
     }
 
     /// Ping-pong states stay within covered layout transitions.
@@ -338,21 +473,68 @@ mod tests {
             let r = read_idx;
             let w = 1 - r;
             assert_eq!(
-                LayoutUse::ComputeSampledRead.dst().0,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                LayoutUse::ColorAttachmentWrite.dst().0,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
             );
-            assert_eq!(
-                LayoutUse::ComputeStorageWrite.dst().0,
-                vk::ImageLayout::GENERAL
-            );
-            layouts[r] = LayoutUse::ComputeSampledRead.dst().0;
-            layouts[w] = LayoutUse::SampledAfterComputeWrite.dst().0;
+            layouts[r] = LayoutUse::FragmentSampled.dst().0;
+            layouts[w] = LayoutUse::FragmentSampled.dst().0;
             read_idx = w;
         }
         assert_eq!(layouts[read_idx], vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         assert_eq!(
             layouts[1 - read_idx],
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        );
+    }
+
+    #[test]
+    fn image_purpose_names_extent_and_msaa() {
+        let extent = vk::Extent2D {
+            width: 6880,
+            height: 2880,
+        };
+        assert_eq!(
+            image_purpose("HDR colour", extent, vk::SampleCountFlags::TYPE_8),
+            "HDR colour 6880x2880 8x MSAA"
+        );
+        assert_eq!(
+            image_purpose("HDR colour", extent, vk::SampleCountFlags::TYPE_1),
+            "HDR colour 6880x2880"
+        );
+    }
+
+    #[test]
+    fn alloc_error_formats_size_mb_and_purpose() {
+        let purpose = image_purpose(
+            "HDR colour",
+            vk::Extent2D {
+                width: 6880,
+                height: 2880,
+            },
+            vk::SampleCountFlags::TYPE_8,
+        );
+        let err = AllocError::new(
+            1211 * 1024 * 1024,
+            purpose,
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        );
+        let formatted = err.to_string();
+        assert!(
+            formatted.contains("1211 MB"),
+            "size in MB missing: {formatted}"
+        );
+        assert!(
+            formatted.contains("HDR colour 6880x2880 8x MSAA"),
+            "purpose missing: {formatted}"
+        );
+        assert!(
+            formatted.contains("ERROR_OUT_OF_DEVICE_MEMORY"),
+            "vk result missing: {formatted}"
+        );
+
+        assert_eq!(
+            render_target_oom_message(&err),
+            "renderer: could not allocate render targets (1211 MB): ERROR_OUT_OF_DEVICE_MEMORY — lower MSAA or render scale"
         );
     }
 }

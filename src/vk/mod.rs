@@ -1,6 +1,6 @@
 /// The Vulkan renderer: instance, device, swapchain, render targets, pipelines,
 /// GPU memory, and frame loop. Vulkan 1.3 with dynamic rendering + synchronization2;
-/// 2 frames in flight; reversed-Z depth; optional MSAA with resolve.
+/// `FRAMES_IN_FLIGHT` command buffers in flight; reversed-Z depth; optional MSAA with resolve.
 ///
 /// Rendering and presentation decouple: frames render into offscreen images and
 /// present only when a swapchain image is available (mailbox). On macOS, vsync
@@ -46,8 +46,9 @@ use crate::skeleton::{FrameSlot, PerSlot};
 use block_textures::BlockTextures;
 use buffers::{DrawIndexedIndirect, FRAMES_IN_FLIGHT, GpuResident, HostBuffer, MeshResidency};
 use device::Device;
-use frame_loop::{DrawEntry, DrawRun};
-use gpu_timer::GpuTimer;
+use frame_loop::{DrawEntry, DrawRun, PendingSubmit};
+use gpu_timer::{GpuPipeStats, GpuTimer};
+use image::AllocError;
 use instance::InstanceBundle;
 use minimap::MinimapTexture;
 use pipeline::Pipelines;
@@ -95,12 +96,12 @@ struct SlotState {
     copy_value: TimelineValue,
     imm: HostBuffer,
     indirect: HostBuffer,
-    /// This slot has stored depth at the current extent; VRS may classify it.
+    /// This slot's rate image was classified at the end of a previous use
+    /// (layout GENERAL) and may be bound as a shading-rate attachment. False
+    /// after create/recreate so the first scene pass of a slot skips VRS.
     vrs_ready: bool,
     /// History image holds a raw classification from a previous VRS dispatch.
     vrs_history: bool,
-    /// Which image holds the final HDR (offscreen or TAA history).
-    hdr_source: HdrSource,
 }
 
 /// Minimap texture edge length in texels.
@@ -210,6 +211,17 @@ pub(crate) struct Renderer {
     last_present: std::time::Instant,
     present_interval: std::time::Duration,
     gpu_timer: GpuTimer,
+    pipe_stats: GpuPipeStats,
+    /// `VOXEL_BENCH_EMPTY=K` (K ≥ 1): that many empty command buffers per
+    /// frame in one submit, no present. Zero disables the experiment.
+    empty_submit: u32,
+    /// Extra primary CBs for `empty_submit` > 1: `(K-1) * FRAMES_IN_FLIGHT`,
+    /// indexed `slot * (K-1) + i`. The slot's usual `cmd` is the first of K.
+    empty_extra: Box<[vk::CommandBuffer]>,
+    /// Uncapped unpresented frames waiting to share one `vkQueueSubmit2`.
+    pending_submits: Vec<PendingSubmit>,
+    /// Runtime batch limit (`VOXEL_SUBMIT_BATCH`, default [`crate::rev::SUBMIT_BATCH_MAX`]).
+    submit_batch_limit: usize,
 }
 
 impl Renderer {
@@ -217,13 +229,16 @@ impl Renderer {
     /// surface (a `!Send` window handle never crosses). Returns the renderer and
     /// the [`InitReply`] main uses to build its allocator. The window itself
     /// stays on main.
+    ///
+    /// Render-target allocation failure is returned (not panicked) so the
+    /// render thread can send [`Err`] to main instead of dying.
     pub(crate) fn build(
         instance: InstanceBundle,
         surface_loader: khr::surface::Instance,
         surface: vk::SurfaceKHR,
         cfg: RenderConfig,
         ret: Sender<RenderReturn>,
-    ) -> (Self, InitReply) {
+    ) -> Result<(Self, InitReply), AllocError> {
         let RenderConfig {
             vsync,
             msaa,
@@ -271,14 +286,51 @@ impl Renderer {
 
         let msaa = resolve_msaa(msaa, device.max_msaa(), "requested");
         let render_extent = scaled_extent(swapchain.extent, render_scale);
-        let targets = RenderTargets::new(
+        let memory_props = unsafe {
+            instance
+                .instance
+                .get_physical_device_memory_properties(device.physical)
+        };
+        let targets = match RenderTargets::new(
             &instance.instance,
             &device.device,
             device.physical,
             render_extent,
             msaa,
             device.fragment_shading_rate.as_ref(),
-        );
+        ) {
+            Ok(targets) => targets,
+            Err(err) => {
+                abort_build(
+                    instance,
+                    surface_loader,
+                    surface,
+                    device,
+                    transfer_lane,
+                    swapchain,
+                    None,
+                    None,
+                );
+                return Err(err);
+            }
+        };
+        let taa = match taa::TaaState::new(&device.device, &memory_props, swapchain.extent) {
+            Ok(taa) => taa,
+            Err(err) => {
+                abort_build(
+                    instance,
+                    surface_loader,
+                    surface,
+                    device,
+                    transfer_lane,
+                    swapchain,
+                    Some(targets),
+                    None,
+                );
+                return Err(err);
+            }
+        };
+        log::info!("HDR color format: {:?}", targets.color_format);
 
         let atlas = FontAtlas::new(
             &instance.instance,
@@ -327,6 +379,7 @@ impl Renderer {
             mesh3d_set_layout,
             device.fragment_shading_rate.as_ref(),
             device.dynamic_rendering_local_read,
+            device.independent_blend,
         );
 
         // Per-slot command buffers plus one extra for the present copy.
@@ -341,6 +394,23 @@ impl Renderer {
                 .expect("Failed to allocate command buffers")
         };
         let copy_cmd = cmds.pop().expect("command buffer allocation");
+        let empty_submit = empty_submit_count();
+        let empty_extra = if empty_submit > 1 {
+            let n = (empty_submit - 1) * FRAMES_IN_FLIGHT as u32;
+            let info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(device.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(n);
+            unsafe {
+                device
+                    .device
+                    .allocate_command_buffers(&info)
+                    .expect("Failed to allocate empty-submit command buffers")
+            }
+            .into_boxed_slice()
+        } else {
+            Box::from([])
+        };
         let timeline = unsafe { Timeline::new(&device.device) };
         let mut cmds = cmds.into_iter();
         let slots = PerSlot::new(std::array::from_fn(|_| SlotState {
@@ -352,7 +422,6 @@ impl Renderer {
             indirect: HostBuffer::new(vk::BufferUsageFlags::INDIRECT_BUFFER),
             vrs_ready: false,
             vrs_history: false,
-            hdr_source: HdrSource::Offscreen,
         }));
 
         let present_semaphores = create_present_semaphores(&device.device, swapchain.images.len());
@@ -366,26 +435,31 @@ impl Renderer {
             pipelines.layout_3d,
             pipelines.layout_debug,
         );
-        let memory_props = unsafe {
-            instance
-                .instance
-                .get_physical_device_memory_properties(device.physical)
-        };
         let exposure = exposure::ExposureState::new(
             &device.device,
             &memory_props,
             render_extent,
             pipeline_cache,
         );
-        let taa = taa::TaaState::new(&device.device, &memory_props, render_extent, pipeline_cache);
-        let bloom = bloom::BloomState::new(&device.device, pipeline_cache);
+        let bloom = bloom::BloomState::new(&device.device, &memory_props, pipeline_cache);
         let sky_cloud = sky::SkyCloudState::new(&device.device, pipeline_cache);
 
         let gpu_timer = GpuTimer::new(
             &device.device,
             device.timestamps_supported && crate::profile::is_enabled(),
             device.timestamp_period_ns,
+            device.host_query_reset,
         );
+        let pipe_stats = GpuPipeStats::new(
+            &device.device,
+            device.pipeline_statistics_query && crate::profile::is_enabled(),
+            device.host_query_reset,
+        );
+        if crate::profile::is_enabled() && !device.pipeline_statistics_query {
+            log::warn!(
+                "profiler: pipelineStatisticsQuery unsupported; skipping frag/prims/overdraw gauges"
+            );
+        }
 
         let caps = DeviceCaps {
             max_msaa: device.max_msaa(),
@@ -400,7 +474,12 @@ impl Renderer {
             exposure: exposure.shared(),
         };
 
-        let cull = cull::CullState::new(&device.device, pipeline_cache, device.cull_wave_atomics);
+        let cull = cull::CullState::new(
+            &device.device,
+            &memory_props,
+            pipeline_cache,
+            device.cull_wave_atomics,
+        );
         // GPU-driven emission: opaque/cutout/shadow draws are always emitted
         // by the cull dispatch, so the device must support drawIndirectCount.
         // Device selection enforces this; this assert makes mis-selection fail
@@ -463,8 +542,13 @@ impl Renderer {
             last_present: std::time::Instant::now(),
             present_interval,
             gpu_timer,
+            pipe_stats,
+            empty_submit,
+            empty_extra,
+            pending_submits: Vec::with_capacity(crate::rev::SUBMIT_BATCH_MAX),
+            submit_batch_limit: frame_loop::submit_batch_limit(),
         };
-        (renderer, reply)
+        Ok((renderer, reply))
     }
 
     /// Handle window resize and flag swapchain rebuild.
@@ -517,6 +601,12 @@ impl Renderer {
         self.flags = flags;
     }
 
+    /// GPU face-run culling. Takes effect at the next cull prepare so partition
+    /// capacity and the cull-params flag always agree for a frame.
+    pub fn set_cull_faces(&mut self, on: bool) {
+        self.cull.set_face_cull(on);
+    }
+
     /// Set render scale; returns clamped value.
     pub fn set_render_scale(&mut self, scale: f32) -> f32 {
         let clamped = Scale::new(scale).get();
@@ -546,6 +636,7 @@ impl Renderer {
             resident.buffer(),
             record.pass(),
             record.detail_scale() > 1.0,
+            cull::MeshAabb::from_record(&record),
         );
         self.mesh_res.apply_upload(slot, generation, resident);
         self.records.install(slot, record);
@@ -554,8 +645,12 @@ impl Renderer {
     /// Replaces a mover's recomposed record, keeping the cull lane counts in
     /// step should its detail (LOD lane) have changed.
     pub(crate) fn apply_set_record(&mut self, slot: u32, record: buffers::MeshRecord) {
-        self.arena_dir
-            .note_record(slot, record.pass(), record.detail_scale() > 1.0);
+        self.arena_dir.note_record(
+            slot,
+            record.pass(),
+            record.detail_scale() > 1.0,
+            cull::MeshAabb::from_record(&record),
+        );
         self.records.set_record(slot, record);
     }
 
@@ -570,6 +665,9 @@ impl Renderer {
 
     /// Retire a freed mesh resident.
     pub(crate) fn apply_free_mesh(&mut self, slot: u32, generation: NonZeroU32) {
+        // Pending frames may still draw this mesh; submit them so
+        // `last_render_value` covers the batch before the free is stamped.
+        self.flush_pending_submits();
         self.arena_dir.note_free(slot, generation);
         self.records.clear_arena(slot);
         self.mesh_res
@@ -601,6 +699,9 @@ impl Renderer {
 
     /// Replace block texture array; old one retired through timeline.
     pub fn set_block_textures(&mut self, size: u32, layers: &[Vec<u8>]) {
+        // Pending frames sample the old array; submit them so `last_reserved`
+        // is a value the GPU will actually signal.
+        self.flush_pending_submits();
         // Clamp to device's max image array layers.
         let cap = self.device.max_image_array_layers as usize;
         let layers = if layers.len() > cap {
@@ -649,6 +750,7 @@ impl Renderer {
     /// buffers and then `vkDestroyDevice` in the correct order. Consuming `self`
     /// (rather than `Drop`) is what lets those fields move out to main.
     pub(crate) fn teardown(mut self) -> DeviceLeftovers {
+        self.flush_pending_submits();
         unsafe {
             let device = &self.device.device;
             let _ = device.device_wait_idle();
@@ -669,6 +771,7 @@ impl Renderer {
             self.retired_textures
                 .collect_all(|mut tex| tex.destroy(device));
             self.gpu_timer.destroy(device);
+            self.pipe_stats.destroy(device);
             self.targets.destroy(device);
             self.records.destroy(device);
             self.cull.destroy(device);
@@ -697,6 +800,23 @@ impl Renderer {
             device: self.device,
         }
     }
+}
+
+/// Profiling experiment: `VOXEL_BENCH_EMPTY=K` (integer K ≥ 1) records K
+/// distinct empty command buffers per frame (begin/end only; re-recording one
+/// primary K times is not valid), submits them in **one** `vkQueueSubmit2`
+/// (one `VkSubmitInfo2` with K `VkCommandBufferSubmitInfo`s and the usual
+/// single timeline signal), and skips present. Isolates whether the ~21 µs
+/// per-submission floor is per submit or per command buffer. Unset / `0` /
+/// non-integer disables. Read once at renderer creation. Not a public API.
+fn empty_submit_count() -> u32 {
+    static COUNT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let Ok(v) = std::env::var("VOXEL_BENCH_EMPTY") else {
+            return 0;
+        };
+        v.parse::<u32>().ok().filter(|&k| k >= 1).unwrap_or(0)
+    })
 }
 
 /// Clamp range for render-resolution scale (0.25x to 2.0x). Re-exported from
@@ -886,6 +1006,35 @@ fn create_present_semaphores(device: &ash::Device, count: usize) -> Vec<BinarySe
         .collect()
 }
 
+/// Tear down Vulkan objects created before a render-target allocation failure
+/// in [`Renderer::build`]. The render thread owns instance/surface/device at
+/// this point; main never sees them.
+#[allow(clippy::too_many_arguments)]
+fn abort_build(
+    mut instance: InstanceBundle,
+    surface_loader: khr::surface::Instance,
+    surface: vk::SurfaceKHR,
+    mut device: Device,
+    mut transfer_lane: TransferLane,
+    mut swapchain: Swapchain,
+    mut targets: Option<RenderTargets>,
+    taa: Option<taa::TaaState>,
+) {
+    unsafe {
+        if let Some(taa) = &taa {
+            taa.destroy(&device.device);
+        }
+        if let Some(targets) = &mut targets {
+            targets.destroy(&device.device);
+        }
+        swapchain.destroy(&device.device);
+        transfer_lane.destroy(&device.device);
+        device.destroy();
+        surface_loader.destroy_surface(surface, None);
+        instance.destroy();
+    }
+}
+
 /// Clamps an MSAA request to a supported {1,2,4,8} sample count (as a `u32`),
 /// mirroring [`Renderer::set_msaa`] so the client can clamp locally.
 pub(crate) fn clamp_msaa(requested: u32, max: u32) -> u32 {
@@ -929,7 +1078,51 @@ fn depth_range() -> vk::ImageSubresourceRange {
     }
 }
 
-/// Synchronization state of the depth image sampled by post-processing.
+/// Resting layout of the single-sample sampleable depth after the scene pass.
+///
+/// Contract: when a later pass *this frame* samples that image (see
+/// [`sampleable_depth_consumed`]), [`scene_pass::RenderPass::end`] transitions
+/// it (the MSAA resolve target when multisampled, else the depth image) from
+/// the scene-pass write scope ([`sampleable_depth_attachment_state`]) to this
+/// layout in the same `vkCmdPipelineBarrier2` as the offscreen HDR finalize,
+/// with dst stage `COMPUTE_SHADER | FRAGMENT_SHADER` and access
+/// `SHADER_SAMPLED_READ`. From then on it RESTS here: the quarter-res spill
+/// pass (godray sampler) and the VRS classifier sample it in the same submit
+/// with no further transition; the present-time fused TAA tonemap samples it
+/// in the later copy submit (the render timeline wait covers that fragment
+/// shader).
+///
+/// When nothing samples it, `end` skips that rest transition and the scene
+/// pass stores depth with `DONT_CARE` (and skips the MSAA SAMPLE_ZERO resolve).
+/// The next scene pass of this slot begins the image from `UNDEFINED` in
+/// either case (contents are cleared every frame, so the discard is free).
+/// The multisampled `depth` attachment is unchanged: it still begins from
+/// UNDEFINED and is never sampled.
+pub(super) const SAMPLEABLE_DEPTH_REST_LAYOUT: vk::ImageLayout =
+    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+
+/// True when a later pass this frame samples the scene's sampleable depth.
+///
+/// Consumers, computed once per frame:
+/// - VRS classify (same submit), even on unpresented frames;
+/// - quarter-res spill/godrays (same submit), on presented frames with bloom
+///   or a live godray march;
+/// - fused TAA tonemap (later present submit), on presented frames with TAA.
+///
+/// Water's in-pass depth input-attachment read is not a rest-layout consumer
+/// (`store_op` is after the pass). Minimap and screenshot capture do not
+/// sample depth.
+pub(super) fn sampleable_depth_consumed(
+    will_present: bool,
+    taa: bool,
+    spill_live: bool,
+    classify_vrs: bool,
+) -> bool {
+    classify_vrs || (will_present && (taa || spill_live))
+}
+
+/// Synchronization state of the depth image sampled by post-processing *during
+/// the scene pass* (the source scope of the rest-layout barrier).
 /// Multisampled rendering writes that image through a resolve operation, whose
 /// synchronization scope is COLOR_ATTACHMENT_OUTPUT/COLOR_ATTACHMENT_WRITE.
 fn sampleable_depth_attachment_state(
@@ -951,15 +1144,6 @@ fn sampleable_depth_attachment_state(
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         )
     }
-}
-
-/// See `SlotState::hdr_source`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum HdrSource {
-    /// The scene render's offscreen target (TAA off).
-    Offscreen,
-    /// The TAA history image at this index (TAA on: the resolve output).
-    TaaHistory(usize),
 }
 
 #[cfg(test)]
@@ -1006,6 +1190,30 @@ mod tests {
         assert!(stage.contains(vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS));
         assert!(stage.contains(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS));
         assert!(access.contains(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE));
+    }
+
+    #[test]
+    fn sampleable_depth_rests_in_shader_read_only() {
+        assert_eq!(
+            SAMPLEABLE_DEPTH_REST_LAYOUT,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        );
+    }
+
+    #[test]
+    fn sampleable_depth_consumed_gates_on_actual_consumers() {
+        // Nothing samples: TAA off, no spill, no VRS — even if presenting.
+        assert!(!sampleable_depth_consumed(false, false, false, false));
+        assert!(!sampleable_depth_consumed(true, false, false, false));
+        // VRS classify samples in the same submit, presented or not.
+        assert!(sampleable_depth_consumed(false, false, false, true));
+        assert!(sampleable_depth_consumed(true, false, false, true));
+        // Fused TAA tonemap samples only on presented frames.
+        assert!(sampleable_depth_consumed(true, true, false, false));
+        assert!(!sampleable_depth_consumed(false, true, false, false));
+        // Spill/godrays sample only on presented frames.
+        assert!(sampleable_depth_consumed(true, false, true, false));
+        assert!(!sampleable_depth_consumed(false, false, true, false));
     }
 
     #[test]

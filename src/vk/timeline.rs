@@ -3,6 +3,8 @@
 //! timeline. The only surviving binary semaphores are the two the WSI
 //! mandates (acquire signal, present wait), modelled by `BinarySemaphore` so
 //! a timeline handle can never reach acquire/present.
+use std::time::{Duration, Instant};
+
 use ash::vk;
 
 // Monotonic timeline value (canonical counter for GPU sync).
@@ -77,6 +79,24 @@ impl Timeline {
         }
     }
 
+    /// Poll the timeline for `budget`, then fall through to a blocking wait.
+    /// Trades a spinning core for the kernel wake latency of `vkWaitSemaphores`.
+    pub unsafe fn wait_spin(&self, device: &ash::Device, value: TimelineValue, budget: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < budget {
+            let v = unsafe {
+                device
+                    .get_semaphore_counter_value(self.sem)
+                    .expect("timeline counter query failed")
+            };
+            if v >= value.raw() {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        unsafe { self.wait(device, value) };
+    }
+
     /// Non-blocking probe of the current timeline value.
     pub fn probe<'a>(&self, device: &'a ash::Device) -> TimelineProbe<'a> {
         TimelineProbe {
@@ -130,11 +150,52 @@ impl RenderSubmit {
         timeline: &Timeline,
         extra_wait: Option<(vk::Semaphore, TimelineValue, vk::PipelineStageFlags2)>,
     ) -> RenderCompletion {
-        let signal = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(timeline.sem)
-            .value(self.value.raw())
+        let cmd = self.cmd;
+        unsafe { self.submit_bufs(device, queue, timeline, &[cmd], extra_wait) }
+    }
+
+    /// One `vkQueueSubmit2` / one timeline signal, with `cmds.len()` command
+    /// buffers (`VkCommandBufferSubmitInfo`s). Used by uncapped submit batching
+    /// and `VOXEL_BENCH_EMPTY=K`.
+    pub unsafe fn submit_bufs(
+        self,
+        device: &ash::Device,
+        queue: vk::Queue,
+        timeline: &Timeline,
+        cmds: &[vk::CommandBuffer],
+        extra_wait: Option<(vk::Semaphore, TimelineValue, vk::PipelineStageFlags2)>,
+    ) -> RenderCompletion {
+        let value = self.value;
+        unsafe { timeline.submit_render(device, queue, cmds, value, extra_wait) }
+    }
+
+    /// Hold the reservation without submitting: the command buffer joins a
+    /// pending batch and is submitted later with the batch's signal value.
+    pub fn into_parts(self) -> (TimelineValue, vk::CommandBuffer) {
+        (self.value, self.cmd)
+    }
+}
+
+impl Timeline {
+    /// One `vkQueueSubmit2` with `cmds` (in order) and a single timeline signal
+    /// at `signal`. Intermediate values reserved for earlier frames in a batch
+    /// are holes: a wait for them succeeds once this higher value is signalled.
+    pub unsafe fn submit_render(
+        &self,
+        device: &ash::Device,
+        queue: vk::Queue,
+        cmds: &[vk::CommandBuffer],
+        signal: TimelineValue,
+        extra_wait: Option<(vk::Semaphore, TimelineValue, vk::PipelineStageFlags2)>,
+    ) -> RenderCompletion {
+        let signal_info = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(self.sem)
+            .value(signal.raw())
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-        let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(self.cmd)];
+        let cmd_infos: Vec<vk::CommandBufferSubmitInfo<'_>> = cmds
+            .iter()
+            .map(|&c| vk::CommandBufferSubmitInfo::default().command_buffer(c))
+            .collect();
         let waits = extra_wait.map(|(sem, value, stages)| {
             [vk::SemaphoreSubmitInfo::default()
                 .semaphore(sem)
@@ -142,8 +203,8 @@ impl RenderSubmit {
                 .stage_mask(stages)]
         });
         let mut submit = vk::SubmitInfo2::default()
-            .command_buffer_infos(&cmds)
-            .signal_semaphore_infos(&signal);
+            .command_buffer_infos(&cmd_infos)
+            .signal_semaphore_infos(&signal_info);
         if let Some(waits) = &waits {
             submit = submit.wait_semaphore_infos(waits);
         }
@@ -153,7 +214,7 @@ impl RenderSubmit {
                 .queue_submit2(queue, &submit, vk::Fence::null())
                 .expect("render submit failed");
         }
-        RenderCompletion(self.value)
+        RenderCompletion(signal)
     }
 }
 

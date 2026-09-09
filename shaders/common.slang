@@ -28,6 +28,31 @@ float luma709(float3 c)
     return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
 
+// Remap output x-coord to source uv, compressing wide periphery. Horizontal only.
+// Shared by the quarter-res spill pass (source uv for bloom/depth taps) and the
+// tonemap HDR sample; tonemap then reads the spill at the UNwarped output uv.
+float2 warpSampleUv(float2 uv, float s, float atan_s)
+{
+    if (s <= 0.0)
+        return uv;
+    float px = uv.x * 2.0 - 1.0;
+    float qx = tan(px * atan_s) / s;
+    return float2(qx * 0.5 + 0.5, uv.y);
+}
+
+// Inverse of warpSampleUv: source uv → presented uv. History is stored in
+// presented space, so a reprojected source uv must be unwarped before the
+// history tap. For `qx = tan(px * atan_s) / s` the inverse is
+// `px = atan(qx * s) / atan_s`. Identity when s <= 0.
+float2 unwarpSampleUv(float2 uv, float s, float atan_s)
+{
+    if (s <= 0.0)
+        return uv;
+    float qx = uv.x * 2.0 - 1.0;
+    float px = atan(qx * s) / atan_s;
+    return float2(px * 0.5 + 0.5, uv.y);
+}
+
 // Cube-face unit normals indexed by the packed-vertex `normal` field
 // (mesh.rs: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z). Shared so the fragment looks
 // the face up instead of interpolating a float3 varying.
@@ -36,6 +61,9 @@ static const float3 FACE_NORMAL[6] = {
     float3(0.0, 1.0, 0.0),  float3(0.0, -1.0, 0.0),
     float3(0.0, 0.0, 1.0),  float3(0.0, 0.0, -1.0),
 };
+
+// 2^(bits-DETAIL_GPU_BIAS) from IEEE exponent bits: bits∈[0,15], bias 2 ⇒ exponent field 125..140, exact.
+float detail_scale(uint detail_pass) { return asfloat(((detail_pass & 0xFu) + (127u - DETAIL_GPU_BIAS)) << 23u); }
 
 // Blocklight (torch/candle) response curve. `x` is a
 // per-channel block-light level in [0,1] (`candle.rgb · level`); the curve lifts
@@ -84,16 +112,14 @@ float3 sun_disc(float3 ray, float3 sun_dir, float3 tint, float radius)
         cos(radius * SUN_DISC_RIM));
 }
 
-// Unified lighting term. `sky` = linear skylight colour (already shadow-
-// attenuated AND omni-shaped by the caller — the directional N·L wrap folds into
-// this direct term), `block` = linear blocklight colour
-// pre-curve, `ao` the ambient-occlusion factor [0,1]. Folds in the candle curve
-// and the hoisted omni ambient floor (`ambient_glow.rgb`). The ambient floor +
-// AO stay global (omni-directional); only `sky` carries the directional shaping.
+// Unified lighting term. `sky` arrives occlusion-applied (direct sun already
+// shaped by AO_DIRECT, dome fill already × full AO); `block` is linear
+// blocklight colour pre-curve; `ao` the ambient-occlusion factor [0,1].
+// Ambient and blocklight keep full AO; the max() is the sky-dome vs candle
+// pick. Only caller is mesh3d.frag.
 float3 light_eval(float3 sky, float3 block, float ao, FrameUniforms frame)
 {
-    float3 diffuse = max(frame.ambient_glow.rgb + sky, candle_curve(block));
-    return diffuse * ao;
+    return max(frame.ambient_glow.rgb * ao + sky, candle_curve(block) * ao);
 }
 
 // Far-field shadow fallback beyond shadow-map cascades. Uses baked sky-visibility

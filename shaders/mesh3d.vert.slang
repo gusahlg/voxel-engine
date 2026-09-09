@@ -5,13 +5,14 @@
 // SV_VulkanInstanceID (not SV_InstanceID) to read plain InstanceIndex.
 //
 // Shifts/masks mirror mesh.rs. UV derives from position and normal. Baked
-// sky/block amounts become RGB here (× frame light/candle) so the fragment
-// interpolates colours, not levels. Face index is packed — no float3 normal
-// varying; the fragment looks `FACE_NORMAL` up.
+// sky/block/AO levels interpolate as scalars; the fragment multiplies by
+// frame light/candle (uniform × interpolated scalar == interpolated product).
+// Face index is packed — no float3 normal varying; the fragment looks
+// `FACE_NORMAL` up.
 
 #include "common.slang"
 
-// Per-mesh placement record (std430, mirrors vk::buffers::MeshRecord).
+// Per-mesh placement record (std430, mirrors vk::buffers::MeshRecord, 80 bytes).
 struct MeshRecord
 {
     int3 block;       // world-space origin
@@ -22,6 +23,8 @@ struct MeshRecord
     uint index_count;
     float3 aabb_max;
     int vertex_offset;
+    uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
+    uint flags; // bit 0 = packed face-runs valid (cull.comp)
 };
 
 // Per-mesh dynamic style (std430, mirrors vk::buffers::DrawDyn).
@@ -59,17 +62,13 @@ struct VertexOutput
     [[vk::location(1)]]
     float3 world;
 
-    // rgb = frame.light.rgb * sky_amount; w = sky_amount (fallback / skip).
+    // x = sky_amount, y = block_amount, z = ao_factor.
     [[vk::location(2)]]
-    float4 sky;
-
-    // rgb = frame.candle.rgb * block_amount; a = AO factor.
-    [[vk::location(3)]]
-    float4 block_ao;
+    float3 light_lv;
 
     // x: layer[0:14] water[14] FLAT_COLOR[15] face[16:19] detail[20:24]
     // y: flat_rgba
-    [[vk::location(4)]]
+    [[vk::location(3)]]
     nointerpolation uint2 ids;
 };
 
@@ -111,9 +110,9 @@ VertexOutput vertexMain(VertexInput input)
     // Per-axis 2-bit two's-complement micro-offsets. Truth: mesh.rs
     // SHIFT_MICRO_{X,Y,Z}=11,13,15, MASK_MICRO=0x3 (raw 0,1,2,3 -> 0,+1,-2,-1).
     // The seam-overdraw anti-z-fight nudge; zero for ordinary vertices.
-    int mx = int((w1 >> 11) & 0x3); if (mx >= 2) mx -= 4;
-    int my = int((w1 >> 13) & 0x3); if (my >= 2) my -= 4;
-    int mz = int((w1 >> 15) & 0x3); if (mz >= 2) mz -= 4;
+    int mx = int(w1 << 19) >> 30;
+    int my = int(w1 << 17) >> 30;
+    int mz = int(w1 << 15) >> 30;
     float3 micro = float3(float(mx), float(my), float(mz)) * MICRO_STEP;
 
     // UV mapping: X face (z,y), Y face (x,z), Z face (x,y).
@@ -138,7 +137,7 @@ VertexOutput vertexMain(VertexInput input)
     MeshRecord rec = mesh_records[input.instance];
     DrawDyn style = draw_dyn[input.instance];
     uint detail = rec.detail_pass & 0xFu;
-    float scale = exp2(float(detail) - float(DETAIL_GPU_BIAS));
+    float scale = detail_scale(detail);
     // Camera-relative placement: block delta first, then fractional parts.
     float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
     float3 world = (float3(x, y, z) + micro) * scale + offset;
@@ -155,8 +154,7 @@ VertexOutput vertexMain(VertexInput input)
     // Scale UV to maintain texel density across LOD levels.
     output.uv = uv * scale;
     output.world = world;
-    output.sky = float4(frame.light.rgb * sky_amount, sky_amount);
-    output.block_ao = float4(frame.candle.rgb * block_amount, ao_factor);
+    output.light_lv = float3(sky_amount, block_amount, ao_factor);
     output.ids = uint2(
         (layer & 0x3FFFu)
             | (water << 14)

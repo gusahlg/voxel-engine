@@ -10,15 +10,17 @@
 //!
 //! # Shared-image hazard analysis
 //!
-//! The depth image is **one** map sampled by both frames in flight, not a
+//! The depth image is **one** map sampled by every frame in flight, not a
 //! per-slot pair. That stops the previous "key change marks every slot dirty"
 //! double regenerate, where each FIF slot re-drew the same casters.
 //!
 //! - **WAR (write after other-slot sample).** Frame N samples the map in
 //!   `FRAGMENT_SHADER`. Frame N+1, on a miss, rewrites it as a depth
-//!   attachment. Before that write, the producer host-waits the previous
-//!   render's timeline value (`last_render_value`, the other FIF slot). Cache
-//!   hits skip the wait: concurrent `SHADER_READ_ONLY` sampling is legal.
+//!   attachment. The producer's first barrier (src `FRAGMENT_SHADER` /
+//!   `SHADER_SAMPLED_READ` → depth write, old layout `UNDEFINED`) covers every
+//!   command earlier in submission order on the graphics queue, so the rewrite
+//!   is ordered on the GPU after every earlier-submitted sample. Cache hits
+//!   skip the producer: concurrent `SHADER_READ_ONLY` sampling is legal.
 //! - **RAW (sample after this-slot write).** Same command buffer: the producer
 //!   already barriers `DEPTH_ATTACHMENT` → `SHADER_READ_ONLY` before the color
 //!   pass samples.
@@ -34,7 +36,7 @@
 //! Alternative considered: keep per-slot images and regenerate-only-this-slot.
 //! That still redraws the same key twice (once per slot as each is reused)
 //! unless the other slot samples this slot's image, which reintroduces the
-//! same WAR and needs the same timeline wait. One shared image is simpler.
+//! same WAR and needs the same GPU barrier. One shared image is simpler.
 
 use ash::vk;
 use glam::{DVec3, Mat4};
@@ -45,7 +47,7 @@ use super::pass::shader_module;
 use super::taa::CleanViewProj;
 use crate::rev::FrameSlot;
 use crate::vk::Renderer;
-use crate::vk::buffers::HostBuffer;
+use crate::vk::buffers::{FRAMES_IN_FLIGHT, HostBuffer};
 use crate::vk::targets::{SHADOW_CASCADES, SHADOW_FORMAT, SHADOW_RESOLUTION};
 use crate::vk::vertex_input::VertexInput;
 
@@ -55,15 +57,16 @@ pub enum Cascade {
     Far,
 }
 
-pub struct PerCascade<T>([T; 2]);
+#[derive(Clone, Copy)]
+pub struct PerCascade<T: Copy>([T; 2]);
 
-impl<T> PerCascade<T> {
+impl<T: Copy> PerCascade<T> {
     pub fn new(pair: [T; 2]) -> Self {
         PerCascade(pair)
     }
 }
 
-impl<T> std::ops::Index<Cascade> for PerCascade<T> {
+impl<T: Copy> std::ops::Index<Cascade> for PerCascade<T> {
     type Output = T;
     fn index(&self, c: Cascade) -> &T {
         &self.0[c as usize]
@@ -112,7 +115,7 @@ const _: () = assert!(std::mem::offset_of!(CascadeUniformsGpu, texel) == 160);
 const SHADOW_DEPTH_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow_depth.vert.spv"));
 
 /// The two cascades in render/index order, so callers never spell `as usize`.
-const CASCADES: [Cascade; SHADOW_CASCADES as usize] = [Cascade::Near, Cascade::Far];
+pub(crate) const CASCADES: [Cascade; SHADOW_CASCADES as usize] = [Cascade::Near, Cascade::Far];
 
 impl ShadowCfg {
     pub const PROVISIONAL: Self = Self {
@@ -123,6 +126,20 @@ impl ShadowCfg {
         fade_band: 16.0,
         splits: [64.0, 256.0],
     };
+
+    /// Fit the far cascade to full-res coverage (`DrawLists::lod_clip`).
+    /// `lod_clip <= 0` keeps [`Self::PROVISIONAL`]. Otherwise the far split is
+    /// `lod_clip` clamped into `[SHADOW_FAR_MIN_RADIUS, PROVISIONAL.splits[1]]`
+    /// (the min is itself min'd with the max so a clamp never panics).
+    pub fn for_coverage(lod_clip: f32) -> Self {
+        let mut cfg = Self::PROVISIONAL;
+        if lod_clip > 0.0 {
+            let hi = Self::PROVISIONAL.splits[1];
+            let lo = crate::genconst::SHADOW_FAR_MIN_RADIUS.min(hi);
+            cfg.splits[1] = lod_clip.clamp(lo, hi);
+        }
+        cfg
+    }
 
     fn texel_world_at(&self, radius: f32) -> f32 {
         2.0 * radius / self.resolution as f32
@@ -197,8 +214,16 @@ pub(crate) struct ShadowCache {
     /// Inputs of the currently-cached generation; `None` forces a render.
     key: Option<ShadowKey>,
     /// Cascade UBO matching `key` (and the shadows-off lit-clear). Copied into
-    /// the recording slot's UBO on a hit so that path skips `fit()`.
+    /// a recording slot's UBO only when that slot does not already hold
+    /// [`Self::uniforms_gen`].
     uniforms: Option<CascadeUniformsGpu>,
+    /// Generation of `uniforms`. Bumped on [`Self::store_uniforms`]; 0 means
+    /// never stored. Lets each FIF slot skip the BAR memcpy when the cascade
+    /// block is unchanged (shadows-off after the lit-clear prime, or a cache
+    /// hit on a slot written since the last rebuild).
+    uniforms_gen: u64,
+    /// Cascade fits computed once on a rebuild; consumed by uniforms + recording.
+    fits: Option<PerCascade<CascadeFit>>,
     /// Shared map holds the fully-lit shadows-off clear.
     lit_ready: bool,
     /// Producer must rewrite the shared map this frame.
@@ -210,6 +235,8 @@ impl ShadowCache {
         Self {
             key: None,
             uniforms: None,
+            uniforms_gen: 0,
+            fits: None,
             lit_ready: false,
             pending_rebuild: true,
         }
@@ -219,6 +246,7 @@ impl ShadowCache {
     pub(crate) fn invalidate(&mut self) {
         self.key = None;
         self.uniforms = None;
+        self.fits = None;
         self.lit_ready = false;
         self.pending_rebuild = true;
     }
@@ -235,6 +263,7 @@ impl ShadowCache {
                 if rebuild {
                     self.key = Some(cur);
                     self.uniforms = None;
+                    self.fits = None;
                 }
                 self.lit_ready = false;
                 self.pending_rebuild = rebuild;
@@ -245,6 +274,7 @@ impl ShadowCache {
                 self.pending_rebuild = !self.lit_ready;
                 if self.pending_rebuild {
                     self.uniforms = None;
+                    self.fits = None;
                 }
                 self.pending_rebuild
             }
@@ -256,7 +286,23 @@ impl ShadowCache {
     }
 
     pub(crate) fn store_uniforms(&mut self, u: CascadeUniformsGpu) {
+        self.uniforms_gen = self.uniforms_gen.wrapping_add(1);
+        if self.uniforms_gen == 0 {
+            self.uniforms_gen = 1;
+        }
         self.uniforms = Some(u);
+    }
+
+    pub(crate) fn uniforms_gen(&self) -> u64 {
+        self.uniforms_gen
+    }
+
+    pub(crate) fn store_fits(&mut self, fits: PerCascade<CascadeFit>) {
+        self.fits = Some(fits);
+    }
+
+    pub(crate) fn fits(&self) -> Option<PerCascade<CascadeFit>> {
+        self.fits
     }
 
     pub(crate) fn uniforms(&self) -> Option<&CascadeUniformsGpu> {
@@ -273,7 +319,9 @@ pub(crate) struct ShadowPass {
     pipeline: vk::Pipeline,
     /// Depth-only caster for immediate `DebugVertex` boxes (player avatars).
     debug_pipeline: vk::Pipeline,
-    ubo: [HostBuffer; 2],
+    ubo: [HostBuffer; FRAMES_IN_FLIGHT as usize],
+    /// [`ShadowCache::uniforms_gen`] last written into each slot's UBO.
+    slot_gen: [u64; FRAMES_IN_FLIGHT as usize],
 }
 
 impl ShadowPass {
@@ -317,7 +365,8 @@ impl ShadowPass {
         Self {
             pipeline,
             debug_pipeline,
-            ubo: [make_ubo(), make_ubo()],
+            ubo: std::array::from_fn(|_| make_ubo()),
+            slot_gen: [0; FRAMES_IN_FLIGHT as usize],
         }
     }
 
@@ -327,16 +376,23 @@ impl ShadowPass {
             .expect("the cascade UBO is written before any receiver binds it")
     }
 
-    pub(crate) fn write_uniforms(&mut self, slot: usize, u: &CascadeUniformsGpu) {
+    /// Copy `u` into `slot`'s mapped cascade UBO unless it already holds
+    /// generation `generation`. `generation` is [`ShadowCache::uniforms_gen`].
+    pub(crate) fn write_uniforms(&mut self, slot: usize, u: &CascadeUniformsGpu, generation: u64) {
+        if generation != 0 && self.slot_gen[slot] == generation {
+            return;
+        }
         unsafe { self.ubo[slot].write(0, bytemuck::bytes_of(u)) };
+        self.slot_gen[slot] = generation;
     }
 
     pub(crate) unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline(self.debug_pipeline, None);
-            self.ubo[0].destroy(device);
-            self.ubo[1].destroy(device);
+            for ubo in &mut self.ubo {
+                ubo.destroy(device);
+            }
         }
     }
 }
@@ -476,44 +532,69 @@ fn receiver_lanes(fit: &CascadeFit, cfg: &ShadowCfg) -> [f32; 4] {
     ]
 }
 
+/// Receiver UBO from precomputed cascade fits. `shadow_limit` is the far split
+/// when shadows are on, `f32::MAX` when off (PCF early-outs as fully lit).
+pub(crate) fn cascade_uniforms(
+    fits: &PerCascade<CascadeFit>,
+    cfg: &ShadowCfg,
+    shadows_on: bool,
+) -> CascadeUniformsGpu {
+    let near = &fits[Cascade::Near];
+    let far = &fits[Cascade::Far];
+    let shadow_limit = if shadows_on { cfg.splits[1] } else { f32::MAX };
+    CascadeUniformsGpu {
+        view_proj: [
+            near.view_proj.0.to_cols_array_2d(),
+            far.view_proj.0.to_cols_array_2d(),
+        ],
+        splits_fade: [near.split, far.split, cfg.fade_band, shadow_limit],
+        bias: [
+            cfg.blur_texels,
+            cfg.slope_bias,
+            cfg.dist_bias,
+            near.texel_world,
+        ],
+        texel: [receiver_lanes(near, cfg), receiver_lanes(far, cfg)],
+    }
+}
+
+/// FxHash-style content hash of immediate caster bytes (avatar boxes).
+/// Seed is the length; each 8-byte LE word (then the tail) is mixed with
+/// rotate-xor-mul. Cheaper than SipHash and sufficient as a dirty key.
+pub(crate) fn hash_casters(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h = bytes.len() as u64;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in chunks.by_ref() {
+        let w = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8)"));
+        h = (h.rotate_left(5) ^ w).wrapping_mul(K);
+    }
+    let rem = chunks.remainder();
+    if !rem.is_empty() {
+        let mut tail = [0u8; 8];
+        tail[..rem.len()].copy_from_slice(rem);
+        let w = u64::from_le_bytes(tail);
+        h = (h.rotate_left(5) ^ w).wrapping_mul(K);
+    }
+    h
+}
+
 impl Renderer {
     pub(crate) fn shadow_uniforms(
         &self,
-        eye: DVec3,
-        sun: DVec3,
+        fits: &PerCascade<CascadeFit>,
         cfg: &ShadowCfg,
     ) -> CascadeUniformsGpu {
-        let fits = PerCascade::new(CASCADES.map(|c| fit(eye, sun, c, cfg)));
-        let near = &fits[Cascade::Near];
-        let far = &fits[Cascade::Far];
-        let shadow_limit = if self.flags.shadows {
-            cfg.splits[1]
-        } else {
-            f32::MAX
-        };
-        CascadeUniformsGpu {
-            view_proj: [
-                near.view_proj.0.to_cols_array_2d(),
-                far.view_proj.0.to_cols_array_2d(),
-            ],
-            splits_fade: [near.split, far.split, cfg.fade_band, shadow_limit],
-            bias: [
-                cfg.blur_texels,
-                cfg.slope_bias,
-                cfg.dist_bias,
-                near.texel_world,
-            ],
-            texel: [receiver_lanes(near, cfg), receiver_lanes(far, cfg)],
-        }
+        cascade_uniforms(fits, cfg, self.flags.shadows)
     }
 
     pub(crate) fn record_shadow_pass(
         &self,
         cmd: vk::CommandBuffer,
         slot: usize,
+        fits: &PerCascade<CascadeFit>,
         eye: DVec3,
-        sun: DVec3,
-        cfg: &ShadowCfg,
+        _cfg: &ShadowCfg,
         caster_verts: u32,
     ) {
         let device = &self.device.device;
@@ -589,7 +670,7 @@ impl Renderer {
             }
 
             for c in CASCADES {
-                let f = fit(eye, sun, c, cfg);
+                let f = fits[c];
                 let depth_attachment = vk::RenderingAttachmentInfo::default()
                     .image_view(shadow.layer_views[c as usize])
                     .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
@@ -717,17 +798,14 @@ mod tests {
     const SUN: DVec3 = DVec3::new(0.3, 0.8, 0.25);
 
     /// Project world point through cascade view-proj to NDC.
-    fn ndc(eye: DVec3, p: DVec3, c: Cascade) -> Vec3 {
-        let f = fit(eye, SUN, c, &ShadowCfg::PROVISIONAL);
+    fn ndc(eye: DVec3, p: DVec3, c: Cascade, cfg: &ShadowCfg) -> Vec3 {
+        let f = fit(eye, SUN, c, cfg);
         let rel = (p - eye).as_vec3();
         let clip = f.view_proj.0 * rel.extend(1.0);
         clip.truncate() / clip.w
     }
 
-    /// All points within selection distance must be covered by the map.
-    #[test]
-    fn every_selectable_fragment_is_covered() {
-        let cfg = ShadowCfg::PROVISIONAL;
+    fn assert_every_selectable_fragment_is_covered(cfg: &ShadowCfg) {
         let eye = DVec3::new(1000.0, 80.0, -2000.0);
         let dirs = [
             DVec3::X,
@@ -743,7 +821,7 @@ mod tests {
             let split = cfg.splits[c as usize] as f64;
             for d in dirs {
                 let p = eye + d.normalize() * split;
-                let n = ndc(eye, p, c);
+                let n = ndc(eye, p, c, cfg);
                 assert!(
                     n.x.abs() <= 1.0 && n.y.abs() <= 1.0,
                     "{c:?} {d:?}: lateral {n:?} outside footprint"
@@ -754,6 +832,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// All points within selection distance must be covered by the map.
+    #[test]
+    fn every_selectable_fragment_is_covered() {
+        assert_every_selectable_fragment_is_covered(&ShadowCfg::PROVISIONAL);
+        assert_every_selectable_fragment_is_covered(&ShadowCfg::for_coverage(192.0));
+    }
+
+    #[test]
+    fn for_coverage_zero_keeps_provisional_splits() {
+        assert_eq!(
+            ShadowCfg::for_coverage(0.0).splits,
+            ShadowCfg::PROVISIONAL.splits
+        );
+    }
+
+    #[test]
+    fn for_coverage_clamps_far_split_to_lod_clip() {
+        assert_eq!(ShadowCfg::for_coverage(192.0).splits[1], 192.0);
+        assert_eq!(
+            ShadowCfg::for_coverage(30.0).splits[1],
+            crate::genconst::SHADOW_FAR_MIN_RADIUS
+        );
     }
 
     /// The fit takes no camera orientation input, so the matrices are
@@ -787,7 +889,7 @@ mod tests {
         for c in [Cascade::Near, Cascade::Far] {
             let res = cfg.resolution as f32;
             let texel = |eye: DVec3| {
-                let n = ndc(eye, p, c);
+                let n = ndc(eye, p, c, &cfg);
                 Vec3::new((n.x * 0.5 + 0.5) * res, (n.y * 0.5 + 0.5) * res, 0.0)
             };
             let t0 = texel(eyes[0]);
@@ -814,7 +916,7 @@ mod tests {
         for c in [Cascade::Near, Cascade::Far] {
             let res = cfg.resolution as f32;
             let uv_texels = |eye: DVec3| {
-                let n = ndc(eye, p, c);
+                let n = ndc(eye, p, c, &cfg);
                 ((n.x * 0.5 + 0.5) * res, (n.y * 0.5 + 0.5) * res)
             };
             let (x0, y0) = uv_texels(eyes[0]);
@@ -863,7 +965,7 @@ mod tests {
         for c in [Cascade::Near, Cascade::Far] {
             let radius = cfg.splits[c as usize] as f64;
             let p = eye + toward_sun * (radius + PULLBACK as f64 * 0.95);
-            let n = ndc(eye, p, c);
+            let n = ndc(eye, p, c, &cfg);
             assert!(
                 (0.0..=1.0).contains(&n.z),
                 "{c:?}: tall occluder at {n:?} clipped"
@@ -905,6 +1007,56 @@ mod tests {
     }
 
     #[test]
+    fn cascade_uniforms_match_previous_formula() {
+        let cfg = ShadowCfg::PROVISIONAL;
+        let eye = DVec3::new(123.4, 56.0, -789.0);
+        let fits = PerCascade::new(CASCADES.map(|c| fit(eye, SUN, c, &cfg)));
+        let near = &fits[Cascade::Near];
+        let far = &fits[Cascade::Far];
+
+        let on = cascade_uniforms(&fits, &cfg, true);
+        assert_eq!(on.view_proj[0], near.view_proj.0.to_cols_array_2d());
+        assert_eq!(on.view_proj[1], far.view_proj.0.to_cols_array_2d());
+        assert_eq!(
+            on.splits_fade,
+            [near.split, far.split, cfg.fade_band, cfg.splits[1]]
+        );
+        assert_eq!(
+            on.bias,
+            [
+                cfg.blur_texels,
+                cfg.slope_bias,
+                cfg.dist_bias,
+                near.texel_world
+            ]
+        );
+        assert_eq!(
+            on.texel,
+            [receiver_lanes(near, &cfg), receiver_lanes(far, &cfg)]
+        );
+
+        let off = cascade_uniforms(&fits, &cfg, false);
+        assert_eq!(off.splits_fade[3], f32::MAX);
+        assert_eq!(off.view_proj, on.view_proj);
+        assert_eq!(&off.splits_fade[..3], &on.splits_fade[..3]);
+        assert_eq!(off.bias, on.bias);
+        assert_eq!(off.texel, on.texel);
+    }
+
+    #[test]
+    fn hash_casters_is_deterministic_and_sensitive() {
+        let a = b"hello world!!!!";
+        assert_eq!(hash_casters(a), hash_casters(a));
+        assert_ne!(hash_casters(b""), hash_casters(b"x"));
+        let mut flipped = a.to_vec();
+        flipped[3] ^= 1;
+        assert_ne!(hash_casters(a), hash_casters(&flipped));
+        // 8-byte aligned and a one-byte tail both mix.
+        assert_ne!(hash_casters(&[0; 8]), hash_casters(&[0; 9]));
+        assert_ne!(hash_casters(&[1; 8]), hash_casters(&[1; 7]));
+    }
+
+    #[test]
     fn shadows_off_primes_once() {
         let mut cache = ShadowCache::new();
         assert!(cache.prepare(None), "first off-path primes the lit clear");
@@ -912,5 +1064,24 @@ mod tests {
         assert!(!cache.prepare(None), "later off-path frames skip");
         cache.invalidate();
         assert!(cache.prepare(None), "recreate re-primes");
+    }
+
+    #[test]
+    fn store_uniforms_bumps_generation() {
+        let mut cache = ShadowCache::new();
+        assert_eq!(cache.uniforms_gen(), 0);
+        let u = <CascadeUniformsGpu as bytemuck::Zeroable>::zeroed();
+        cache.store_uniforms(u);
+        assert_eq!(cache.uniforms_gen(), 1);
+        cache.store_uniforms(u);
+        assert_eq!(cache.uniforms_gen(), 2);
+        cache.invalidate();
+        assert_eq!(
+            cache.uniforms_gen(),
+            2,
+            "invalidate drops the block, not the generation"
+        );
+        cache.store_uniforms(u);
+        assert_eq!(cache.uniforms_gen(), 3);
     }
 }

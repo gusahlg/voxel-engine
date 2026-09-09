@@ -20,6 +20,10 @@
 //!   RENDERED frame (the render thread may coalesce main-thread frames). The
 //!   tonemap present copy runs only on presented frames; its meter carries the
 //!   per-rendered-frame share, with the per-presented cost alongside.
+//!   `gap` is device time between the end of the previous render submit's last
+//!   stamp and this submit's first stamp: idle GPU plus submit/command-processor
+//!   overhead. It is not part of the gpu total; the header's `idle N%` is the
+//!   window average of `gap / (gap + gpu_frame)`.
 //! - Workers run in parallel off the critical path; their ms/frame is *offered
 //!   load* — if it exceeds the frame wall-time, the backlog grows and far
 //!   terrain lags behind the player.
@@ -57,6 +61,7 @@ pub enum Meter {
     // Substages (like the tile ones) — excluded from the submit tier total and
     // printed in brackets after it, so they never double-count `Record`.
     RecShadow,
+    RecCull,
     RecMesh,
     RecSky,
     RecImmediate,
@@ -89,7 +94,15 @@ pub enum Meter {
     GpuVrs,
     /// Scene-pass begin: attachment transitions + `cmd_begin_rendering` clears.
     GpuClear,
+    /// Combined opaque span (full-res + cutout + coarse LOD), summed at GPU
+    /// timestamp readback. The three group meters are substages of this.
     GpuOpaque,
+    /// Full-res opaque (camera group 0). Substage of [`Meter::GpuOpaque`].
+    GpuOpaqueFull,
+    /// Cutout (camera group 1). Substage of [`Meter::GpuOpaque`].
+    GpuCutout,
+    /// Coarse-LOD opaque (camera group 2). Substage of [`Meter::GpuOpaque`].
+    GpuOpaqueLod,
     GpuSky,
     GpuCubes,
     GpuLines,
@@ -99,15 +112,21 @@ pub enum Meter {
     /// End of the scene pass: `cmd_end_rendering` (the MSAA color resolve lands
     /// here) and the offscreen finalize transitions.
     GpuResolve,
-    /// TAA resolve compute.
+    /// Retired TAA compute resolve. Fused into [`Meter::GpuTonemap`] at present
+    /// time; left in the enum so ordinals stay stable (reports 0).
     GpuTaa,
     /// Exposure metering reduce + finalize.
     GpuExposure,
-    /// The bloom chain — the render-command tail.
+    /// The bloom chain + quarter-res spill (bloom composite + godrays) — the
+    /// render-command tail.
     GpuBloom,
-    /// The present copy (tonemap + godrays + warp + 2D overlay) — a separate
-    /// submit that runs only on presented frames.
+    /// The present copy (tonemap + fused TAA + warp + 2D overlay) — a separate
+    /// submit that runs only on presented frames. Bloom composite and godrays
+    /// live in the bloom span's spill dispatch.
     GpuTonemap,
+    /// Device-time gap before this render submit: idle GPU plus submit /
+    /// command-processor overhead (`start(N) - end(N-1)` on the device clock).
+    GpuGap,
     // Tier::Workers — off-thread chunk jobs; the tile stages are sub-timings
     WorkGenerate,
     WorkMesh,
@@ -118,7 +137,7 @@ pub enum Meter {
 }
 
 impl Meter {
-    const ALL: [Meter; 50] = [
+    const ALL: [Meter; 55] = [
         Meter::NetEvents,
         Meter::Physics,
         Meter::StreamDrain,
@@ -134,6 +153,7 @@ impl Meter {
         Meter::Pack,
         Meter::Record,
         Meter::RecShadow,
+        Meter::RecCull,
         Meter::RecMesh,
         Meter::RecSky,
         Meter::RecImmediate,
@@ -152,6 +172,9 @@ impl Meter {
         Meter::GpuVrs,
         Meter::GpuClear,
         Meter::GpuOpaque,
+        Meter::GpuOpaqueFull,
+        Meter::GpuCutout,
+        Meter::GpuOpaqueLod,
         Meter::GpuSky,
         Meter::GpuCubes,
         Meter::GpuLines,
@@ -163,6 +186,7 @@ impl Meter {
         Meter::GpuExposure,
         Meter::GpuBloom,
         Meter::GpuTonemap,
+        Meter::GpuGap,
         Meter::WorkGenerate,
         Meter::WorkMesh,
         Meter::WorkLight,
@@ -189,6 +213,7 @@ impl Meter {
             Meter::Pack => "pack",
             Meter::Record => "record",
             Meter::RecShadow => "rec.shadow",
+            Meter::RecCull => "rec.cull",
             Meter::RecMesh => "rec.mesh",
             Meter::RecSky => "rec.sky",
             Meter::RecImmediate => "rec.imm",
@@ -207,6 +232,9 @@ impl Meter {
             Meter::GpuVrs => "vrs",
             Meter::GpuClear => "clear",
             Meter::GpuOpaque => "opaque",
+            Meter::GpuOpaqueFull => "opaque.full",
+            Meter::GpuCutout => "cutout",
+            Meter::GpuOpaqueLod => "opaque.lod",
             Meter::GpuSky => "sky",
             Meter::GpuCubes => "cubes",
             Meter::GpuLines => "lines",
@@ -218,6 +246,7 @@ impl Meter {
             Meter::GpuExposure => "exposure",
             Meter::GpuBloom => "bloom",
             Meter::GpuTonemap => "tonemap",
+            Meter::GpuGap => "gap",
             Meter::WorkGenerate => "generate",
             Meter::WorkMesh => "mesh",
             Meter::WorkLight => "light",
@@ -242,6 +271,7 @@ impl Meter {
             | Meter::Pack
             | Meter::Record
             | Meter::RecShadow
+            | Meter::RecCull
             | Meter::RecMesh
             | Meter::RecSky
             | Meter::RecImmediate
@@ -257,6 +287,9 @@ impl Meter {
             | Meter::GpuVrs
             | Meter::GpuClear
             | Meter::GpuOpaque
+            | Meter::GpuOpaqueFull
+            | Meter::GpuCutout
+            | Meter::GpuOpaqueLod
             | Meter::GpuSky
             | Meter::GpuCubes
             | Meter::GpuLines
@@ -267,7 +300,8 @@ impl Meter {
             | Meter::GpuTaa
             | Meter::GpuExposure
             | Meter::GpuBloom
-            | Meter::GpuTonemap => Tier::Gpu,
+            | Meter::GpuTonemap
+            | Meter::GpuGap => Tier::Gpu,
             Meter::WorkGenerate
             | Meter::WorkMesh
             | Meter::WorkLight
@@ -289,22 +323,46 @@ pub enum Gauge {
     WorldSkins,
     UploadBytes,
     DrawsPacked,
+    DrawsFull,
+    DrawsCutout,
+    DrawsLod,
+    TrisFull,
+    TrisCutout,
+    TrisLod,
     Vrs1x1,
     Vrs2x2,
     Vrs4x4,
+    FragFull,
+    FragLod,
+    FragCutout,
+    FragBlend,
+    FragSky,
+    PrimsFull,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 9] = [
+    const ALL: [Gauge; 21] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
         Gauge::WorldSkins,
         Gauge::UploadBytes,
         Gauge::DrawsPacked,
+        Gauge::DrawsFull,
+        Gauge::DrawsCutout,
+        Gauge::DrawsLod,
+        Gauge::TrisFull,
+        Gauge::TrisCutout,
+        Gauge::TrisLod,
         Gauge::Vrs1x1,
         Gauge::Vrs2x2,
         Gauge::Vrs4x4,
+        Gauge::FragFull,
+        Gauge::FragLod,
+        Gauge::FragCutout,
+        Gauge::FragBlend,
+        Gauge::FragSky,
+        Gauge::PrimsFull,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -316,20 +374,42 @@ impl Gauge {
             Gauge::WorldSkins => "skins",
             Gauge::UploadBytes => "upload.bytes",
             Gauge::DrawsPacked => "draws.packed",
+            Gauge::DrawsFull => "draws.full",
+            Gauge::DrawsCutout => "draws.cutout",
+            Gauge::DrawsLod => "draws.lod",
+            Gauge::TrisFull => "tris.full",
+            Gauge::TrisCutout => "tris.cutout",
+            Gauge::TrisLod => "tris.lod",
             Gauge::Vrs1x1 => "vrs.1x1",
             Gauge::Vrs2x2 => "vrs.2x2",
             Gauge::Vrs4x4 => "vrs.4x4",
+            Gauge::FragFull => "frag.full",
+            Gauge::FragLod => "frag.lod",
+            Gauge::FragCutout => "frag.cutout",
+            Gauge::FragBlend => "frag.blend",
+            Gauge::FragSky => "frag.sky",
+            Gauge::PrimsFull => "prims.full",
         }
     }
 }
 
 /// Last-set value per gauge (overwritten each frame, never accumulated).
 static GAUGES: [AtomicU64; Gauge::COUNT] = [const { AtomicU64::new(0) }; Gauge::COUNT];
+/// Full-res overdraw (`frag.full / pixels`), stored as f64 bits. Printed with
+/// two decimals on the `sets` line. Zero when pipe stats are unpublished.
+static OVERDRAW_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Record the current value of a gauge. Cheap no-op when profiling is off.
 pub fn gauge(g: Gauge, value: u64) {
     if enabled() {
         GAUGES[g as usize].store(value, Ordering::Relaxed);
+    }
+}
+
+/// Record full-res overdraw (`frag.full / render-extent pixels`).
+pub fn overdraw_full(ratio: f64) {
+    if enabled() && ratio.is_finite() {
+        OVERDRAW_FULL.store(ratio.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -374,10 +454,16 @@ pub enum Counter {
     Rendered,
     /// Frames that reached a present copy + `vkQueuePresentKHR`.
     Presented,
+    /// Queued game frames dropped by the render loop (kept only the newest).
+    Coalesced,
+    /// Render `vkQueueSubmit2` calls (a batched submit of N command buffers
+    /// counts as one). Compared with [`Self::Rendered`] this is how much
+    /// uncapped submission batching coalesced.
+    Submits,
 }
 
 impl Counter {
-    const COUNT: usize = 2;
+    const COUNT: usize = 4;
 }
 
 static COUNTERS: [AtomicU64; Counter::COUNT] = [const { AtomicU64::new(0) }; Counter::COUNT];
@@ -393,6 +479,8 @@ pub fn count(c: Counter) {
 /// thread's timestamp readback; drained by `report` for the p50/p95 header.
 /// Capped so a runaway window can never grow it unboundedly.
 static GPU_FRAMES: Mutex<Vec<f32>> = Mutex::new(Vec::new());
+/// Per-frame `gap / (gap + gpu_frame)` for the header's `idle N%`. Same cap.
+static GPU_IDLE_FRACS: Mutex<Vec<f32>> = Mutex::new(Vec::new());
 const GPU_FRAME_CAP: usize = 4096;
 
 /// Record one rendered frame's total GPU time (ms). Cheap no-op when off.
@@ -403,6 +491,27 @@ pub fn gpu_frame_ms(ms: f64) {
     let mut samples = GPU_FRAMES.lock().unwrap_or_else(|e| e.into_inner());
     if samples.len() < GPU_FRAME_CAP {
         samples.push(ms as f32);
+    }
+}
+
+/// Record the idle gap (ms) before this GPU frame. Also accumulates the
+/// windowed idle fraction `gap / (gap + gpu_frame)` for the header.
+/// Cheap no-op when profiling is off.
+pub fn gpu_gap_ms(gap_ms: f64, frame_ms: f64) {
+    if !enabled() || !gap_ms.is_finite() || gap_ms < 0.0 {
+        return;
+    }
+    add_ms(Meter::GpuGap, gap_ms);
+    if !frame_ms.is_finite() || frame_ms < 0.0 {
+        return;
+    }
+    let den = gap_ms + frame_ms;
+    if den <= 0.0 {
+        return;
+    }
+    let mut samples = GPU_IDLE_FRACS.lock().unwrap_or_else(|e| e.into_inner());
+    if samples.len() < GPU_FRAME_CAP {
+        samples.push((gap_ms / den) as f32);
     }
 }
 
@@ -556,6 +665,8 @@ fn report(frames: u64) {
     let f = frames as f64;
     let rendered = COUNTERS[Counter::Rendered as usize].swap(0, Ordering::Relaxed);
     let presented = COUNTERS[Counter::Presented as usize].swap(0, Ordering::Relaxed);
+    let coalesced = COUNTERS[Counter::Coalesced as usize].swap(0, Ordering::Relaxed);
+    let submits = COUNTERS[Counter::Submits as usize].swap(0, Ordering::Relaxed);
     // GPU meters are per RENDERED frame (the render thread may coalesce);
     // without a rendered count (no timestamps, minimized) fall back to frames.
     let gpu_f = if rendered > 0 { rendered as f64 } else { f };
@@ -574,6 +685,8 @@ fn report(frames: u64) {
         per_frame_count[m as usize] = c / f;
     }
     let mut gpu_frames = std::mem::take(&mut *GPU_FRAMES.lock().unwrap_or_else(|e| e.into_inner()));
+    let gpu_idle_fracs =
+        std::mem::take(&mut *GPU_IDLE_FRACS.lock().unwrap_or_else(|e| e.into_inner()));
 
     // Header: real frame period (hence fps) when we have a prior window mark,
     // plus the window's worst single frame — a stall that lasted only a few
@@ -618,8 +731,13 @@ fn report(frames: u64) {
     ) {
         header.push_str(&format!(" (p50 {p50:.2} p95 {p95:.2})"));
     }
+    if !gpu_idle_fracs.is_empty() {
+        let idle =
+            gpu_idle_fracs.iter().map(|x| f64::from(*x)).sum::<f64>() / gpu_idle_fracs.len() as f64;
+        header.push_str(&format!(" idle {:.0}%", idle * 100.0));
+    }
     header.push_str(&format!(
-        " work {:.2} | rendered {rendered} presented {presented}",
+        " work {:.2} | rendered {rendered} coalesced {coalesced} submits {submits} presented {presented}",
         tier_total(Tier::Workers),
     ));
     // `eprintln!`, not `log::info!`: `VOXEL_PROFILE` is an explicit opt-in, so
@@ -662,6 +780,32 @@ fn report(frames: u64) {
             if matches!(m, Meter::GpuTonemap) && ms_per_sample[m as usize] > 0.0 {
                 line.push_str(&format!(" ({:.2}/present)", ms_per_sample[m as usize]));
             }
+            // Opaque group split: substages of `opaque` (not in the gpu total),
+            // hottest-first, so the combined number stays comparable.
+            if matches!(m, Meter::GpuOpaque) {
+                let split = sorted(vec![
+                    Meter::GpuOpaqueFull,
+                    Meter::GpuCutout,
+                    Meter::GpuOpaqueLod,
+                ]);
+                line.push_str(" [");
+                for (i, s) in split.into_iter().enumerate() {
+                    if i > 0 {
+                        line.push(' ');
+                    }
+                    line.push_str(&format!("{} {:.2}", s.label(), ms_per_frame[s as usize]));
+                }
+                line.push(']');
+            }
+        }
+        if tier == Tier::Gpu {
+            // Idle gap is GPU device time but not GPU *work*; keep it off the
+            // hottest-first pass list (and the gpu total) and pin it at the end.
+            line.push_str(&format!(
+                " {} {:.2}",
+                Meter::GpuGap.label(),
+                ms_per_frame[Meter::GpuGap as usize],
+            ));
         }
         if tier == Tier::Workers {
             line.push_str(&format!(
@@ -676,6 +820,7 @@ fn report(frames: u64) {
             // `record` number goes without double-counting it.
             let rec = sorted(vec![
                 Meter::RecShadow,
+                Meter::RecCull,
                 Meter::RecMesh,
                 Meter::RecSky,
                 Meter::RecImmediate,
@@ -705,28 +850,55 @@ fn report(frames: u64) {
             GAUGES[g as usize].load(Ordering::Relaxed)
         ));
     }
+    sline.push_str(&format!(
+        " overdraw.full {:.2}",
+        f64::from_bits(OVERDRAW_FULL.load(Ordering::Relaxed))
+    ));
     eprintln!("{sline}");
 }
 
-/// Tile sub-stage meters are reported inline in the workers line, not as their
-/// own tier entries (they double-count `tile`'s wall-time).
+/// Tile/record/opaque-group sub-stage meters are reported inline, not as their
+/// own tier entries (they double-count a parent). `GpuGap` is idle between
+/// submits — reported at the end of the gpu line and as `idle N%` in the
+/// header, never in the gpu total.
 fn is_substage(m: Meter) -> bool {
     matches!(
         m,
         Meter::TileSample
             | Meter::TileMesh
             | Meter::RecShadow
+            | Meter::RecCull
             | Meter::RecMesh
             | Meter::RecSky
             | Meter::RecImmediate
             | Meter::RecOverlay
             | Meter::RecTransitions
+            | Meter::GpuGap
+            | Meter::GpuOpaqueFull
+            | Meter::GpuCutout
+            | Meter::GpuOpaqueLod
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_submits_is_the_fourth_window_count() {
+        assert_eq!(Counter::Rendered as usize, 0);
+        assert_eq!(Counter::Presented as usize, 1);
+        assert_eq!(Counter::Coalesced as usize, 2);
+        assert_eq!(Counter::Submits as usize, 3);
+        assert_eq!(Counter::COUNT, 4);
+    }
+
+    #[test]
+    fn gauge_ordinals_index_all_in_order() {
+        for (i, g) in Gauge::ALL.into_iter().enumerate() {
+            assert_eq!(g as usize, i, "{} is out of order in Gauge::ALL", g.label());
+        }
+    }
 
     #[test]
     fn meter_ordinals_index_all_in_order() {
@@ -749,6 +921,24 @@ mod tests {
             labels.sort_unstable();
             labels.dedup();
             assert_eq!(labels.len(), n, "duplicate label in tier {}", tier.label());
+        }
+    }
+
+    #[test]
+    fn opaque_group_meters_are_gpu_substages() {
+        assert!(matches!(Meter::GpuOpaque.tier(), Tier::Gpu));
+        assert!(!is_substage(Meter::GpuOpaque));
+        for m in [Meter::GpuOpaqueFull, Meter::GpuCutout, Meter::GpuOpaqueLod] {
+            assert!(
+                matches!(m.tier(), Tier::Gpu),
+                "{} should be a GPU meter",
+                m.label()
+            );
+            assert!(
+                is_substage(m),
+                "{} should not join the gpu total",
+                m.label()
+            );
         }
     }
 

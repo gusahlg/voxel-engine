@@ -11,7 +11,7 @@ use crate::skeleton::FrameSlot;
 use super::buffers::{self, DrawIndexedIndirect};
 use super::cull;
 use super::frame_loop::{ImmOffsets, jittered_clip};
-use super::gpu_timer::GpuPass;
+use super::gpu_timer::{GpuPass, PipeStatPass};
 use super::pipeline;
 use super::{HdrReadable, Renderer, color_range, depth_range};
 
@@ -27,10 +27,18 @@ pub(super) struct RenderPass<'a> {
     /// Whether `layout_3d` descriptors are currently live. Incompatible layouts
     /// (sky, debug, 2D) disturb them; tracking lets mesh passes skip re-pushing.
     mesh_desc_bound: std::cell::Cell<bool>,
+    /// Jittered clip matrix and eye split, computed once in `begin` when a 3D
+    /// scene is present. Shared by mesh push constants, debug view_proj, and sky.
+    scene_state: Option<(glam::Mat4, pipeline::EyeSplit)>,
+    mesh_push_bound: std::cell::Cell<bool>,
+    index_bound: std::cell::Cell<bool>,
+    /// A later pass this frame samples the sampleable depth (VRS / spill / TAA).
+    sample_depth: bool,
 }
 
 impl<'a> RenderPass<'a> {
     /// Records attachment layout transitions and begins dynamic rendering.
+    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn begin(
         r: &'a Renderer,
         cmd: vk::CommandBuffer,
@@ -38,68 +46,71 @@ impl<'a> RenderPass<'a> {
         lists: &'a DrawLists,
         offsets: ImmOffsets,
         do_vrs: bool,
+        sample_depth: bool,
+        store_color: bool,
     ) -> RenderPass<'a> {
         let device = &r.device.device;
         let extent = r.render_extent;
         let offscreen_image = r.targets.offscreen[slot].image();
         let profiling = crate::profile::is_enabled();
         unsafe {
-            // Generate the rate map first: it samples this slot's depth (leaving
-            // it in DEPTH_ATTACHMENT_OPTIMAL, ready for the pass below) and
-            // returns the only valid `RateAttachment`. Done before the color
-            // barriers so the compute dispatch overlaps nothing it depends on.
-            let rate = do_vrs.then(|| {
-                let scene = lists.scene.as_ref().expect("do_vrs implies a 3D scene");
-                let focal_px = 0.5 * extent.height as f32 / scene.fovy_tan_half.max(1e-4);
-                let d_threshold = crate::camera::Z_NEAR / focal_px;
-                let rate = r.record_vrs_generate(cmd, slot, d_threshold);
-                if profiling {
-                    r.gpu_timer.mark(device, cmd, slot, GpuPass::Vrs);
-                }
-                rate
-            });
+            // Bind last-use's rate image if this slot has already classified
+            // (`vrs_ready`). The classifier ran at the END of that previous use
+            // and left the image in GENERAL; the begin batch below transitions
+            // it to FRAGMENT_SHADING_RATE_ATTACHMENT. First use after
+            // create/recreate skips VRS (`vrs_ready` is false).
+            let rate = do_vrs.then(|| r.vrs_rate_attachment(slot));
 
-            // Transition attachments to render targets; old contents discarded.
-            // The VRS pass above transitions the sampled depth when `do_vrs` —
-            // under MSAA that is `resolved_depth`, so the MS `depth` attachment
-            // still needs its own transition here.
-            let mut image_barriers = [vk::ImageMemoryBarrier2::default(); 4];
+            // One vkCmdPipelineBarrier2 for every image the pass writes, plus
+            // the rate image when VRS is bound. Sampleable depth always begins
+            // from UNDEFINED (cleared every frame; see SAMPLEABLE_DEPTH_REST_LAYOUT).
+            let mut image_barriers = [vk::ImageMemoryBarrier2::default(); 5];
             let mut barrier_count = 0;
-            image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .image(offscreen_image)
-                .subresource_range(color_range());
-            barrier_count += 1;
-            // MS depth needs a fresh-target transition unless the VRS pass
-            // already put THIS image there — which it only does single-sampled
-            // (under MSAA the VRS pass transitions `resolved_depth` instead).
-            if !do_vrs || r.targets.msaa.is_some() {
+            // Offscreen: src COLOR_ATTACHMENT_OUTPUT / NONE (discard).
+            // Dst COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE.
+            // Old UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
+            // MSAA: this image is the AVERAGE resolve target; skip the barrier
+            // when colour is not stored (no resolve this frame).
+            if store_color || r.targets.msaa.is_none() {
                 image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(
-                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    )
-                    .dst_access_mask(
-                        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                    )
+                    .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
                     .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(r.depth_pass_layout())
-                    .image(r.targets.depth[slot].image())
-                    .subresource_range(depth_range());
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image(offscreen_image)
+                    .subresource_range(color_range());
                 barrier_count += 1;
             }
-            // The single-sample resolve target: bring it to the attachment layout
-            // for the SAMPLE_ZERO resolve. When `do_vrs`, the VRS pass already
-            // restored it to DEPTH_ATTACHMENT_OPTIMAL after sampling.
-            if !do_vrs && let Some(resolved) = &r.targets.resolved_depth[slot] {
+            // Depth attachment (MS depth when multisampled, else the
+            // single-sample depth): src LATE_FRAGMENT_TESTS / NONE (discard).
+            // Dst EARLY|LATE_FRAGMENT_TESTS / DEPTH_STENCIL_ATTACHMENT_{READ,WRITE}.
+            // Old UNDEFINED → depth_pass_layout. Unconditional: VRS no longer
+            // round-trips this image, and contents are cleared anyway.
+            image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                )
+                .dst_access_mask(
+                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                )
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(r.depth_pass_layout())
+                .image(r.targets.depth[slot].image())
+                .subresource_range(depth_range());
+            barrier_count += 1;
+            // MSAA SAMPLE_ZERO resolve target: src COLOR_ATTACHMENT_OUTPUT / NONE
+            // (Vulkan runs depth resolves at color-output). Dst COLOR_ATTACHMENT_OUTPUT
+            // / COLOR_ATTACHMENT_WRITE. Old UNDEFINED → DEPTH_ATTACHMENT_OPTIMAL.
+            // The MS `depth` attachment above is never sampled; only this image
+            // rests in SAMPLEABLE_DEPTH_REST_LAYOUT after `end` when a later
+            // pass samples it. Skip the resolve-target barrier when nothing does.
+            if sample_depth && let Some(resolved) = &r.targets.resolved_depth[slot] {
                 image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .src_access_mask(vk::AccessFlags2::NONE)
@@ -112,6 +123,9 @@ impl<'a> RenderPass<'a> {
                 barrier_count += 1;
             }
             if let Some(msaa) = &r.targets.msaa {
+                // MSAA color: src COLOR_ATTACHMENT_OUTPUT / NONE (discard).
+                // Dst COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE.
+                // Old UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
                 image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .src_access_mask(vk::AccessFlags2::NONE)
@@ -121,6 +135,10 @@ impl<'a> RenderPass<'a> {
                     .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .image(msaa.image())
                     .subresource_range(color_range());
+                barrier_count += 1;
+            }
+            if do_vrs {
+                image_barriers[barrier_count] = r.vrs_rate_to_attachment_barrier(slot);
                 barrier_count += 1;
             }
             device.cmd_pipeline_barrier2(
@@ -142,34 +160,60 @@ impl<'a> RenderPass<'a> {
                 },
             };
             let offscreen_view = r.targets.offscreen[slot].view();
+            // Sky triangle covers every pixel left at reversed-Z far (depth 0).
+            // Debug-flat (TerrainKey) frames carry `lists.sky == None` and still clear.
+            let color_load = if lists.scene.is_some() && r.flags.sky && lists.sky.is_some() {
+                vk::AttachmentLoadOp::DONT_CARE
+            } else {
+                vk::AttachmentLoadOp::CLEAR
+            };
             let mut color_attachment = if let Some(msaa) = &r.targets.msaa {
-                vk::RenderingAttachmentInfo::default()
+                // MS store is always DONT_CARE; the offscreen AVERAGE resolve
+                // is the colour that bloom/exposure/spill/tonemap read. Skip
+                // that resolve when this frame will not present (those
+                // consumers are present-only; minimap is a separate texture,
+                // screenshots copy the swapchain after tonemap, VRS reads
+                // depth not colour).
+                let mut att = vk::RenderingAttachmentInfo::default()
                     .image_view(msaa.view())
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .resolve_mode(vk::ResolveModeFlags::AVERAGE)
-                    .resolve_image_view(offscreen_view)
-                    .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .load_op(color_load)
+                    .store_op(vk::AttachmentStoreOp::DONT_CARE);
+                if store_color {
+                    att = att
+                        .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                        .resolve_image_view(offscreen_view)
+                        .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+                }
+                att
             } else {
-                // Offscreen is color target; store contents for present copy.
+                // Offscreen is color target. Store for present-copy consumers;
+                // DONT_CARE when this frame is not presented.
                 vk::RenderingAttachmentInfo::default()
                     .image_view(offscreen_view)
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .load_op(color_load)
+                    .store_op(if store_color {
+                        vk::AttachmentStoreOp::STORE
+                    } else {
+                        vk::AttachmentStoreOp::DONT_CARE
+                    })
             };
             color_attachment = color_attachment.clear_value(clear_color);
             let color_attachments = [color_attachment];
 
             // Reversed-Z: clear depth to 0.0, GREATER_OR_EQUAL test. Single-
-            // sampled: store the depth so a later cycle can classify it for VRS.
-            // MSAA: DONT_CARE the MS store — its single-sample SAMPLE_ZERO
-            // resolve into `resolved_depth` is what feeds VRS/TAA/godrays.
-            let depth_store = if r.targets.msaa.is_some() {
-                vk::AttachmentStoreOp::DONT_CARE
-            } else {
+            // sampled: store the depth so later consumers (end-of-frame
+            // classify, spill-godrays, present TAA) can sample it after it
+            // rests in SAMPLEABLE_DEPTH_REST_LAYOUT. MSAA: DONT_CARE the MS
+            // store — its single-sample SAMPLE_ZERO resolve into
+            // `resolved_depth` is what those consumers read. When nothing
+            // samples depth this frame, DONT_CARE the store and skip the
+            // resolve; the next begin discards from UNDEFINED.
+            let depth_store = if sample_depth && r.targets.msaa.is_none() {
                 vk::AttachmentStoreOp::STORE
+            } else {
+                vk::AttachmentStoreOp::DONT_CARE
             };
             let mut depth_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(r.targets.depth[slot].view())
@@ -182,16 +226,15 @@ impl<'a> RenderPass<'a> {
                         stencil: 0,
                     },
                 });
-            if let Some(resolved) = &r.targets.resolved_depth[slot] {
+            if sample_depth && let Some(resolved) = &r.targets.resolved_depth[slot] {
                 depth_attachment = depth_attachment
                     .resolve_mode(vk::ResolveModeFlags::SAMPLE_ZERO)
                     .resolve_image_view(resolved.view())
                     .resolve_image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL);
             }
 
-            // `rate` (generated above) is the only source of a `RateAttachment`,
-            // so its image is guaranteed classified and in the shading-rate
-            // layout before it is bound here.
+            // `rate` is the previous classify of this slot, transitioned to
+            // the shading-rate layout in the begin batch above.
             let mut rate_attachment = rate.as_ref().map(|rate| {
                 vk::RenderingFragmentShadingRateAttachmentInfoKHR::default()
                     .image_view(rate.view)
@@ -215,6 +258,7 @@ impl<'a> RenderPass<'a> {
             // Close the begin span (transitions + load-op clears) so the first
             // draw pass reports only its draws.
             if profiling {
+                r.gpu_timer.recorded(slot);
                 r.gpu_timer.mark(device, cmd, slot, GpuPass::Clear);
             }
 
@@ -242,6 +286,13 @@ impl<'a> RenderPass<'a> {
             // incompatible layouts), not once here.
         }
 
+        let scene_state = lists.scene.as_ref().map(|scene| {
+            (
+                jittered_clip(scene.view_proj, scene.jitter.0, r.render_extent),
+                pipeline::EyeSplit::of(scene.eye),
+            )
+        });
+
         RenderPass {
             r,
             cmd,
@@ -251,6 +302,10 @@ impl<'a> RenderPass<'a> {
             offscreen_image,
             ended: false,
             mesh_desc_bound: std::cell::Cell::new(false),
+            scene_state,
+            mesh_push_bound: std::cell::Cell::new(false),
+            index_bound: std::cell::Cell::new(false),
+            sample_depth,
         }
     }
 
@@ -260,16 +315,44 @@ impl<'a> RenderPass<'a> {
     /// pass rather than once up front, because interleaved passes bind
     /// incompatible layouts that disturb this state. Only sound when at least
     /// one mesh run exists (else the offsets SSBO can be a null buffer).
+    ///
+    /// Push-constant bytes are identical for every mesh pass (`lists.lod_clip`,
+    /// `lod_clip_v`); the quad IBO binding survives pipeline/layout changes.
+    /// Both are bound once and skipped until a foreign pass invalidates them
+    /// (push constants) — the IBO is never invalidated.
     unsafe fn bind_mesh3d_state(&self) {
         unsafe {
             self.push_mesh3d_descriptors();
-            // LOD slab extents: LOD tiles hard-discard inside the full-res volume.
-            self.push_mesh3d_constants(self.lists.lod_clip, self.lists.lod_clip_v);
+            if !self.mesh_push_bound.get() {
+                // LOD slab extents: LOD tiles hard-discard inside the full-res volume.
+                self.push_mesh3d_constants(self.lists.lod_clip, self.lists.lod_clip_v);
+                self.mesh_push_bound.set(true);
+            }
+            if !self.index_bound.get() {
+                let quad_ibo = self
+                    .r
+                    .quad_ibo
+                    .bound()
+                    .expect("a mesh pass implies the quad IBO is allocated");
+                self.r.device.device.cmd_bind_index_buffer(
+                    self.cmd,
+                    quad_ibo,
+                    0,
+                    vk::IndexType::UINT32,
+                );
+                self.index_bound.set(true);
+            }
         }
     }
 
     /// Pushes `layout_3d` descriptors only if a foreign pass disturbed them.
     /// Skips redundant pushes when adjacent mesh passes share state.
+    ///
+    /// `mesh3d` and `mesh3d_lod` share `layout_3d`, so one
+    /// `vkCmdPushDescriptorSetKHR` remains valid across both pipeline binds
+    /// (push-descriptor state is per compatible layout, not per pipeline).
+    /// Shadows-off still pushes the cascade UBO + shadow sampler: the layout
+    /// requires every binding; the skip is the host UBO memcpy, not this push.
     unsafe fn push_mesh3d_descriptors(&self) {
         if self.mesh_desc_bound.get() {
             return;
@@ -296,21 +379,17 @@ impl<'a> RenderPass<'a> {
         self.mesh_desc_bound.set(true);
     }
 
-    /// Pushes view-proj + LOD slab extents. Pass-specific, so unconditionally
-    /// pushed per pass (unlike descriptors). Jitter packaged here as a local.
+    /// Pushes view-proj + LOD slab extents. Identical for every mesh pass, so
+    /// skipped while `mesh_push_bound`. Jitter packaged once in `begin`.
     unsafe fn push_mesh3d_constants(&self, clip: f32, clip_v: f32) {
         let r = self.r;
-        let scene = self
-            .lists
-            .scene
-            .as_ref()
-            .expect("a mesh pass implies a 3D scene");
+        let (view_proj, eye) = self.scene_state.expect("a mesh pass implies a 3D scene");
         let push = pipeline::Mesh3dPush {
-            view_proj: jittered_clip(scene.view_proj, scene.jitter.0, r.render_extent),
+            view_proj,
             clip,
             clip_v,
             _pad: [0.0; 2],
-            eye: pipeline::EyeSplit::of(scene.eye),
+            eye,
         };
         let layout = r.pipelines.layout_3d;
         unsafe {
@@ -329,6 +408,8 @@ impl<'a> RenderPass<'a> {
     /// cubes/lines/shadows, 2D), so the next `layout_3d` pass re-pushes them.
     fn invalidate_mesh_desc(&self) {
         self.mesh_desc_bound.set(false);
+        self.mesh_push_bound.set(false);
+        // Index-buffer binding survives pipeline/layout changes.
     }
 
     /// Issues indirect mesh draws for one pass, using the best available
@@ -346,6 +427,7 @@ impl<'a> RenderPass<'a> {
         if !self.r.draw_runs.iter().any(|run| run.pass == pass) {
             return;
         }
+        self.r.gpu_timer.recorded(self.slot);
         // Interleaved debug/sky/2D passes bind pipelines with layouts that are
         // not push-compatible with `layout_3d`, which per Vulkan's layout-
         // compatibility rules disturbs this layout's push constants and push
@@ -401,15 +483,6 @@ impl<'a> RenderPass<'a> {
                 .indirect
                 .bound()
                 .expect("a draw run implies the indirect buffer is allocated");
-            // One shared quad IBO for every run: bucket-permuted vertices make each
-            // run's `first_index`/`vertex_offset` address it directly. Bound once —
-            // index-buffer binding survives the per-run pipeline rebinds below.
-            let quad_ibo = self
-                .r
-                .quad_ibo
-                .bound()
-                .expect("a draw run implies the quad IBO is allocated");
-            device.cmd_bind_index_buffer(cmd, quad_ibo, 0, vk::IndexType::UINT32);
             const STRIDE: u64 = std::mem::size_of::<DrawIndexedIndirect>() as u64;
             // Rebind only when the pass's pipeline changes.
             let mut bound: Option<vk::Pipeline> = None;
@@ -466,7 +539,8 @@ impl<'a> RenderPass<'a> {
     /// earlier in this command buffer. Never called for Blend (CPU-sorted path).
     /// Opaque draws its full-res partition (no-`discard` pipeline) first, then
     /// the coarse-LOD partition (slab-clip pipeline) — near before far, so the
-    /// LOD skirt behind full-res terrain is mostly depth-rejected.
+    /// LOD skirt behind full-res terrain is mostly depth-rejected. Each group's
+    /// draws close a GPU timestamp (`OpaqueFull` / `OpaqueLod` / `Cutout`).
     unsafe fn record_mesh_indirect_count(&self, pass: Pass) {
         let groups: &[(cull::Group, vk::Pipeline)] = match pass {
             Pass::Opaque => &[
@@ -482,59 +556,111 @@ impl<'a> RenderPass<'a> {
     }
 
     /// Draws every non-empty arena partition of one cull group with `pipeline`.
+    /// [`GpuTimer::mark`] is a no-op when the group recorded nothing, so empty
+    /// groups account 0 instead of a BOTTOM_OF_PIPE stamp.
     unsafe fn record_group_indirect_count(&self, group: cull::Group, pipeline: vk::Pipeline) {
-        let Some(frame) = &self.r.cull_frame else {
-            return; // nothing live to draw
-        };
-        let span = frame.arena_count * cull::BUCKETS;
-        let base = group as usize * span;
-        if frame.partitions[base..base + span]
-            .iter()
-            .all(|p| p.capacity == 0)
-        {
-            return;
-        }
-        unsafe { self.bind_mesh3d_state() };
-        let device = &self.r.device.device;
-        unsafe {
-            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            let quad_ibo = self
-                .r
-                .quad_ibo
-                .bound()
-                .expect("live records imply the quad IBO is allocated");
-            device.cmd_bind_index_buffer(self.cmd, quad_ibo, 0, vk::IndexType::UINT32);
-            for arena in 0..frame.arena_count {
-                let first = cull::camera_part(group as usize, arena, 0, frame.arena_count);
-                if frame.partitions[first..first + cull::BUCKETS]
-                    .iter()
-                    .all(|p| p.capacity == 0)
-                {
-                    continue;
-                }
-                device.cmd_bind_vertex_buffers(
-                    self.cmd,
-                    0,
-                    &[self.r.arena_dir.arena_buffer(arena)],
-                    &[0],
-                );
-                for bucket in 0..cull::BUCKETS {
-                    let idx = first + bucket;
-                    let part = frame.partitions[idx];
-                    if part.capacity == 0 {
-                        continue;
+        self.pipe_begin_group(group);
+        if let Some(frame) = &self.r.cull_frame {
+            let span = frame.arena_count * cull::BUCKETS;
+            let base = group as usize * span;
+            if !frame.partitions[base..base + span]
+                .iter()
+                .all(|p| p.capacity == 0)
+            {
+                self.r.gpu_timer.recorded(self.slot);
+                unsafe { self.bind_mesh3d_state() };
+                let device = &self.r.device.device;
+                unsafe {
+                    device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                    for arena in 0..frame.arena_count {
+                        let first = cull::camera_part(group as usize, arena, 0, frame.arena_count);
+                        if frame.partitions[first..first + cull::BUCKETS]
+                            .iter()
+                            .all(|p| p.capacity == 0)
+                        {
+                            continue;
+                        }
+                        device.cmd_bind_vertex_buffers(
+                            self.cmd,
+                            0,
+                            &[self.r.arena_dir.arena_buffer(arena)],
+                            &[0],
+                        );
+                        for bucket in 0..cull::BUCKETS {
+                            let idx = first + bucket;
+                            let part = frame.partitions[idx];
+                            if part.capacity == 0 {
+                                continue;
+                            }
+                            device.cmd_draw_indexed_indirect_count(
+                                self.cmd,
+                                frame.commands,
+                                u64::from(part.offset) * cull::CMD_STRIDE,
+                                frame.counts,
+                                (idx * 4) as u64,
+                                part.capacity,
+                                cull::CMD_STRIDE as u32,
+                            );
+                        }
                     }
-                    device.cmd_draw_indexed_indirect_count(
-                        self.cmd,
-                        frame.commands,
-                        u64::from(part.offset) * cull::CMD_STRIDE,
-                        frame.counts,
-                        (idx * 4) as u64,
-                        part.capacity,
-                        cull::CMD_STRIDE as u32,
-                    );
                 }
             }
+        }
+        self.stamp_group(group);
+        self.pipe_end_group(group);
+    }
+
+    /// GPU timestamp closing `group`'s draws. No-op when profiling is off or
+    /// the group recorded nothing.
+    fn stamp_group(&self, group: cull::Group) {
+        if !crate::profile::is_enabled() {
+            return;
+        }
+        let pass = match group {
+            cull::Group::Opaque => GpuPass::OpaqueFull,
+            cull::Group::Cutout => GpuPass::Cutout,
+            cull::Group::OpaqueLod => GpuPass::OpaqueLod,
+        };
+        unsafe {
+            self.r
+                .gpu_timer
+                .mark(&self.r.device.device, self.cmd, self.slot, pass);
+        }
+    }
+
+    fn pipe_stat_pass(group: cull::Group) -> PipeStatPass {
+        match group {
+            cull::Group::Opaque => PipeStatPass::OpaqueFull,
+            cull::Group::OpaqueLod => PipeStatPass::OpaqueLod,
+            cull::Group::Cutout => PipeStatPass::Cutout,
+        }
+    }
+
+    fn pipe_begin_group(&self, group: cull::Group) {
+        if !crate::profile::is_enabled() {
+            return;
+        }
+        unsafe {
+            self.r.pipe_stats.begin_pass(
+                &self.r.device.device,
+                self.cmd,
+                self.slot,
+                Self::pipe_stat_pass(group),
+            );
+        }
+    }
+
+    fn pipe_end_group(&self, group: cull::Group) {
+        if !crate::profile::is_enabled() {
+            return;
+        }
+        unsafe {
+            self.r.pipe_stats.end_pass(
+                &self.r.device.device,
+                self.cmd,
+                self.slot,
+                Self::pipe_stat_pass(group),
+            );
         }
     }
 
@@ -569,15 +695,11 @@ impl<'a> RenderPass<'a> {
     /// Done per debug pass because the mesh passes bind `layout_3d`, whose
     /// incompatible push-constant range disturbs this value.
     unsafe fn push_debug_view_proj(&self) {
-        let scene = self
-            .lists
-            .scene
-            .as_ref()
-            .expect("a debug pass implies a 3D scene");
+        let view_proj = self.scene_state.expect("a debug pass implies a 3D scene").0;
         let push = pipeline::DebugPush {
             // Match the mesh pass jitter so debug geometry doesn't shimmer against
             // jittered terrain under TAA.
-            view_proj: jittered_clip(scene.view_proj, scene.jitter.0, self.r.render_extent),
+            view_proj,
         };
         unsafe {
             self.r.device.device.cmd_push_constants(
@@ -597,6 +719,7 @@ impl<'a> RenderPass<'a> {
         let cmd = self.cmd;
         unsafe {
             if !self.lists.cube_verts.is_empty() {
+                self.r.gpu_timer.recorded(self.slot);
                 device.cmd_bind_pipeline(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -626,6 +749,7 @@ impl<'a> RenderPass<'a> {
         let cmd = self.cmd;
         unsafe {
             if !self.lists.shadow_verts.is_empty() {
+                self.r.gpu_timer.recorded(self.slot);
                 device.cmd_bind_pipeline(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -654,6 +778,7 @@ impl<'a> RenderPass<'a> {
         let cmd = self.cmd;
         unsafe {
             if !self.lists.line_verts.is_empty() {
+                self.r.gpu_timer.recorded(self.slot);
                 device.cmd_bind_pipeline(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -685,16 +810,12 @@ impl<'a> RenderPass<'a> {
         let Some(desc) = self.lists.sky else {
             return;
         };
-        let scene = self
-            .lists
-            .scene
-            .as_ref()
-            .expect("a sky pass implies a 3D scene");
+        self.r.gpu_timer.recorded(self.slot);
         let device = &self.r.device.device;
         let cmd = self.cmd;
         // Same jitter the mesh pass applies, so TAA sees a coherently jittered
         // frame (sky vs terrain silhouettes) and history reprojection is stable.
-        let jittered = jittered_clip(scene.view_proj, scene.jitter.0, self.r.render_extent);
+        let jittered = self.scene_state.expect("a sky pass implies a 3D scene").0;
         let params = pipeline::SkyParams::compose(jittered.inverse(), &desc);
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.r.pipelines.sky);
@@ -741,45 +862,84 @@ impl<'a> RenderPass<'a> {
     /// `SHADER_READ_ONLY_OPTIMAL`, and returns the [`HdrReadable`] proof. The
     /// timeline orders later submits; this barrier owns layout and visibility.
     /// Use when no later pass writes the offscreen, so this pass owns the final
-    /// transition for tonemapping.
-    pub(super) unsafe fn end_sampled(self) -> HdrReadable {
+    /// transition for tonemapping. Sampleable depth rests here when a later
+    /// pass samples it (see [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]);
+    /// `classify_vrs` joins the rate and history images into the same barrier.
+    pub(super) unsafe fn end_sampled(self, classify_vrs: bool) -> HdrReadable {
         let slot = self.slot;
-        unsafe { self.end(true) };
+        unsafe { self.end(true, classify_vrs) };
         HdrReadable::new(slot)
     }
 
-    /// Ends dynamic rendering WITHOUT the sampled transition: a later offscreen
-    /// writer (TAA resolve / exposure metering) runs after this, and one of them
-    /// owns the finalization instead (its barrier would otherwise race their
-    /// writes). Yields no proof — the deferred finalizer produces it.
-    pub(super) unsafe fn end_deferred(self) {
-        unsafe { self.end(false) };
+    /// Ends dynamic rendering WITHOUT the offscreen sampled transition: a later
+    /// offscreen writer (exposure metering) runs after this and owns the
+    /// finalization instead (its barrier would otherwise race the write).
+    /// Sampleable depth still rests in [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]
+    /// when a later pass samples it. Yields no proof — the deferred finalizer
+    /// produces it.
+    pub(super) unsafe fn end_deferred(self, classify_vrs: bool) {
+        unsafe { self.end(false, classify_vrs) };
     }
 
-    unsafe fn end(mut self, transition_offscreen: bool) {
+    unsafe fn end(mut self, transition_offscreen: bool, classify_vrs: bool) {
         let device = &self.r.device.device;
         let cmd = self.cmd;
         unsafe {
             device.cmd_end_rendering(cmd);
+            self.r.gpu_timer.recorded(self.slot);
 
             self.ended = true;
-            if !transition_offscreen {
-                return;
+
+            // Mix fill (profiling only) must precede the barrier that makes it
+            // visible to the classifier. Joins as a CLEAR→COMPUTE memory barrier.
+            let mix_filled = classify_vrs && self.r.record_vrs_mix_fill(cmd, self.slot);
+
+            // One vkCmdPipelineBarrier2: offscreen (optional) + sampleable-depth
+            // rest (only when a later pass samples it) + (if classifying)
+            // rate/history → GENERAL. No extra VRS pipeline barrier beyond the
+            // two the frame already has.
+            let mut images = [vk::ImageMemoryBarrier2::default(); 4];
+            let mut n = 0;
+            if transition_offscreen {
+                // Offscreen: src COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE
+                // (scene color, including the MSAA average resolve). Dst
+                // FRAGMENT_SHADER / SHADER_SAMPLED_READ (tonemap present-copy;
+                // bloom/exposure insert their own barriers when they run).
+                // Old COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
+                images[n] = vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image(self.offscreen_image)
+                    .subresource_range(color_range());
+                n += 1;
+            }
+            // Sampleable depth rest: see `sampleable_depth_rest_barrier`.
+            // Skipped when nothing samples; the next begin is UNDEFINED.
+            if self.sample_depth {
+                images[n] = self.r.sampleable_depth_rest_barrier(self.slot);
+                n += 1;
+            }
+            if classify_vrs {
+                images[n] = self.r.vrs_rate_to_general_barrier(self.slot);
+                n += 1;
+                images[n] = self.r.vrs_history_to_general_barrier(self.slot);
+                n += 1;
             }
 
-            let to_sampled = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image(self.offscreen_image)
-                .subresource_range(color_range())];
-            device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
-            );
+            let mix_mem = [super::Renderer::vrs_mix_fill_memory_barrier()];
+            let mem: &[vk::MemoryBarrier2] = if mix_filled { &mix_mem } else { &[] };
+            if n > 0 || mix_filled {
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default()
+                        .memory_barriers(mem)
+                        .image_memory_barriers(&images[..n]),
+                );
+            }
         }
     }
 }

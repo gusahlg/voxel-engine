@@ -79,9 +79,9 @@ pub(crate) fn compute_pipeline(
     pipeline
 }
 
-/// Linear-filter, clamp-to-edge sampler — the primary read sampler taa,
-/// exposure, and bloom's threshold stage each build identically (bloom's
-/// second, mip-filtered composite sampler is pass-specific and stays put).
+/// Linear-filter, clamp-to-edge sampler — the primary read sampler exposure
+/// and bloom's threshold stage each build identically (bloom's second,
+/// mip-filtered composite sampler is pass-specific and stays put).
 pub(crate) fn linear_clamp_sampler(device: &ash::Device, label: &str) -> vk::Sampler {
     unsafe {
         device
@@ -98,8 +98,8 @@ pub(crate) fn linear_clamp_sampler(device: &ash::Device, label: &str) -> vk::Sam
     }
 }
 
-/// Nearest-filter, clamp-to-edge sampler — point depth fetches (TAA reprojection)
-/// must not interpolate reversed-Z.
+/// Nearest-filter, clamp-to-edge sampler — point depth fetches (fused TAA
+/// reprojection) must not interpolate reversed-Z.
 pub(crate) fn nearest_clamp_sampler(device: &ash::Device, label: &str) -> vk::Sampler {
     unsafe {
         device

@@ -125,12 +125,6 @@ const SHADERS: &[Shader] = &[
         entry: "computeMain",
         dst: "cull.comp.spv",
     },
-    Shader {
-        src: "shaders/taa_resolve.comp.slang",
-        stage: "compute",
-        entry: "computeMain",
-        dst: "taa_resolve.comp.spv",
-    },
     // Bloom: two entry points from one source (threshold + downsample-chain).
     Shader {
         src: "shaders/bloom.comp.slang",
@@ -143,6 +137,13 @@ const SHADERS: &[Shader] = &[
         stage: "compute",
         entry: "downsample",
         dst: "bloom_downsample.comp.spv",
+    },
+    // Quarter-res bloom-composite + godrays, sampled once by tonemap.
+    Shader {
+        src: "shaders/spill.comp.slang",
+        stage: "compute",
+        entry: "computeMain",
+        dst: "spill.comp.spv",
     },
 ];
 
@@ -172,6 +173,16 @@ const MESH3D_LOD: Shader = Shader {
     stage: "fragment",
     entry: "fragmentMain",
     dst: "mesh3d_lod.frag.spv",
+};
+
+/// Present-time TAA tonemap fragment (`-DTAA_FUSED`): two color attachments
+/// (swapchain + history) and the larger fused push block. The default variant
+/// in SHADERS stays the one-output TAA-off path.
+const TONEMAP_TAA: Shader = Shader {
+    src: "shaders/tonemap.frag.slang",
+    stage: "fragment",
+    entry: "fragmentMain",
+    dst: "tonemap_taa.frag.spv",
 };
 
 /// One compile unit: a shader plus its `-D` defines and extra slangc args.
@@ -225,6 +236,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shaders_spv");
     println!("cargo:rerun-if-env-changed={REFRESH_SHADER_FALLBACKS}");
     println!("cargo:rerun-if-env-changed=VOXEL_BUILD_PROBE");
+    println!("cargo:rerun-if-env-changed=VOXEL_LIGHT_LEGACY");
     // Emitting any rerun-if-changed replaces cargo's default "rerun if any
     // package file changed", so build.rs itself must be listed explicitly —
     // otherwise edits to the CONSTS table below would not regenerate outputs.
@@ -277,10 +289,15 @@ fn main() {
         defines: &["-DMESH3D_OPAQUE", "-DMESH3D_LOD"],
         extra_args: &[],
     });
+    jobs.push(Job {
+        shader: &TONEMAP_TAA,
+        defines: &["-DTAA_FUSED"],
+        extra_args: &[],
+    });
     compile_all(toolchain.as_ref(), &out_dir, fallback_dir, &jobs);
     // Wave-aggregated InterlockedAdd variant of the cull shader. Not in SHADERS:
     // shaders_spv/ keeps the plain-atomic module (no subgroup caps) as the
-    // no-slangc fallback; this file lives only in OUT_DIR.
+    // no-slangc fallback; this file lives only in OUT_DIR. See compile_cull_wave.
     compile_cull_wave(toolchain.as_ref(), &out_dir);
 
     // Substrate probe: compute shaders for BDA, QUAD, STORAGE, and occupancy tests.
@@ -579,10 +596,19 @@ fn fingerprint(toolchain: &Toolchain, args: &[String], src: &Path) -> String {
     format!("{hash:016x}")
 }
 
-/// Wave-aggregated InterlockedAdd variant of the cull shader. Without slangc,
-/// clone the plain module so `include_bytes!` still resolves; the runtime then
-/// picks the plain pipeline because wave ops are absent. Lives only in OUT_DIR
-/// (shaders_spv/ keeps the no-subgroup fallback).
+/// Wave-aggregated InterlockedAdd variant of the cull shader. Lives only in
+/// OUT_DIR: shaders_spv/ keeps the plain-atomic module (no subgroup caps).
+///
+/// Without slangc, `cull_wave.comp.spv` is a copy of the plain `cull.comp.spv`.
+/// That copy is semantically safe: it is a correct plain-atomic module (same
+/// bindings, same push constants, same per-thread InterlockedAdd emit). The
+/// Rust side (`device.cull_wave_atomics`) selects `CULL_COMP_WAVE` vs
+/// `CULL_COMP` from GPU subgroup BASIC+BALLOT, not by inspecting SPIR-V.
+/// Selecting the copy on a wave-capable GPU is equivalent to selecting
+/// `CULL_COMP` — results match; only the wave aggregation is skipped. The
+/// copy does not declare GroupNonUniform, so validation does not require
+/// subgroup features. A dedicated `shaders_spv/cull_wave.comp.spv` is not
+/// needed; unlike `-DTAA_FUSED`, a plain clone is not a different interface.
 fn compile_cull_wave(toolchain: Option<&Toolchain>, out_dir: &Path) {
     const CULL_WAVE: Shader = Shader {
         src: "shaders/cull.comp.slang",
@@ -603,6 +629,7 @@ fn compile_cull_wave(toolchain: Option<&Toolchain>, out_dir: &Path) {
         );
         return;
     }
+    // Plain-atomic clone: see the safety argument on this function.
     let plain = out_dir.join("cull.comp.spv");
     let wave = out_dir.join(CULL_WAVE.dst);
     fs::copy(&plain, &wave)
@@ -726,6 +753,12 @@ fn lit(x: f32) -> String {
 }
 
 fn build_table() -> Vec<Def> {
+    // VOXEL_LIGHT_LEGACY=1 selects constant values that make Steps 2–4 of the
+    // lighting look algebraically identical to the pre-change shaders. Unset
+    // (the default) is the new sky-tinted / AO-shaped / blended-cascade look.
+    // Step 1 (varying diet) is bit-identical either way.
+    let light_legacy = env_flag("VOXEL_LIGHT_LEGACY");
+
     // Precompute the sRGB decode table once here so CPU and shader agree exactly.
     let mut srgb = Vec::with_capacity(256);
     for v in 0u32..256 {
@@ -777,12 +810,12 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "HISTORY_BLEND",
-            doc: "TAA history feedback weight: fraction of the (reprojected, variance-clamped)\nhistory kept each frame. Higher = steadier but slower to react. Read by vk/taa.rs.\nReduced 0.95→0.92: animated water waves and clouds demand faster per-frame\nreactivity. 0.92 (~8% new sample) reduces ghosting while maintaining temporal\ncoherence. Range [0.85–0.98].",
+            doc: "TAA history feedback weight: fraction of the (reprojected, variance-clamped)\nhistory kept each present. Higher = steadier but slower to react. Read by vk/taa.rs\nand pushed into the fused tonemap. Reduced 0.95→0.92: animated water waves and\nclouds demand faster per-frame reactivity. 0.92 (~8% new sample) reduces ghosting\nwhile maintaining temporal coherence. Range [0.85–0.98].",
             val: Val::Scalar(0.92),
         },
         Def {
             name: "VARIANCE_GAMMA",
-            doc: "TAA neighbourhood variance-clamp width in std-devs: history is clamped to\nYCoCg mean +/- VARIANCE_GAMMA*stddev of the 5-tap cross current taps. Wider =\nsteadier (less crawl) but more ghosting. Read by taa_resolve.comp.",
+            doc: "TAA neighbourhood variance-clamp width in std-devs: history is clamped to\nYCoCg mean +/- VARIANCE_GAMMA*stddev of the unweighted 3x3 current taps. Wider =\nsteadier (less crawl) but more ghosting. Read by tonemap.frag (TAA_FUSED).",
             val: Val::Scalar(1.25),
         },
         Def {
@@ -822,6 +855,26 @@ fn build_table() -> Vec<Def> {
             name: "SHADOW_SKY_AMBIENT",
             doc: "Floor on the skylight's lit factor under sun shadow: the sky DOME still\nlights a sun-shadowed surface (blue-sky bounce), so shadow can attenuate\nskylight only down to this fraction — never to the black pit that erased\nall material detail in shadowed cliffs. Scales with sky_amount, so caves\n(sky_amount 0) stay dark; only outdoor shadow gains the floor.",
             val: Val::Scalar(0.22),
+        },
+        Def {
+            name: "CASCADE_BLEND_FRAC",
+            doc: "Fraction of the near split over which near/far PCF cross-fade; 0 = hard\nswitch. New look 0.15; VOXEL_LIGHT_LEGACY=1 keeps the hard 64 m cut.",
+            val: Val::Scalar(if light_legacy { 0.0 } else { 0.15 }),
+        },
+        Def {
+            name: "SHADOW_BOUNCE_TINT",
+            doc: "How far the sun-shadow fill tints from sun colour toward luma-matched\nzenith colour. 0 = fill is SHADOW_SKY_AMBIENT × sun colour (legacy);\n0.75 pulls the fill toward sky-blue so shadowed ground is sky-lit, not warm.",
+            val: Val::Scalar(if light_legacy { 0.0 } else { 0.75 }),
+        },
+        Def {
+            name: "AO_DIRECT",
+            doc: "Fraction of baked AO applied to the direct sun term. Dome/ambient/blocklight\nkeep full AO. 1.0 = AO darkens direct sun as much as ambient (legacy,\ndouble-darkens creases the cascade already shades); 0.5 is the new look.",
+            val: Val::Scalar(if light_legacy { 1.0 } else { 0.5 }),
+        },
+        Def {
+            name: "SHADOW_FAR_MIN_RADIUS",
+            doc: "Lower clamp of the far cascade split when fitted to DrawLists::lod_clip.\n96 >= 64·1.15 + 16 m fade band, so the blend band and SHADOW_LIMIT fade\nnever overlap the near split. Legacy 256 keeps the fixed far radius.",
+            val: Val::Scalar(if light_legacy { 256.0 } else { 96.0 }),
         },
         Def {
             name: "SHADOW_RESOLUTION",
@@ -865,7 +918,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "TAA_TILE",
-            doc: "TAA resolve workgroup edge in texels (groupshared tile + 1-pixel apron).\nCPU dispatch (vk/taa.rs) must divide by the same value.",
+            doc: "Retired TAA compute workgroup edge; the resolve now runs in the present-time\ntonemap fragment (no groupshared tile). Kept so generated constants stay stable.",
             val: Val::UInt(16),
         },
         Def {
@@ -930,7 +983,7 @@ fn build_table() -> Vec<Def> {
             doc: "Ceiling on the exposure multiplier so a near-black frame can't blow up unbounded.",
             val: Val::Scalar(8.0),
         },
-        // Bloom: threshold → downsample → golden-spiral upsample in tonemap.frag.
+        // Bloom: threshold → downsample → quarter-res spill (golden-spiral + godrays).
         Def {
             name: "BLOOM_THRESHOLD_LO",
             doc: "Bloom soft-knee low edge on exposed luma (luma·exposure). Below this the\npixel contributes no spill. Read by vk/bloom.rs → bloom.comp.",
@@ -963,7 +1016,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "BLOOM_MAX_MIPS",
-            doc: "Bloom pyramid mip cap. Tonemap samples only BLOOM_SPIRAL_LOD, so the chain\nstops at that level (base + LOD). CPU (vk/targets.rs) must agree.",
+            doc: "Bloom pyramid mip cap. The spill pass samples only BLOOM_SPIRAL_LOD, so the\nchain stops at that level (base + LOD). CPU (vk/targets.rs) must agree.",
             val: Val::UInt(3),
         },
         Def {
@@ -971,7 +1024,17 @@ fn build_table() -> Vec<Def> {
             doc: "Bloom spiral radius in output uv (isotropic). Small — the mip chain already\ncarries the wide blur, so this only softens the seams between taps.",
             val: Val::Scalar(0.08),
         },
-        // Screen-space godrays: dithered march toward sun, composite veil in tonemap.
+        Def {
+            name: "SPILL_FACTOR",
+            doc: "Spill image is 1/SPILL_FACTOR of the render extent on each axis (quarter-res\nat 4). CPU image create (vk/targets.rs) and the spill dispatch must agree.",
+            val: Val::UInt(4),
+        },
+        Def {
+            name: "SPILL_WG",
+            doc: "Spill compute workgroup edge. CPU dispatch divides the spill extent by this;\nthe shader's [numthreads] uses the same value.",
+            val: Val::UInt(8),
+        },
+        // Screen-space godrays: dithered march toward sun, composite veil in the spill pass.
         Def {
             name: "GODRAY_SAMPLES",
             doc: "March taps from each pixel toward the sun's screen position. Low (4); a\nfixed half-step start-offset centres the first sample.\nCast to int in the shader.",
@@ -984,7 +1047,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "GODRAY_STRENGTH",
-            doc: "Godray veil composite weight before tonemap sigmoid (after bloom).",
+            doc: "Godray veil composite weight in the quarter-res spill (before tonemap sigmoid).",
             val: Val::Scalar(0.6),
         },
         Def {
@@ -1267,6 +1330,10 @@ fn derived_lane_table() -> Vec<Lane> {
         Lane {
             name: "glow_day",
             doc: "Engine-derived. rgb = light.rgb * (0.5 + turbidity) (sky-halo tint×scale);\nw = abs(2*day_night_mix - 1) (shadow_fallback day factor).",
+        },
+        Lane {
+            name: "shadow_bounce",
+            doc: "Engine-derived. rgb = SHADOW_SKY_AMBIENT * lerp(light.rgb, zenith.rgb *\nluma709(light)/luma709(zenith), SHADOW_BOUNCE_TINT); light.rgb when zenith\nluma is 0. w reserved 0.",
         },
     ]
 }

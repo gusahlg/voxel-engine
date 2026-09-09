@@ -69,7 +69,9 @@ impl Default for Config {
 /// vk/shadow.rs) — no shader variants.
 #[derive(Clone, Copy)]
 pub struct RenderFlags {
-    /// Camera jitter + TAA resolve, always coupled.
+    /// Camera jitter + TAA resolve at present time (output/swapchain
+    /// resolution). Always coupled: jitter is injected every rendered frame;
+    /// the resolve (and history write) run only on presented frames.
     pub taa: bool,
     /// Distance fog (`horizon.w` density).
     pub fog: bool,
@@ -81,10 +83,12 @@ pub struct RenderFlags {
     pub sunlight: bool,
     /// Auto-exposure metering; off pins exposure at 1.0.
     pub exposure: bool,
-    /// HDR bloom (threshold + downsample compute → tonemap composite). Off skips
-    /// the dispatch and clears the bloom target so the tonemap add is a no-op.
+    /// HDR bloom (threshold + downsample compute → quarter-res spill). Off skips
+    /// the pyramid dispatch and clears the bloom target so the spill bloom term
+    /// is zero; with godrays also off the spill dispatch is skipped entirely.
     pub bloom: bool,
-    /// Screen-space godrays: volumetric sun rays in tonemap. Off disables them.
+    /// Screen-space godrays: volumetric sun rays in the quarter-res spill pass.
+    /// Off zeroes that term; with bloom also off the spill dispatch is skipped.
     pub godrays: bool,
     /// Cascade occluder draws + far-field fallback; off is fully lit.
     pub shadows: bool,
@@ -94,6 +98,11 @@ pub struct RenderFlags {
     /// fragment shading on distant/flat/sky tiles. Off skips both the classify
     /// dispatch and the rate attachment (full-rate shading everywhere). No-op
     /// when the device lacks attachment fragment shading rate.
+    ///
+    /// Default off: measured on an RTX 4060 at 1080p the classify pass plus
+    /// the shading-rate attachment cost more than the coarse shading saves
+    /// (3361 vs 5064 FPS). VRS pays off only at 4K-class render extents, so
+    /// it is opt-in.
     pub vrs: bool,
     /// Water surface animation (`anim` lane time). Off freezes the phase:
     /// water renders, tinted and reflective, but still — the cheapest frame
@@ -120,7 +129,7 @@ impl Default for RenderFlags {
             godrays: true,
             shadows: true,
             sky: true,
-            vrs: true,
+            vrs: false,
             water_anim: true,
             vignette: false,
             stars: true,
@@ -155,10 +164,11 @@ pub struct Engine {
 }
 
 impl Engine {
-    fn new(window: winit::window::Window, mut client: RenderClient, config: &Config) -> Self {
-        let lists = client.take_frame();
+    fn new(event_loop: &ActiveEventLoop, config: &Config) -> Result<Self, String> {
+        let (window, mut client) = RenderClient::spawn(event_loop, config)?;
+        let lists = client.take_frame(!config.vsync && config.target_fps == 0);
         let exposure_shared = client.exposure();
-        Self {
+        Ok(Self {
             client,
             exposure_shared,
             window,
@@ -172,7 +182,7 @@ impl Engine {
             fps_window_frames: 0,
             fps_cached: 0,
             should_close: false,
-        }
+        })
     }
 
     // ---- window / timing ----
@@ -193,6 +203,21 @@ impl Engine {
     /// Measured frames per second, averaged over a short window.
     pub fn fps(&self) -> i32 {
         self.fps_cached
+    }
+
+    /// Frames the render thread completed (`draw_frame` returned). Monotonic.
+    ///
+    /// A benchmark must count rendered frames, not game frames: the render loop
+    /// coalesces queued snapshots to the newest, so the game FPS counter can
+    /// run ahead of what actually reached the GPU.
+    pub fn frames_rendered(&self) -> u64 {
+        self.client.frames_rendered()
+    }
+
+    /// Frames dropped by render-loop coalescing (kept only the newest queued
+    /// `RenderCmd::Frame`). Monotonic.
+    pub fn frames_coalesced(&self) -> u64 {
+        self.client.frames_coalesced()
     }
 
     pub fn set_target_fps(&mut self, fps: u32) {
@@ -264,9 +289,12 @@ impl Engine {
         self.client.max_texture_layers()
     }
 
-    /// Enables opt-in six-way face culling: each mesh submits only its
-    /// camera-facing direction buckets. Off by default (one draw per mesh);
-    /// earns its keep only under heavy vertex load.
+    /// GPU per-direction face-run culling: the cull shader emits contiguous
+    /// camera-facing quad runs instead of a whole-mesh draw.
+    ///
+    /// On by default (`Config` has no field). Safe to toggle at runtime — the
+    /// change is sent on the render-thread command stream and lands at the next
+    /// frame boundary. `false` is an explicit opt-out (whole-mesh draws).
     pub fn set_cull_faces(&mut self, on: bool) {
         self.client.set_cull_faces(on);
     }
@@ -455,8 +483,9 @@ impl Engine {
     pub(crate) fn finish_frame(&mut self) {
         // Recycle returned buffers/allocations, submit the recorded snapshot,
         // then take a fresh pooled one to record into. Submit first so the
-        // render thread can start (and recycle a box) while we wait; with a
-        // 3-box pool that wait is rare.
+        // render thread can start (and recycle a box) while we wait. The pool
+        // is sized so main stays at most one frame ahead; `take_frame` parks
+        // when every box is in flight.
         self.client.drain_returns();
         if let Some(next) = self.client.pop_idle_frame() {
             let filled = std::mem::replace(&mut self.lists, next);
@@ -464,7 +493,8 @@ impl Engine {
         } else {
             let filled = std::mem::replace(&mut self.lists, self.client.take_placeholder());
             self.client.submit_frame(filled);
-            let dummy = std::mem::replace(&mut self.lists, self.client.take_frame());
+            let spin = self.is_uncapped();
+            let dummy = std::mem::replace(&mut self.lists, self.client.take_frame(spin));
             self.client.stash_placeholder(dummy);
         }
         self.lists.reset();
@@ -510,6 +540,11 @@ impl Engine {
         }
     }
 
+    /// Vsync off and no FPS cap: the loop should not park on purpose.
+    fn is_uncapped(&self) -> bool {
+        !self.vsync() && self.target_fps == 0
+    }
+
     /// Event-driven cadence: the deadline at which the next sim frame must run
     /// if no OS event wakes us first. `None` when uncapped (run every cycle).
     /// `frame_start` was stamped in [`Self::tick_timing`] this cycle.
@@ -528,7 +563,10 @@ pub fn run(config: Config, frame_callback: impl FnMut(&mut Engine) -> bool) {
     // The engine reports everything through `log`; give binaries that never
     // set up a logger a working RUST_LOG path (no-op if one exists).
     let _ = env_logger::try_init();
-    let event_loop = EventLoop::new().expect("Failed to create event loop");
+    let event_loop = EventLoop::new().expect(
+        "Failed to create event loop: set DISPLAY or WAYLAND_DISPLAY, and a \
+         windowing library must be loadable",
+    );
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = EngineApp {
         config,
@@ -536,8 +574,26 @@ pub fn run(config: Config, frame_callback: impl FnMut(&mut Engine) -> bool) {
         callback: frame_callback,
         finished: false,
         ran_this_cycle: false,
+        init_failed: false,
     };
-    event_loop.run_app(&mut app).expect("Event loop failed");
+    if let Err(err) = event_loop.run_app(&mut app) {
+        log::error!(
+            "event loop failed: {err}; the windowing connection was lost — the \
+             compositor drops clients whose main thread stalls for seconds; \
+             check for long synchronous work in the frame callback"
+        );
+        // Keep `run` as `()` so `voxel_engine::run(config, |eng| ...)` callers
+        // (the game and the demo) stay source-compatible. `process::exit` skips
+        // remaining destructors, so drop the app first: `Engine`/`RenderClient`
+        // join the render thread and destroy Vulkan objects the same way a
+        // normal `finished` exit does.
+        drop(app);
+        std::process::exit(1);
+    }
+    if app.init_failed {
+        drop(app);
+        std::process::exit(1);
+    }
 }
 
 struct EngineApp<F> {
@@ -550,6 +606,9 @@ struct EngineApp<F> {
     /// One frame per event-loop cycle: an OS-delivered RedrawRequested
     /// (expose, live-resize) and about_to_wait must not both run a frame.
     ran_this_cycle: bool,
+    /// Renderer construction failed (logged); `run` exits non-zero after the
+    /// event loop returns so this is not a panic and not a silent close.
+    init_failed: bool,
 }
 
 impl<F: FnMut(&mut Engine) -> bool> EngineApp<F> {
@@ -597,8 +656,14 @@ impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
         // Window + instance + surface are created on main; the render thread is
         // spawned and builds the Renderer, then replies so the client can build
         // its allocator. The window stays on main (in `Engine`).
-        let (window, client) = RenderClient::spawn(event_loop, &self.config);
-        self.engine = Some(Engine::new(window, client, &self.config));
+        match Engine::new(event_loop, &self.config) {
+            Ok(engine) => self.engine = Some(engine),
+            Err(_) => {
+                // `RenderClient::spawn` already logged the readable error.
+                self.init_failed = true;
+                event_loop.exit();
+            }
+        }
     }
 
     fn window_event(
@@ -633,6 +698,28 @@ impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // winit 0.30 delivers window/device events only between iterations.
+        // Under ControlFlow::Poll every about_to_wait also pays a socket-read
+        // + epoll cycle. When uncapped, a ~20 µs frame would spend a large
+        // fraction of its budget there. Extra engine frames in this iteration
+        // are safe: events queue on the compositor connection until we return,
+        // Resized/RedrawRequested already have their own path, and we never
+        // skip a poll longer than EVENT_POLL_BUDGET (well below input/resize
+        // latency). If this cycle already ran a frame from RedrawRequested,
+        // do not burst — live resize must see the next OS events promptly.
+        const EVENT_POLL_BUDGET: Duration = Duration::from_micros(250);
+        let already_ran = self.ran_this_cycle;
+        let poll_start = Instant::now();
         self.run_frame(event_loop);
+        if already_ran {
+            return;
+        }
+        while !self.finished
+            && self.engine.as_ref().is_some_and(|e| e.is_uncapped())
+            && poll_start.elapsed() < EVENT_POLL_BUDGET
+        {
+            self.ran_this_cycle = false;
+            self.run_frame(event_loop);
+        }
     }
 }

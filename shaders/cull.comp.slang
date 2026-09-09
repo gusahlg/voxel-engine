@@ -2,11 +2,12 @@
 // Camera partitions are (group, arena, distance-bucket); shadows are
 // per-cascade and unbucketed. Camera groups (CULL_CAMERA_GROUPS): 0 full-res
 // Opaque, 1 Cutout, 2 coarse-LOD Opaque (scale > 1, the only camera draws
-// that pay for the slab-clip `discard`).
+// that pay for the slab-clip `discard`). Group 2 meshes whose AABB is fully
+// inside that slab are not emitted (every fragment would be discarded).
 
 #include "common.slang"
 
-// Mirrors vk::buffers::MeshRecord exactly (std430).
+// Mirrors vk::buffers::MeshRecord exactly (std430, 80 bytes).
 struct MeshRecord
 {
     int3 block;
@@ -17,6 +18,8 @@ struct MeshRecord
     uint index_count;
     float3 aabb_max;
     int vertex_offset;
+    uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
+    uint flags; // bit 0 = packed face-runs valid; clear → whole-mesh draw
 };
 
 // Mirrors vk::cull::PartitionGpu (std430).
@@ -46,9 +49,9 @@ struct CullParams
     float3 cam_frac;
     uint arena_count;
     uint shadow_enabled;
-    uint pad0;
-    uint pad1;
-    uint pad2;
+    uint flags; // bit 0 = per-direction face-run culling
+    float clip;   // full-res slab radius; 0 = disabled (same as mesh3d push)
+    float clip_v; // full-res slab half-height; 0 = disabled
 };
 
 [[vk::binding(0, 0)]]
@@ -75,6 +78,18 @@ ConstantBuffer<CullParams> params;
 [[vk::binding(6, 0)]]
 StructuredBuffer<uint> visible;
 
+// Per camera group (0 full-res opaque, 1 cutout, 2 coarse LOD):
+// [draws0, index_count0, draws1, index_count1, draws2, index_count2].
+// Written only when the stats push flag is set (profiling).
+[[vk::binding(7, 0)]]
+RWStructuredBuffer<uint> stats;
+
+struct Push
+{
+    uint flags; // bit0 = accumulate geometry stats
+};
+[[vk::push_constant]] Push pc;
+
 // P-vertex test: same as camera.rs Frustum::intersects_aabb.
 bool outside_plane(float4 plane, float3 mn, float3 mx)
 {
@@ -96,6 +111,22 @@ uint distance_bucket(float dist)
     if (dist >= CULL_BUCKET_SPLIT_2)
         b = 3;
     return min(b, CULL_DISTANCE_BUCKETS - 1u);
+}
+
+// True when every fragment of a camera-relative AABB would be discarded by the
+// coarse-LOD slab clip (`mesh3d.frag.slang`). Both extents must be active:
+// `clip_v == 0` makes the fragment `inside_v` false, so nothing is discarded.
+// Horizontal test uses the farthest xz corner (max |x|, max |z|) so a skip is
+// exact for the per-fragment `length(world.xz) < clip` test. Host mirror:
+// `lod_aabb_inside_slab` in vk/cull.rs.
+bool lod_aabb_inside_slab(float3 mn, float3 mx, float clip, float clip_v)
+{
+    if (!(clip > 0.0 && clip_v > 0.0))
+        return false;
+    float2 far_xz = max(abs(mn.xz), abs(mx.xz));
+    bool inside_h = length(far_xz) < clip;
+    bool inside_v = max(abs(mn.y), abs(mx.y)) < clip_v;
+    return inside_h && inside_v;
 }
 
 void emit(uint part, DrawCmd cmd)
@@ -151,8 +182,7 @@ void computeMain(uint3 id: SV_DispatchThreadID)
     if (pass > 1u)
         return; // Blend: CPU-sorted path
 
-    // Detail is biased; exp2 handles fractional scales for half-block levels.
-    float scale = exp2(float(rec.detail_pass & 0xFu) - float(DETAIL_GPU_BIAS));
+    float scale = detail_scale(rec.detail_pass);
     float3 offset = float3(rec.block - params.cam_block) - params.cam_frac + rec.local_off;
     float3 mn = rec.aabb_min * scale + offset;
     float3 mx = rec.aabb_max * scale + offset;
@@ -174,10 +204,88 @@ void computeMain(uint3 id: SV_DispatchThreadID)
         {
             // Camera group: the pass index, except coarse-LOD opaque → group 2.
             uint group = (pass == 0u && scale > 1.0) ? 2u : pass;
-            float dist = length(0.5 * (mn + mx));
-            uint bucket = distance_bucket(dist);
-            uint part = (group * params.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
-            emit(part, cmd);
+            // Group 2 fully inside the slab would discard every fragment.
+            if (group != 2u || !lod_aabb_inside_slab(mn, mx, params.clip, params.clip_v))
+            {
+                float dist = length(0.5 * (mn + mx));
+                uint bucket = distance_bucket(dist);
+                uint part = (group * params.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
+                if ((params.flags & 1u) == 0u || (rec.flags & 1u) == 0u)
+                {
+                    emit(part, cmd);
+                    if ((pc.flags & 1u) != 0)
+                    {
+                        uint unused;
+                        InterlockedAdd(stats[group * 2u], 1u, unused);
+                        InterlockedAdd(stats[group * 2u + 1u], cmd.index_count, unused);
+                    }
+                }
+                else
+                {
+                    // Cumulative 6*quads from packed u16 pairs (upload slots 0|1, 2|3, 4|5).
+                    uint b[7];
+                    b[0] = 0u;
+                    [unroll]
+                    for (uint i = 0u; i < 3u; i++)
+                    {
+                        uint packed = rec.face_quads[i];
+                        b[i * 2u + 1u] = b[i * 2u] + 6u * (packed & 0xFFFFu);
+                        b[i * 2u + 2u] = b[i * 2u + 1u] + 6u * (packed >> 16);
+                    }
+                    // +axis vis iff mn[axis] < 0; −axis iff mx[axis] > 0. +Y uses the
+                    // drooped AABB because mesh3d.vert lowers far vertices by
+                    // min(|xz|²·CURVE_INV_2R, CURVE_MAX_DROP). −Y without droop is
+                    // already conservative.
+                    bool vis[6];
+                    vis[0] = mn.x < 0.0;
+                    float2 far = max(abs(mn.xz), abs(mx.xz));
+                    float droop = min(dot(far, far) * CURVE_INV_2R, CURVE_MAX_DROP);
+                    vis[1] = (mn.y - droop) < 0.0;
+                    vis[2] = mn.z < 0.0;
+                    vis[3] = mx.x > 0.0;
+                    vis[4] = mx.y > 0.0;
+                    vis[5] = mx.z > 0.0;
+                    // Merge consecutive visible non-empty buckets. emit may be called
+                    // ≤3 times per lane; the wave path already handles divergent callers.
+                    uint start = ~0u;
+                    for (uint k = 0u; k < 6u; k++)
+                    {
+                        bool occ = vis[k] && (b[k + 1u] != b[k]);
+                        if (occ)
+                        {
+                            if (start == ~0u)
+                                start = k;
+                        }
+                        else if (start != ~0u)
+                        {
+                            DrawCmd run = cmd;
+                            run.first_index = b[start];
+                            run.index_count = b[k] - b[start];
+                            emit(part, run);
+                            if ((pc.flags & 1u) != 0)
+                            {
+                                uint unused;
+                                InterlockedAdd(stats[group * 2u], 1u, unused);
+                                InterlockedAdd(stats[group * 2u + 1u], run.index_count, unused);
+                            }
+                            start = ~0u;
+                        }
+                    }
+                    if (start != ~0u)
+                    {
+                        DrawCmd run = cmd;
+                        run.first_index = b[start];
+                        run.index_count = b[6] - b[start];
+                        emit(part, run);
+                        if ((pc.flags & 1u) != 0)
+                        {
+                            uint unused;
+                            InterlockedAdd(stats[group * 2u], 1u, unused);
+                            InterlockedAdd(stats[group * 2u + 1u], run.index_count, unused);
+                        }
+                    }
+                }
+            }
         }
     }
 

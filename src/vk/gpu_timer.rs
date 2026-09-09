@@ -19,37 +19,50 @@ pub(super) enum GpuPass {
     Cull,
     /// The cascaded shadow-map pass (stamped only on regenerating frames).
     ShadowMap,
-    /// The VRS classify dispatch (stamped only when it runs).
-    Vrs,
     /// Scene-pass begin: attachment transitions + `cmd_begin_rendering` clears.
     Clear,
-    Opaque,
+    /// Full-res opaque (camera group 0, all distance buckets).
+    OpaqueFull,
+    /// Coarse-LOD opaque (camera group 2); recorded after full-res so the
+    /// LOD skirt is mostly depth-rejected. Before cutout.
+    OpaqueLod,
+    /// Cutout (camera group 1); recorded after both opaque partitions.
+    Cutout,
     Sky,
     Cubes,
     Lines,
     Shadows,
     Transparent,
+    /// HUD overlay. Drawn in the present copy (`GpuTonemap`); the scene-pass
+    /// stamp accounts 0 so the report still lists this meter.
     Overlay,
     /// End of the scene pass: `cmd_end_rendering` (where the MSAA color
-    /// resolve executes) and the offscreen finalize transitions.
+    /// resolve executes) and the offscreen/depth-rest finalize transitions.
     Resolve,
-    /// The TAA resolve compute (stamped only when it runs).
+    /// The VRS classify dispatch (end of frame, after depth rests; stamped
+    /// only when it runs).
+    Vrs,
+    /// Retired TAA compute stamp. Resolve is fused into the present-time
+    /// tonemap (`GpuTonemap`); this variant is never marked and reports 0 so
+    /// `GpuPass` ordinals stay stable.
     Taa,
     /// Exposure metering reduce + finalize (stamped only when it runs).
     Exposure,
-    /// The bloom chain — the render-command tail. Without this closing stamp
-    /// everything after the last boundary silently vanishes from the report.
+    /// The bloom chain + quarter-res spill dispatch — the render-command tail.
+    /// Without this closing stamp everything after the last boundary silently
+    /// vanishes from the report.
     Bloom,
 }
 
 impl GpuPass {
-    pub(super) const ALL: [GpuPass; 16] = [
+    pub(super) const ALL: [GpuPass; 18] = [
         GpuPass::Copies,
         GpuPass::Cull,
         GpuPass::ShadowMap,
-        GpuPass::Vrs,
         GpuPass::Clear,
-        GpuPass::Opaque,
+        GpuPass::OpaqueFull,
+        GpuPass::OpaqueLod,
+        GpuPass::Cutout,
         GpuPass::Sky,
         GpuPass::Cubes,
         GpuPass::Lines,
@@ -57,6 +70,7 @@ impl GpuPass {
         GpuPass::Transparent,
         GpuPass::Overlay,
         GpuPass::Resolve,
+        GpuPass::Vrs,
         GpuPass::Taa,
         GpuPass::Exposure,
         GpuPass::Bloom,
@@ -69,9 +83,10 @@ impl GpuPass {
             GpuPass::Copies => Meter::GpuCopies,
             GpuPass::Cull => Meter::GpuCull,
             GpuPass::ShadowMap => Meter::GpuShadowMap,
-            GpuPass::Vrs => Meter::GpuVrs,
             GpuPass::Clear => Meter::GpuClear,
-            GpuPass::Opaque => Meter::GpuOpaque,
+            GpuPass::OpaqueFull => Meter::GpuOpaqueFull,
+            GpuPass::OpaqueLod => Meter::GpuOpaqueLod,
+            GpuPass::Cutout => Meter::GpuCutout,
             GpuPass::Sky => Meter::GpuSky,
             GpuPass::Cubes => Meter::GpuCubes,
             GpuPass::Lines => Meter::GpuLines,
@@ -79,10 +94,20 @@ impl GpuPass {
             GpuPass::Transparent => Meter::GpuTransparent,
             GpuPass::Overlay => Meter::GpuOverlay,
             GpuPass::Resolve => Meter::GpuResolve,
+            GpuPass::Vrs => Meter::GpuVrs,
             GpuPass::Taa => Meter::GpuTaa,
             GpuPass::Exposure => Meter::GpuExposure,
             GpuPass::Bloom => Meter::GpuBloom,
         }
+    }
+
+    /// Combined opaque span (full-res + coarse LOD + cutout). Not a stamped
+    /// pass — summed from the three group stamps at readback so the `opaque`
+    /// meter stays comparable with reports that predate the split.
+    pub(super) fn opaque_ms(passes: &[f64; Self::COUNT]) -> f64 {
+        passes[Self::OpaqueFull as usize]
+            + passes[Self::OpaqueLod as usize]
+            + passes[Self::Cutout as usize]
     }
 }
 
@@ -98,7 +123,11 @@ const QUERY_COUNT: u32 = COPY_STAMP_BASE + 2;
 /// after each recorded pass. Only the passes that actually run write a stamp,
 /// and the label written alongside each stamp keeps deltas attributable even
 /// when a frame skips passes (no 3D, VRS off). A slot's results are read one
-/// cycle later, after its fence is waited, so the read never stalls.
+/// reuse cycle later (`FRAMES_IN_FLIGHT` frames), after its fence is waited, so
+/// the read never stalls — and because that wait is in render order, consecutive
+/// `read_into` calls are consecutive rendered frames (possibly different slots).
+/// Their timestamps share the device clock, so `start(N) - end(N-1)` is the idle
+/// gap before this submit.
 ///
 /// `count`/`label` are [`Cell`]s so a mark needs only `&self`: the render pass
 /// holds an immutable `&Renderer` while recording, and all timer state is
@@ -108,18 +137,47 @@ pub(super) struct GpuTimer {
     pool: vk::QueryPool,
     /// Nanoseconds per tick (`limits.timestampPeriod`).
     period_ns: f32,
+    /// `hostQueryReset` (Vulkan 1.2). Host-reset after the slot fence wait;
+    /// otherwise `vkCmdResetQueryPool` outside the render pass.
+    host_reset: bool,
     /// Whether each slot holds completed timestamps to read back.
     primed: [bool; FRAMES_IN_FLIGHT as usize],
     /// Stamps written for each slot's most recent recording (incl. the start).
     count: [std::cell::Cell<u32>; FRAMES_IN_FLIGHT as usize],
     /// The pass that ended at each stamp (index `i` labels the span `i-1..i`).
     label: [[std::cell::Cell<GpuPass>; GPU_STAMPS]; FRAMES_IN_FLIGHT as usize],
+    /// Armed when the open span recorded GPU commands. [`Self::mark`] writes a
+    /// stamp only when this is set; otherwise the pass accounts 0.
+    pending: [std::cell::Cell<bool>; FRAMES_IN_FLIGHT as usize],
     /// Whether the present-copy pair holds a completed range to read back.
     copy_primed: bool,
+    /// Last stamp of the previously *read* render submit (raw ticks), used to
+    /// compute the idle gap before the next readable frame. Cleared when a
+    /// readback is unavailable so a later start is not compared across a hole.
+    prev_end: Option<u64>,
+}
+
+/// Device-time gap (ms) from the previous render submit's last stamp to this
+/// submit's first stamp. `period_ns` is `VkPhysicalDeviceLimits::timestampPeriod`.
+///
+/// A start that precedes the previous end is GPU overlap (the next command
+/// buffer began before the last one drained) — zero idle, not a 64-bit wrap.
+/// Session-length 64-bit timestamp clocks do not wrap.
+pub(super) fn idle_gap_ms(prev_end: u64, this_start: u64, period_ns: f32) -> f64 {
+    if this_start <= prev_end {
+        0.0
+    } else {
+        this_start.wrapping_sub(prev_end) as f64 * period_ns as f64 / 1.0e6
+    }
 }
 
 impl GpuTimer {
-    pub(super) fn new(device: &ash::Device, supported: bool, period_ns: f32) -> Self {
+    pub(super) fn new(
+        device: &ash::Device,
+        supported: bool,
+        period_ns: f32,
+        host_reset: bool,
+    ) -> Self {
         let pool = if supported {
             let info = vk::QueryPoolCreateInfo::default()
                 .query_type(vk::QueryType::TIMESTAMP)
@@ -135,12 +193,15 @@ impl GpuTimer {
         Self {
             pool,
             period_ns,
+            host_reset,
             primed: [false; FRAMES_IN_FLIGHT as usize],
             count: std::array::from_fn(|_| std::cell::Cell::new(0)),
             label: std::array::from_fn(|_| {
-                std::array::from_fn(|_| std::cell::Cell::new(GpuPass::Opaque))
+                std::array::from_fn(|_| std::cell::Cell::new(GpuPass::OpaqueFull))
             }),
+            pending: std::array::from_fn(|_| std::cell::Cell::new(false)),
             copy_primed: false,
+            prev_end: None,
         }
     }
 
@@ -150,55 +211,92 @@ impl GpuTimer {
 
     /// Reads `slot`'s prior render-pass per-pass durations (ms), adding each to
     /// `sink`. The caller must have waited `slot`'s fence, so the result is
-    /// ready without a GPU stall. Returns the summed render-pass time (ms).
+    /// ready without a GPU stall. Returns the summed render-pass time and the
+    /// idle gap before this submit (`None` on the first readable frame).
+    ///
+    /// Reuses the timestamps already fetched for the per-pass spans — no extra
+    /// query readback. An unavailable result (too few stamps, or the pool
+    /// read failing) drops the stored previous end so the next successful
+    /// frame does not treat skipped GPU work as idle.
     pub(super) unsafe fn read_into(
-        &self,
+        &mut self,
         device: &ash::Device,
         slot: usize,
         sink: &mut [f64],
-    ) -> Option<f64> {
+    ) -> Option<(f64, Option<f64>)> {
         if !self.enabled() || !self.primed[slot] {
             return None;
         }
         let n = self.count[slot].get() as usize;
         if n < 2 {
+            self.prev_end = None;
             return None;
         }
         let mut ts = [0u64; GPU_STAMPS];
-        unsafe {
+        let read = unsafe {
             device.get_query_pool_results(
                 self.pool,
                 slot as u32 * GPU_STAMPS as u32,
                 &mut ts[..n],
                 vk::QueryResultFlags::TYPE_64,
             )
+        };
+        if read.is_err() {
+            self.prev_end = None;
+            return None;
         }
-        .ok()?;
         let mut total = 0.0;
         for i in 1..n {
             let ms = ts[i].wrapping_sub(ts[i - 1]) as f64 * self.period_ns as f64 / 1.0e6;
             sink[self.label[slot][i].get() as usize] += ms;
             total += ms;
         }
-        Some(total)
+        // `ts[0]` is the TOP_OF_PIPE `begin`; `ts[n-1]` is the last BOTTOM_OF_PIPE `mark`.
+        let gap = self
+            .prev_end
+            .map(|end| idle_gap_ms(end, ts[0], self.period_ns));
+        self.prev_end = Some(ts[n - 1]);
+        Some((total, gap))
+    }
+
+    fn reset_queries(&self, device: &ash::Device, cmd: vk::CommandBuffer, first: u32, count: u32) {
+        unsafe {
+            if self.host_reset {
+                device.reset_query_pool(self.pool, first, count);
+            } else {
+                device.cmd_reset_query_pool(cmd, self.pool, first, count);
+            }
+        }
     }
 
     /// Resets `slot`'s queries and writes the start timestamp. Must be recorded
-    /// outside any render pass.
+    /// outside any render pass. Host-resets the pool when the device has
+    /// `hostQueryReset`; otherwise `vkCmdResetQueryPool`.
     pub(super) unsafe fn begin(&self, device: &ash::Device, cmd: vk::CommandBuffer, slot: usize) {
         if !self.enabled() {
             return;
         }
         let base = slot as u32 * GPU_STAMPS as u32;
+        self.reset_queries(device, cmd, base, GPU_STAMPS as u32);
         unsafe {
-            device.cmd_reset_query_pool(cmd, self.pool, base, GPU_STAMPS as u32);
             device.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, self.pool, base);
         }
         self.count[slot].set(1);
+        self.pending[slot].set(false);
     }
 
-    /// Writes a boundary timestamp closing `pass` for `slot`. Recorded inside
-    /// the render pass; needs only `&self` (interior-mutable bookkeeping).
+    /// Arm the next [`Self::mark`]: the open span recorded GPU commands.
+    /// Cheap no-op when timestamps are off.
+    pub(super) fn recorded(&self, slot: usize) {
+        if self.enabled() {
+            self.pending[slot].set(true);
+        }
+    }
+
+    /// Writes a boundary timestamp closing `pass` for `slot` if the pass
+    /// recorded GPU work ([`Self::recorded`]). Otherwise a no-op: the pass
+    /// accounts 0 at readback (the sink starts at 0; `GpuPass::ALL` is still
+    /// fed so the profiler report format is unchanged).
     pub(super) unsafe fn mark(
         &self,
         device: &ash::Device,
@@ -206,7 +304,7 @@ impl GpuTimer {
         slot: usize,
         pass: GpuPass,
     ) {
-        if !self.enabled() {
+        if !self.enabled() || !self.pending[slot].replace(false) {
             return;
         }
         let i = self.count[slot].get();
@@ -254,12 +352,13 @@ impl GpuTimer {
 
     /// Resets the present-copy pair and writes its start stamp. Recorded on the
     /// copy command buffer, outside any render pass, after [`Self::read_copy`].
+    /// Host-resets when the device has `hostQueryReset`.
     pub(super) unsafe fn begin_copy(&self, device: &ash::Device, cmd: vk::CommandBuffer) {
         if !self.enabled() {
             return;
         }
+        self.reset_queries(device, cmd, COPY_STAMP_BASE, 2);
         unsafe {
-            device.cmd_reset_query_pool(cmd, self.pool, COPY_STAMP_BASE, 2);
             device.cmd_write_timestamp2(
                 cmd,
                 vk::PipelineStageFlags2::TOP_OF_PIPE,
@@ -294,6 +393,183 @@ impl GpuTimer {
     }
 }
 
+/// Pipeline-statistics pass, in record order. The ordinal indexes the per-slot
+/// query (`slot * COUNT + pass`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) enum PipeStatPass {
+    OpaqueFull,
+    OpaqueLod,
+    Cutout,
+    Sky,
+    Transparent,
+}
+
+impl PipeStatPass {
+    pub(super) const COUNT: usize = 5;
+}
+
+/// One query writes counters in bit-order of the enabled flags: IA primitives
+/// (free extra), clipping primitives, then fragment shader invocations.
+/// `repr(C)` so `get_query_pool_results` can use this as the per-query stride
+/// (ash's query_count is `data.len()`, stride is `size_of::<T>`).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PipeStatRow {
+    _ia_prims: u64,
+    clip_prims: u64,
+    frag_invocs: u64,
+}
+fn pipe_stat_flags() -> vk::QueryPipelineStatisticFlags {
+    vk::QueryPipelineStatisticFlags::INPUT_ASSEMBLY_PRIMITIVES
+        | vk::QueryPipelineStatisticFlags::CLIPPING_PRIMITIVES
+        | vk::QueryPipelineStatisticFlags::FRAGMENT_SHADER_INVOCATIONS
+}
+const PIPE_QUERY_COUNT: u32 = (PipeStatPass::COUNT * FRAMES_IN_FLIGHT as usize) as u32;
+
+/// Delayed-slot index of `pass` in `slot`'s query range.
+pub(super) fn pipe_stat_query(slot: usize, pass: PipeStatPass) -> u32 {
+    slot as u32 * PipeStatPass::COUNT as u32 + pass as u32
+}
+
+/// Full-res overdraw: fragment invocations per render-extent pixel.
+pub(super) fn overdraw_ratio(frag_full: u64, width: u32, height: u32) -> f64 {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels == 0 {
+        0.0
+    } else {
+        frag_full as f64 / pixels as f64
+    }
+}
+
+/// Per-pass `VK_QUERY_TYPE_PIPELINE_STATISTICS` pool (fragment invocations +
+/// clipping primitives). Same delayed-slot readback as [`GpuTimer`]: a slot is
+/// read after its fence wait, then reset (host reset when the device has it,
+/// otherwise `vkCmdResetQueryPool` outside the render pass).
+pub(super) struct GpuPipeStats {
+    pool: vk::QueryPool,
+    host_reset: bool,
+    primed: [bool; FRAMES_IN_FLIGHT as usize],
+}
+
+impl GpuPipeStats {
+    pub(super) fn new(device: &ash::Device, supported: bool, host_reset: bool) -> Self {
+        let pool = if supported {
+            let info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::PIPELINE_STATISTICS)
+                .query_count(PIPE_QUERY_COUNT)
+                .pipeline_statistics(pipe_stat_flags());
+            unsafe {
+                device
+                    .create_query_pool(&info, None)
+                    .expect("Failed to create pipeline statistics query pool")
+            }
+        } else {
+            vk::QueryPool::null()
+        };
+        Self {
+            pool,
+            host_reset,
+            primed: [false; FRAMES_IN_FLIGHT as usize],
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.pool != vk::QueryPool::null()
+    }
+
+    /// Reads `slot`'s prior counters. Caller has waited the slot fence.
+    /// Returns `(frag[5], prims_full)` or `None` if the slot was never recorded
+    /// or the read failed (unsupported / not ready).
+    pub(super) unsafe fn read_into(
+        &mut self,
+        device: &ash::Device,
+        slot: usize,
+    ) -> Option<([u64; PipeStatPass::COUNT], u64)> {
+        if !self.enabled() || !self.primed[slot] {
+            return None;
+        }
+        let mut raw = [PipeStatRow::default(); PipeStatPass::COUNT];
+        let first = pipe_stat_query(slot, PipeStatPass::OpaqueFull);
+        let read = unsafe {
+            device.get_query_pool_results(self.pool, first, &mut raw, vk::QueryResultFlags::TYPE_64)
+        };
+        if read.is_err() {
+            return None;
+        }
+        let mut frag = [0u64; PipeStatPass::COUNT];
+        for pass in 0..PipeStatPass::COUNT {
+            frag[pass] = raw[pass].frag_invocs;
+        }
+        let prims_full = raw[PipeStatPass::OpaqueFull as usize].clip_prims;
+        Some((frag, prims_full))
+    }
+
+    /// Reset `slot`'s queries before recording. Host reset after the fence wait
+    /// when available; otherwise a command-buffer reset outside the render pass.
+    pub(super) unsafe fn prepare(&self, device: &ash::Device, cmd: vk::CommandBuffer, slot: usize) {
+        if !self.enabled() {
+            return;
+        }
+        let first = pipe_stat_query(slot, PipeStatPass::OpaqueFull);
+        let count = PipeStatPass::COUNT as u32;
+        unsafe {
+            if self.host_reset {
+                device.reset_query_pool(self.pool, first, count);
+            } else {
+                device.cmd_reset_query_pool(cmd, self.pool, first, count);
+            }
+        }
+    }
+
+    pub(super) unsafe fn begin_pass(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        pass: PipeStatPass,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        unsafe {
+            device.cmd_begin_query(
+                cmd,
+                self.pool,
+                pipe_stat_query(slot, pass),
+                vk::QueryControlFlags::empty(),
+            );
+        }
+    }
+
+    pub(super) unsafe fn end_pass(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        pass: PipeStatPass,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        unsafe {
+            device.cmd_end_query(cmd, self.pool, pipe_stat_query(slot, pass));
+        }
+    }
+
+    pub(super) fn finish(&mut self, slot: usize) {
+        if self.enabled() {
+            self.primed[slot] = true;
+        }
+    }
+
+    pub(super) unsafe fn destroy(&mut self, device: &ash::Device) {
+        if self.enabled() {
+            unsafe { device.destroy_query_pool(self.pool, None) };
+            self.pool = vk::QueryPool::null();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +591,65 @@ mod tests {
             QUERY_COUNT as usize,
             GPU_STAMPS * FRAMES_IN_FLIGHT as usize + 2
         );
+        // Opaque split: stamped after each camera group, in draw order
+        // (full-res, coarse LOD, then cutout). Combined `opaque` is summed
+        // at readback and is not a GpuPass.
+        assert_eq!(GpuPass::OpaqueFull as usize, GpuPass::Clear as usize + 1);
+        assert_eq!(
+            GpuPass::OpaqueLod as usize,
+            GpuPass::OpaqueFull as usize + 1
+        );
+        assert_eq!(GpuPass::Cutout as usize, GpuPass::OpaqueLod as usize + 1);
+        assert_eq!(GpuPass::Sky as usize, GpuPass::Cutout as usize + 1);
+    }
+
+    #[test]
+    fn opaque_ms_sums_the_three_group_stamps() {
+        let mut passes = [0.0f64; GpuPass::COUNT];
+        passes[GpuPass::OpaqueFull as usize] = 0.03;
+        passes[GpuPass::OpaqueLod as usize] = 0.05;
+        passes[GpuPass::Cutout as usize] = 0.01;
+        assert!((GpuPass::opaque_ms(&passes) - 0.09).abs() < 1e-12);
+    }
+
+    #[test]
+    fn idle_gap_ms_converts_ticks_via_period() {
+        // 1 ns/tick: 1_000_000 ticks = 1 ms.
+        assert!((idle_gap_ms(10, 10 + 1_000_000, 1.0) - 1.0).abs() < 1e-12);
+        // 1000 ns/tick (1 µs): 1000 ticks = 1 ms.
+        assert!((idle_gap_ms(0, 1000, 1000.0) - 1.0).abs() < 1e-12);
+        // Back-to-back stamps: zero idle.
+        assert_eq!(idle_gap_ms(42, 42, 1.0), 0.0);
+        // This submit started before the previous end (GPU overlap): zero idle.
+        assert_eq!(idle_gap_ms(100, 50, 1.0), 0.0);
+    }
+
+    #[test]
+    fn pipe_stat_query_is_slot_delayed_linear() {
+        assert_eq!(pipe_stat_query(0, PipeStatPass::OpaqueFull), 0);
+        assert_eq!(pipe_stat_query(0, PipeStatPass::Transparent), 4);
+        assert_eq!(
+            pipe_stat_query(1, PipeStatPass::OpaqueFull),
+            PipeStatPass::COUNT as u32
+        );
+        assert_eq!(
+            pipe_stat_query(1, PipeStatPass::Sky),
+            PipeStatPass::COUNT as u32 + PipeStatPass::Sky as u32
+        );
+        assert_eq!(
+            PIPE_QUERY_COUNT as usize,
+            PipeStatPass::COUNT * FRAMES_IN_FLIGHT as usize
+        );
+        // Counter layout inside one query: IA prims, clip prims, frag invocs.
+        assert_eq!(std::mem::size_of::<PipeStatRow>(), 3 * 8);
+    }
+
+    #[test]
+    fn overdraw_ratio_divides_by_extent_pixels() {
+        assert_eq!(overdraw_ratio(0, 100, 100), 0.0);
+        assert_eq!(overdraw_ratio(10_000, 100, 100), 1.0);
+        assert!((overdraw_ratio(25_000, 100, 100) - 2.5).abs() < 1e-12);
+        assert_eq!(overdraw_ratio(99, 0, 10), 0.0);
+        assert_eq!(overdraw_ratio(99, 10, 0), 0.0);
     }
 }
