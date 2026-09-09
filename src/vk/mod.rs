@@ -6,10 +6,12 @@
 /// present only when a swapchain image is available (mailbox). On macOS, vsync
 /// paces at refresh via presentation backpressure; vsync off uncaps the loop.
 pub(crate) mod alloc;
+pub(crate) mod arena;
 pub(crate) mod block_textures;
 pub(crate) mod bloom;
 pub(crate) mod buffers;
 pub(crate) mod cull;
+pub(crate) mod cull_math;
 pub(crate) mod device;
 pub(crate) mod exposure;
 pub(crate) mod frame_loop;
