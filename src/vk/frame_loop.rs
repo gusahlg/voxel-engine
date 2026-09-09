@@ -1608,7 +1608,7 @@ mod tests {
 
     #[test]
     fn fif_covers_a_full_batch_plus_the_slot_being_recorded() {
-        assert!(FRAMES_IN_FLIGHT as usize >= SUBMIT_BATCH_MAX + 1);
+        assert!(FRAMES_IN_FLIGHT as usize > SUBMIT_BATCH_MAX);
     }
 
     /// Walk the slot ring under the production defer/flush rules. The next

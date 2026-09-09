@@ -42,7 +42,7 @@ const _: () = assert!(FRAMES_IN_FLIGHT >= 2);
 /// pending batch. [`FRAMES_IN_FLIGHT`] must cover a full batch plus the slot
 /// being recorded next.
 pub const SUBMIT_BATCH_MAX: usize = 2;
-const _: () = assert!(FRAMES_IN_FLIGHT as usize >= SUBMIT_BATCH_MAX + 1);
+const _: () = assert!(FRAMES_IN_FLIGHT as usize > SUBMIT_BATCH_MAX);
 
 /// Frame slot index in `0..FRAMES_IN_FLIGHT`; type-safe prevents raw-usize indexing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

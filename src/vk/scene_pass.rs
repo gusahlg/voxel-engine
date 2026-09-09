@@ -38,6 +38,7 @@ pub(super) struct RenderPass<'a> {
 
 impl<'a> RenderPass<'a> {
     /// Records attachment layout transitions and begins dynamic rendering.
+    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn begin(
         r: &'a Renderer,
         cmd: vk::CommandBuffer,
