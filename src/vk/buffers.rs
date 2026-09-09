@@ -499,15 +499,21 @@ pub(crate) unsafe fn build_mesh_resident(
         })
     };
 
-    let mut aabb_min = Vec3::splat(f32::INFINITY);
-    let mut aabb_max = Vec3::splat(f32::NEG_INFINITY);
-    for bucket in &data.vertices {
-        for v in bucket {
-            let p = Vec3::from_array(v.local_pos());
-            aabb_min = aabb_min.min(p);
-            aabb_max = aabb_max.max(p);
+    let (aabb_min, aabb_max) = data.aabb();
+    let aabb_min = Vec3::from_array(aabb_min);
+    let aabb_max = Vec3::from_array(aabb_max);
+    debug_assert!({
+        let mut scan_min = Vec3::splat(f32::INFINITY);
+        let mut scan_max = Vec3::splat(f32::NEG_INFINITY);
+        for bucket in &data.vertices {
+            for v in bucket {
+                let p = Vec3::from_array(v.local_pos());
+                scan_min = scan_min.min(p);
+                scan_max = scan_max.max(p);
+            }
         }
-    }
+        scan_min == aabb_min && scan_max == aabb_max
+    });
 
     const _: () =
         assert!(MESH_ALIGN.is_multiple_of(VERTEX_STRIDE) && MESH_ALIGN.is_multiple_of(256));

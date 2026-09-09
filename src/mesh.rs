@@ -307,6 +307,8 @@ pub struct MeshData {
     /// Vertices per face direction, indexed by [`Normal`] as `usize`.
     pub(crate) vertices: [Vec<MeshVertex>; 6],
     pub(crate) pass: Pass,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
 }
 
 impl MeshData {
@@ -315,6 +317,8 @@ impl MeshData {
         Self {
             vertices: std::array::from_fn(|_| Vec::new()),
             pass,
+            aabb_min: [f32::INFINITY; 3],
+            aabb_max: [f32::NEG_INFINITY; 3],
         }
     }
 
@@ -323,7 +327,18 @@ impl MeshData {
     /// are expected to share that normal (greedy quads do).
     pub fn quad(&mut self, corners: [MeshVertex; 4]) {
         let dir = corners[0].normal() as usize;
+        for c in corners {
+            let p = c.local_pos();
+            for i in 0..3 {
+                self.aabb_min[i] = self.aabb_min[i].min(p[i]);
+                self.aabb_max[i] = self.aabb_max[i].max(p[i]);
+            }
+        }
         self.vertices[dir].extend_from_slice(&corners);
+    }
+
+    pub(crate) fn aabb(&self) -> ([f32; 3], [f32; 3]) {
+        (self.aabb_min, self.aabb_max)
     }
 
     /// The mesh's draw pass.
@@ -337,6 +352,8 @@ impl MeshData {
         for bucket in &mut self.vertices {
             bucket.clear();
         }
+        self.aabb_min = [f32::INFINITY; 3];
+        self.aabb_max = [f32::NEG_INFINITY; 3];
     }
 
     pub fn is_empty(&self) -> bool {
