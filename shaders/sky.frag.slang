@@ -11,17 +11,6 @@ struct FragmentInput
     float4 frag_pos : SV_Position;
 };
 
-struct PushConstants
-{
-    float4x4 inv_view_proj; // camera rebased to origin: (ndc,0,1) → view ray
-    float4 sun;             // xyz unit sun dir, w = cos(radius * SUN_DISC_CORE)
-    float4 sun_tint;        // rgb linear disc tint, w = cos(radius * SUN_DISC_RIM)
-    float4 moon;            // x = moon cos_core, y = moon cos_rim
-};
-
-[[vk::push_constant]]
-ConstantBuffer<PushConstants> pc;
-
 // Set 0, binding 0: octahedral cloud LUT (RGBA16F, linear-clamp).
 [[vk::binding(0, 0)]]
 Sampler2D cloudLut;
@@ -60,19 +49,19 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // Reconstruct the view ray from the (wide, rectilinear) source projection.
     // The tonemap resample compresses the sky's periphery in lockstep with the
     // terrain, so no per-pixel warp is needed here.
-    float4 far = mul(pc.inv_view_proj, float4(input.ndc, 0.0, 1.0));
+    float4 far = mul(frame.inv_view_proj, float4(input.ndc, 0.0, 1.0));
     float3 ray = normalize(far.xyz);
 
     // Fog IS the sky: the same analytic radiance the terrain fades toward, plus
     // the additive HDR sun disc. glow_pow / sun dir / disc cosines are hoisted.
     float3 col = sky_radiance(ray, frame)
-               + sun_disc_cos(ray, pc.sun.xyz, pc.sun_tint.rgb, pc.sun.w, pc.sun_tint.w);
+               + sun_disc_cos(ray, frame.sun.xyz, frame.sun_tint.rgb, frame.sun.w, frame.sun_tint.w);
 
     // Moon opposite sun, stars and moon gated by night (1 - light.w).
     float night = 1.0 - frame.light.w;
-    float3 moon_dir = -pc.sun.xyz;
+    float3 moon_dir = -frame.sun.xyz;
     float3 moon_tint = float3(MOON_TINT[0], MOON_TINT[1], MOON_TINT[2]);
-    col += sun_disc_cos(ray, moon_dir, moon_tint, pc.moon.x, pc.moon.y) * night;
+    col += sun_disc_cos(ray, moon_dir, moon_tint, frame.moon.x, frame.moon.y) * night;
     // Uniform branch (both factors are per-frame constants): skips the whole
     // hash-grid star evaluation by day and when `RenderFlags::stars` is off —
     // the multiplied-out zero was still being computed for every sky pixel.

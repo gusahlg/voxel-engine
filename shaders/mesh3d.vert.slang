@@ -72,24 +72,6 @@ struct VertexOutput
     nointerpolation uint2 ids;
 };
 
-struct PushConstants
-{
-    float4x4 view_proj;
-    // LOD slab extents (fragment pass only).
-    float clip;
-    float clip_v;
-    float2 pad;
-    // f64 camera eye split: eye = cam_block + cam_frac, frac in [0,1).
-    int3 cam_block;
-    int pad0;
-    float3 cam_frac;
-    float pad1;
-    // Lighting from per-frame UBO (binding 2).
-};
-
-[[vk::push_constant]]
-ConstantBuffer<PushConstants> pc;
-
 // Planet curvature: droop is visual only (CLIP position only, not world).
 // Keeps culling conservative and shadows against flat silhouette.
 
@@ -139,7 +121,7 @@ VertexOutput vertexMain(VertexInput input)
     uint detail = rec.detail_pass & 0xFu;
     float scale = detail_scale(detail);
     // Camera-relative placement: block delta first, then fractional parts.
-    float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
+    float3 offset = float3(rec.block - frame.cam_block) - frame.cam_frac + rec.local_off;
     float3 world = (float3(x, y, z) + micro) * scale + offset;
 
     VertexOutput output;
@@ -147,7 +129,7 @@ VertexOutput vertexMain(VertexInput input)
     float3 curved = world;
     curved.y -= min(dot(world.xz, world.xz) * CURVE_INV_2R, CURVE_MAX_DROP);
     // Plain rectilinear projection; wide-FOV compression is a post-process.
-    output.position = mul(pc.view_proj, float4(curved, 1.0));
+    output.position = mul(frame.view_proj, float4(curved, 1.0));
     // Resolve depth ties in coplanar LOD levels: push each farther proportionally to cell size.
     if (scale > 1.0)
         output.position.z *= 1.0 - scale / 4096.0;

@@ -104,13 +104,60 @@ impl FrameUniformsExt {
             ambient_glow: [ambient.x, ambient.y, ambient.z, glow_pow],
             glow_day: [glow_rgb.x, glow_rgb.y, glow_rgb.z, day],
             shadow_bounce: [bounce.x, bounce.y, bounce.z, 0.0],
+            view_proj: IDENTITY_MAT4,
+            clip: 0.0,
+            clip_v: 0.0,
+            clip_pad: [0.0; 2],
+            cam_block: [0; 3],
+            cam_pad0: 0,
+            cam_frac: [0.0; 3],
+            cam_pad1: 0.0,
+            inv_view_proj: IDENTITY_MAT4,
+            sun: [0.0; 4],
+            sun_tint: [0.0; 4],
+            moon: [0.0; 4],
         }
+    }
+
+    /// Mesh3d clip/eye that used to be vertex+fragment push constants.
+    pub(crate) fn set_scene(
+        &mut self,
+        view_proj: &[f32; 16],
+        clip: f32,
+        clip_v: f32,
+        cam_block: [i32; 3],
+        cam_frac: [f32; 3],
+    ) {
+        self.view_proj = *view_proj;
+        self.clip = clip;
+        self.clip_v = clip_v;
+        self.cam_block = cam_block;
+        self.cam_frac = cam_frac;
+    }
+
+    /// Sky disc/inv-VP that used to be fragment push constants.
+    pub(crate) fn set_sky(
+        &mut self,
+        inv_view_proj: &[f32; 16],
+        sun: [f32; 4],
+        sun_tint: [f32; 4],
+        moon: [f32; 4],
+    ) {
+        self.inv_view_proj = *inv_view_proj;
+        self.sun = sun;
+        self.sun_tint = sun_tint;
+        self.moon = moon;
     }
 }
 
+/// Column-major identity; used when a 2D-only frame never writes the scene lanes.
+const IDENTITY_MAT4: [f32; 16] = [
+    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+];
+
 // Bumped when the GPU `FrameUniforms` layout changes (public prefix extras.yz
-// sky lanes, or the engine-derived tail).
-pub const FRAME_UNIFORMS_VERSION: u32 = 6;
+// sky lanes, the engine-derived tail, or the record-varying mesh/sky block).
+pub const FRAME_UNIFORMS_VERSION: u32 = 7;
 
 /// The per-frame UBO ring. Indexed only by [`FrameSlot`],
 /// so raw-usize slot confusion is inexpressible here.
@@ -141,7 +188,7 @@ impl UboRing {
         }
     }
 
-    /// Copy this frame's already-derived uniforms (176-byte `FrameUniformsExt`)
+    /// Copy this frame's already-derived uniforms (`FrameUniformsExt`)
     /// into `slot`'s mapped buffer. Coherent memory: the write is visible to
     /// the GPU with no explicit flush. `prepare_derived` runs once on the
     /// producer (begin_3d / full_bright); `FrameUniformsExt::derive` runs once
@@ -198,14 +245,20 @@ mod tests {
     }
 
     /// Public wire stays 8 float4s so the game's `From<&FrameSnapshot>` layout
-    /// cannot silently grow; derived lanes live past that prefix.
+    /// cannot silently grow; derived and record-varying lanes live past that prefix.
     #[test]
     fn public_wire_stays_eight_lanes() {
         assert_eq!(size_of::<FrameUniformsGpu>(), 128);
-        assert_eq!(size_of::<FrameUniformsExt>(), 176);
+        assert_eq!(size_of::<FrameUniformsExt>(), 400);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, ambient_glow), 128);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, glow_day), 144);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, shadow_bounce), 160);
+        assert_eq!(std::mem::offset_of!(FrameUniformsExt, view_proj), 176);
+        assert_eq!(std::mem::offset_of!(FrameUniformsExt, clip), 240);
+        assert_eq!(std::mem::offset_of!(FrameUniformsExt, cam_block), 256);
+        assert_eq!(std::mem::offset_of!(FrameUniformsExt, inv_view_proj), 288);
+        assert_eq!(std::mem::offset_of!(FrameUniformsExt, sun), 352);
+        assert_eq!(std::mem::offset_of!(FrameUniformsExt, moon), 384);
     }
 
     #[test]

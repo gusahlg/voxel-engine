@@ -314,10 +314,28 @@ impl Renderer {
                     1.0,
                 ];
             }
-            self.ubo_ring.write(
-                FrameSlot::new(slot),
-                &super::uniforms::FrameUniformsExt::derive(u),
-            );
+            let mut ext = super::uniforms::FrameUniformsExt::derive(u);
+            if let Some(scene) = lists.scene.as_ref() {
+                let view_proj = jittered_clip(scene.view_proj, scene.jitter.0, self.render_extent);
+                let eye = pipeline::EyeSplit::of(scene.eye);
+                ext.set_scene(
+                    &view_proj.to_cols_array(),
+                    lists.lod_clip,
+                    lists.lod_clip_v,
+                    eye.block,
+                    eye.frac,
+                );
+                if let Some(desc) = lists.sky {
+                    let sky = pipeline::SkyParams::compose(view_proj.inverse(), &desc);
+                    ext.set_sky(
+                        &sky.inv_view_proj.to_cols_array(),
+                        sky.sun,
+                        sky.sun_tint,
+                        sky.moon,
+                    );
+                }
+            }
+            self.ubo_ring.write(FrameSlot::new(slot), &ext);
         }
         let warp_map = lists
             .scene
@@ -1073,6 +1091,7 @@ impl Renderer {
             }
             self.publish_pipe_stats(slot);
         }
+
         // Begin render submission; this gets the timeline value to stamp mesh copies.
         let rs = self.timeline.begin_render(cmd);
         let done_at = rs.value();

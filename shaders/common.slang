@@ -90,7 +90,7 @@ float3 sky_radiance(float3 ray, FrameUniforms frame)
     return base + glow;
 }
 
-// Analytic sun disc with precomputed cone cosines (sky push constants).
+// Analytic sun disc with precomputed cone cosines (frame UBO sun/sun_tint/moon).
 // `sun_dir` is unit. Full tint out to `cos_core`, smoothstepped to zero at `cos_rim`.
 float3 sun_disc_cos(float3 ray, float3 sun_dir, float3 tint, float cos_core, float cos_rim)
 {

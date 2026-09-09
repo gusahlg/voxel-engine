@@ -34,17 +34,6 @@ struct FragmentInput
     nointerpolation uint2 ids;
 };
 
-// View-proj and LOD slab clip extents.
-struct PushConstants
-{
-    float4x4 view_proj;
-    float clip;
-    float clip_v;
-};
-
-[[vk::push_constant]]
-ConstantBuffer<PushConstants> pc;
-
 // Set 0, binding 1: block texture array (shares the 3D push-descriptor set with
 // the vertex stage's per-draw offsets SSBO at binding 0).
 [[vk::binding(1, 0)]]
@@ -212,18 +201,18 @@ float4 fragmentMain(FragmentInput input) : SV_Target
 {
 #if defined(MESH3D_LOD)
     // Coarse-LOD partition is scale > 1 by construction; skip the scale test.
-    if (pc.clip > 0.0) {
-        bool inside_h = length(input.world.xz) < pc.clip;
-        bool inside_v = pc.clip_v > 0.0 && abs(input.world.y) < pc.clip_v;
+    if (frame.clip > 0.0) {
+        bool inside_h = length(input.world.xz) < frame.clip;
+        bool inside_v = frame.clip_v > 0.0 && abs(input.world.y) < frame.clip_v;
         if (inside_h && inside_v)
             discard;
     }
 #elif !defined(MESH3D_OPAQUE)
     // Blend module: mixed full-res / LOD draws share this path.
     float scale = detail_scale(input.ids.x >> 20);
-    if (scale > 1.0 && pc.clip > 0.0) {
-        bool inside_h = length(input.world.xz) < pc.clip;
-        bool inside_v = pc.clip_v > 0.0 && abs(input.world.y) < pc.clip_v;
+    if (scale > 1.0 && frame.clip > 0.0) {
+        bool inside_h = length(input.world.xz) < frame.clip;
+        bool inside_v = frame.clip_v > 0.0 && abs(input.world.y) < frame.clip_v;
         if (inside_h && inside_v)
             discard;
     }

@@ -28,9 +28,8 @@ pub(super) struct RenderPass<'a> {
     /// (sky, debug, 2D) disturb them; tracking lets mesh passes skip re-pushing.
     mesh_desc_bound: std::cell::Cell<bool>,
     /// Jittered clip matrix and eye split, computed once in `begin` when a 3D
-    /// scene is present. Shared by mesh push constants, debug view_proj, and sky.
+    /// scene is present. Shared by debug view_proj (still a push constant).
     scene_state: Option<(glam::Mat4, pipeline::EyeSplit)>,
-    mesh_push_bound: std::cell::Cell<bool>,
     index_bound: std::cell::Cell<bool>,
     /// A later pass this frame samples the sampleable depth (VRS / spill / TAA).
     sample_depth: bool,
@@ -281,9 +280,9 @@ impl<'a> RenderPass<'a> {
                 }],
             );
 
-            // Push-constant / push-descriptor state is bound per pass at record
-            // time (each pass re-establishes it after interleaved passes bind
-            // incompatible layouts), not once here.
+            // Push-descriptor state is bound per pass at record time (each pass
+            // re-establishes it after interleaved passes bind incompatible
+            // layouts), not once here.
         }
 
         let scene_state = lists.scene.as_ref().map(|scene| {
@@ -303,31 +302,24 @@ impl<'a> RenderPass<'a> {
             ended: false,
             mesh_desc_bound: std::cell::Cell::new(false),
             scene_state,
-            mesh_push_bound: std::cell::Cell::new(false),
             index_bound: std::cell::Cell::new(false),
             sample_depth,
         }
     }
 
-    /// Pushes the `layout_3d` constants (view_proj + sky lighting/fog) and the
-    /// push descriptors (per-draw offsets SSBO at binding 0, block-texture array
-    /// at binding 1) shared by both mesh passes. Called at the head of each mesh
-    /// pass rather than once up front, because interleaved passes bind
-    /// incompatible layouts that disturb this state. Only sound when at least
-    /// one mesh run exists (else the offsets SSBO can be a null buffer).
+    /// Pushes the `layout_3d` descriptors (per-draw offsets SSBO at binding 0,
+    /// block-texture array at binding 1, frame UBO at binding 2) shared by both
+    /// mesh passes. Called at the head of each mesh pass rather than once up
+    /// front, because interleaved passes bind incompatible layouts that disturb
+    /// this state. Only sound when at least one mesh run exists (else the
+    /// offsets SSBO can be a null buffer).
     ///
-    /// Push-constant bytes are identical for every mesh pass (`lists.lod_clip`,
-    /// `lod_clip_v`); the quad IBO binding survives pipeline/layout changes.
-    /// Both are bound once and skipped until a foreign pass invalidates them
-    /// (push constants) — the IBO is never invalidated.
+    /// View-proj, LOD clip, and camera eye live in the per-slot frame UBO
+    /// (written after the slot fence). The quad IBO binding survives
+    /// pipeline/layout changes and is bound once.
     unsafe fn bind_mesh3d_state(&self) {
         unsafe {
             self.push_mesh3d_descriptors();
-            if !self.mesh_push_bound.get() {
-                // LOD slab extents: LOD tiles hard-discard inside the full-res volume.
-                self.push_mesh3d_constants(self.lists.lod_clip, self.lists.lod_clip_v);
-                self.mesh_push_bound.set(true);
-            }
             if !self.index_bound.get() {
                 let quad_ibo = self
                     .r
@@ -379,36 +371,11 @@ impl<'a> RenderPass<'a> {
         self.mesh_desc_bound.set(true);
     }
 
-    /// Pushes view-proj + LOD slab extents. Identical for every mesh pass, so
-    /// skipped while `mesh_push_bound`. Jitter packaged once in `begin`.
-    unsafe fn push_mesh3d_constants(&self, clip: f32, clip_v: f32) {
-        let r = self.r;
-        let (view_proj, eye) = self.scene_state.expect("a mesh pass implies a 3D scene");
-        let push = pipeline::Mesh3dPush {
-            view_proj,
-            clip,
-            clip_v,
-            _pad: [0.0; 2],
-            eye,
-        };
-        let layout = r.pipelines.layout_3d;
-        unsafe {
-            r.device.device.cmd_push_constants(
-                self.cmd,
-                layout,
-                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                0,
-                bytemuck::bytes_of(&push),
-            );
-        }
-    }
-
     /// Marks the `layout_3d` push descriptors stale: call after binding any
     /// pipeline whose layout is not push-compatible with `layout_3d` (sky, debug
     /// cubes/lines/shadows, 2D), so the next `layout_3d` pass re-pushes them.
     fn invalidate_mesh_desc(&self) {
         self.mesh_desc_bound.set(false);
-        self.mesh_push_bound.set(false);
         // Index-buffer binding survives pipeline/layout changes.
     }
 
@@ -430,8 +397,8 @@ impl<'a> RenderPass<'a> {
         self.r.gpu_timer.recorded(self.slot);
         // Interleaved debug/sky/2D passes bind pipelines with layouts that are
         // not push-compatible with `layout_3d`, which per Vulkan's layout-
-        // compatibility rules disturbs this layout's push constants and push
-        // descriptors. Re-establish them at the head of every mesh pass so the
+        // compatibility rules disturbs this layout's push descriptors.
+        // Re-establish them at the head of every mesh pass so the
         // transparent pass (recorded after sky) draws with valid state.
         unsafe { self.bind_mesh3d_state() };
         // The water-absorption blend variant reads the scene depth as an input
@@ -800,33 +767,22 @@ impl<'a> RenderPass<'a> {
         }
     }
 
-    /// The procedural sky background pass (sky pipeline: fragment push constant,
-    /// FrameUniforms at set 0 binding 1, cloud LUT at binding 0, no vertex
+    /// The procedural sky background pass (sky pipeline: FrameUniforms at set 0
+    /// binding 1 including inv-VP / disc, cloud LUT at binding 0, no vertex
     /// buffer). A single fullscreen triangle at the reversed-Z far plane; the
     /// read-only depth test rejects it wherever terrain wrote closer depth, so
     /// it shades only background pixels. Skipped unless the frame set a sky
     /// palette.
     pub(super) unsafe fn record_sky(&self) {
-        let Some(desc) = self.lists.sky else {
+        if self.lists.sky.is_none() {
             return;
-        };
+        }
         self.r.gpu_timer.recorded(self.slot);
         let device = &self.r.device.device;
         let cmd = self.cmd;
-        // Same jitter the mesh pass applies, so TAA sees a coherently jittered
-        // frame (sky vs terrain silhouettes) and history reprojection is stable.
-        let jittered = self.scene_state.expect("a sky pass implies a 3D scene").0;
-        let params = pipeline::SkyParams::compose(jittered.inverse(), &desc);
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.r.pipelines.sky);
             self.invalidate_mesh_desc();
-            device.cmd_push_constants(
-                cmd,
-                self.r.pipelines.layout_sky,
-                vk::ShaderStageFlags::FRAGMENT,
-                0,
-                bytemuck::bytes_of(&params),
-            );
             let lut = &self.r.targets.sky_cloud[self.slot];
             let lut_infos = [vk::DescriptorImageInfo::default()
                 .sampler(self.r.pipelines.sky_lut_sampler)

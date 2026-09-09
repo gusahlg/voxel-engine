@@ -20,8 +20,7 @@ use crate::vk::vertex_input::{VertexInput, vertex_struct};
 pub const PUSH_BYTES_3D: u32 = size_of::<Mesh3dPush>() as u32;
 pub const PUSH_BYTES_DEBUG: u32 = size_of::<DebugPush>() as u32;
 pub const PUSH_BYTES_2D: u32 = size_of::<[f32; 2]>() as u32; // pixels_to_ndc
-pub const PUSH_BYTES_SKY: u32 = size_of::<SkyParams>() as u32; // inv_view_proj + disc cosines
-const _: () = assert!(size_of::<SkyParams>() <= 128);
+// Sky disc/inv-VP live in the per-slot frame UBO; no sky push-constant range.
 // exposure + wide-FOV remap coefficients (s, atan_s) + vignette; see camera::WarpPush.
 pub const PUSH_BYTES_TONEMAP: u32 = size_of::<crate::camera::WarpPush>() as u32;
 pub const PUSH_BYTES_TONEMAP_TAA: u32 = size_of::<super::taa::TonemapTaaPush>() as u32;
@@ -71,15 +70,16 @@ pub struct DebugPush {
     pub view_proj: Mat4,
 }
 
-/// Sky push constant: inverse view-proj, unit sun dir, disc tint, precomputed
-/// sun/moon cone cosines (the per-pixel `cos(radius·SUN_DISC_*)` hoist).
+/// Sky disc/inv-VP block, written into the per-slot frame UBO (was a push
+/// constant). Inverse view-proj, unit sun dir, disc tint, precomputed sun/moon
+/// cone cosines (the per-pixel `cos(radius·SUN_DISC_*)` hoist).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SkyParams {
-    inv_view_proj: Mat4,
-    sun: [f32; 4],
-    sun_tint: [f32; 4],
-    moon: [f32; 4],
+    pub inv_view_proj: Mat4,
+    pub sun: [f32; 4],
+    pub sun_tint: [f32; 4],
+    pub moon: [f32; 4],
 }
 
 impl SkyParams {
@@ -180,8 +180,8 @@ pub struct Pipelines {
     /// Unused in rectilinear mode (the overlay stays in the offscreen scene pass).
     pub tris2d_present: vk::Pipeline,
     pub tris2d_tex_present: vk::Pipeline,
-    /// Vertex-less fullscreen background pass: geometry push constant + set 0
-    /// binding 0 (cloud LUT) and binding 1 (the shared per-frame `FrameUniforms`).
+    /// Vertex-less fullscreen background pass: set 0 binding 0 (cloud LUT) and
+    /// binding 1 (the shared per-frame `FrameUniforms`, including inv-VP / disc).
     /// Depth-tests (read-only) at the reversed-Z far plane so it shades only
     /// pixels the terrain left uncovered.
     pub sky: vk::Pipeline,
@@ -264,14 +264,10 @@ impl Pipelines {
                 .expect("Failed to create debug pipeline layout")
         };
 
-        // Sky layout: fragment push constant (inv VP + disc cosines) plus set 0
-        // binding 0 = cloud LUT, binding 1 = FrameUniforms. Dedicated rather than
+        // Sky layout: set 0 binding 0 = cloud LUT, binding 1 = FrameUniforms
+        // (inv VP + disc cosines live in that UBO). Dedicated rather than
         // sharing mesh3d_set_layout: the LUT is a sampled image the mesh pass
         // never touches.
-        let push_sky = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-            .offset(0)
-            .size(PUSH_BYTES_SKY)];
         let sky_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -295,9 +291,7 @@ impl Pipelines {
                 .expect("Failed to create sky set layout")
         };
         let set_layouts_sky = [sky_set_layout];
-        let layout_sky_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts_sky)
-            .push_constant_ranges(&push_sky);
+        let layout_sky_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts_sky);
         let layout_sky = unsafe {
             device
                 .create_pipeline_layout(&layout_sky_info, None)
