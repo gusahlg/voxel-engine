@@ -316,6 +316,30 @@ impl Engine {
         self.client.msaa()
     }
 
+    /// Hint: enable VRS when the current render extent is large enough that
+    /// coarse shading pays for the classify pass.
+    ///
+    /// Formula: recommend when `render_pixels > texel_width * texel_height * 32768`.
+    /// On desktop parts with 16×16 attachment texels that threshold is 8_388_608
+    /// pixels (~8 Mpx), below which VRS was measured as a net loss. Returns
+    /// `false` when the device has no attachment shading rate.
+    ///
+    /// This is a hint. [`RenderFlags::vrs`] (the user override) always wins:
+    /// the engine enables VRS only from that flag, never from this method.
+    pub fn vrs_recommended(&self) -> bool {
+        match self.vrs_useful_above_pixels() {
+            None => false,
+            Some(min) => self.client.render_pixels() > min,
+        }
+    }
+
+    /// Pixel count above which [`Self::vrs_recommended`] becomes true, or
+    /// `None` when the device has no attachment fragment shading rate.
+    pub fn vrs_useful_above_pixels(&self) -> Option<u32> {
+        let (w, h) = self.client.vrs_texel_size()?;
+        Some(vrs_useful_above_pixels(w, h))
+    }
+
     pub fn max_msaa(&self) -> u32 {
         self.client.max_msaa()
     }
@@ -833,5 +857,23 @@ impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
             self.ran_this_cycle = false;
             self.run_frame(event_loop);
         }
+    }
+}
+
+/// Pixel count above which VRS is recommended: `texel_area * 32768`.
+/// 16×16 texels → 8_388_608 (~8 Mpx), the desktop crossover from measurements.
+fn vrs_useful_above_pixels(texel_w: u32, texel_h: u32) -> u32 {
+    texel_w.saturating_mul(texel_h).saturating_mul(32768)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vrs_useful_above_pixels;
+
+    #[test]
+    fn vrs_threshold_is_texel_area_times_32768() {
+        assert_eq!(vrs_useful_above_pixels(16, 16), 16 * 16 * 32768);
+        assert_eq!(vrs_useful_above_pixels(16, 16), 8_388_608);
+        assert_eq!(vrs_useful_above_pixels(8, 8), 8 * 8 * 32768);
     }
 }

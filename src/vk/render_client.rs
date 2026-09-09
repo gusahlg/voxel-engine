@@ -50,6 +50,8 @@ pub(crate) struct DeviceCaps {
     pub device_name: String,
     pub device_local_bytes: u64,
     pub supports_vrs: bool,
+    /// Attachment shading-rate texel size when VRS is available.
+    pub vrs_texel_size: Option<(u32, u32)>,
     pub supports_pipeline_stats: bool,
 }
 
@@ -603,6 +605,19 @@ impl RenderClient {
 
     pub(crate) fn msaa(&self) -> u32 {
         self.msaa
+    }
+
+    /// Attachment shading-rate texel size, if the device has one.
+    pub(crate) fn vrs_texel_size(&self) -> Option<(u32, u32)> {
+        self.caps.vrs_texel_size
+    }
+
+    /// Offscreen pixel count after render scale (same formula as `scaled_extent`).
+    pub(crate) fn render_pixels(&self) -> u32 {
+        let scale = self.render_scale.get();
+        let w = ((self.size.width as f32 * scale) as u32).max(1);
+        let h = ((self.size.height as f32 * scale) as u32).max(1);
+        w.saturating_mul(h)
     }
 
     pub(crate) fn max_msaa(&self) -> u32 {

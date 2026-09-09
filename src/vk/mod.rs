@@ -482,6 +482,9 @@ impl Renderer {
             },
             device_local_bytes: Device::device_local_bytes(&memory_props),
             supports_vrs: device.fragment_shading_rate.is_some(),
+            vrs_texel_size: device.fragment_shading_rate.as_ref().map(|fsr| {
+                (fsr.texel_size.width, fsr.texel_size.height)
+            }),
             supports_pipeline_stats: device.pipeline_statistics_query,
         };
         let mesh_staging = unsafe {
