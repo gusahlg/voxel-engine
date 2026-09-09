@@ -9,8 +9,12 @@ use crate::skeleton::FrameSlot;
 use super::alloc;
 use super::image_upload;
 use super::render_client::Capture;
+use super::taa::{
+    TONEMAP_TAA_DEPTH_BINDING, TONEMAP_TAA_HDR_BINDING, TONEMAP_TAA_HISTORY_BINDING,
+    TONEMAP_TAA_SPILL_BINDING, TaaPresent,
+};
 use super::timeline::{RenderCompletion, queue_present};
-use super::{Env, Renderer, color_range};
+use super::{Env, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, color_range};
 
 /// Witness that HDR image is ready for present.
 #[must_use = "the offscreen HDR must be finalized to SHADER_READ before present"]
@@ -51,6 +55,7 @@ impl Renderer {
     /// tonemap samples the offscreen, so this signature makes it impossible to
     /// present a frame whose offscreen was never finalized to
     /// `SHADER_READ_ONLY_OPTIMAL`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn present(
         &mut self,
         slot: usize,
@@ -59,11 +64,14 @@ impl Renderer {
         overlay: OverlayPresent,
         hdr_readable: HdrReadable,
         spill_live: bool,
+        taa: Option<TaaPresent>,
     ) {
         // The proof must be for the slot we are about to sample.
         debug_assert_eq!(hdr_readable.slot, slot, "HdrReadable slot mismatch");
         if let Some(image_index) = present_target {
-            unsafe { self.submit_present_copy(slot, image_index, warp_map, overlay, spill_live) };
+            unsafe {
+                self.submit_present_copy(slot, image_index, warp_map, overlay, spill_live, taa)
+            };
             self.last_present = std::time::Instant::now();
         }
     }
@@ -72,22 +80,37 @@ impl Renderer {
     /// swapchain attachment, using the present-format pipeline variants. Mirrors
     /// `RenderPass::record_2d` but for the post-tonemap pass; the caller has set a
     /// negative-height viewport so `tris2d.vert`'s pixel→NDC mapping is correct.
+    ///
+    /// `fused_overlay` selects the two-attachment overlay pipelines (empty
+    /// history write mask). That is only legal with `independentBlend`; the
+    /// caller must pass false and use a one-attachment rendering otherwise.
     unsafe fn record_overlay_present(
         &self,
         cmd: vk::CommandBuffer,
         slot: usize,
         overlay: OverlayPresent,
         extent: vk::Extent2D,
+        fused_overlay: bool,
     ) {
         let device = &self.device.device;
         let pixels_to_ndc = [2.0 / extent.width as f32, 2.0 / extent.height as f32];
+        let tris2d = if fused_overlay {
+            self.pipelines
+                .tris2d_present_taa
+                .expect("two-attachment overlay pipelines exist when independentBlend is enabled")
+        } else {
+            self.pipelines.tris2d_present
+        };
+        let tris2d_tex = if fused_overlay {
+            self.pipelines
+                .tris2d_tex_present_taa
+                .expect("two-attachment overlay pipelines exist when independentBlend is enabled")
+        } else {
+            self.pipelines.tris2d_tex_present
+        };
         unsafe {
             if overlay.d2_count > 0 {
-                device.cmd_bind_pipeline(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.pipelines.tris2d_present,
-                );
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, tris2d);
                 self.atlas.push_descriptor(
                     &self.device.push_descriptor,
                     cmd,
@@ -110,11 +133,7 @@ impl Renderer {
             }
 
             if self.minimap.ready() && overlay.d2_tex_count > 0 {
-                device.cmd_bind_pipeline(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.pipelines.tris2d_tex_present,
-                );
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, tris2d_tex);
                 self.minimap.push_descriptor(
                     &self.device.push_descriptor,
                     cmd,
@@ -149,6 +168,7 @@ impl Renderer {
         warp_map: crate::camera::WarpMap,
         overlay: OverlayPresent,
         spill_live: bool,
+        taa: Option<TaaPresent>,
     ) {
         // A pending capture piggybacks on this copy: after the tonemap draw,
         // the swapchain image is read back into `readback` instead of going
@@ -162,7 +182,6 @@ impl Renderer {
             self.create_readback((extent.width as u64) * (extent.height as u64) * 4)
         });
 
-        let device = &self.device.device;
         let swap_image = self.swapchain.images[image_index as usize];
         let swap_view = self.swapchain.image_views[image_index as usize];
         // Exposure applied before the tonemap curve. Render scale is handled by the
@@ -180,6 +199,27 @@ impl Renderer {
         };
         let vignette = if self.flags.vignette { 1.0 } else { 0.0 };
         let tonemap_push = warp_map.push(exposure, vignette);
+        // TAA-off: one-attachment pipeline, history omitted. TAA-on: two
+        // attachments (swapchain + write-history). Overlay joins that
+        // rendering only when independentBlend is enabled (attachment 1
+        // write-mask empty so the HUD never lands in history). Without it,
+        // overlay is a second one-attachment rendering after a
+        // COLOR_ATTACHMENT_OUTPUT write→read|write barrier.
+        let taa_fused = taa.is_some();
+        let independent_blend = self.device.independent_blend;
+        let taa_push = taa.as_ref().map(|t| self.tonemap_taa_push(t, tonemap_push));
+        let hist_write_view = taa_fused.then(|| self.taa.write_view());
+        let hist_read_view = taa_fused.then(|| self.taa.read_view());
+        let depth_view = taa_fused.then(|| self.targets.sampleable_depth(slot).view());
+        let (hist_pre_write, hist_pre_read) = if taa_fused {
+            let (w, r) = self.taa.history_pre_barriers();
+            (Some(w), r)
+        } else {
+            (None, None)
+        };
+        let hdr_view = self.targets.offscreen[slot].view();
+
+        let device = &self.device.device;
         unsafe {
             device
                 .reset_command_buffer(self.copy_cmd, vk::CommandBufferResetFlags::empty())
@@ -191,6 +231,7 @@ impl Renderer {
                 .expect("begin command buffer failed");
             // Time the copy on its own pair: read the previous copy (retired —
             // `decide_present` only acquires once it has) before resetting.
+            // TAA resolve is fused into this span (no separate GpuTaa stamp).
             let profiling = crate::profile::is_enabled();
             if profiling {
                 if let Some(ms) = self.gpu_timer.read_copy(device) {
@@ -199,8 +240,12 @@ impl Renderer {
                 self.gpu_timer.begin_copy(device, self.copy_cmd);
             }
 
-            // Swapchain image → color attachment; old contents discarded.
-            let to_color = [vk::ImageMemoryBarrier2::default()
+            // One barrier before the pass: swapchain UNDEFINED→COLOR, and when
+            // TAA is on write-history → COLOR plus first-present read-history
+            // UNDEFINED→SHADER_READ. Depth already rests in SHADER_READ_ONLY
+            // (SAMPLEABLE_DEPTH_REST_LAYOUT); the render→present timeline wait
+            // makes it visible to this fragment shader.
+            let swap_to_color = vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                 .src_access_mask(vk::AccessFlags2::NONE)
                 .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -208,24 +253,46 @@ impl Renderer {
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .image(swap_image)
-                .subresource_range(color_range())];
+                .subresource_range(color_range());
+            let mut pre = [vk::ImageMemoryBarrier2::default(); 3];
+            pre[0] = swap_to_color;
+            let mut pre_n = 1;
+            if let Some(w) = hist_pre_write {
+                pre[pre_n] = w;
+                pre_n += 1;
+            }
+            if let Some(r) = hist_pre_read {
+                pre[pre_n] = r;
+                pre_n += 1;
+            }
             device.cmd_pipeline_barrier2(
                 self.copy_cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_color),
+                &vk::DependencyInfo::default().image_memory_barriers(&pre[..pre_n]),
             );
 
-            let color_attachment = [vk::RenderingAttachmentInfo::default()
+            let swap_att = vk::RenderingAttachmentInfo::default()
                 .image_view(swap_view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::DONT_CARE)
-                .store_op(vk::AttachmentStoreOp::STORE)];
+                .store_op(vk::AttachmentStoreOp::STORE);
+            let hist_att = hist_write_view.map(|view| {
+                vk::RenderingAttachmentInfo::default()
+                    .image_view(view)
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+            });
+            let color_1 = [swap_att];
+            let color_2 = [swap_att, hist_att.unwrap_or_default()];
+            let color_attachments: &[vk::RenderingAttachmentInfo] =
+                if taa_fused { &color_2 } else { &color_1 };
             let rendering_info = vk::RenderingInfo::default()
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
                     extent,
                 })
                 .layer_count(1)
-                .color_attachments(&color_attachment);
+                .color_attachments(color_attachments);
             device.cmd_begin_rendering(self.copy_cmd, &rendering_info);
 
             // Standard (positive-height) viewport: the fullscreen triangle's uv
@@ -250,59 +317,158 @@ impl Renderer {
                     extent,
                 }],
             );
-            device.cmd_bind_pipeline(
-                self.copy_cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipelines.tonemap,
-            );
-            // Binding 0: the frame HDR — the offscreen, or the TAA output
-            // when the resolve ran (the copy-back is gone).
-            let hdr_view = self.hdr_of(slot).1;
-            image_upload::push_combined_image_sampler(
-                &self.device.push_descriptor,
-                self.copy_cmd,
-                self.pipelines.layout_tonemap,
-                0,
-                self.pipelines.tonemap_sampler,
-                hdr_view,
-            );
-            // Binding 1: quarter-res spill (bloom composite + godrays), built
-            // in the render submit and made visible here by the render→present
-            // semaphore. When bloom and godrays are both off the spill dispatch
-            // is skipped and this is a 1×1 black image (tonemap stays a single
-            // HDR fetch plus a cached 1×1 add of zero).
+
             let spill_view = if spill_live {
                 self.targets.spill[slot].view()
             } else {
                 self.bloom.black_view()
             };
-            let spill_info = [vk::DescriptorImageInfo::default()
-                .sampler(self.pipelines.tonemap_sampler)
-                .image_view(spill_view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let post_writes = [vk::WriteDescriptorSet::default()
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&spill_info)];
-            self.device.push_descriptor.cmd_push_descriptor_set(
-                self.copy_cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipelines.layout_tonemap,
-                0,
-                &post_writes,
-            );
-            device.cmd_push_constants(
-                self.copy_cmd,
-                self.pipelines.layout_tonemap,
-                vk::ShaderStageFlags::FRAGMENT,
-                0,
-                bytemuck::bytes_of(&tonemap_push),
-            );
+            if let (Some(push), Some(hist_view), Some(depth_view)) =
+                (taa_push.as_ref(), hist_read_view, depth_view)
+            {
+                device.cmd_bind_pipeline(
+                    self.copy_cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipelines.tonemap_taa,
+                );
+                let hdr_info = [vk::DescriptorImageInfo::default()
+                    .sampler(self.pipelines.tonemap_sampler)
+                    .image_view(hdr_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let spill_info = [vk::DescriptorImageInfo::default()
+                    .sampler(self.pipelines.tonemap_sampler)
+                    .image_view(spill_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let hist_info = [vk::DescriptorImageInfo::default()
+                    .sampler(self.pipelines.tonemap_sampler)
+                    .image_view(hist_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let depth_info = [vk::DescriptorImageInfo::default()
+                    .sampler(self.pipelines.tonemap_depth_sampler)
+                    .image_view(depth_view)
+                    .image_layout(SAMPLEABLE_DEPTH_REST_LAYOUT)];
+                let writes = [
+                    vk::WriteDescriptorSet::default()
+                        .dst_binding(TONEMAP_TAA_HDR_BINDING)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&hdr_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_binding(TONEMAP_TAA_SPILL_BINDING)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&spill_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_binding(TONEMAP_TAA_HISTORY_BINDING)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&hist_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_binding(TONEMAP_TAA_DEPTH_BINDING)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&depth_info),
+                ];
+                self.device.push_descriptor.cmd_push_descriptor_set(
+                    self.copy_cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipelines.layout_tonemap_taa,
+                    0,
+                    &writes,
+                );
+                device.cmd_push_constants(
+                    self.copy_cmd,
+                    self.pipelines.layout_tonemap_taa,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    bytemuck::bytes_of(push),
+                );
+            } else {
+                device.cmd_bind_pipeline(
+                    self.copy_cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipelines.tonemap,
+                );
+                image_upload::push_combined_image_sampler(
+                    &self.device.push_descriptor,
+                    self.copy_cmd,
+                    self.pipelines.layout_tonemap,
+                    0,
+                    self.pipelines.tonemap_sampler,
+                    hdr_view,
+                );
+                // Binding 1: quarter-res spill (bloom composite + godrays), built
+                // in the render submit and made visible here by the render→present
+                // semaphore. When bloom and godrays are both off the spill dispatch
+                // is skipped and this is a 1×1 black image (tonemap stays a single
+                // HDR fetch plus a cached 1×1 add of zero).
+                let spill_info = [vk::DescriptorImageInfo::default()
+                    .sampler(self.pipelines.tonemap_sampler)
+                    .image_view(spill_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let post_writes = [vk::WriteDescriptorSet::default()
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&spill_info)];
+                self.device.push_descriptor.cmd_push_descriptor_set(
+                    self.copy_cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipelines.layout_tonemap,
+                    0,
+                    &post_writes,
+                );
+                device.cmd_push_constants(
+                    self.copy_cmd,
+                    self.pipelines.layout_tonemap,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    bytemuck::bytes_of(&tonemap_push),
+                );
+            }
             device.cmd_draw(self.copy_cmd, 3, 1, 0, 0);
             // Composite the 2D overlay onto the tonemapped swapchain (never drawn in
             // the offscreen scene pass). Post-tonemap on BOTH paths: wide-FOV so the
             // warp never bends the HUD, rectilinear so the TAA resolve never reprojects
             // it. Uses a GL-style negative-height viewport, matching tris2d.vert.
+            //
+            // independentBlend: overlay stays in the fused two-attachment scope.
+            // Without it: end that scope after the tonemap triangle, then a second
+            // one-attachment rendering (LOAD) using the single-attachment overlay
+            // pipelines. Consecutive dynamic-rendering instances that write the
+            // same colour attachment are NOT ordered by an implicit
+            // COLOR_ATTACHMENT_OUTPUT WAW (unlike render-pass subpasses); blend
+            // LOAD also reads the attachment, so this is a write→read|write
+            // barrier on the swapchain. Same layout, no extra image transition.
+            let fused_overlay = taa_fused && independent_blend;
+            if taa_fused && !independent_blend {
+                device.cmd_end_rendering(self.copy_cmd);
+                let overlay_sync = [vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(
+                        vk::AccessFlags2::COLOR_ATTACHMENT_READ
+                            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                    )
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image(swap_image)
+                    .subresource_range(color_range())];
+                device.cmd_pipeline_barrier2(
+                    self.copy_cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&overlay_sync),
+                );
+                let overlay_att = vk::RenderingAttachmentInfo::default()
+                    .image_view(swap_view)
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::LOAD)
+                    .store_op(vk::AttachmentStoreOp::STORE);
+                let overlay_color = [overlay_att];
+                let overlay_info = vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent,
+                    })
+                    .layer_count(1)
+                    .color_attachments(&overlay_color);
+                device.cmd_begin_rendering(self.copy_cmd, &overlay_info);
+            }
             device.cmd_set_viewport(
                 self.copy_cmd,
                 0,
@@ -315,13 +481,18 @@ impl Renderer {
                     max_depth: 1.0,
                 }],
             );
-            self.record_overlay_present(self.copy_cmd, slot, overlay, extent);
+            self.record_overlay_present(self.copy_cmd, slot, overlay, extent, fused_overlay);
             device.cmd_end_rendering(self.copy_cmd);
+
+            // Publish write-history to SHADER_READ (next present's read). Folded
+            // into the first after-pass swapchain barrier.
+            let hist_post = taa_fused.then(|| self.taa.history_post_barrier());
 
             // When capturing, detour through TRANSFER_SRC to copy the finished
             // image into the host buffer, then continue to PRESENT.
             if let Some(rb) = &readback {
-                let to_src = [vk::ImageMemoryBarrier2::default()
+                let mut to_src = [vk::ImageMemoryBarrier2::default(); 2];
+                to_src[0] = vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
                     .dst_stage_mask(vk::PipelineStageFlags2::COPY)
@@ -329,10 +500,15 @@ impl Renderer {
                     .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                     .image(swap_image)
-                    .subresource_range(color_range())];
+                    .subresource_range(color_range());
+                let mut n = 1;
+                if let Some(h) = hist_post {
+                    to_src[n] = h;
+                    n += 1;
+                }
                 device.cmd_pipeline_barrier2(
                     self.copy_cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&to_src),
+                    &vk::DependencyInfo::default().image_memory_barriers(&to_src[..n]),
                 );
                 let region = [vk::BufferImageCopy::default()
                     .image_subresource(vk::ImageSubresourceLayers {
@@ -368,7 +544,7 @@ impl Renderer {
                     vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 )
             };
-            let to_present = [vk::ImageMemoryBarrier2::default()
+            let swap_to_present = vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(src_stage)
                 .src_access_mask(src_access)
                 .dst_stage_mask(vk::PipelineStageFlags2::NONE)
@@ -376,10 +552,23 @@ impl Renderer {
                 .old_layout(old_layout)
                 .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
                 .image(swap_image)
-                .subresource_range(color_range())];
+                .subresource_range(color_range());
+            // Capture path already published history in the TRANSFER_SRC barrier.
+            // The non-capture path folds history into this PRESENT barrier.
+            let mut to_present = [swap_to_present, vk::ImageMemoryBarrier2::default()];
+            let present_n = if readback.is_none() {
+                if let Some(h) = hist_post {
+                    to_present[1] = h;
+                    2
+                } else {
+                    1
+                }
+            } else {
+                1
+            };
             device.cmd_pipeline_barrier2(
                 self.copy_cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_present),
+                &vk::DependencyInfo::default().image_memory_barriers(&to_present[..present_n]),
             );
             if profiling {
                 self.gpu_timer.end_copy(device, self.copy_cmd);
@@ -401,6 +590,9 @@ impl Renderer {
             self.slots[FrameSlot::new(slot)].copy_value = value;
             self.last_copy_value = value;
             self.track_copy(slot);
+            if let Some(t) = taa {
+                self.taa.finish_present(t.view_proj, t.eye);
+            }
 
             match queue_present(
                 &self.swapchain.loader,

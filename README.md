@@ -27,6 +27,10 @@ See the maintained [demo](src/bin/demo.rs) for a complete API example.
   against per-mesh AABBs, immediate cubes and wire cubes.
 - **2D overlay**: rects, lines, text from an embedded public-domain 8x8 font
   (no asset files), alpha-blended over the 3D pass in call order.
+- **TAA**: optional temporal anti-aliasing. The scene is jittered every rendered
+  frame; the resolve runs in the present-time tonemap at swapchain resolution
+  (history is a second colour attachment), so TAA also up/downsamples
+  `render_scale` and skipped mailbox frames do no TAA work.
 - **Settings at runtime**: borderless fullscreen, vsync (FIFO/MAILBOX/
   IMMEDIATE), MSAA 1–8x with resolve, resizable window — all applied lazily at
   the next frame boundary.

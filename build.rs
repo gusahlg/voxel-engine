@@ -125,12 +125,6 @@ const SHADERS: &[Shader] = &[
         entry: "computeMain",
         dst: "cull.comp.spv",
     },
-    Shader {
-        src: "shaders/taa_resolve.comp.slang",
-        stage: "compute",
-        entry: "computeMain",
-        dst: "taa_resolve.comp.spv",
-    },
     // Bloom: two entry points from one source (threshold + downsample-chain).
     Shader {
         src: "shaders/bloom.comp.slang",
@@ -290,6 +284,9 @@ fn main() {
     // shaders_spv/ keeps the plain-atomic module (no subgroup caps) as the
     // no-slangc fallback; this file lives only in OUT_DIR.
     compile_cull_wave(toolchain.as_ref(), &out_dir);
+    // Present-time TAA tonemap variant (`-DTAA_FUSED`). Lives only in OUT_DIR
+    // (shaders_spv/ is not refreshed here).
+    compile_tonemap_taa(toolchain.as_ref(), &out_dir);
 
     // Substrate probe: compute shaders for BDA, QUAD, STORAGE, and occupancy tests.
     // Gated behind VOXEL_BUILD_PROBE to avoid requiring extended SPIR-V profile.
@@ -617,6 +614,35 @@ fn compile_cull_wave(toolchain: Option<&Toolchain>, out_dir: &Path) {
         .unwrap_or_else(|e| panic!("copy plain cull module to {}: {e}", wave.display()));
 }
 
+/// Fused TAA tonemap fragment (`-DTAA_FUSED`, two color attachments). Without
+/// slangc, clone the plain tonemap module so `include_bytes!` still resolves;
+/// the fused pipeline is only correct when slangc compiled the variant.
+fn compile_tonemap_taa(toolchain: Option<&Toolchain>, out_dir: &Path) {
+    const TONEMAP_TAA: Shader = Shader {
+        src: "shaders/tonemap.frag.slang",
+        stage: "fragment",
+        entry: "fragmentMain",
+        dst: "tonemap_taa.frag.spv",
+    };
+    if toolchain.is_some() {
+        compile_all(
+            toolchain,
+            out_dir,
+            Path::new("shaders_spv"),
+            &[Job {
+                shader: &TONEMAP_TAA,
+                defines: &["-DTAA_FUSED"],
+                extra_args: &[],
+            }],
+        );
+        return;
+    }
+    let plain = out_dir.join("tonemap.frag.spv");
+    let fused = out_dir.join(TONEMAP_TAA.dst);
+    fs::copy(&plain, &fused)
+        .unwrap_or_else(|e| panic!("copy plain tonemap module to {}: {e}", fused.display()));
+}
+
 fn compile(
     toolchain: Option<&Toolchain>,
     out_dir: &Path,
@@ -791,12 +817,12 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "HISTORY_BLEND",
-            doc: "TAA history feedback weight: fraction of the (reprojected, variance-clamped)\nhistory kept each frame. Higher = steadier but slower to react. Read by vk/taa.rs.\nReduced 0.95→0.92: animated water waves and clouds demand faster per-frame\nreactivity. 0.92 (~8% new sample) reduces ghosting while maintaining temporal\ncoherence. Range [0.85–0.98].",
+            doc: "TAA history feedback weight: fraction of the (reprojected, variance-clamped)\nhistory kept each present. Higher = steadier but slower to react. Read by vk/taa.rs\nand pushed into the fused tonemap. Reduced 0.95→0.92: animated water waves and\nclouds demand faster per-frame reactivity. 0.92 (~8% new sample) reduces ghosting\nwhile maintaining temporal coherence. Range [0.85–0.98].",
             val: Val::Scalar(0.92),
         },
         Def {
             name: "VARIANCE_GAMMA",
-            doc: "TAA neighbourhood variance-clamp width in std-devs: history is clamped to\nYCoCg mean +/- VARIANCE_GAMMA*stddev of the 5-tap cross current taps. Wider =\nsteadier (less crawl) but more ghosting. Read by taa_resolve.comp.",
+            doc: "TAA neighbourhood variance-clamp width in std-devs: history is clamped to\nYCoCg mean +/- VARIANCE_GAMMA*stddev of the 5-tap cross current taps. Wider =\nsteadier (less crawl) but more ghosting. Read by tonemap.frag (TAA_FUSED).",
             val: Val::Scalar(1.25),
         },
         Def {
@@ -899,7 +925,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "TAA_TILE",
-            doc: "TAA resolve workgroup edge in texels (groupshared tile + 1-pixel apron).\nCPU dispatch (vk/taa.rs) must divide by the same value.",
+            doc: "Retired TAA compute workgroup edge; the resolve now runs in the present-time\ntonemap fragment (no groupshared tile). Kept so generated constants stay stable.",
             val: Val::UInt(16),
         },
         Def {

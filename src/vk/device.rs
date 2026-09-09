@@ -78,6 +78,11 @@ pub struct Device {
     pub draw_indirect_first_instance: bool,
     /// Required for GPU-driven culling; kept as field for single-source enable.
     pub draw_indirect_count: bool,
+    /// Distinct per-attachment blend states. Fused-TAA overlay uses this so
+    /// attachment 0 can alpha-blend while attachment 1 (history) has an empty
+    /// write mask. Without it the present path draws overlay in a second
+    /// one-attachment rendering after the fused tonemap.
+    pub independent_blend: bool,
     /// Compute-stage subgroup BASIC+BALLOT: cull uses wave-aggregated atomics.
     pub cull_wave_atomics: bool,
     pub timestamp_period_ns: f32,
@@ -96,6 +101,7 @@ struct Candidate {
     multi_draw_indirect: bool,
     draw_indirect_first_instance: bool,
     draw_indirect_count: bool,
+    independent_blend: bool,
     memory_budget: bool,
     max_anisotropy: Option<f32>,
     fragment_shading_rate: Option<FragmentShadingRate>,
@@ -202,7 +208,17 @@ impl Device {
         let device_features = vk::PhysicalDeviceFeatures::default()
             .multi_draw_indirect(best.multi_draw_indirect)
             .draw_indirect_first_instance(best.draw_indirect_first_instance)
-            .sampler_anisotropy(best.max_anisotropy.is_some());
+            .sampler_anisotropy(best.max_anisotropy.is_some())
+            .independent_blend(best.independent_blend);
+        if best.independent_blend {
+            log::info!(
+                "fused TAA overlay: independentBlend enabled (HUD in fused two-attachment present)"
+            );
+        } else {
+            log::info!(
+                "fused TAA overlay: independentBlend unsupported (separate one-attachment overlay after fused TAA)"
+            );
+        }
         if !best.multi_draw_indirect || !best.draw_indirect_first_instance {
             log::info!(
                 "indirect draw features: multiDrawIndirect={} drawIndirectFirstInstance={} (using fallback draw path)",
@@ -321,6 +337,7 @@ impl Device {
             multi_draw_indirect: best.multi_draw_indirect,
             draw_indirect_first_instance: best.draw_indirect_first_instance,
             draw_indirect_count: best.draw_indirect_count,
+            independent_blend: best.independent_blend,
             cull_wave_atomics,
             timestamp_period_ns: best.properties.limits.timestamp_period,
             timestamps_supported: best.properties.limits.timestamp_compute_and_graphics == vk::TRUE,
@@ -373,6 +390,7 @@ fn evaluate(
     unsafe { instance.get_physical_device_features2(physical, &mut features2) };
     let multi_draw_indirect = features2.features.multi_draw_indirect == vk::TRUE;
     let draw_indirect_first_instance = features2.features.draw_indirect_first_instance == vk::TRUE;
+    let independent_blend = features2.features.independent_blend == vk::TRUE;
     let max_anisotropy = (features2.features.sampler_anisotropy == vk::TRUE)
         .then_some(properties.limits.max_sampler_anisotropy);
     // Required for GPU-driven culling; reject devices that lack it.
@@ -482,6 +500,7 @@ fn evaluate(
         multi_draw_indirect,
         draw_indirect_first_instance,
         draw_indirect_count,
+        independent_blend,
         memory_budget,
         max_anisotropy,
         fragment_shading_rate,

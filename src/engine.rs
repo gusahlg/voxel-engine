@@ -69,7 +69,9 @@ impl Default for Config {
 /// vk/shadow.rs) — no shader variants.
 #[derive(Clone, Copy)]
 pub struct RenderFlags {
-    /// Camera jitter + TAA resolve, always coupled.
+    /// Camera jitter + TAA resolve at present time (output/swapchain
+    /// resolution). Always coupled: jitter is injected every rendered frame;
+    /// the resolve (and history write) run only on presented frames.
     pub taa: bool,
     /// Distance fog (`horizon.w` density).
     pub fog: bool,

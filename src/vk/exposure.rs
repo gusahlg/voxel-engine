@@ -425,8 +425,9 @@ impl ExposureState {
 
 impl super::Renderer {
     /// Record the metering reduction and fold the previous result into the
-    /// published exposure. Inserted by the orchestrator AFTER the HDR pass and
-    /// BEFORE tonemap, and only on frames that will present. `slot` is this
+    /// published exposure. Inserted AFTER the HDR pass and BEFORE the
+    /// present-time tonemap, and only on frames that will present. Meters the
+    /// jittered offscreen (TAA resolves later). `slot` is this
     /// frame's slot; `views(slot)` reads and then overwrites the SAME slot's
     /// buffer — the read value is the one this slot's fence (already waited this
     /// frame) proves complete, and the read happens at record time, before the
@@ -444,7 +445,6 @@ impl super::Renderer {
     ) -> super::HdrReadable {
         let device = &self.device.device;
         let (hdr_image, hdr_view) = self.hdr_of(slot.index());
-        let from_offscreen = self.slots[slot].hdr_source == super::HdrSource::Offscreen;
         let exp = &mut self.exposure;
 
         // Parity resolver: read the waited slot's buffer (frame N-2's result,
@@ -463,26 +463,23 @@ impl super::Renderer {
 
         let tiles = exp.tiles;
         unsafe {
-            // With the offscreen as the source: color-attachment write →
-            // compute sampled read. With the TAA output as the source, its
-            // pass already left the image SHADER_READ visible to compute —
-            // no barrier needed (the tile-mean buffer needs none either way:
-            // host-coherent + freshly fence-cleared).
-            if from_offscreen {
-                let pre = [vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                    .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .image(hdr_image)
-                    .subresource_range(super::color_range())];
-                device.cmd_pipeline_barrier2(
-                    cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&pre),
-                );
-            }
+            // Color-attachment write → compute sampled read. TAA no longer
+            // rewrites the offscreen; `end_deferred` left it in COLOR_ATTACHMENT
+            // and this pass owns the finalize. The tile-mean buffer needs no
+            // barrier (host-coherent + freshly fence-cleared).
+            let pre = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(hdr_image)
+                .subresource_range(super::color_range())];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&pre),
+            );
 
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, exp.compute.pipeline);
             let hdr_info = [vk::DescriptorImageInfo::default()

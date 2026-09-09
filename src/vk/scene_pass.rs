@@ -179,9 +179,9 @@ impl<'a> RenderPass<'a> {
 
             // Reversed-Z: clear depth to 0.0, GREATER_OR_EQUAL test. Single-
             // sampled: store the depth so the end-of-frame classify (and
-            // TAA/spill-godrays) can sample it after it rests in SAMPLEABLE_DEPTH_REST_LAYOUT.
+            // spill-godrays / present TAA) can sample it after it rests in SAMPLEABLE_DEPTH_REST_LAYOUT.
             // MSAA: DONT_CARE the MS store — its single-sample SAMPLE_ZERO
-            // resolve into `resolved_depth` is what feeds VRS/TAA/spill.
+            // resolve into `resolved_depth` is what feeds VRS/spill/present TAA.
             let depth_store = if r.targets.msaa.is_some() {
                 vk::AttachmentStoreOp::DONT_CARE
             } else {
@@ -502,7 +502,8 @@ impl<'a> RenderPass<'a> {
     /// earlier in this command buffer. Never called for Blend (CPU-sorted path).
     /// Opaque draws its full-res partition (no-`discard` pipeline) first, then
     /// the coarse-LOD partition (slab-clip pipeline) — near before far, so the
-    /// LOD skirt behind full-res terrain is mostly depth-rejected.
+    /// LOD skirt behind full-res terrain is mostly depth-rejected. Each group's
+    /// draws close a GPU timestamp (`OpaqueFull` / `OpaqueLod` / `Cutout`).
     unsafe fn record_mesh_indirect_count(&self, pass: Pass) {
         let groups: &[(cull::Group, vk::Pipeline)] = match pass {
             Pass::Opaque => &[
@@ -518,53 +519,71 @@ impl<'a> RenderPass<'a> {
     }
 
     /// Draws every non-empty arena partition of one cull group with `pipeline`.
+    /// Always closes the group's GPU timestamp, including empty groups, so
+    /// skipped draws do not leak into the next span.
     unsafe fn record_group_indirect_count(&self, group: cull::Group, pipeline: vk::Pipeline) {
-        let Some(frame) = &self.r.cull_frame else {
-            return; // nothing live to draw
-        };
-        let span = frame.arena_count * cull::BUCKETS;
-        let base = group as usize * span;
-        if frame.partitions[base..base + span]
-            .iter()
-            .all(|p| p.capacity == 0)
-        {
-            return;
-        }
-        unsafe { self.bind_mesh3d_state() };
-        let device = &self.r.device.device;
-        unsafe {
-            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            for arena in 0..frame.arena_count {
-                let first = cull::camera_part(group as usize, arena, 0, frame.arena_count);
-                if frame.partitions[first..first + cull::BUCKETS]
-                    .iter()
-                    .all(|p| p.capacity == 0)
-                {
-                    continue;
-                }
-                device.cmd_bind_vertex_buffers(
-                    self.cmd,
-                    0,
-                    &[self.r.arena_dir.arena_buffer(arena)],
-                    &[0],
-                );
-                for bucket in 0..cull::BUCKETS {
-                    let idx = first + bucket;
-                    let part = frame.partitions[idx];
-                    if part.capacity == 0 {
-                        continue;
+        if let Some(frame) = &self.r.cull_frame {
+            let span = frame.arena_count * cull::BUCKETS;
+            let base = group as usize * span;
+            if !frame.partitions[base..base + span]
+                .iter()
+                .all(|p| p.capacity == 0)
+            {
+                unsafe { self.bind_mesh3d_state() };
+                let device = &self.r.device.device;
+                unsafe {
+                    device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                    for arena in 0..frame.arena_count {
+                        let first = cull::camera_part(group as usize, arena, 0, frame.arena_count);
+                        if frame.partitions[first..first + cull::BUCKETS]
+                            .iter()
+                            .all(|p| p.capacity == 0)
+                        {
+                            continue;
+                        }
+                        device.cmd_bind_vertex_buffers(
+                            self.cmd,
+                            0,
+                            &[self.r.arena_dir.arena_buffer(arena)],
+                            &[0],
+                        );
+                        for bucket in 0..cull::BUCKETS {
+                            let idx = first + bucket;
+                            let part = frame.partitions[idx];
+                            if part.capacity == 0 {
+                                continue;
+                            }
+                            device.cmd_draw_indexed_indirect_count(
+                                self.cmd,
+                                frame.commands,
+                                u64::from(part.offset) * cull::CMD_STRIDE,
+                                frame.counts,
+                                (idx * 4) as u64,
+                                part.capacity,
+                                cull::CMD_STRIDE as u32,
+                            );
+                        }
                     }
-                    device.cmd_draw_indexed_indirect_count(
-                        self.cmd,
-                        frame.commands,
-                        u64::from(part.offset) * cull::CMD_STRIDE,
-                        frame.counts,
-                        (idx * 4) as u64,
-                        part.capacity,
-                        cull::CMD_STRIDE as u32,
-                    );
                 }
             }
+        }
+        self.stamp_group(group);
+    }
+
+    /// GPU timestamp closing `group`'s draws. No-op when profiling is off.
+    fn stamp_group(&self, group: cull::Group) {
+        if !crate::profile::is_enabled() {
+            return;
+        }
+        let pass = match group {
+            cull::Group::Opaque => GpuPass::OpaqueFull,
+            cull::Group::Cutout => GpuPass::Cutout,
+            cull::Group::OpaqueLod => GpuPass::OpaqueLod,
+        };
+        unsafe {
+            self.r
+                .gpu_timer
+                .mark(&self.r.device.device, self.cmd, self.slot, pass);
         }
     }
 
@@ -772,11 +791,10 @@ impl<'a> RenderPass<'a> {
     }
 
     /// Ends dynamic rendering WITHOUT the offscreen sampled transition: a later
-    /// offscreen writer (TAA resolve / exposure metering) runs after this, and
-    /// one of them owns the finalization instead (its barrier would otherwise
-    /// race their writes). Sampleable depth still rests in
-    /// [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]. Yields no proof — the deferred
-    /// finalizer produces it.
+    /// offscreen writer (exposure metering) runs after this and owns the
+    /// finalization instead (its barrier would otherwise race the write).
+    /// Sampleable depth still rests in [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`].
+    /// Yields no proof — the deferred finalizer produces it.
     pub(super) unsafe fn end_deferred(self, classify_vrs: bool) {
         unsafe { self.end(false, classify_vrs) };
     }

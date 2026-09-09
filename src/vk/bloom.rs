@@ -435,7 +435,7 @@ impl super::Renderer {
                 )
                 .src_access_mask(
                     vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
-                        | vk::AccessFlags2::SHADER_STORAGE_WRITE
+                        | vk::AccessFlags2::SHADER_SAMPLED_READ
                         | vk::AccessFlags2::TRANSFER_WRITE,
                 )
                 .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)

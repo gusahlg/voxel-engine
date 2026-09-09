@@ -322,7 +322,7 @@ pub struct RenderTargets {
     pub(crate) depth: [ImageResource; FRAMES_IN_FLIGHT as usize],
     /// Per-slot single-sample MSAA depth resolve target; `Some` only when
     /// multisampled. The MS `depth` can't feed a `Sampler2D`, so the geometry
-    /// pass resolves (SAMPLE_ZERO) into this and VRS/TAA/godrays sample it.
+    /// pass resolves (SAMPLE_ZERO) into this and VRS/godrays/present TAA sample it.
     pub(crate) resolved_depth: [Option<ImageResource>; FRAMES_IN_FLIGHT as usize],
     pub depth_format: vk::Format,
     /// `Some` only when multisampled; `None` is single-sampled (no MSAA image).
@@ -431,7 +431,8 @@ impl RenderTargets {
                 &ImageDesc {
                     extent,
                     format: color_format,
-                    // Sampled by tonemap + TAA resolve destination.
+                    // Sampled by tonemap (and bloom/exposure). TAA history is a
+                    // separate swapchain-sized image.
                     usage: vk::ImageUsageFlags::COLOR_ATTACHMENT
                         | vk::ImageUsageFlags::SAMPLED
                         | vk::ImageUsageFlags::TRANSFER_DST,
@@ -503,7 +504,7 @@ impl RenderTargets {
         }
     }
 
-    /// The single-sample depth VRS/TAA/spill-godrays sample: the MSAA resolve target
+    /// The single-sample depth VRS/spill-godrays/present-TAA sample: the MSAA resolve target
     /// when multisampled, else the (already single-sample) `depth`. After the
     /// scene pass this image rests in [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`];
     /// during the pass its write scope is [`super::sampleable_depth_attachment_state`].

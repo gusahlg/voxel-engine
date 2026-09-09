@@ -40,6 +40,19 @@ float2 warpSampleUv(float2 uv, float s, float atan_s)
     return float2(qx * 0.5 + 0.5, uv.y);
 }
 
+// Inverse of warpSampleUv: source uv → presented uv. History is stored in
+// presented space, so a reprojected source uv must be unwarped before the
+// history tap. For `qx = tan(px * atan_s) / s` the inverse is
+// `px = atan(qx * s) / atan_s`. Identity when s <= 0.
+float2 unwarpSampleUv(float2 uv, float s, float atan_s)
+{
+    if (s <= 0.0)
+        return uv;
+    float qx = uv.x * 2.0 - 1.0;
+    float px = atan(qx * s) / atan_s;
+    return float2(px * 0.5 + 0.5, uv.y);
+}
+
 // Cube-face unit normals indexed by the packed-vertex `normal` field
 // (mesh.rs: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z). Shared so the fragment looks
 // the face up instead of interpolating a float3 varying.
