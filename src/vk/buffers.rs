@@ -413,6 +413,38 @@ impl GpuResident {
     }
 }
 
+/// Copies each direction's vertices into `dst` in [`FACE_UPLOAD_ORDER`], one
+/// `copy_nonoverlapping` per direction. Returns bytes written.
+///
+/// # Safety
+/// `dst` must be valid for `data.vertex_bytes()` writes.
+unsafe fn write_vertices_upload_order(data: &MeshData, dst: *mut u8) -> usize {
+    let mut cursor = 0usize;
+    for &dir in &FACE_UPLOAD_ORDER {
+        let bytes: &[u8] = bytemuck::cast_slice(&data.vertices[dir]);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(cursor), bytes.len());
+        }
+        cursor += bytes.len();
+    }
+    debug_assert_eq!(
+        cursor,
+        data.vertex_bytes(),
+        "upload must cover every vertex"
+    );
+    cursor
+}
+
+/// Local index boundaries into the shared quad IBO from per-[`crate::mesh::Normal`]
+/// quad counts: `bounds[k]..bounds[k+1]` is upload-order face `k` (`6*quads`).
+fn index_bounds_from_quad_counts(counts: [u32; 6]) -> [u32; 7] {
+    let mut bounds = [0u32; 7];
+    for (k, &dir) in FACE_UPLOAD_ORDER.iter().enumerate() {
+        bounds[k + 1] = bounds[k] + counts[dir] * 6;
+    }
+    bounds
+}
+
 /// Allocates a device buffer for `data`, writes/stages its bytes, and returns
 /// the main-owned [`MeshMeta`] plus render-owned [`GpuResident`]. Main-thread
 /// only: touches the allocator + persistent mapping, never the timeline.
@@ -429,28 +461,21 @@ pub(crate) unsafe fn build_mesh_resident(
 
     let vertex_bytes_len = data.vertex_bytes();
     let total = vertex_bytes_len as u64;
+    let bounds = index_bounds_from_quad_counts(data.quad_counts());
+    debug_assert_eq!(
+        bounds[6] as usize / 6 * 4,
+        vertex_bytes_len / VERTEX_STRIDE as usize,
+        "vertex count stays 4 * quads"
+    );
 
     let alloc = unsafe { allocator.alloc_device(device, total, MESH_ALIGN) }
         .map_err(|err| log::error!("mesh allocation failed: {err:?}"))
         .ok()?;
 
-    let write_into = |dst: *mut u8| unsafe {
-        let mut cursor = 0usize;
-        for &dir in &FACE_UPLOAD_ORDER {
-            let bucket = &data.vertices[dir];
-            debug_assert_eq!(bucket.len() % 4, 0, "each quad contributes 4 vertices");
-            for quad in bucket.chunks_exact(4) {
-                let verts: &[u8] = bytemuck::cast_slice(quad);
-                std::ptr::copy_nonoverlapping(verts.as_ptr(), dst.add(cursor), verts.len());
-                cursor += verts.len();
-            }
-        }
-        debug_assert_eq!(cursor, vertex_bytes_len, "upload must cover every vertex");
-    };
-
     let copy = if let Some(mapped) = alloc.mapped {
         // Unified memory: write straight into the device-local block.
-        write_into(mapped.as_ptr());
+        let written = unsafe { write_vertices_upload_order(data, mapped.as_ptr()) };
+        debug_assert_eq!(written, vertex_bytes_len);
         None
     } else {
         let staging = match unsafe { allocator.alloc_staging(device, total, 4) } {
@@ -464,7 +489,8 @@ pub(crate) unsafe fn build_mesh_resident(
         let mapped = staging
             .mapped
             .expect("staging memory is always host-visible");
-        write_into(mapped.as_ptr());
+        let written = unsafe { write_vertices_upload_order(data, mapped.as_ptr()) };
+        debug_assert_eq!(written, vertex_bytes_len);
         Some(PendingCopy {
             dst_buffer: alloc.buffer,
             dst_offset: alloc.offset,
@@ -487,19 +513,6 @@ pub(crate) unsafe fn build_mesh_resident(
         assert!(MESH_ALIGN.is_multiple_of(VERTEX_STRIDE) && MESH_ALIGN.is_multiple_of(256));
     debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
     let vertex_offset = (alloc.offset / VERTEX_STRIDE) as i32;
-
-    // Local, 0-based index boundaries into the shared quad IBO: `bounds[k]` is
-    // the cumulative `6*quads` before upload-order face `k`. The IBO's index
-    // value at position `6j` is `4j`, and quad `j` sits at vertices `4j..4j+4`, so
-    // adding the unchanged `vertex_offset` base reproduces the old vertex fetches.
-    let mut bounds = [0u32; 7];
-    for (k, &dir) in FACE_UPLOAD_ORDER.iter().enumerate() {
-        bounds[k + 1] = bounds[k] + data.vertices[dir].len() as u32 / 4 * 6;
-    }
-    debug_assert_eq!(
-        bounds[6] as usize / 6 * 4,
-        vertex_bytes_len / VERTEX_STRIDE as usize
-    );
 
     let meta = MeshMeta {
         aabb_min,
@@ -2110,14 +2123,20 @@ mod tests {
 
     #[test]
     fn compose_clears_face_runs_when_a_bucket_exceeds_u16() {
-        use super::{DrawDyn, MESH_FLAG_FACE_RUNS, MeshMeta, MeshRecord, PlacementState};
-        use crate::mesh::{Detail, MeshPlacement};
-        let huge = (u32::from(u16::MAX) + 1) * 6;
-        // Upload slot 2 overflows; the other five buckets are empty.
+        use super::{
+            DrawDyn, MESH_FLAG_FACE_RUNS, MeshMeta, MeshRecord, PlacementState,
+            index_bounds_from_quad_counts,
+        };
+        use crate::mesh::{Detail, FACE_UPLOAD_ORDER, MeshPlacement};
+        let mut counts = [0u32; 6];
+        // Upload slot 2 overflows; the other five directions are empty.
+        counts[FACE_UPLOAD_ORDER[2]] = u32::from(u16::MAX) + 1;
+        let bounds = index_bounds_from_quad_counts(counts);
+        let huge = counts[FACE_UPLOAD_ORDER[2]] * 6;
         let meta = MeshMeta {
             aabb_min: glam::Vec3::ZERO,
             aabb_max: glam::Vec3::ONE,
-            bounds: [0, 0, 0, huge, huge, huge, huge],
+            bounds,
             vertex_offset: 12,
             pass: crate::mesh::Pass::Opaque,
             placement: PlacementState::Pinned,
@@ -2137,5 +2156,106 @@ mod tests {
             "index range stays whole-mesh (bounds[0]..bounds[6])"
         );
         assert_eq!(rec.vertex_offset, 12);
+    }
+
+    /// Old upload: vertices in insertion order, six index buckets of the
+    /// shared-IBO pattern `[b, b+1, b+2, b, b+2, b+3]`, then one 4-vertex copy
+    /// per quad in [`super::FACE_UPLOAD_ORDER`].
+    fn permute_old(quads: &[[crate::mesh::MeshVertex; 4]]) -> Vec<crate::mesh::MeshVertex> {
+        use super::FACE_UPLOAD_ORDER;
+        let mut vertices = Vec::new();
+        let mut buckets: [Vec<u32>; 6] = std::array::from_fn(|_| Vec::new());
+        for corners in quads {
+            let dir = corners[0].normal() as usize;
+            let base = vertices.len() as u32;
+            vertices.extend_from_slice(corners);
+            buckets[dir].extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        let mut out = Vec::new();
+        for &dir in &FACE_UPLOAD_ORDER {
+            for quad in buckets[dir].chunks_exact(6) {
+                let b = quad[0];
+                assert_eq!(
+                    *quad,
+                    [b, b + 1, b + 2, b, b + 2, b + 3],
+                    "reference permuter assumes the shared-IBO pattern"
+                );
+                out.extend_from_slice(&vertices[b as usize..b as usize + 4]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn upload_layout_matches_old_index_permutation() {
+        use super::{
+            FACE_UPLOAD_ORDER, MESH_FLAG_FACE_RUNS, MeshRecord, index_bounds_from_quad_counts,
+            write_vertices_upload_order,
+        };
+        use crate::mesh::{Ao, Light, MeshData, MeshVertex, Normal, Pass};
+
+        fn tagged_quad(normal: Normal, tag: u8) -> [MeshVertex; 4] {
+            std::array::from_fn(|i| {
+                MeshVertex::new(
+                    [i as u8, tag, 0],
+                    normal,
+                    u16::from(tag),
+                    Ao::NONE,
+                    Light::FULL,
+                    false,
+                )
+            })
+        }
+
+        // Mixed directions, one empty (NegX), two PosX quads so within-bucket
+        // order is visible. Insertion order is not upload order.
+        let quads = [
+            tagged_quad(Normal::NegY, 1),
+            tagged_quad(Normal::PosX, 2),
+            tagged_quad(Normal::PosZ, 3),
+            tagged_quad(Normal::PosX, 4),
+            tagged_quad(Normal::PosY, 5),
+            tagged_quad(Normal::NegZ, 6),
+        ];
+        let mut data = MeshData::new(Pass::Opaque);
+        for q in quads {
+            data.quad(q);
+        }
+
+        let expected = permute_old(&quads);
+        assert_eq!(
+            expected.len(),
+            4 * data.quad_counts().iter().sum::<u32>() as usize,
+            "vertex count stays 4 * quads"
+        );
+        assert_eq!(data.vertices(), expected);
+
+        let mut buf = vec![0u8; data.vertex_bytes()];
+        let written = unsafe { write_vertices_upload_order(&data, buf.as_mut_ptr()) };
+        assert_eq!(written, data.vertex_bytes());
+        let got: &[MeshVertex] = bytemuck::cast_slice(&buf);
+        assert_eq!(got, expected.as_slice());
+
+        let counts = data.quad_counts();
+        assert_eq!(counts[Normal::PosX as usize], 2);
+        assert_eq!(counts[Normal::NegX as usize], 0);
+        assert_eq!(counts[Normal::PosY as usize], 1);
+        assert_eq!(counts[Normal::NegY as usize], 1);
+        assert_eq!(counts[Normal::PosZ as usize], 1);
+        assert_eq!(counts[Normal::NegZ as usize], 1);
+
+        let bounds = index_bounds_from_quad_counts(counts);
+        // FACE_UPLOAD_ORDER: +X,+Y,+Z,−X,−Y,−Z → 2,1,1,0,1,1 quads.
+        assert_eq!(bounds, [0, 12, 18, 24, 24, 30, 36]);
+        let (face_quads, flags) = MeshRecord::pack_face_quads(&bounds);
+        assert_eq!(flags, MESH_FLAG_FACE_RUNS);
+        assert_eq!(
+            face_quads,
+            [
+                counts[FACE_UPLOAD_ORDER[0]] | (counts[FACE_UPLOAD_ORDER[1]] << 16),
+                counts[FACE_UPLOAD_ORDER[2]] | (counts[FACE_UPLOAD_ORDER[3]] << 16),
+                counts[FACE_UPLOAD_ORDER[4]] | (counts[FACE_UPLOAD_ORDER[5]] << 16),
+            ]
+        );
     }
 }
