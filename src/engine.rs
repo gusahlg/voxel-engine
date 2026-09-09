@@ -521,14 +521,31 @@ impl Engine {
     /// ([`MeshVertex`](crate::MeshVertex)'s `layer` field selects the layer).
     /// `layers` are
     /// RGBA8 images of `size*size*4` bytes each; the engine builds mip chains
-    /// (box filter) CPU-side and uploads a fresh device-local texture array.
+    /// (box filter) CPU-side.
     ///
-    /// Rare operation (world load / palette growth): waits for the GPU to go
-    /// idle. Contract: layer 0 must render pure white — the engine's
-    /// immediate cubes/wires always draw with layer 0. Before the first call
-    /// a default 1x1 all-white single-layer array is bound.
+    /// The array is allocated with layer-capacity headroom (next power of two
+    /// ≥ requested, at least 64, capped by
+    /// [`Self::max_texture_array_layers`]). When `size` matches the bound
+    /// array and `layers.len()` fits that capacity, only new or changed
+    /// layers are uploaded on the transfer lane — no device idle wait. A
+    /// texel-size change or capacity overflow reallocates the image on the
+    /// next frame (GPU-copy of existing layers, no idle wait); the old image
+    /// is freed after the timeline value of the last frame that used it.
+    ///
+    /// Contract: layer 0 must render pure white — the engine's immediate
+    /// cubes/wires always draw with layer 0. Before the first call a default
+    /// 1x1 all-white single-layer array is bound.
     pub fn set_block_textures(&mut self, size: u32, layers: &[Vec<u8>]) {
         self.client.set_block_textures(size, layers);
+    }
+
+    /// Appends layers to the bound block texture array at the current texel
+    /// size. Each layer is `size*size*4` RGBA8 bytes (`size` is the last
+    /// value passed to [`Self::set_block_textures`], or 1 before the first
+    /// call). Same-capacity appends upload only the new layers on the
+    /// transfer lane; overflowing the capacity reallocates.
+    pub fn append_block_textures(&mut self, layers: &[Vec<u8>]) {
+        self.client.append_block_textures(layers);
     }
 
     /// Uploads minimap pixels (synced per-slot, version-gated). Copies `rgba`.

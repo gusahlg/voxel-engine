@@ -89,6 +89,9 @@ pub(crate) enum RenderCmd {
         size: u32,
         layers: Box<[Vec<u8>]>,
     },
+    AppendBlockTextures {
+        layers: Box<[Vec<u8>]>,
+    },
     UpdateMinimap(Box<[u8]>),
     UpdateMinimapRect {
         x: u32,
@@ -539,6 +542,12 @@ impl RenderClient {
         });
     }
 
+    pub(crate) fn append_block_textures(&mut self, layers: &[Vec<u8>]) {
+        let _ = self.tx.send(RenderCmd::AppendBlockTextures {
+            layers: layers.to_vec().into_boxed_slice(),
+        });
+    }
+
     pub(crate) fn update_minimap(&mut self, rgba: &[u8]) {
         let _ = self
             .tx
@@ -915,6 +924,9 @@ fn render_loop(
                 }
                 RenderCmd::SetBlockTextures { size, layers } => {
                     renderer.set_block_textures(size, &layers)
+                }
+                RenderCmd::AppendBlockTextures { layers } => {
+                    renderer.append_block_textures(&layers)
                 }
                 RenderCmd::UpdateMinimap(px) => renderer.update_minimap(&px),
                 RenderCmd::UpdateMinimapRect { x, y, w, h, pixels } => {
