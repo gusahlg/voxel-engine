@@ -12,7 +12,62 @@ use super::pipeline::Pipelines;
 use super::render_client::RenderReturn;
 use super::swapchain::Swapchain;
 use super::targets::{RenderTargets, next_lower};
-use super::{Renderer, create_present_semaphores, scaled_extent};
+use super::{Renderer, SampleCount, create_present_semaphores, scaled_extent};
+
+/// Whether to keep live render targets or free them after the requested rung
+/// fails at recreate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecreateOomStrategy {
+    /// Previous targets still match the new size and the request was a
+    /// higher-memory rung: keep them and revert MSAA / scale.
+    Retain,
+    /// Previous targets cannot serve (wrong size, or the failed request was
+    /// already at or below them in memory): free first, then walk from the
+    /// request.
+    FreeFirst,
+}
+
+/// Decide retain vs free-first after the requested render-target rung fails.
+///
+/// `extent_changed` is true when the previous targets' pixel size does not
+/// match the new swapchain at the previous scale. Requested vs previous is
+/// first-order target memory: pixel count grows with `scale²`, MSAA
+/// multiplies the sample-dependent planes.
+fn recreate_oom_strategy(
+    extent_changed: bool,
+    requested_msaa: SampleCount,
+    requested_scale: f32,
+    previous_msaa: SampleCount,
+    previous_scale: f32,
+) -> RecreateOomStrategy {
+    if extent_changed
+        || rung_at_or_below(
+            requested_msaa,
+            requested_scale,
+            previous_msaa,
+            previous_scale,
+        )
+    {
+        RecreateOomStrategy::FreeFirst
+    } else {
+        RecreateOomStrategy::Retain
+    }
+}
+
+fn rung_at_or_below(
+    requested_msaa: SampleCount,
+    requested_scale: f32,
+    previous_msaa: SampleCount,
+    previous_scale: f32,
+) -> bool {
+    rung_memory_weight(requested_msaa, requested_scale)
+        <= rung_memory_weight(previous_msaa, previous_scale)
+}
+
+fn rung_memory_weight(msaa: SampleCount, scale: f32) -> u64 {
+    let cents = (scale * 100.0).round() as u64;
+    u64::from(msaa.as_u32()) * cents * cents
+}
 
 impl Renderer {
     /// While no frames are being submitted (minimized window): waits out the
@@ -156,59 +211,137 @@ impl Renderer {
                 }
                 Err(err) => {
                     log::warn!("{}", render_target_oom_message(&err));
-                    let mut msaa = requested_msaa;
-                    let mut scale = requested_scale;
+                    let at_prev_scale = scaled_extent(self.swapchain.extent, prev_scale);
+                    let extent_changed = prev_extent.width != at_prev_scale.width
+                        || prev_extent.height != at_prev_scale.height;
+                    let strategy = recreate_oom_strategy(
+                        extent_changed,
+                        requested_msaa,
+                        requested_scale,
+                        prev_msaa,
+                        prev_scale,
+                    );
                     let mut found = None;
-                    while let Some((next_msaa, next_scale)) = next_lower(msaa, scale) {
-                        msaa = next_msaa;
-                        scale = next_scale;
-                        let extent = scaled_extent(self.swapchain.extent, scale);
-                        // Live images already match this rung: do not allocate a
-                        // second copy, and do not walk below a working config.
-                        let already_live = next_msaa == prev_msaa
-                            && (next_scale - prev_scale).abs() <= f32::EPSILON
-                            && prev_extent.width == extent.width
-                            && prev_extent.height == extent.height;
-                        if already_live {
-                            break;
-                        }
-                        match RenderTargets::new(
-                            &self.instance.instance,
-                            &self.device.device,
-                            self.device.physical,
-                            extent,
-                            next_msaa,
-                            self.device.fragment_shading_rate.as_ref(),
-                        ) {
-                            Ok(new_targets) => {
-                                found = Some((new_targets, next_msaa, next_scale, extent));
-                                break;
+                    match strategy {
+                        RecreateOomStrategy::FreeFirst => {
+                            log::info!(
+                                "renderer: freeing previous render targets before walking the ladder (requested MSAA {} / scale {}, previous {} / {})",
+                                requested_msaa.as_u32(),
+                                requested_scale,
+                                prev_msaa.as_u32(),
+                                prev_scale,
+                            );
+                            // Device is already idle from the wait at the start
+                            // of `apply_pending`.
+                            self.targets.destroy(&self.device.device);
+                            let mut msaa = requested_msaa;
+                            let mut scale = requested_scale;
+                            loop {
+                                let extent = scaled_extent(self.swapchain.extent, scale);
+                                match RenderTargets::new(
+                                    &self.instance.instance,
+                                    &self.device.device,
+                                    self.device.physical,
+                                    extent,
+                                    msaa,
+                                    self.device.fragment_shading_rate.as_ref(),
+                                ) {
+                                    Ok(new_targets) => {
+                                        found = Some((new_targets, msaa, scale, extent));
+                                        break;
+                                    }
+                                    Err(err) => {
+                                        log::warn!("{}", render_target_oom_message(&err));
+                                    }
+                                }
+                                match next_lower(msaa, scale) {
+                                    Some((next_msaa, next_scale)) => {
+                                        msaa = next_msaa;
+                                        scale = next_scale;
+                                    }
+                                    None => break,
+                                }
                             }
-                            Err(err) => {
-                                log::warn!("{}", render_target_oom_message(&err));
+                        }
+                        RecreateOomStrategy::Retain => {
+                            log::info!(
+                                "renderer: retaining previous render targets (MSAA {} / scale {}); requested MSAA {} / scale {} did not fit",
+                                prev_msaa.as_u32(),
+                                prev_scale,
+                                requested_msaa.as_u32(),
+                                requested_scale,
+                            );
+                            let mut msaa = requested_msaa;
+                            let mut scale = requested_scale;
+                            while let Some((next_msaa, next_scale)) = next_lower(msaa, scale) {
+                                msaa = next_msaa;
+                                scale = next_scale;
+                                let extent = scaled_extent(self.swapchain.extent, scale);
+                                // Live images already match this rung: do not allocate a
+                                // second copy, and do not walk below a working config.
+                                let already_live = next_msaa == prev_msaa
+                                    && (next_scale - prev_scale).abs() <= f32::EPSILON
+                                    && prev_extent.width == extent.width
+                                    && prev_extent.height == extent.height;
+                                if already_live {
+                                    break;
+                                }
+                                match RenderTargets::new(
+                                    &self.instance.instance,
+                                    &self.device.device,
+                                    self.device.physical,
+                                    extent,
+                                    next_msaa,
+                                    self.device.fragment_shading_rate.as_ref(),
+                                ) {
+                                    Ok(new_targets) => {
+                                        found = Some((new_targets, next_msaa, next_scale, extent));
+                                        break;
+                                    }
+                                    Err(err) => {
+                                        log::warn!("{}", render_target_oom_message(&err));
+                                    }
+                                }
                             }
                         }
                     }
                     if let Some((new_targets, msaa, scale, extent)) = found {
-                        log::warn!(
-                            "renderer: render targets fell back to MSAA {} / render scale {} (requested {} / {})",
-                            msaa.as_u32(),
-                            scale,
-                            requested_msaa.as_u32(),
-                            requested_scale,
-                        );
-                        self.targets.destroy(&self.device.device);
+                        let fell_back = msaa != requested_msaa
+                            || (scale - requested_scale).abs() > f32::EPSILON;
+                        if fell_back {
+                            log::warn!(
+                                "renderer: render targets fell back to MSAA {} / render scale {} (requested {} / {})",
+                                msaa.as_u32(),
+                                scale,
+                                requested_msaa.as_u32(),
+                                requested_scale,
+                            );
+                        }
+                        if matches!(strategy, RecreateOomStrategy::Retain) {
+                            self.targets.destroy(&self.device.device);
+                        }
                         self.targets = new_targets;
                         self.msaa = super::Pending::new(msaa);
                         self.render_scale = super::Pending::new(scale);
                         self.render_extent = extent;
                         replaced_targets = true;
                     } else {
-                        // Previous targets still exist: keep them and revert
-                        // MSAA / scale so the next frame matches live GPU state.
-                        self.msaa = super::Pending::new(prev_msaa);
-                        self.render_scale = super::Pending::new(prev_scale);
-                        self.render_extent = prev_extent;
+                        match strategy {
+                            RecreateOomStrategy::FreeFirst => {
+                                panic!(
+                                    "renderer: could not allocate any render-target rung after freeing previous targets (requested MSAA {} / scale {})",
+                                    requested_msaa.as_u32(),
+                                    requested_scale,
+                                );
+                            }
+                            RecreateOomStrategy::Retain => {
+                                // Previous targets still exist: keep them and revert
+                                // MSAA / scale so the next frame matches live GPU state.
+                                self.msaa = super::Pending::new(prev_msaa);
+                                self.render_scale = super::Pending::new(prev_scale);
+                                self.render_extent = prev_extent;
+                            }
+                        }
                     }
                 }
             }
@@ -281,5 +414,62 @@ impl Renderer {
 
             self.needs_recreate = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recreate_oom_strategy_retains_higher_request_at_same_extent() {
+        assert_eq!(
+            recreate_oom_strategy(false, SampleCount::X8, 2.0, SampleCount::X2, 2.0),
+            RecreateOomStrategy::Retain,
+        );
+        assert_eq!(
+            recreate_oom_strategy(false, SampleCount::X2, 2.0, SampleCount::X2, 1.0),
+            RecreateOomStrategy::Retain,
+        );
+        assert_eq!(
+            recreate_oom_strategy(false, SampleCount::X4, 1.0, SampleCount::X1, 1.0),
+            RecreateOomStrategy::Retain,
+        );
+    }
+
+    #[test]
+    fn recreate_oom_strategy_frees_first_when_extent_changed() {
+        // Fullscreen switch: previous MSAA 2 / 2.0 cannot serve the new size,
+        // even though the request is a higher-memory rung.
+        assert_eq!(
+            recreate_oom_strategy(true, SampleCount::X8, 2.0, SampleCount::X2, 2.0),
+            RecreateOomStrategy::FreeFirst,
+        );
+        assert_eq!(
+            recreate_oom_strategy(true, SampleCount::X2, 2.0, SampleCount::X2, 2.0),
+            RecreateOomStrategy::FreeFirst,
+        );
+        assert_eq!(
+            recreate_oom_strategy(true, SampleCount::X1, 0.75, SampleCount::X2, 2.0),
+            RecreateOomStrategy::FreeFirst,
+        );
+    }
+
+    #[test]
+    fn recreate_oom_strategy_frees_first_when_requested_at_or_below_previous() {
+        // Same config (at), lower MSAA, lower scale: previous is holding the
+        // memory the retry needs.
+        assert_eq!(
+            recreate_oom_strategy(false, SampleCount::X2, 2.0, SampleCount::X2, 2.0),
+            RecreateOomStrategy::FreeFirst,
+        );
+        assert_eq!(
+            recreate_oom_strategy(false, SampleCount::X1, 2.0, SampleCount::X2, 2.0),
+            RecreateOomStrategy::FreeFirst,
+        );
+        assert_eq!(
+            recreate_oom_strategy(false, SampleCount::X1, 0.75, SampleCount::X2, 2.0),
+            RecreateOomStrategy::FreeFirst,
+        );
     }
 }
