@@ -83,7 +83,12 @@ pub fn upload_image(
         .array_layers(params.array_layers)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        // TRANSFER_SRC: block-texture grow copies existing layers GPU-side.
+        .usage(
+            vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED,
+        )
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let image = unsafe {
         device
@@ -142,13 +147,19 @@ pub fn upload_image(
         device.unmap_memory(staging_memory);
     }
 
-    let subresource = vk::ImageSubresourceRange {
+    // The sampled view spans every allocated array layer. Transition the
+    // whole capacity (all mips) so unused headroom is SHADER_READ_ONLY rather
+    // than UNDEFINED — a descriptor whose view covers those layers is accessed
+    // at every draw (VUID-vkCmdDraw-None-09600). Copies still write only the
+    // used layers in `regions`.
+    let copy_range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
         level_count: params.mip_levels,
         base_array_layer: 0,
         layer_count: params.array_layers,
     };
+    let view_range = copy_range;
 
     let separate_queue = lane.is_separate_queue();
     let needs_qfot = lane.needs_ownership_transfer();
@@ -203,7 +214,7 @@ pub fn upload_image(
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(image)
-            .subresource_range(subresource)];
+            .subresource_range(copy_range)];
         device.cmd_pipeline_barrier2(
             copy_cmd,
             &vk::DependencyInfo::default().image_memory_barriers(&to_transfer),
@@ -244,7 +255,7 @@ pub fn upload_image(
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image(image)
-            .subresource_range(subresource)];
+            .subresource_range(copy_range)];
         device.cmd_pipeline_barrier2(
             copy_cmd,
             &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
@@ -287,7 +298,7 @@ pub fn upload_image(
                         .src_queue_family_index(lane.family())
                         .dst_queue_family_index(graphics_family)
                         .image(image)
-                        .subresource_range(subresource)];
+                        .subresource_range(copy_range)];
                     device.cmd_pipeline_barrier2(
                         acquire_cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&acquire),
@@ -345,7 +356,7 @@ pub fn upload_image(
         .image(image)
         .view_type(params.view_type)
         .format(params.format)
-        .subresource_range(subresource);
+        .subresource_range(view_range);
     let view = unsafe {
         device
             .create_image_view(&view_info, None)

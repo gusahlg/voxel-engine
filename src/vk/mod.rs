@@ -128,7 +128,7 @@ pub(crate) struct Renderer {
     atlas: FontAtlas,
     block_textures: BlockTextures,
     /// Retired textures.
-    retired_textures: buffers::RetireQueue<BlockTextures>,
+    retired_textures: buffers::RetireQueue<block_textures::RetiredBlockTextures>,
     /// Minimap texture.
     minimap: MinimapTexture,
 
@@ -186,8 +186,10 @@ pub(crate) struct Renderer {
     /// Transfer queue for staging copies.
     transfer_lane: TransferLane,
     /// Transfer-lane value this graphics submission waits on: last frame's
-    /// deferred mesh copies and/or this frame's quad-IBO grow.
-    pending_transfer_wait: Option<TimelineValue>,
+    /// deferred mesh copies, this frame's quad-IBO grow, and/or in-place
+    /// block-texture layer uploads. Stages are the first consumers of that
+    /// batch (vertex input for meshes, fragment shader for textures).
+    pending_transfer_wait: Option<(TimelineValue, vk::PipelineStageFlags2)>,
     /// Last present copy timeline value.
     last_copy_value: TimelineValue,
     /// Last render timeline value.
@@ -353,6 +355,7 @@ impl Renderer {
             device.command_pool,
             &mut transfer_lane,
             device.anisotropy,
+            device.max_image_array_layers,
         );
         let mesh3d_set_layout =
             buffers::create_mesh3d_set_layout(&device.device, device.dynamic_rendering_local_read);
@@ -697,12 +700,10 @@ impl Renderer {
         }
     }
 
-    /// Replace block texture array; old one retired through timeline.
+    /// Replace block texture array. Same texel size within capacity uploads
+    /// only new/changed layers on the transfer lane (no idle wait). Size
+    /// change or capacity overflow reallocates and retires the old image.
     pub fn set_block_textures(&mut self, size: u32, layers: &[Vec<u8>]) {
-        // Pending frames sample the old array; submit them so `last_reserved`
-        // is a value the GPU will actually signal.
-        self.flush_pending_submits();
-        // Clamp to device's max image array layers.
         let cap = self.device.max_image_array_layers as usize;
         let layers = if layers.len() > cap {
             log::error!(
@@ -713,29 +714,57 @@ impl Renderer {
         } else {
             layers
         };
-        // Build before swap to avoid double-free on panic.
-        let new_textures = BlockTextures::upload(
-            &self.instance.instance,
-            &self.device.device,
-            self.device.physical,
-            self.device.graphics_queue,
-            self.device.graphics_family,
-            self.device.command_pool,
-            &mut self.transfer_lane,
-            self.device.anisotropy,
-            size,
-            layers,
-        );
-        let old_textures = std::mem::replace(&mut self.block_textures, new_textures);
-        // Old array may be sampled by in-flight frames; retire past max timeline.
-        let done_at = self.timeline.last_reserved();
-        self.retired_textures.push(done_at, old_textures);
+        if self
+            .block_textures
+            .can_update_in_place(size, layers.len() as u32)
+        {
+            self.block_textures.queue_set(layers);
+            log::debug!(
+                "block textures in-place: {} used / {} cap of {}x{}",
+                self.block_textures.layers,
+                self.block_textures.capacity(),
+                self.block_textures.size,
+                self.block_textures.size,
+            );
+            return;
+        }
+        // Pending frames sample the old array; submit them so the grow copy's
+        // graphics-queue barrier (and the retire stamp) covers them. No idle wait.
+        self.flush_pending_submits();
+        self.block_textures.queue_grow(size, layers.to_vec());
         log::debug!(
-            "block textures swapped: {} layers of {}x{}",
+            "block textures grow queued: {} layers of {}x{} (bound {} used / {} cap of {}x{})",
+            layers.len(),
+            size,
+            size,
             self.block_textures.layers,
+            self.block_textures.capacity(),
             self.block_textures.size,
             self.block_textures.size,
         );
+    }
+
+    /// Append layers at the current texel size. Fits-in-capacity uploads only
+    /// the new layers; overflow reallocates through [`Self::set_block_textures`].
+    pub fn append_block_textures(&mut self, layers: &[Vec<u8>]) {
+        let limit = self.device.max_image_array_layers;
+        match self.block_textures.try_append(layers, limit) {
+            Ok(()) => {
+                log::debug!(
+                    "block textures append: {} used / {} cap of {}x{}",
+                    self.block_textures.layers,
+                    self.block_textures.capacity(),
+                    self.block_textures.size,
+                    self.block_textures.size,
+                );
+            }
+            Err(()) => {
+                let mut all = self.block_textures.palette().to_vec();
+                all.extend(layers.iter().cloned());
+                let size = self.block_textures.size;
+                self.set_block_textures(size, &all);
+            }
+        }
     }
 
     /// Uploads minimap pixels to staging buffer (synced per-slot).

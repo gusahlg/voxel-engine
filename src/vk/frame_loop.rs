@@ -8,6 +8,7 @@ use crate::frame::DrawLists;
 use crate::mesh::Pass;
 use crate::skeleton::FrameSlot;
 
+use super::block_textures::BLOCK_TEXTURE_CONSUMER_STAGES;
 use super::buffers::{
     DrawIndexedIndirect, FRAMES_IN_FLIGHT, MESH_CONSUMER_STAGES, SUBMIT_BATCH_MAX,
 };
@@ -81,9 +82,19 @@ pub(super) struct DrawRun {
 pub(super) struct PendingSubmit {
     slot: usize,
     cmd: vk::CommandBuffer,
-    extra_wait: Option<TimelineValue>,
+    extra_wait: Option<(TimelineValue, vk::PipelineStageFlags2)>,
     /// Value reserved by `begin_render`; the batch signals the last entry's.
     signal: TimelineValue,
+}
+
+fn fold_transfer_wait(
+    a: Option<(TimelineValue, vk::PipelineStageFlags2)>,
+    b: Option<(TimelineValue, vk::PipelineStageFlags2)>,
+) -> Option<(TimelineValue, vk::PipelineStageFlags2)> {
+    match (a, b) {
+        (Some((v, s)), Some((w, t))) => Some((v.max(w), s | t)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Whether the just-recorded frame may join the pending batch (`Defer`) or
@@ -435,7 +446,7 @@ impl Renderer {
             let extra_wait = self
                 .pending_transfer_wait
                 .take()
-                .map(|value| (self.transfer_lane.semaphore(), value, MESH_CONSUMER_STAGES));
+                .map(|(value, stages)| (self.transfer_lane.semaphore(), value, stages));
             let completion = unsafe {
                 rs.submit_bufs(
                     &self.device.device,
@@ -569,6 +580,7 @@ impl Renderer {
             if !self.mesh_res.has_garbage()
                 && self.retired_textures.is_empty()
                 && !self.quad_ibo.has_garbage()
+                && !self.block_textures.has_garbage()
             {
                 return;
             }
@@ -581,6 +593,7 @@ impl Renderer {
                 .collect(current, &mut |a| drop(ret.send(RenderReturn::FreeAlloc(a))));
             self.retired_textures
                 .collect(current, |mut tex| tex.destroy(device));
+            self.block_textures.collect(device, current);
             // Superseded quad IBO buffers are render-owned raw buffers (not
             // allocator suballocations), so destroy them here rather than shipping
             // them back to main's freelist.
@@ -594,6 +607,8 @@ impl Renderer {
                     drop(ret.send(RenderReturn::FreeAlloc(a)))
                 });
                 self.quad_ibo.collect_transfer(device, transfer_current);
+                self.block_textures
+                    .collect_transfer(device, transfer_current);
             }
         }
     }
@@ -1073,6 +1088,12 @@ impl Renderer {
             }
             self.publish_pipe_stats(slot);
         }
+        // Overwrite of already-sampled layers: pending frames that still
+        // sample SHADER_READ must be on the graphics queue before a
+        // dedicated-family release (or a same-family extra wait).
+        if self.block_textures.has_overwrite_pending() {
+            self.flush_pending_submits();
+        }
         // Begin render submission; this gets the timeline value to stamp mesh copies.
         let rs = self.timeline.begin_render(cmd);
         let done_at = rs.value();
@@ -1128,15 +1149,41 @@ impl Renderer {
                 self.device.graphics_family,
                 done_at,
             );
-            self.pending_transfer_wait = match (deferred, quad_wait) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            };
+            let tex = self.block_textures.flush(
+                &self.instance.instance,
+                device,
+                self.device.physical,
+                &mut self.transfer_lane,
+                cmd,
+                self.device.graphics_queue,
+                self.device.graphics_family,
+                &self.timeline,
+                self.last_render_value,
+                done_at,
+            );
+            let grew = tex.retire.is_some();
+            if let Some((stamp, retired)) = tex.retire {
+                self.retired_textures.push(stamp, retired);
+            }
+            self.pending_transfer_wait = fold_transfer_wait(
+                match (deferred, quad_wait) {
+                    (Some(a), Some(b)) => Some((a.max(b), MESH_CONSUMER_STAGES)),
+                    (Some(v), None) | (None, Some(v)) => Some((v, MESH_CONSUMER_STAGES)),
+                    (None, None) => None,
+                },
+                tex.transfer_wait
+                    .map(|v| (v, BLOCK_TEXTURE_CONSUMER_STAGES)),
+            );
             // Upload this slot's minimap texture (if its version is stale) on the
             // live frame command buffer, before the render pass begins.
             let minimap = self.minimap.sync(device, cmd, slot);
             if profiling {
-                if copies_pending || quad_wait.is_some() || minimap {
+                if copies_pending
+                    || quad_wait.is_some()
+                    || tex.transfer_wait.is_some()
+                    || grew
+                    || minimap
+                {
                     self.gpu_timer.recorded(slot);
                 }
                 self.gpu_timer.mark(device, cmd, slot, GpuPass::Copies);
@@ -1519,8 +1566,8 @@ impl Renderer {
             .pending_submits
             .iter()
             .filter_map(|p| p.extra_wait)
-            .max()
-            .map(|value| (self.transfer_lane.semaphore(), value, MESH_CONSUMER_STAGES));
+            .fold(None, |acc, w| fold_transfer_wait(acc, Some(w)))
+            .map(|(value, stages)| (self.transfer_lane.semaphore(), value, stages));
         let signal = self
             .pending_submits
             .last()
