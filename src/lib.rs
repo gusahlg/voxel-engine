@@ -39,6 +39,7 @@ pub use mesh::{
 };
 pub use rev::Rev;
 pub use vk::RENDER_SCALE_RANGE;
+pub use vk::mesh_staging::{MeshStager, MeshStaging, MeshVertexWriter};
 
 /// Text metrics for the embedded font, usable without an [`Engine`].
 pub use font::measure_text;

@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::alloc::{Allocation, GpuAllocator, find_memory_type, try_find_memory_type};
 use super::cull::ArenaDirectory;
+use super::mesh_staging::{MeshStaging, MeshStagingPool, StagingLease, Stamp};
 use super::timeline::TimelineValue;
 use super::transfer::TransferLane;
 use crate::mesh::{Detail, FACE_UPLOAD_ORDER, MeshData, MeshHandle, Pass};
@@ -390,26 +391,39 @@ struct DeferredArrival {
     acquires: Vec<vk::BufferMemoryBarrier2<'static>>,
 }
 
+/// What to reclaim after a staged host→device copy completes.
+enum CopySource {
+    Alloc(Allocation),
+    Pool(StagingLease),
+}
+
 struct PendingCopy {
-    staging: Allocation,
+    src_buffer: vk::Buffer,
+    src_offset: u64,
     dst_buffer: vk::Buffer,
     dst_offset: u64,
     size: u64,
+    source: CopySource,
 }
 
 /// Render-owned GPU residency for one mesh: the device buffer plus its
 /// deferred staging copy. `Send` because [`Allocation`] is now `Send`.
 pub(crate) struct GpuResident {
-    alloc: Allocation,
+    buffer: vk::Buffer,
+    /// Device-arena suballocation to return to [`GpuAllocator`]. `None` when
+    /// the mesh lives in the staging pool (zero-copy resident path).
+    arena: Option<Allocation>,
     copy: Option<PendingCopy>,
     /// Timeline value ordering copy before reads; `None` while budget-deferred.
     arrived_at: Option<TimelineValue>,
+    /// Staging region used as the mesh's final backing (zero-copy path).
+    staging: Option<StagingLease>,
 }
 
 impl GpuResident {
     /// Get the device buffer.
     pub fn buffer(&self) -> vk::Buffer {
-        self.alloc.buffer
+        self.buffer
     }
 }
 
@@ -492,10 +506,12 @@ pub(crate) unsafe fn build_mesh_resident(
         let written = unsafe { write_vertices_upload_order(data, mapped.as_ptr()) };
         debug_assert_eq!(written, vertex_bytes_len);
         Some(PendingCopy {
+            src_buffer: staging.buffer,
+            src_offset: staging.offset,
             dst_buffer: alloc.buffer,
             dst_offset: alloc.offset,
             size: total,
-            staging,
+            source: CopySource::Alloc(staging),
         })
     };
 
@@ -536,9 +552,123 @@ pub(crate) unsafe fn build_mesh_resident(
     Some((
         meta,
         GpuResident {
-            alloc,
+            buffer: alloc.buffer,
+            arena: Some(alloc),
             copy,
             arrived_at,
+            staging: None,
+        },
+    ))
+}
+
+fn aabb_from_vertices(verts: &[crate::mesh::MeshVertex]) -> (Vec3, Vec3) {
+    let mut aabb_min = Vec3::splat(f32::INFINITY);
+    let mut aabb_max = Vec3::splat(f32::NEG_INFINITY);
+    for v in verts {
+        let p = Vec3::from_array(v.local_pos());
+        aabb_min = aabb_min.min(p);
+        aabb_max = aabb_max.max(p);
+    }
+    (aabb_min, aabb_max)
+}
+
+/// Installs a worker-written staging region as a mesh: the region is the final
+/// vertex block when the pool is a vertex-resident BAR/ReBAR heap, otherwise
+/// one device-arena allocation plus a pending `vkCmdCopyBuffer` (batched with
+/// every other copy of the frame by [`MeshResidency::flush_copies`]).
+pub(crate) unsafe fn build_mesh_resident_staged(
+    device: &ash::Device,
+    allocator: &mut GpuAllocator,
+    pool: &MeshStagingPool,
+    staging: MeshStaging,
+    quads: [u32; 6],
+    pass: Pass,
+) -> Option<(MeshMeta, GpuResident)> {
+    let vertex_count: usize = quads.iter().map(|&q| q as usize * 4).sum();
+    if vertex_count == 0 {
+        return None;
+    }
+    let vertex_bytes_len = vertex_count * VERTEX_STRIDE as usize;
+    if staging.as_bytes().len() < vertex_bytes_len {
+        log::error!(
+            "mesh staging region ({} bytes) smaller than vertex payload ({vertex_bytes_len})",
+            staging.as_bytes().len()
+        );
+        return None;
+    }
+    let (aabb_min, aabb_max) = {
+        let verts: &[crate::mesh::MeshVertex] =
+            bytemuck::cast_slice(&staging.as_bytes()[..vertex_bytes_len]);
+        aabb_from_vertices(verts)
+    };
+    let bounds = index_bounds_from_quad_counts(quads);
+    debug_assert_eq!(
+        bounds[6] as usize / 6 * 4,
+        vertex_count,
+        "vertex count stays 4 * quads"
+    );
+
+    let total = vertex_bytes_len as u64;
+    let lease = staging.into_lease();
+
+    let (buffer, offset, arena, copy, staging_lease, arrived_at) = if pool.vertex_resident() {
+        const _: () =
+            assert!(MESH_ALIGN.is_multiple_of(VERTEX_STRIDE) && MESH_ALIGN.is_multiple_of(256));
+        (
+            pool.buffer(),
+            lease.offset(),
+            None,
+            None,
+            Some(lease),
+            Some(TimelineValue::START),
+        )
+    } else {
+        let alloc = match unsafe { allocator.alloc_device(device, total, MESH_ALIGN) } {
+            Ok(alloc) => alloc,
+            Err(err) => {
+                log::error!("mesh allocation failed: {err:?}");
+                lease.stamp(Stamp::Render(0));
+                return None;
+            }
+        };
+        debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
+        let copy = PendingCopy {
+            src_buffer: pool.buffer(),
+            src_offset: lease.offset(),
+            dst_buffer: alloc.buffer,
+            dst_offset: alloc.offset,
+            size: total,
+            source: CopySource::Pool(lease),
+        };
+        (
+            alloc.buffer,
+            alloc.offset,
+            Some(alloc),
+            Some(copy),
+            None,
+            None,
+        )
+    };
+
+    debug_assert_eq!(offset % VERTEX_STRIDE, 0);
+    let vertex_offset = (offset / VERTEX_STRIDE) as i32;
+    let meta = MeshMeta {
+        aabb_min,
+        aabb_max,
+        bounds,
+        vertex_offset,
+        pass,
+        placement: PlacementState::Tracked(None),
+        dyn_lane: DrawDyn::resting(),
+    };
+    Some((
+        meta,
+        GpuResident {
+            buffer,
+            arena,
+            copy,
+            arrived_at,
+            staging: staging_lease,
         },
     ))
 }
@@ -620,9 +750,17 @@ impl MeshResidency {
             return;
         }
         if let Some(res) = self.slots.get_mut(i).and_then(Option::take) {
-            self.retire.push(done_at, res.alloc);
+            if let Some(arena) = res.arena {
+                self.retire.push(done_at, arena);
+            }
             if let Some(copy) = res.copy {
-                self.retire.push(done_at, copy.staging);
+                match copy.source {
+                    CopySource::Alloc(alloc) => self.retire.push(done_at, alloc),
+                    CopySource::Pool(lease) => lease.stamp(Stamp::Render(done_at.raw())),
+                }
+            }
+            if let Some(lease) = res.staging {
+                lease.stamp(Stamp::Render(done_at.raw()));
             }
             self.live -= 1;
         }
@@ -714,7 +852,8 @@ impl MeshResidency {
         let mut copies: Vec<(vk::Buffer, vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
         let mut written: Vec<BufferRange> = Vec::with_capacity(batch.len());
         let mut copied_slots: Vec<u32> = Vec::with_capacity(batch.len());
-        let mut staging: Vec<Allocation> = Vec::with_capacity(batch.len());
+        let mut staging_allocs: Vec<Allocation> = Vec::with_capacity(batch.len());
+        let mut staging_leases: Vec<StagingLease> = Vec::new();
         for slot in batch {
             let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) else {
                 continue;
@@ -723,15 +862,15 @@ impl MeshResidency {
                 continue;
             };
             let region = vk::BufferCopy::default()
-                .src_offset(copy.staging.offset)
+                .src_offset(copy.src_offset)
                 .dst_offset(copy.dst_offset)
                 .size(copy.size);
             match copies
                 .iter_mut()
-                .find(|(src, dst, _)| *src == copy.staging.buffer && *dst == copy.dst_buffer)
+                .find(|(src, dst, _)| *src == copy.src_buffer && *dst == copy.dst_buffer)
             {
                 Some((_, _, regions)) => regions.push(region),
-                None => copies.push((copy.staging.buffer, copy.dst_buffer, vec![region])),
+                None => copies.push((copy.src_buffer, copy.dst_buffer, vec![region])),
             }
             written.push(BufferRange {
                 buffer: copy.dst_buffer,
@@ -739,7 +878,10 @@ impl MeshResidency {
                 size: copy.size,
             });
             bytes += copy.size;
-            staging.push(copy.staging);
+            match copy.source {
+                CopySource::Alloc(alloc) => staging_allocs.push(alloc),
+                CopySource::Pool(lease) => staging_leases.push(lease),
+            }
             copied_slots.push(slot);
         }
 
@@ -813,8 +955,16 @@ impl MeshResidency {
         } else {
             &mut self.retire
         };
-        for alloc in staging {
+        for alloc in staging_allocs {
             staging_queue.push(arrived_at, alloc);
+        }
+        let pool_stamp = if separate_queue {
+            Stamp::Transfer(arrived_at.raw())
+        } else {
+            Stamp::Render(arrived_at.raw())
+        };
+        for lease in staging_leases {
+            lease.stamp(pool_stamp);
         }
         for slot in copied_slots {
             if let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) {
@@ -906,10 +1056,16 @@ impl MeshResidency {
     pub fn destroy_all(&mut self, recycle: &mut impl FnMut(Allocation)) {
         for slot in self.slots.iter_mut() {
             if let Some(res) = slot.take() {
-                recycle(res.alloc);
-                if let Some(copy) = res.copy {
-                    recycle(copy.staging);
+                if let Some(arena) = res.arena {
+                    recycle(arena);
                 }
+                if let Some(copy) = res.copy {
+                    match copy.source {
+                        CopySource::Alloc(alloc) => recycle(alloc),
+                        CopySource::Pool(lease) => drop(lease),
+                    }
+                }
+                drop(res.staging);
             }
         }
         self.retire.collect_all(|alloc| recycle(alloc));
@@ -933,11 +1089,11 @@ const HOST_BAR_CAP: u64 = 64 << 20;
 /// a discrete GPU's small BAR window.
 const SMALL_BAR_HEAP: u64 = 1 << 30;
 /// Bytes currently charged against [`HOST_BAR_CAP`] (small-BAR devices only).
-static HOST_BAR_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HOST_BAR_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Host-visible, host-coherent — the property set every [`HostBuffer`] write
 /// relies on (persistent mapping, no explicit flush).
-const HOST_COHERENT: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::from_raw(
+pub(crate) const HOST_COHERENT: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::from_raw(
     vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw()
         | vk::MemoryPropertyFlags::HOST_COHERENT.as_raw(),
 );
@@ -955,7 +1111,7 @@ fn heap_size(memory_props: &vk::PhysicalDeviceMemoryProperties, type_index: u32)
 /// The `bool` is whether the pick *is* the BAR type (allocation failure then
 /// falls back to system memory). Charging the cap is a separate decision at
 /// allocate time: only small BAR heaps consume [`HOST_BAR_BYTES`].
-fn host_buffer_memory_type(
+pub(crate) fn host_buffer_memory_type(
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     type_filter: u32,
     size: u64,
@@ -974,7 +1130,7 @@ fn host_buffer_memory_type(
     try_find_memory_type(memory_props, type_filter, HOST_COHERENT).map(|i| (i, false))
 }
 
-fn bar_charge(
+pub(crate) fn bar_charge(
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     type_index: u32,
     size: u64,

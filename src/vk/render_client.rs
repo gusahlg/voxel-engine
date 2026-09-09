@@ -29,15 +29,17 @@ use winit::window::Window;
 
 use super::alloc::{Allocation, DEVICE_SHRINK_SETTLE_TICKS, GpuAllocator};
 use super::buffers::{
-    DrawDyn, GpuResident, MeshHandles, MeshRecord, PlacementState, build_mesh_resident,
+    DrawDyn, GpuResident, MeshHandles, MeshMeta, MeshRecord, PlacementState, build_mesh_resident,
+    build_mesh_resident_staged,
 };
 use super::device::{Device, MemoryBudget};
 use super::image::{AllocError, render_target_oom_message};
 use super::instance::InstanceBundle;
+use super::mesh_staging::{MeshStager, MeshStaging, MeshStagingPool};
 use super::{Renderer, Scale, clamp_msaa, display_refresh_interval};
 use crate::engine::Config;
 use crate::frame::DrawLists;
-use crate::mesh::{Detail, MeshData, MeshHandle, MeshPlacement};
+use crate::mesh::{Detail, MeshData, MeshHandle, MeshPlacement, Pass};
 
 /// Device capabilities cached on main for local clamp and [`crate::GpuCaps`].
 #[derive(Clone)]
@@ -135,6 +137,8 @@ pub(crate) struct InitReply {
     pub caps: DeviceCaps,
     /// Render thread's published exposure cell for Engine's compose().
     pub exposure: super::exposure::ExposureShared,
+    /// Shared with the render thread; workers clone [`MeshStager`] from it.
+    pub mesh_staging: Arc<MeshStagingPool>,
 }
 
 /// Render-thread build parameters.
@@ -146,6 +150,8 @@ pub(crate) struct RenderConfig {
     pub present_interval: Duration,
     /// CPU-side feature flags for the render thread (see [`crate::RenderFlags`]).
     pub flags: crate::RenderFlags,
+    /// Mesh staging pool size in bytes (`0` disables the pool).
+    pub mesh_staging_bytes: u64,
 }
 
 /// The device/instance/surface handed back from the render thread at shutdown so
@@ -225,6 +231,7 @@ pub(crate) struct RenderClient {
     visible: Vec<u32>,
     visible_dirty: std::collections::BTreeSet<u32>,
     mesh_alloc: GpuAllocator,
+    mesh_staging: Arc<MeshStagingPool>,
     device: ash::Device,
     caps: DeviceCaps,
     size: PhysicalSize<u32>,
@@ -289,6 +296,7 @@ impl RenderClient {
             size,
             present_interval,
             flags: config.flags,
+            mesh_staging_bytes: config.mesh_staging_bytes,
         };
 
         let (cmd_tx, cmd_rx) = sync_channel::<RenderCmd>(1024);
@@ -353,6 +361,7 @@ impl RenderClient {
             visible: Vec::new(),
             visible_dirty: std::collections::BTreeSet::new(),
             mesh_alloc,
+            mesh_staging: reply.mesh_staging,
             device: reply.device,
             caps: reply.caps,
             size,
@@ -375,6 +384,11 @@ impl RenderClient {
 
     // ---- meshes ----
 
+    /// Cheap `Clone` handle workers use to acquire staging regions.
+    pub(crate) fn mesh_stager(&self) -> MeshStager {
+        self.mesh_staging.stager()
+    }
+
     /// Legacy upload: placement is recovered from each draw's offset
     /// ([`PlacementState::Tracked`]). Movers and demo geometry.
     pub(crate) fn upload_mesh(&mut self, data: &MeshData) -> Option<MeshHandle> {
@@ -391,9 +405,63 @@ impl RenderClient {
         self.upload(data, Some(placement))
     }
 
+    /// Install a worker-written staging region as a placed mesh.
+    pub(crate) fn upload_mesh_staged(
+        &mut self,
+        staging: MeshStaging,
+        quads: [u32; 6],
+        pass: Pass,
+        placement: MeshPlacement,
+    ) -> Option<MeshHandle> {
+        let (meta, resident) = unsafe {
+            build_mesh_resident_staged(
+                &self.device,
+                &mut self.mesh_alloc,
+                &self.mesh_staging,
+                staging,
+                quads,
+                pass,
+            )
+        }?;
+        self.install(meta, resident, Some(placement))
+    }
+
+    /// Explicit release of a stale staging region; same as drop.
+    pub(crate) fn release_mesh_staging(&self, staging: MeshStaging) {
+        staging.release();
+    }
+
     fn upload(&mut self, data: &MeshData, placement: Option<MeshPlacement>) -> Option<MeshHandle> {
-        let (mut meta, resident) =
-            unsafe { build_mesh_resident(&self.device, &mut self.mesh_alloc, data) }?;
+        let (meta, resident) = match self.acquire_and_write(data) {
+            Some(staging) => unsafe {
+                build_mesh_resident_staged(
+                    &self.device,
+                    &mut self.mesh_alloc,
+                    &self.mesh_staging,
+                    staging,
+                    data.quad_counts(),
+                    data.pass(),
+                )?
+            },
+            // Pool exhausted: keep the pre-staging path so CPU-side uploads
+            // still succeed while workers occupy the ring.
+            None => unsafe { build_mesh_resident(&self.device, &mut self.mesh_alloc, data)? },
+        };
+        self.install(meta, resident, placement)
+    }
+
+    fn acquire_and_write(&self, data: &MeshData) -> Option<MeshStaging> {
+        let mut staging = self.mesh_staging.stager().acquire(data.vertex_bytes())?;
+        staging.write_vertices(std::array::from_fn(|i| data.vertices[i].as_slice()));
+        Some(staging)
+    }
+
+    fn install(
+        &mut self,
+        mut meta: MeshMeta,
+        resident: GpuResident,
+        placement: Option<MeshPlacement>,
+    ) -> Option<MeshHandle> {
         if placement.is_some() {
             meta.placement = PlacementState::Pinned;
         }

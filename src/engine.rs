@@ -17,7 +17,8 @@ use crate::color::LinearRgb;
 use crate::font;
 use crate::frame::{DrawLists, Frame};
 use crate::input::{InputState, Key, MouseButton};
-use crate::mesh::{MeshData, MeshHandle};
+use crate::mesh::{MeshData, MeshHandle, MeshPlacement, Pass};
+use crate::vk::mesh_staging::{DEFAULT_MESH_STAGING_BYTES, MeshStager, MeshStaging};
 use crate::vk::render_client::{Capture, RenderClient};
 
 #[derive(Clone)]
@@ -42,6 +43,9 @@ pub struct Config {
     pub fullscreen: bool,
     /// CPU-side render feature flags (app is the single source; see [`RenderFlags`]).
     pub flags: RenderFlags,
+    /// Host-visible mesh staging pool size in bytes. Workers write vertices
+    /// here; `0` disables the pool. Default 32 MiB.
+    pub mesh_staging_bytes: u64,
 }
 
 impl Default for Config {
@@ -57,6 +61,7 @@ impl Default for Config {
             resizable: true,
             fullscreen: false,
             flags: RenderFlags::default(),
+            mesh_staging_bytes: DEFAULT_MESH_STAGING_BYTES,
         }
     }
 }
@@ -419,6 +424,11 @@ impl Engine {
 
     // ---- meshes ----
 
+    /// Cheap `Clone` handle workers use to acquire staging regions.
+    pub fn mesh_stager(&self) -> MeshStager {
+        self.client.mesh_stager()
+    }
+
     /// Upload a tracked mesh; placement recovered from draw offset (movers).
     /// Static geometry should use [`upload_mesh_placed`](Self::upload_mesh_placed).
     pub fn upload_mesh(&mut self, data: &MeshData) -> Option<MeshHandle> {
@@ -429,9 +439,26 @@ impl Engine {
     pub fn upload_mesh_placed(
         &mut self,
         data: &MeshData,
-        placement: crate::mesh::MeshPlacement,
+        placement: MeshPlacement,
     ) -> Option<MeshHandle> {
         self.client.upload_mesh_placed(data, placement)
+    }
+
+    /// Install a worker-written staging region as a placed mesh.
+    pub fn upload_mesh_staged(
+        &mut self,
+        staging: MeshStaging,
+        quads: [u32; 6],
+        pass: Pass,
+        placement: MeshPlacement,
+    ) -> Option<MeshHandle> {
+        self.client
+            .upload_mesh_staged(staging, quads, pass, placement)
+    }
+
+    /// Explicit release of a stale staging region; same as drop.
+    pub fn release_mesh_staging(&self, staging: MeshStaging) {
+        self.client.release_mesh_staging(staging);
     }
 
     /// Frees a mesh. Safe while the GPU still uses it (deferred internally).

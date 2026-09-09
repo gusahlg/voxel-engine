@@ -561,6 +561,13 @@ impl Renderer {
             }
             self.publish_vrs_mix(slot);
             self.publish_cull_stats(slot);
+            // Staging-pool reclaim is once per frame even when the allocator
+            // retire queues are empty: stale worker builds never touch those.
+            let transfer_current = self.transfer_lane.counter(device);
+            self.mesh_staging.reclaim(
+                self.slots[FrameSlot::new(wait_slot)].render_value,
+                transfer_current,
+            );
             // Nothing retired (the steady state): skip the two counter reads
             // and the queue drains, which would find nothing to reclaim.
             if !self.mesh_res.has_garbage()
@@ -586,7 +593,7 @@ impl Renderer {
             // reclaimed against the LANE's own timeline, not the render
             // one — a non-blocking probe (never waited: nothing here may
             // stall this reclaim pass on the transfer queue's progress).
-            if let Some(transfer_current) = self.transfer_lane.counter(device) {
+            if let Some(transfer_current) = transfer_current {
                 self.mesh_res.collect_transfer(transfer_current, &mut |a| {
                     drop(ret.send(RenderReturn::FreeAlloc(a)))
                 });
