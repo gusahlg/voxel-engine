@@ -43,7 +43,8 @@ See the maintained [demo](src/bin/demo.rs) for a complete API example.
 
 - `cargo run --release --bin demo` — spinning demo scene (F fullscreen,
   V vsync, M MSAA cycle, Esc quit).
-- Shaders are Slang (`shaders/`), compiled by `build.rs` with `slangc`
+- Shaders are Slang (`shaders/`), compiled by `build.rs` through the
+  `voxel_slang_build` workspace crate (`crates/slang-build`) with `slangc`
   (`-O2`, SPIR-V 1.6 — the Vulkan 1.3 baseline) and embedded into the binary.
   Modules compile in parallel, are re-validated with `spirv-val` whenever it
   is on PATH (the build fails on invalid SPIR-V), and are only recompiled when
@@ -52,6 +53,8 @@ See the maintained [demo](src/bin/demo.rs) for a complete API example.
   when `slangc` is not installed. Ordinary builds never rewrite these files.
   Refresh them with the pinned compiler via
   `nix develop --command env VOXEL_ENGINE_REFRESH_SHADER_FALLBACKS=1 cargo check --locked`.
+  A downstream game can take `voxel_slang_build` as a build-dependency to
+  compile its own Slang with the same `slangc` pin and fallback rules.
 - `nix develop` — dev shell with Rust, slangc, the Vulkan loader/tools and
   validation layers. `nix run` builds and runs the demo.
 - macOS: install MoltenVK + the Vulkan loader (`brew install molten-vk

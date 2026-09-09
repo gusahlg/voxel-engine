@@ -5,6 +5,11 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 build = "build.rs"
 
+[workspace]
+members = ["crates/slang-build"]
+default-members = [".", "crates/slang-build"]
+resolver = "3"
+
 [lib]
 name = "voxel_engine"
 path = "src/lib.rs"
@@ -26,6 +31,10 @@ env_logger = "0.11"
 png = "0.17"
 
 [build-dependencies]
+voxel_slang_build = { path = "crates/slang-build" }
+
+[dev-dependencies]
+voxel_slang_build = { path = "crates/slang-build" }
 
 # The game links this crate; keep its release profile aggressive so `cargo run
 # --release` in either repo gets the same fully-inlined engine.
