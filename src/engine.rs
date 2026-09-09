@@ -698,6 +698,28 @@ impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // winit 0.30 delivers window/device events only between iterations.
+        // Under ControlFlow::Poll every about_to_wait also pays a socket-read
+        // + epoll cycle. When uncapped, a ~20 µs frame would spend a large
+        // fraction of its budget there. Extra engine frames in this iteration
+        // are safe: events queue on the compositor connection until we return,
+        // Resized/RedrawRequested already have their own path, and we never
+        // skip a poll longer than EVENT_POLL_BUDGET (well below input/resize
+        // latency). If this cycle already ran a frame from RedrawRequested,
+        // do not burst — live resize must see the next OS events promptly.
+        const EVENT_POLL_BUDGET: Duration = Duration::from_micros(250);
+        let already_ran = self.ran_this_cycle;
+        let poll_start = Instant::now();
         self.run_frame(event_loop);
+        if already_ran {
+            return;
+        }
+        while !self.finished
+            && self.engine.as_ref().is_some_and(|e| e.is_uncapped())
+            && poll_start.elapsed() < EVENT_POLL_BUDGET
+        {
+            self.ran_this_cycle = false;
+            self.run_frame(event_loop);
+        }
     }
 }
