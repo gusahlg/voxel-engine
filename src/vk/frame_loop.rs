@@ -244,6 +244,13 @@ impl Renderer {
         let slot = self.slot;
         use crate::profile::{Meter, scope};
         crate::profile::count(crate::profile::Counter::Rendered);
+        self.mesh_res.note_frame();
+        crate::profile::gauge(
+            crate::profile::Gauge::PoolAcquires,
+            super::mesh_staging::take_acquire_count(),
+        );
+        crate::profile::gauge(crate::profile::Gauge::PoolCopies, 0);
+        crate::profile::gauge(crate::profile::Gauge::PoolArrivalFrames, 0);
 
         let sun = sun_dir(lists);
         let camera_eye = lists.scene.as_ref().map(|scene| {

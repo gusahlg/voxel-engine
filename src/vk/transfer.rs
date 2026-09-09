@@ -101,6 +101,7 @@ impl<T: Copy + PartialEq> BatchRing<T> {
     }
 
     /// The batch on `handle` was ended without a submit: idle right away.
+    #[allow(dead_code)] // used by `TransferLane::discard` (empty-batch path)
     fn discarded(&mut self, handle: T) {
         self.set_state(handle, BatchState::Free);
     }
@@ -232,7 +233,9 @@ impl TransferLane {
     }
 
     /// End a batch without submitting (nothing to do); its buffer is idle
-    /// again immediately.
+    /// again immediately. Mesh copies no longer begin the lane speculatively,
+    /// so production no longer hits an empty batch; tests still do.
+    #[allow(dead_code)]
     pub unsafe fn discard(&mut self, device: &ash::Device, batch: LaneRecording) {
         let res = self
             .resources

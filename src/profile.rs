@@ -338,10 +338,17 @@ pub enum Gauge {
     FragBlend,
     FragSky,
     PrimsFull,
+    /// Worker/main `MeshStager::acquire` successes since the last flush.
+    PoolAcquires,
+    /// Pooled `vkCmdCopyBuffer` regions submitted this frame.
+    PoolCopies,
+    /// Frames a pooled mesh sat in `pending` before `is_arrived` (1 = flushed
+    /// the same render-loop iteration it was applied; >1 = budget-deferred).
+    PoolArrivalFrames,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 21] = [
+    const ALL: [Gauge; 24] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
@@ -363,6 +370,9 @@ impl Gauge {
         Gauge::FragBlend,
         Gauge::FragSky,
         Gauge::PrimsFull,
+        Gauge::PoolAcquires,
+        Gauge::PoolCopies,
+        Gauge::PoolArrivalFrames,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -389,6 +399,9 @@ impl Gauge {
             Gauge::FragBlend => "frag.blend",
             Gauge::FragSky => "frag.sky",
             Gauge::PrimsFull => "prims.full",
+            Gauge::PoolAcquires => "pool.acq",
+            Gauge::PoolCopies => "pool.copies",
+            Gauge::PoolArrivalFrames => "pool.arrive",
         }
     }
 }

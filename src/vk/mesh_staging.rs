@@ -4,9 +4,10 @@
 //! Game workers acquire a region, write vertices straight into the mapped
 //! bytes, and hand the region to the main thread. Main copies those bytes into
 //! a mesh arena block (host memcpy when the arena is mapped, otherwise one
-//! `vkCmdCopyBuffer` through the transfer lane) and stamps the region so
-//! reclaim can recycle it. Stale builds [`Drop`] the region; reclaim never
-//! GPU-waits.
+//! `vkCmdCopyBuffer` batched on the graphics command buffer with a single
+//! barrier) and stamps the region so reclaim can recycle it. Stale builds
+//! [`Drop`] the region; reclaim never GPU-waits. The ring lives in system
+//! memory: it is transient staging, not a vertex buffer.
 //!
 //! The ring is a FIFO (`reclaim` advances `tail` only past a contiguous ready
 //! prefix) and therefore holds only **transient** data. A live mesh must never
@@ -18,7 +19,7 @@
 //!
 //! Cost: uploads are many and small, so the ring is the only per-acquire work
 //! on the worker. Reclaim, copies, and barriers stay batched on the render
-//! thread (one pass / one transfer CB / one barrier per frame).
+//! thread (one pass / one graphics-CB copy batch / one barrier per frame).
 
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
@@ -28,9 +29,17 @@ use std::sync::{Arc, Mutex};
 use ash::vk;
 
 use super::alloc::try_find_memory_type;
-use super::buffers::{HOST_BAR_BYTES, HOST_COHERENT, bar_charge, host_buffer_memory_type};
+use super::buffers::{HOST_BAR_BYTES, HOST_COHERENT};
 use super::timeline::TimelineValue;
 use crate::mesh::{FACE_UPLOAD_ORDER, MeshVertex};
+
+/// Acquires since the last [`take_acquire_count`] (profiler).
+static ACQUIRE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Swap-out the acquire counter. Called once per render frame.
+pub(crate) fn take_acquire_count() -> u64 {
+    ACQUIRE_COUNT.swap(0, Ordering::Relaxed)
+}
 
 /// Default host-visible mesh staging ring size (32 MiB).
 ///
@@ -60,6 +69,24 @@ fn parse_mesh_staging_mb(s: &str) -> Option<u64> {
     Some(mb.saturating_mul(1 << 20))
 }
 
+/// Host-coherent system memory for the transient staging ring: skip
+/// `DEVICE_LOCAL` (BAR/ReBAR) so CPU writes and GPU copies match the old
+/// per-mesh staging blocks. Falls back to any host-coherent type.
+fn sysmem_staging_type(
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    type_filter: u32,
+) -> Option<u32> {
+    let n = memory_props.memory_type_count;
+    let sysmem = (0..n).find(|&i| {
+        if type_filter & (1 << i) == 0 {
+            return false;
+        }
+        let flags = memory_props.memory_types[i as usize].property_flags;
+        flags.contains(HOST_COHERENT) && !flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    });
+    sysmem.or_else(|| try_find_memory_type(memory_props, type_filter, HOST_COHERENT))
+}
+
 /// Same 1 GiB cutoff [`super::alloc`] uses to tell ReBAR / unified from a
 /// discrete GPU's small BAR window.
 const SMALL_BAR_HEAP: u64 = 1 << 30;
@@ -75,6 +102,8 @@ pub(crate) struct StagingRegion {
     pub offset: u64,
     pub len: u64,
     pub generation: u64,
+    /// Monotonic acquire head; keys [`StagingRing::live`] for O(log n) stamp.
+    key: u64,
 }
 
 /// When a region may be reused. [`Held`] is still owned by a [`MeshStaging`];
@@ -84,6 +113,9 @@ pub(crate) struct StagingRegion {
 pub(crate) enum Stamp {
     Held,
     Render(u64),
+    /// Transfer-lane timeline. Kept for reclaim tests and any copy that still
+    /// submits on the lane; pooled copies stamp [`Self::Render`].
+    #[allow(dead_code)]
     Transfer(u64),
 }
 
@@ -168,6 +200,7 @@ impl StagingRing {
                 offset,
                 len: size,
                 generation,
+                key: head,
             };
             self.lock_live().insert(
                 head,
@@ -177,6 +210,9 @@ impl StagingRing {
                     stamp: Stamp::Held,
                 },
             );
+            if crate::profile::is_enabled() {
+                ACQUIRE_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
             return Some(region);
         }
     }
@@ -185,13 +221,10 @@ impl StagingRing {
     /// is a no-op.
     pub(crate) fn stamp(&self, region: StagingRegion, stamp: Stamp) {
         let mut live = self.lock_live();
-        let Some(entry) = live
-            .values_mut()
-            .find(|e| e.region.generation == region.generation && e.region.offset == region.offset)
-        else {
+        let Some(entry) = live.get_mut(&region.key) else {
             return;
         };
-        if entry.stamp == Stamp::Held {
+        if entry.region.generation == region.generation && entry.stamp == Stamp::Held {
             entry.stamp = stamp;
         }
     }
@@ -426,8 +459,13 @@ unsafe impl Send for MeshStagingPool {}
 unsafe impl Sync for MeshStagingPool {}
 
 impl MeshStagingPool {
-    /// Allocate the pool buffer (BAR/ReBAR when available, like [`super::buffers::HostBuffer`]).
-    /// `size == 0` disables the pool (acquire always returns `None`).
+    /// Allocate the pool buffer in host-coherent *system* memory.
+    ///
+    /// The ring is transient staging (copied out the same frame it is
+    /// acquired), so a BAR/ReBAR heap is the wrong place: CPU reads and
+    /// transfer-queue copies from that window serialize the graphics wait
+    /// that pooled copies used to arm every frame. `size == 0` disables the
+    /// pool (acquire always returns `None`).
     pub(crate) unsafe fn new(
         instance: &ash::Instance,
         device: &ash::Device,
@@ -439,7 +477,8 @@ impl MeshStagingPool {
         }
         let size = size.next_multiple_of(VERTEX_STRIDE).max(VERTEX_STRIDE);
         let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
-        let usage = vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC;
+        // TRANSFER_SRC only: the ring is never bound as a vertex buffer.
+        let usage = vk::BufferUsageFlags::TRANSFER_SRC;
         let info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage)
@@ -450,42 +489,18 @@ impl MeshStagingPool {
                 .expect("create mesh staging buffer")
         };
         let req = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let bar_used = HOST_BAR_BYTES.load(Ordering::Relaxed);
-        let (type_index, is_bar) =
-            host_buffer_memory_type(&memory_props, req.memory_type_bits, req.size, bar_used)
-                .expect("no HOST_VISIBLE | HOST_COHERENT memory type for mesh staging");
-        let allocate = |type_index: u32| unsafe {
-            device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(req.size)
-                    .memory_type_index(type_index),
-                None,
-            )
-        };
-        let (memory, type_index, bar_bytes) = match allocate(type_index) {
-            Ok(memory) => (
-                memory,
-                type_index,
-                if is_bar {
-                    bar_charge(&memory_props, type_index, req.size)
-                } else {
-                    0
-                },
-            ),
-            Err(err) if is_bar => {
-                log::debug!("BAR mesh staging allocation refused ({err:?}); using system memory");
-                let fallback =
-                    try_find_memory_type(&memory_props, req.memory_type_bits, HOST_COHERENT)
-                        .expect("no HOST_VISIBLE | HOST_COHERENT memory type for mesh staging");
-                (
-                    allocate(fallback).expect("allocate mesh staging memory"),
-                    fallback,
-                    0,
+        let type_index = sysmem_staging_type(&memory_props, req.memory_type_bits)
+            .expect("no HOST_VISIBLE | HOST_COHERENT memory type for mesh staging");
+        let memory = unsafe {
+            device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(type_index),
+                    None,
                 )
-            }
-            Err(err) => panic!("allocate mesh staging memory: {err:?}"),
+                .expect("allocate mesh staging memory")
         };
-        HOST_BAR_BYTES.fetch_add(bar_bytes, Ordering::Relaxed);
         unsafe {
             device
                 .bind_buffer_memory(buffer, memory, 0)
@@ -509,7 +524,7 @@ impl MeshStagingPool {
             buffer,
             memory,
             mapped: NonNull::new(mapped),
-            bar_bytes,
+            bar_bytes: 0,
             destroyed: AtomicBool::new(false),
             _pin: None,
         })
@@ -573,7 +588,7 @@ impl MeshStagingPool {
 
 #[cfg(test)]
 impl MeshStagingPool {
-    fn new_host(capacity: usize) -> Arc<Self> {
+    pub(crate) fn new_host(capacity: usize) -> Arc<Self> {
         let mut pin = vec![0u8; capacity].into_boxed_slice();
         let mapped = NonNull::new(pin.as_mut_ptr());
         Arc::new(Self {
@@ -770,6 +785,110 @@ mod tests {
         assert_eq!(parse_mesh_staging_mb("1"), Some(1 << 20));
         assert_eq!(parse_mesh_staging_mb(""), None);
         assert_eq!(parse_mesh_staging_mb("nope"), None);
+    }
+
+    fn memory_props(
+        types: &[(vk::MemoryPropertyFlags, u32)],
+        heap_sizes: &[u64],
+    ) -> vk::PhysicalDeviceMemoryProperties {
+        let mut p = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: types.len() as u32,
+            memory_heap_count: heap_sizes.len() as u32,
+            ..Default::default()
+        };
+        for (i, &(property_flags, heap_index)) in types.iter().enumerate() {
+            p.memory_types[i] = vk::MemoryType {
+                property_flags,
+                heap_index,
+            };
+        }
+        for (i, &size) in heap_sizes.iter().enumerate() {
+            p.memory_heaps[i].size = size;
+        }
+        p
+    }
+
+    #[test]
+    fn sysmem_staging_skips_bar_types() {
+        let bar = HOST_COHERENT | vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        let discrete = memory_props(
+            &[
+                (vk::MemoryPropertyFlags::DEVICE_LOCAL, 0),
+                (HOST_COHERENT, 1),
+                (bar, 2),
+            ],
+            &[8 << 30, 16 << 30, 256 << 20],
+        );
+        assert_eq!(sysmem_staging_type(&discrete, 0b111), Some(1));
+        // ReBAR: still prefer the non-DEVICE_LOCAL host type.
+        let rebar = memory_props(
+            &[
+                (vk::MemoryPropertyFlags::DEVICE_LOCAL, 0),
+                (HOST_COHERENT, 1),
+                (bar, 0),
+            ],
+            &[8 << 30, 16 << 30],
+        );
+        assert_eq!(sysmem_staging_type(&rebar, 0b111), Some(1));
+        // Unified-only (no sysmem type): fall back to the host-coherent BAR type.
+        let unified = memory_props(&[(bar, 0)], &[8 << 30]);
+        assert_eq!(sysmem_staging_type(&unified, 0b1), Some(0));
+    }
+
+    #[test]
+    fn transfer_stamp_uses_the_transfer_timeline_not_render() {
+        let r = ring(16);
+        let a = r.acquire(16).unwrap();
+        r.stamp(a, Stamp::Transfer(1));
+        // A high render value must not free a Transfer stamp.
+        r.reclaim(100, None);
+        assert!(
+            r.acquire(8).is_none(),
+            "Transfer stamp is not ready without a transfer counter"
+        );
+        r.reclaim(100, Some(0));
+        assert!(
+            r.acquire(8).is_none(),
+            "transfer counter 0 has not reached 1"
+        );
+        r.reclaim(0, Some(1));
+        let b = r
+            .acquire(16)
+            .expect("Transfer(1) reclaims at transfer value 1");
+        assert_eq!(b.offset, 0);
+    }
+
+    #[test]
+    fn pooled_copy_arrival_latency_is_one_frame_on_a_fake_timeline() {
+        // Mirrors the render loop: apply_upload (Held) in the command drain,
+        // then note_frame + flush (Stamp::Render of this graphics submit) in
+        // draw. is_arrived becomes true at flush; reclaim waits for that
+        // render value — one deferred frame, no GPU wait on the host.
+        let r = ring(16);
+        let region = r.acquire(16).unwrap();
+        let queued_frame = 0u64;
+        assert_eq!(region.offset, 0);
+
+        // Frame 1: flush stamps the graphics timeline value; region still live.
+        let frame = queued_frame + 1;
+        assert_eq!(
+            frame - queued_frame,
+            1,
+            "flushed the iteration it was applied"
+        );
+        r.stamp(region, Stamp::Render(frame));
+        r.reclaim(0, None);
+        assert!(
+            r.acquire(8).is_none(),
+            "Render(1) region waits for the fake render timeline"
+        );
+
+        // Frame 1's graphics has completed: next reclaim frees it.
+        r.reclaim(frame, None);
+        let recycled = r
+            .acquire(16)
+            .expect("pooled region reclaimed one frame later");
+        assert_eq!(recycled.offset, 0);
     }
 
     #[test]

@@ -221,6 +221,20 @@ pub struct Allocation {
     pool: Pool,
 }
 
+#[cfg(test)]
+impl Allocation {
+    pub(crate) fn dummy() -> Self {
+        Self {
+            buffer: vk::Buffer::null(),
+            offset: 0,
+            size: 0,
+            mapped: None,
+            block: 0,
+            pool: Pool::Device,
+        }
+    }
+}
+
 struct Block {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,

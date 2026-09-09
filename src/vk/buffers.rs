@@ -572,9 +572,10 @@ fn aabb_from_vertices(verts: &[crate::mesh::MeshVertex]) -> (Vec3, Vec3) {
 /// allocation. When the arena is host-mapped (unified / ReBAR) the vertex bytes
 /// are copied with one `copy_nonoverlapping` and the region is stamped
 /// `Stamp::Render(0)` so the next reclaim frees it. Otherwise one pending
-/// `vkCmdCopyBuffer` is batched with the rest of the frame by
-/// [`MeshResidency::flush_copies`] and the region is stamped with the transfer
-/// timeline. The staging ring is transient in both modes.
+/// `vkCmdCopyBuffer` is batched onto the graphics command buffer (one copy
+/// command per arena + one barrier) by [`MeshResidency::flush_copies`] and
+/// the region is stamped `Stamp::Render` of that submit. The staging ring is
+/// transient in both modes.
 pub(crate) unsafe fn build_mesh_resident_staged(
     device: &ash::Device,
     allocator: &mut GpuAllocator,
@@ -671,7 +672,9 @@ pub(crate) unsafe fn build_mesh_resident_staged(
 pub(crate) struct MeshResidency {
     slots: Vec<Option<GpuResident>>,
     generations: Vec<NonZeroU32>,
-    pending: Vec<u32>,
+    /// `(slot, frame)` queued at [`Self::apply_upload`]; `frame` is
+    /// [`Self::frame`] at apply so arrival delay is host-testable.
+    pending: Vec<(u32, u64)>,
     /// Device buffers and same-queue staging (render-Rev).
     retire: RetireQueue<Allocation>,
     /// Staging for separate transfer queue (lane-Rev).
@@ -682,6 +685,11 @@ pub(crate) struct MeshResidency {
     /// The last separate-queue batch's wait value + ACQUIRE barriers, owed
     /// to the next graphics submission (see [`Self::flush_copies`]).
     deferred: Option<DeferredArrival>,
+    /// Bumped once per render-loop iteration ([`Self::note_frame`]) before
+    /// flush, so a copy applied in the preceding drain has delay 1.
+    frame: u64,
+    /// Last flush's max pending-to-arrived delay in frames (pooled copies).
+    last_pool_arrival_frames: u64,
 }
 
 impl MeshResidency {
@@ -695,7 +703,16 @@ impl MeshResidency {
             live: 0,
             arrived_since_flush: Vec::new(),
             deferred: None,
+            frame: 0,
+            last_pool_arrival_frames: 0,
         }
+    }
+
+    /// Advance the arrival-delay clock. Call once per render-loop iteration
+    /// after the command drain (so apply sees the previous value) and before
+    /// [`Self::flush_copies`].
+    pub fn note_frame(&mut self) {
+        self.frame = self.frame.saturating_add(1);
     }
 
     /// Check if slot's bytes are visible to the cull dispatch.
@@ -724,7 +741,7 @@ impl MeshResidency {
         let i = slot as usize;
         self.ensure_slot(i);
         if resident.copy.is_some() {
-            self.pending.push(slot);
+            self.pending.push((slot, self.frame));
         }
         if self.slots[i].is_none() {
             self.live += 1;
@@ -761,6 +778,10 @@ impl MeshResidency {
     /// Copies are issued as one `vkCmdCopyBuffer` per (staging block, arena)
     /// pair and the barriers cover coalesced destination runs (see
     /// [`coalesce_ranges`]), so a burst of N meshes costs O(arenas) commands.
+    /// Pooled copies record into `graphics_cmd` with a draw barrier and do
+    /// **not** arm a transfer-lane wait — later graphics submits see them
+    /// via queue order (one deferred arrival frame). Per-mesh staging allocs
+    /// keep the transfer-lane path.
     ///
     /// # Cross-queue hazard analysis (why the wait is deferred one frame)
     ///
@@ -794,7 +815,7 @@ impl MeshResidency {
     /// contents — every byte is overwritten by the copy.
     ///
     /// `graphics_cmd` must be a real, valid (reset-and-begun) command buffer:
-    /// the `SameQueueFallback` tier records its copies and barrier into it.
+    /// pooled copies (and the `SameQueueFallback` tier) record into it.
     pub unsafe fn flush_copies(
         &mut self,
         device: &ash::Device,
@@ -811,7 +832,7 @@ impl MeshResidency {
         // Take first item unconditionally, then more while under budget.
         let mut budget = TRANSFER_BUDGET_BYTES_PER_FRAME;
         let mut take = 0;
-        for (i, &slot) in self.pending.iter().enumerate() {
+        for (i, &(slot, _)) in self.pending.iter().enumerate() {
             let size = self
                 .slots
                 .get(slot as usize)
@@ -829,18 +850,28 @@ impl MeshResidency {
 
         let separate_queue = lane.is_separate_queue();
         let needs_qfot = lane.needs_ownership_transfer();
-        let lane_batch = separate_queue.then(|| unsafe { lane.begin(device) });
-        let record_cmd = lane_batch.as_ref().map_or(graphics_cmd, |b| b.cmd());
 
         let mut bytes = 0u64;
-        // Regions grouped per (staging block, destination arena) pair; the
-        // destination ranges feed the coalesced barriers below.
-        let mut copies: Vec<(vk::Buffer, vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
-        let mut written: Vec<BufferRange> = Vec::with_capacity(batch.len());
-        let mut copied_slots: Vec<u32> = Vec::with_capacity(batch.len());
-        let mut staging_allocs: Vec<Allocation> = Vec::with_capacity(batch.len());
+        // Alloc copies may ride the transfer lane; pooled copies always record
+        // into `graphics_cmd` so they never arm `pending_transfer_wait`.
+        let mut alloc_copies: Vec<(vk::Buffer, vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
+        let mut pool_copies: Vec<(vk::Buffer, vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
+        let mut alloc_written: Vec<BufferRange> = Vec::new();
+        let mut pool_written: Vec<BufferRange> = Vec::new();
+        let mut alloc_slots: Vec<u32> = Vec::new();
+        let mut pool_slots: Vec<(u32, u64)> = Vec::new();
+        let mut staging_allocs: Vec<Allocation> = Vec::new();
         let mut staging_leases: Vec<StagingLease> = Vec::new();
-        for slot in batch {
+        let push = |copies: &mut Vec<(vk::Buffer, vk::Buffer, Vec<vk::BufferCopy>)>,
+                    src: vk::Buffer,
+                    dst: vk::Buffer,
+                    region: vk::BufferCopy| {
+            match copies.iter_mut().find(|(s, d, _)| *s == src && *d == dst) {
+                Some((_, _, regions)) => regions.push(region),
+                None => copies.push((src, dst, vec![region])),
+            }
+        };
+        for (slot, queued_at) in batch {
             let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) else {
                 continue;
             };
@@ -851,60 +882,74 @@ impl MeshResidency {
                 .src_offset(copy.src_offset)
                 .dst_offset(copy.dst_offset)
                 .size(copy.size);
-            match copies
-                .iter_mut()
-                .find(|(src, dst, _)| *src == copy.src_buffer && *dst == copy.dst_buffer)
-            {
-                Some((_, _, regions)) => regions.push(region),
-                None => copies.push((copy.src_buffer, copy.dst_buffer, vec![region])),
-            }
-            written.push(BufferRange {
+            let dest = BufferRange {
                 buffer: copy.dst_buffer,
                 offset: copy.dst_offset,
                 size: copy.size,
-            });
+            };
             bytes += copy.size;
             match copy.source {
-                CopySource::Alloc(alloc) => staging_allocs.push(alloc),
-                CopySource::Pool(lease) => staging_leases.push(lease),
+                CopySource::Alloc(alloc) => {
+                    push(&mut alloc_copies, copy.src_buffer, copy.dst_buffer, region);
+                    alloc_written.push(dest);
+                    staging_allocs.push(alloc);
+                    alloc_slots.push(slot);
+                }
+                CopySource::Pool(lease) => {
+                    push(&mut pool_copies, copy.src_buffer, copy.dst_buffer, region);
+                    pool_written.push(dest);
+                    staging_leases.push(lease);
+                    pool_slots.push((slot, queued_at));
+                }
             }
-            copied_slots.push(slot);
         }
 
-        if copied_slots.is_empty() {
-            // Every batched resident was freed before this flush ran (nothing
-            // actually copied), so there is no completion to hand back.
-            if let Some(lane_batch) = lane_batch {
-                unsafe { lane.discard(device, lane_batch) };
-            }
+        if alloc_slots.is_empty() && pool_slots.is_empty() {
             return;
         }
         crate::profile::gauge(crate::profile::Gauge::UploadBytes, bytes);
 
-        unsafe {
-            for (src, dst, regions) in &copies {
-                device.cmd_copy_buffer(record_cmd, *src, *dst, regions);
+        let record = |cmd, copies: &[(vk::Buffer, vk::Buffer, Vec<vk::BufferCopy>)]| unsafe {
+            for (src, dst, regions) in copies {
+                device.cmd_copy_buffer(cmd, *src, *dst, regions);
             }
-        }
-        let written = coalesce_ranges(written);
-        let barriers = |role: CopyBarrier| -> Vec<vk::BufferMemoryBarrier2<'static>> {
-            written
+        };
+        let barriers = |written: &[BufferRange],
+                        role: CopyBarrier|
+         -> Vec<vk::BufferMemoryBarrier2<'static>> {
+            coalesce_ranges(written.to_vec())
                 .iter()
                 .map(|r| copy_barrier(r.buffer, r.offset, r.size, mesh_reads(), role))
                 .collect()
         };
+        let draw_barrier = |cmd, written: &[BufferRange]| {
+            let draw = barriers(written, CopyBarrier::Draw);
+            if draw.is_empty() {
+                return;
+            }
+            unsafe {
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&draw),
+                );
+            }
+        };
 
-        let arrived_at = if let Some(lane_batch) = lane_batch {
-            // Cross-queue: the RELEASE half rides the lane batch on the
-            // dedicated-family tier; the ACQUIRE half and the semaphore wait
-            // are deferred to the next graphics submission (see the hazard
-            // analysis above). `SecondQueueSameFamily` needs neither: same
-            // family, and the timeline signal/wait pair covers visibility.
+        // Per-mesh staging allocs keep the transfer-lane path (old staging).
+        let alloc_arrived = if alloc_copies.is_empty() {
+            render_done_at
+        } else if separate_queue {
+            let lane_batch = unsafe { lane.begin(device) };
+            let record_cmd = lane_batch.cmd();
+            record(record_cmd, &alloc_copies);
             if needs_qfot {
-                let release = barriers(CopyBarrier::Release {
-                    src_family: lane.family(),
-                    dst_family: graphics_family,
-                });
+                let release = barriers(
+                    &alloc_written,
+                    CopyBarrier::Release {
+                        src_family: lane.family(),
+                        dst_family: graphics_family,
+                    },
+                );
                 unsafe {
                     device.cmd_pipeline_barrier2(
                         record_cmd,
@@ -914,50 +959,99 @@ impl MeshResidency {
             }
             let value = unsafe { lane.submit(device, lane_batch) };
             let acquires = if needs_qfot {
-                barriers(CopyBarrier::Acquire {
-                    src_family: lane.family(),
-                    dst_family: graphics_family,
-                })
+                barriers(
+                    &alloc_written,
+                    CopyBarrier::Acquire {
+                        src_family: lane.family(),
+                        dst_family: graphics_family,
+                    },
+                )
             } else {
                 Vec::new()
             };
             self.defer_arrival(value, acquires);
             value
         } else {
-            // Same queue: the barrier in graphics_cmd orders the copies ahead
-            // of every later vertex fetch in submission order.
-            let draw = barriers(CopyBarrier::Draw);
-            unsafe {
-                device.cmd_pipeline_barrier2(
-                    record_cmd,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&draw),
-                );
-            }
+            record(graphics_cmd, &alloc_copies);
+            draw_barrier(graphics_cmd, &alloc_written);
             render_done_at
         };
-        // Retire staging on its own timeline (separate queue) or render (fallback).
+
+        // Pooled copies: graphics CB + one barrier. Later graphics submits
+        // see them via queue order — no transfer-lane wait, one deferred
+        // arrival frame (cull already ran with `is_arrived` false).
+        if !pool_copies.is_empty() {
+            record(graphics_cmd, &pool_copies);
+            draw_barrier(graphics_cmd, &pool_written);
+        }
+        let pool_arrived = render_done_at;
+
         let staging_queue = if separate_queue {
             &mut self.transfer_retire
         } else {
             &mut self.retire
         };
         for alloc in staging_allocs {
-            staging_queue.push(arrived_at, alloc);
+            staging_queue.push(alloc_arrived, alloc);
         }
-        let pool_stamp = if separate_queue {
-            Stamp::Transfer(arrived_at.raw())
-        } else {
-            Stamp::Render(arrived_at.raw())
-        };
         for lease in staging_leases {
-            lease.stamp(pool_stamp);
+            lease.stamp(Stamp::Render(pool_arrived.raw()));
         }
-        for slot in copied_slots {
+
+        let mut max_pool_delay = 0u64;
+        for slot in alloc_slots {
             if let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) {
-                res.arrived_at = Some(arrived_at);
+                res.arrived_at = Some(alloc_arrived);
                 self.arrived_since_flush.push(slot);
             }
         }
+        let pool_n = pool_slots.len() as u64;
+        for (slot, queued_at) in pool_slots {
+            max_pool_delay = max_pool_delay.max(self.frame.saturating_sub(queued_at));
+            if let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) {
+                res.arrived_at = Some(pool_arrived);
+                self.arrived_since_flush.push(slot);
+            }
+        }
+        self.last_pool_arrival_frames = max_pool_delay;
+        crate::profile::gauge(crate::profile::Gauge::PoolCopies, pool_n);
+        crate::profile::gauge(crate::profile::Gauge::PoolArrivalFrames, max_pool_delay);
+    }
+
+    /// Host-only flush of pending pooled copies: marks them arrived and
+    /// stamps leases the way [`Self::flush_copies`] does on the graphics path
+    /// (`Stamp::Render`). Used to unit-test arrival latency without Vulkan.
+    #[cfg(test)]
+    pub(crate) fn complete_pooled_copies_for_test(&mut self, arrived_at: TimelineValue) {
+        let batch = std::mem::take(&mut self.pending);
+        let mut max_delay = 0u64;
+        let mut n = 0u64;
+        for (slot, queued_at) in batch {
+            let Some(res) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) else {
+                continue;
+            };
+            let Some(copy) = res.copy.take() else {
+                continue;
+            };
+            match copy.source {
+                CopySource::Pool(lease) => {
+                    lease.stamp(Stamp::Render(arrived_at.raw()));
+                    n += 1;
+                    max_delay = max_delay.max(self.frame.saturating_sub(queued_at));
+                }
+                CopySource::Alloc(_) => {}
+            }
+            res.arrived_at = Some(arrived_at);
+            self.arrived_since_flush.push(slot);
+        }
+        self.last_pool_arrival_frames = max_delay;
+        crate::profile::gauge(crate::profile::Gauge::PoolCopies, n);
+        crate::profile::gauge(crate::profile::Gauge::PoolArrivalFrames, max_delay);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_pool_arrival_frames(&self) -> u64 {
+        self.last_pool_arrival_frames
     }
 
     /// Stashes a submitted lane batch's graphics-side half. Folds into any
@@ -2401,6 +2495,66 @@ mod tests {
                 counts[FACE_UPLOAD_ORDER[2]] | (counts[FACE_UPLOAD_ORDER[3]] << 16),
                 counts[FACE_UPLOAD_ORDER[4]] | (counts[FACE_UPLOAD_ORDER[5]] << 16),
             ]
+        );
+    }
+
+    #[test]
+    fn pooled_mesh_arrives_one_frame_later_with_a_fake_timeline() {
+        use super::super::alloc::Allocation;
+        use super::super::mesh_staging::MeshStagingPool;
+        use super::{CopySource, GpuResident, MeshResidency, PendingCopy};
+        use std::num::NonZeroU32;
+
+        let pool = MeshStagingPool::new_host(8);
+        let staging = pool.stager().acquire(8).expect("host pool");
+        let lease = staging.into_lease();
+
+        let mut res = MeshResidency::new();
+        res.apply_upload(
+            0,
+            NonZeroU32::MIN,
+            GpuResident {
+                buffer: vk::Buffer::null(),
+                arena: Allocation::dummy(),
+                copy: Some(PendingCopy {
+                    src_buffer: vk::Buffer::null(),
+                    src_offset: 0,
+                    dst_buffer: vk::Buffer::null(),
+                    dst_offset: 0,
+                    size: 8,
+                    source: CopySource::Pool(lease),
+                }),
+                arrived_at: None,
+            },
+        );
+        assert!(!res.is_arrived(0), "pending copy is not arrived at apply");
+        assert!(
+            !res.has_deferred(),
+            "pooled copies must not arm a transfer wait"
+        );
+
+        // Drain then draw: note_frame then flush. Delay == 1.
+        res.note_frame();
+        let done = TimelineValue::from_raw_for_test(1);
+        res.complete_pooled_copies_for_test(done);
+        assert!(res.is_arrived(0));
+        assert_eq!(res.last_pool_arrival_frames(), 1);
+        assert_eq!(res.take_arrived(), vec![0]);
+        assert!(
+            !res.has_deferred(),
+            "graphics-queue pooled flush defers arrival without a lane wait"
+        );
+
+        // Stamp::Render(1): reclaim against render 0 keeps the region.
+        pool.reclaim(TimelineValue::START, None);
+        assert!(
+            pool.stager().acquire(8).is_none(),
+            "region waits for the fake render timeline"
+        );
+        pool.reclaim(done, None);
+        assert!(
+            pool.stager().acquire(8).is_some(),
+            "reclaimed one deferred frame later, no GPU wait"
         );
     }
 }
