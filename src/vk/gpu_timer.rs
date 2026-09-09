@@ -39,6 +39,9 @@ pub(super) enum GpuPass {
     /// End of the scene pass: `cmd_end_rendering` (where the MSAA color
     /// resolve executes) and the offscreen/depth-rest finalize transitions.
     Resolve,
+    /// Hi-Z pyramid reduce (after depth rests, before VRS classify; stamped
+    /// only when it runs).
+    HiZ,
     /// The VRS classify dispatch (end of frame, after depth rests; stamped
     /// only when it runs).
     Vrs,
@@ -55,7 +58,7 @@ pub(super) enum GpuPass {
 }
 
 impl GpuPass {
-    pub(super) const ALL: [GpuPass; 18] = [
+    pub(super) const ALL: [GpuPass; 19] = [
         GpuPass::Copies,
         GpuPass::Cull,
         GpuPass::ShadowMap,
@@ -70,6 +73,7 @@ impl GpuPass {
         GpuPass::Transparent,
         GpuPass::Overlay,
         GpuPass::Resolve,
+        GpuPass::HiZ,
         GpuPass::Vrs,
         GpuPass::Taa,
         GpuPass::Exposure,
@@ -94,6 +98,7 @@ impl GpuPass {
             GpuPass::Transparent => Meter::GpuTransparent,
             GpuPass::Overlay => Meter::GpuOverlay,
             GpuPass::Resolve => Meter::GpuResolve,
+            GpuPass::HiZ => Meter::GpuHiz,
             GpuPass::Vrs => Meter::GpuVrs,
             GpuPass::Taa => Meter::GpuTaa,
             GpuPass::Exposure => Meter::GpuExposure,

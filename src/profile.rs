@@ -92,6 +92,8 @@ pub enum Meter {
     GpuShadowMap,
     /// VRS classify dispatch (only with a rate image and primed depth).
     GpuVrs,
+    /// Hi-Z pyramid reduce (only with occlusion on and a 3D scene).
+    GpuHiz,
     /// Scene-pass begin: attachment transitions + `cmd_begin_rendering` clears.
     GpuClear,
     /// Combined opaque span (full-res + cutout + coarse LOD), summed at GPU
@@ -137,7 +139,7 @@ pub enum Meter {
 }
 
 impl Meter {
-    const ALL: [Meter; 55] = [
+    const ALL: [Meter; 56] = [
         Meter::NetEvents,
         Meter::Physics,
         Meter::StreamDrain,
@@ -170,6 +172,7 @@ impl Meter {
         Meter::GpuCull,
         Meter::GpuShadowMap,
         Meter::GpuVrs,
+        Meter::GpuHiz,
         Meter::GpuClear,
         Meter::GpuOpaque,
         Meter::GpuOpaqueFull,
@@ -230,6 +233,7 @@ impl Meter {
             Meter::GpuCull => "cull",
             Meter::GpuShadowMap => "shadowmap",
             Meter::GpuVrs => "vrs",
+            Meter::GpuHiz => "hiz",
             Meter::GpuClear => "clear",
             Meter::GpuOpaque => "opaque",
             Meter::GpuOpaqueFull => "opaque.full",
@@ -285,6 +289,7 @@ impl Meter {
             | Meter::GpuCull
             | Meter::GpuShadowMap
             | Meter::GpuVrs
+            | Meter::GpuHiz
             | Meter::GpuClear
             | Meter::GpuOpaque
             | Meter::GpuOpaqueFull

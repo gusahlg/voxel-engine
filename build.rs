@@ -107,6 +107,19 @@ const SHADERS: &[Shader] = &[
         entry: "computeMain",
         dst: "vrs.comp.spv",
     },
+    // Hi-Z: two entry points from one source (depth → mip 0, then mip chain).
+    Shader {
+        src: "shaders/hiz.comp.slang",
+        stage: "compute",
+        entry: "reduce_depth",
+        dst: "hiz_depth.comp.spv",
+    },
+    Shader {
+        src: "shaders/hiz.comp.slang",
+        stage: "compute",
+        entry: "reduce_mip",
+        dst: "hiz_mip.comp.spv",
+    },
     Shader {
         src: "shaders/shadow_depth.vert.slang",
         stage: "vertex",

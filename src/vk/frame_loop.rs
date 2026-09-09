@@ -503,9 +503,9 @@ impl Renderer {
     /// Issued only when [`sampleable_depth_consumed`] is true. Src is the
     /// attachment-write scope (depth tests, or COLOR_ATTACHMENT_OUTPUT for the
     /// MSAA SAMPLE_ZERO resolve). Dst covers every consumer that samples it
-    /// without a further transition: VRS compute, the quarter-res spill compute
-    /// (godrays), and the present-time tonemap fragment (fused TAA). The present
-    /// copy is a later submit that waits on the render timeline.
+    /// without a further transition: Hi-Z compute, VRS compute, the quarter-res
+    /// spill compute (godrays), and the present-time tonemap fragment (fused TAA).
+    /// The present copy is a later submit that waits on the render timeline.
     pub(super) fn sampleable_depth_rest_barrier(&self, slot: usize) -> vk::ImageMemoryBarrier2<'_> {
         let (src_layout, src_stage, src_access) = self.sampleable_depth_attachment_state();
         vk::ImageMemoryBarrier2::default()
@@ -1241,11 +1241,17 @@ impl Renderer {
         let vrs_on = lists.scene.is_some() && self.flags.vrs && self.targets.vrs.is_some();
         let do_vrs = vrs_on && self.slots[FrameSlot::new(slot)].vrs_ready;
         let classify_vrs = vrs_on;
+        let build_hiz = lists.scene.is_some() && self.flags.occlusion;
         // Depth consumers after the scene pass, computed once: VRS classify,
-        // spill/godrays (presented + bloom or a live march), fused TAA.
+        // Hi-Z reduce, spill/godrays (presented + bloom or a live march), fused TAA.
         let spill_live = self.flags.bloom || godray.strength > 0.0;
-        let sample_depth =
-            sampleable_depth_consumed(will_present, self.flags.taa, spill_live, classify_vrs);
+        let sample_depth = sampleable_depth_consumed(
+            will_present,
+            self.flags.taa,
+            spill_live,
+            classify_vrs,
+            build_hiz,
+        );
         // HDR colour is only read by bloom/exposure/spill/tonemap, all of which
         // run on presented frames. Minimap is a separate texture; screenshots
         // copy the swapchain after tonemap; VRS classify reads depth not colour.
@@ -1354,8 +1360,9 @@ impl Renderer {
         let readable: HdrReadable = {
             let _g = crate::profile::scope(crate::profile::Meter::RecTransitions);
             if run_exposure {
-                unsafe { pass.end_deferred(classify_vrs) };
+                unsafe { pass.end_deferred(classify_vrs, build_hiz) };
                 stamp(GpuPass::Resolve);
+                self.finish_hiz(cmd, slot, build_hiz, lists);
                 self.finish_vrs_classify(cmd, slot, classify_vrs, lists);
                 // Reduce the (jittered, unresolved) frame HDR to per-tile mean
                 // log2-luma, publish the smoothed exposure, and finalize the HDR
@@ -1371,13 +1378,14 @@ impl Renderer {
                 }
                 readable
             } else if will_present {
-                let readable = unsafe { pass.end_sampled(classify_vrs) };
+                let readable = unsafe { pass.end_sampled(classify_vrs, build_hiz) };
                 if profiling {
                     unsafe {
                         self.gpu_timer
                             .mark(&self.device.device, cmd, slot, GpuPass::Resolve)
                     };
                 }
+                self.finish_hiz(cmd, slot, build_hiz, lists);
                 self.finish_vrs_classify(cmd, slot, classify_vrs, lists);
                 readable
             } else {
@@ -1385,8 +1393,9 @@ impl Renderer {
                 // the next begin discards the offscreen from UNDEFINED. Depth
                 // rests only when this frame samples it (classifier); a later
                 // present uses a different slot's depth.
-                unsafe { pass.end_deferred(classify_vrs) };
+                unsafe { pass.end_deferred(classify_vrs, build_hiz) };
                 stamp(GpuPass::Resolve);
+                self.finish_hiz(cmd, slot, build_hiz, lists);
                 self.finish_vrs_classify(cmd, slot, classify_vrs, lists);
                 HdrReadable::new(slot)
             }
@@ -1436,6 +1445,25 @@ impl Renderer {
             self.targets.offscreen[slot].image(),
             self.targets.offscreen[slot].view(),
         )
+    }
+
+    /// End-of-frame Hi-Z: this slot's just-written depth, for the next frame's
+    /// cull compute. Depth already rests in [`SAMPLEABLE_DEPTH_REST_LAYOUT`];
+    /// the pyramid → GENERAL joined the post-scene barrier. The reduce leaves
+    /// it in `SHADER_READ_ONLY`.
+    fn finish_hiz(&mut self, cmd: vk::CommandBuffer, slot: usize, build: bool, lists: &DrawLists) {
+        if !build {
+            return;
+        }
+        let _ = lists.scene.as_ref().expect("build_hiz implies a 3D scene");
+        unsafe { self.record_hiz_generate(cmd, slot) };
+        if crate::profile::is_enabled() {
+            unsafe {
+                self.gpu_timer.recorded(slot);
+                self.gpu_timer
+                    .mark(&self.device.device, cmd, slot, GpuPass::HiZ)
+            };
+        }
     }
 
     /// End-of-frame classify: this slot's just-written depth, for the next use

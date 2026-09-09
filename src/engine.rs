@@ -113,6 +113,11 @@ pub struct RenderFlags {
     /// Night starfield in the sky pass (`extras.x` gain). Off skips the
     /// per-pixel hash-grid star evaluation entirely.
     pub stars: bool,
+    /// GPU occlusion culling: a Hi-Z depth pyramid is built after the scene
+    /// pass and the next frame's cull compute tests camera draws against it.
+    /// Off skips the pyramid pass (and, once wired, the occlusion test).
+    /// Default on.
+    pub occlusion: bool,
 }
 
 impl Default for RenderFlags {
@@ -133,6 +138,7 @@ impl Default for RenderFlags {
             water_anim: true,
             vignette: false,
             stars: true,
+            occlusion: true,
         }
     }
 }

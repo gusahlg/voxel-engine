@@ -864,10 +864,11 @@ impl<'a> RenderPass<'a> {
     /// Use when no later pass writes the offscreen, so this pass owns the final
     /// transition for tonemapping. Sampleable depth rests here when a later
     /// pass samples it (see [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]);
-    /// `classify_vrs` joins the rate and history images into the same barrier.
-    pub(super) unsafe fn end_sampled(self, classify_vrs: bool) -> HdrReadable {
+    /// `classify_vrs` / `build_hiz` join the rate/history and Hi-Z pyramid
+    /// images into the same barrier.
+    pub(super) unsafe fn end_sampled(self, classify_vrs: bool, build_hiz: bool) -> HdrReadable {
         let slot = self.slot;
-        unsafe { self.end(true, classify_vrs) };
+        unsafe { self.end(true, classify_vrs, build_hiz) };
         HdrReadable::new(slot)
     }
 
@@ -877,11 +878,11 @@ impl<'a> RenderPass<'a> {
     /// Sampleable depth still rests in [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]
     /// when a later pass samples it. Yields no proof — the deferred finalizer
     /// produces it.
-    pub(super) unsafe fn end_deferred(self, classify_vrs: bool) {
-        unsafe { self.end(false, classify_vrs) };
+    pub(super) unsafe fn end_deferred(self, classify_vrs: bool, build_hiz: bool) {
+        unsafe { self.end(false, classify_vrs, build_hiz) };
     }
 
-    unsafe fn end(mut self, transition_offscreen: bool, classify_vrs: bool) {
+    unsafe fn end(mut self, transition_offscreen: bool, classify_vrs: bool, build_hiz: bool) {
         let device = &self.r.device.device;
         let cmd = self.cmd;
         unsafe {
@@ -895,10 +896,9 @@ impl<'a> RenderPass<'a> {
             let mix_filled = classify_vrs && self.r.record_vrs_mix_fill(cmd, self.slot);
 
             // One vkCmdPipelineBarrier2: offscreen (optional) + sampleable-depth
-            // rest (only when a later pass samples it) + (if classifying)
-            // rate/history → GENERAL. No extra VRS pipeline barrier beyond the
-            // two the frame already has.
-            let mut images = [vk::ImageMemoryBarrier2::default(); 4];
+            // rest (only when a later pass samples it) + (if building Hi-Z)
+            // pyramid → GENERAL + (if classifying) rate/history → GENERAL.
+            let mut images = [vk::ImageMemoryBarrier2::default(); 5];
             let mut n = 0;
             if transition_offscreen {
                 // Offscreen: src COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE
@@ -921,6 +921,10 @@ impl<'a> RenderPass<'a> {
             // Skipped when nothing samples; the next begin is UNDEFINED.
             if self.sample_depth {
                 images[n] = self.r.sampleable_depth_rest_barrier(self.slot);
+                n += 1;
+            }
+            if build_hiz {
+                images[n] = self.r.hiz_to_general_barrier(self.slot);
                 n += 1;
             }
             if classify_vrs {

@@ -312,6 +312,126 @@ impl BloomChain {
     }
 }
 
+/// Half-res R32F mip extents down to 1×1. Mirrors the bloom base (ceil-half
+/// of the render extent) but continues until both axes are 1.
+pub(crate) fn hiz_mip_extents(extent: vk::Extent2D) -> Vec<vk::Extent2D> {
+    let mut e = vk::Extent2D {
+        width: extent.width.div_ceil(2).max(1),
+        height: extent.height.div_ceil(2).max(1),
+    };
+    let mut mip_extents = vec![e];
+    while e.width > 1 || e.height > 1 {
+        e = vk::Extent2D {
+            width: e.width.div_ceil(2).max(1),
+            height: e.height.div_ceil(2).max(1),
+        };
+        mip_extents.push(e);
+    }
+    mip_extents
+}
+
+/// Per-slot Hi-Z depth pyramid: conservative farthest-depth mips starting at
+/// half render resolution. STORAGE for the reduce writes, SAMPLED for the
+/// next frame's cull, TRANSFER_DST for the history-invalidation clear-to-0.
+pub(crate) struct HizChain {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub sample_view: vk::ImageView,
+    pub mip_views: Vec<vk::ImageView>,
+    pub mip_extents: Vec<vk::Extent2D>,
+    /// True once a reduce or a clear-to-0 has left this pyramid in
+    /// `SHADER_READ_ONLY`. False after create/recreate.
+    pub ready: bool,
+}
+
+impl HizChain {
+    fn new(
+        device: &ash::Device,
+        memory_props: &vk::PhysicalDeviceMemoryProperties,
+        extent: vk::Extent2D,
+    ) -> Result<HizChain, AllocError> {
+        let mip_extents = hiz_mip_extents(extent);
+        let base = mip_extents[0];
+        let levels = mip_extents.len() as u32;
+        let purpose = image_purpose("Hi-Z pyramid", base, vk::SampleCountFlags::TYPE_1);
+
+        let image = unsafe {
+            device
+                .create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(vk::Format::R32_SFLOAT)
+                        .extent(vk::Extent3D {
+                            width: base.width,
+                            height: base.height,
+                            depth: 1,
+                        })
+                        .mip_levels(levels)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(
+                            vk::ImageUsageFlags::STORAGE
+                                | vk::ImageUsageFlags::SAMPLED
+                                | vk::ImageUsageFlags::TRANSFER_DST,
+                        )
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )
+                .expect("create Hi-Z image")
+        };
+        let memory = match allocate_and_bind_image(device, memory_props, image, &purpose) {
+            Ok(memory) => memory,
+            Err(err) => {
+                unsafe { device.destroy_image(image, None) };
+                return Err(err);
+            }
+        };
+
+        let view = |base_mip: u32, count: u32| unsafe {
+            device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::R32_SFLOAT)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: base_mip,
+                            level_count: count,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        }),
+                    None,
+                )
+                .expect("create Hi-Z image view")
+        };
+        let sample_view = view(0, levels);
+        let mip_views = (0..levels).map(|m| view(m, 1)).collect();
+
+        Ok(HizChain {
+            image,
+            memory,
+            sample_view,
+            mip_views,
+            mip_extents,
+            ready: false,
+        })
+    }
+
+    unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.destroy_image_view(self.sample_view, None);
+            for v in &self.mip_views {
+                device.destroy_image_view(*v, None);
+            }
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
 pub struct RenderTargets {
     /// Per-slot so the VRS compute pass can sample this slot's depth from
     /// `FRAMES_IN_FLIGHT` cycles ago (fence-synchronised) while other slots are in flight.
@@ -337,6 +457,10 @@ pub struct RenderTargets {
     /// images, history, and mix readback. `RenderFlags::vrs` decides whether
     /// a frame actually classifies and binds the rate attachment.
     pub(crate) vrs: Option<super::vrs::Vrs>,
+    /// Per-slot Hi-Z depth pyramid (half-res R32F mip chain down to 1×1).
+    /// Built after the scene pass when `RenderFlags::occlusion` is on; sampled
+    /// by the next frame's cull compute. Recreated with the targets.
+    pub(crate) hiz: [HizChain; FRAMES_IN_FLIGHT as usize],
     /// Shared cascaded shadow map (every FIF slot samples the same image).
     /// Regenerated once per `ShadowKey`; see `shadow.rs` hazard analysis.
     pub(crate) shadow: ShadowMap,
@@ -362,6 +486,7 @@ struct TargetBuild<'a> {
     msaa: Option<ImageResource>,
     offscreen: [Option<ImageResource>; SLOTS],
     vrs: Option<super::vrs::Vrs>,
+    hiz: [Option<HizChain>; SLOTS],
     shadow: Option<ShadowMap>,
     bloom: [Option<BloomChain>; SLOTS],
     spill: [Option<ImageResource>; SLOTS],
@@ -390,6 +515,9 @@ impl Drop for TargetBuild<'_> {
             }
             if let Some(vrs) = &mut self.vrs {
                 vrs.destroy(device);
+            }
+            for chain in self.hiz.iter().flatten() {
+                chain.destroy(device);
             }
             if let Some(shadow) = &self.shadow {
                 shadow.destroy(device);
@@ -424,6 +552,7 @@ impl TargetBuild<'_> {
             samples,
             color_format,
             vrs: self.vrs.take(),
+            hiz: take_filled(&mut self.hiz),
             shadow: self.shadow.take().expect("shadow map"),
             bloom: take_filled(&mut self.bloom),
             spill: take_filled(&mut self.spill),
@@ -458,6 +587,7 @@ impl RenderTargets {
             msaa: None,
             offscreen: std::array::from_fn(|_| None),
             vrs: None,
+            hiz: std::array::from_fn(|_| None),
             shadow: None,
             bloom: std::array::from_fn(|_| None),
             spill: std::array::from_fn(|_| None),
@@ -552,6 +682,10 @@ impl RenderTargets {
             build.vrs = Some(super::vrs::Vrs::new(device, &memory_props, f, extent)?);
         }
 
+        for chain in &mut build.hiz {
+            *chain = Some(HizChain::new(device, &memory_props, extent)?);
+        }
+
         build.shadow = Some(ShadowMap::new(device, &memory_props)?);
 
         for chain in &mut build.bloom {
@@ -631,6 +765,9 @@ impl RenderTargets {
             }
             if let Some(vrs) = &mut self.vrs {
                 vrs.destroy(device);
+            }
+            for chain in &self.hiz {
+                chain.destroy(device);
             }
             self.shadow.destroy(device);
             for chain in &self.bloom {
@@ -863,5 +1000,66 @@ mod tests {
         assert!(!color_format_has_alpha(HDR_11BIT_FORMAT));
         assert!(color_format_has_alpha(HDR_COLOR_FORMAT));
         assert!(color_format_has_alpha(vk::Format::B8G8R8A8_UNORM));
+    }
+
+    #[test]
+    fn hiz_mip_chain_starts_at_half_res_and_reaches_1x1() {
+        let e = vk::Extent2D {
+            width: 1920,
+            height: 1080,
+        };
+        let mips = hiz_mip_extents(e);
+        assert_eq!(
+            mips[0],
+            vk::Extent2D {
+                width: 960,
+                height: 540
+            }
+        );
+        let last = *mips.last().unwrap();
+        assert_eq!(
+            last,
+            vk::Extent2D {
+                width: 1,
+                height: 1
+            }
+        );
+        // Each step is ceil-half of the previous.
+        for w in mips.windows(2) {
+            assert_eq!(w[1].width, w[0].width.div_ceil(2).max(1));
+            assert_eq!(w[1].height, w[0].height.div_ceil(2).max(1));
+        }
+    }
+
+    #[test]
+    fn hiz_mip_chain_odd_extent_ceils_and_still_reaches_1x1() {
+        let mips = hiz_mip_extents(vk::Extent2D {
+            width: 3,
+            height: 1,
+        });
+        assert_eq!(
+            mips,
+            [
+                vk::Extent2D {
+                    width: 2,
+                    height: 1
+                },
+                vk::Extent2D {
+                    width: 1,
+                    height: 1
+                },
+            ]
+        );
+        let tiny = hiz_mip_extents(vk::Extent2D {
+            width: 1,
+            height: 1,
+        });
+        assert_eq!(
+            tiny,
+            [vk::Extent2D {
+                width: 1,
+                height: 1
+            }]
+        );
     }
 }

@@ -14,6 +14,7 @@ pub(crate) mod device;
 pub(crate) mod exposure;
 pub(crate) mod frame_loop;
 pub(crate) mod gpu_timer;
+pub(crate) mod hiz;
 pub(crate) mod image;
 pub(crate) mod image_upload;
 pub(crate) mod instance;
@@ -164,6 +165,8 @@ pub(crate) struct Renderer {
     exposure: exposure::ExposureState,
     /// Bloom pipelines.
     bloom: bloom::BloomState,
+    /// Hi-Z pyramid compute.
+    hiz: hiz::HizState,
     /// Cloud-LUT compute pipeline.
     sky_cloud: sky::SkyCloudState,
     /// TAA state.
@@ -442,6 +445,7 @@ impl Renderer {
             pipeline_cache,
         );
         let bloom = bloom::BloomState::new(&device.device, &memory_props, pipeline_cache);
+        let hiz = hiz::HizState::new(&device.device, pipeline_cache);
         let sky_cloud = sky::SkyCloudState::new(&device.device, pipeline_cache);
 
         let gpu_timer = GpuTimer::new(
@@ -519,6 +523,7 @@ impl Renderer {
             shadow,
             exposure,
             bloom,
+            hiz,
             sky_cloud,
             taa,
             draw_scratch: Vec::new(),
@@ -765,6 +770,7 @@ impl Renderer {
             self.shadow.destroy(device);
             self.exposure.destroy(device);
             self.bloom.destroy(device);
+            self.hiz.destroy(device);
             self.sky_cloud.destroy(device);
             self.taa.destroy(device);
             self.block_textures.destroy(device);
@@ -1087,10 +1093,10 @@ fn depth_range() -> vk::ImageSubresourceRange {
 /// layout in the same `vkCmdPipelineBarrier2` as the offscreen HDR finalize,
 /// with dst stage `COMPUTE_SHADER | FRAGMENT_SHADER` and access
 /// `SHADER_SAMPLED_READ`. From then on it RESTS here: the quarter-res spill
-/// pass (godray sampler) and the VRS classifier sample it in the same submit
-/// with no further transition; the present-time fused TAA tonemap samples it
-/// in the later copy submit (the render timeline wait covers that fragment
-/// shader).
+/// pass (godray sampler), the Hi-Z pyramid reduce, and the VRS classifier
+/// sample it in the same submit with no further transition; the present-time
+/// fused TAA tonemap samples it in the later copy submit (the render timeline
+/// wait covers that fragment shader).
 ///
 /// When nothing samples it, `end` skips that rest transition and the scene
 /// pass stores depth with `DONT_CARE` (and skips the MSAA SAMPLE_ZERO resolve).
@@ -1105,6 +1111,7 @@ pub(super) const SAMPLEABLE_DEPTH_REST_LAYOUT: vk::ImageLayout =
 ///
 /// Consumers, computed once per frame:
 /// - VRS classify (same submit), even on unpresented frames;
+/// - Hi-Z pyramid reduce (same submit), even on unpresented frames;
 /// - quarter-res spill/godrays (same submit), on presented frames with bloom
 ///   or a live godray march;
 /// - fused TAA tonemap (later present submit), on presented frames with TAA.
@@ -1117,8 +1124,9 @@ pub(super) fn sampleable_depth_consumed(
     taa: bool,
     spill_live: bool,
     classify_vrs: bool,
+    build_hiz: bool,
 ) -> bool {
-    classify_vrs || (will_present && (taa || spill_live))
+    classify_vrs || build_hiz || (will_present && (taa || spill_live))
 }
 
 /// Synchronization state of the depth image sampled by post-processing *during
@@ -1203,17 +1211,22 @@ mod tests {
     #[test]
     fn sampleable_depth_consumed_gates_on_actual_consumers() {
         // Nothing samples: TAA off, no spill, no VRS — even if presenting.
-        assert!(!sampleable_depth_consumed(false, false, false, false));
-        assert!(!sampleable_depth_consumed(true, false, false, false));
+        assert!(!sampleable_depth_consumed(
+            false, false, false, false, false
+        ));
+        assert!(!sampleable_depth_consumed(true, false, false, false, false));
         // VRS classify samples in the same submit, presented or not.
-        assert!(sampleable_depth_consumed(false, false, false, true));
-        assert!(sampleable_depth_consumed(true, false, false, true));
+        assert!(sampleable_depth_consumed(false, false, false, true, false));
+        assert!(sampleable_depth_consumed(true, false, false, true, false));
+        // Hi-Z reduce samples in the same submit, presented or not.
+        assert!(sampleable_depth_consumed(false, false, false, false, true));
+        assert!(sampleable_depth_consumed(true, false, false, false, true));
         // Fused TAA tonemap samples only on presented frames.
-        assert!(sampleable_depth_consumed(true, true, false, false));
-        assert!(!sampleable_depth_consumed(false, true, false, false));
+        assert!(sampleable_depth_consumed(true, true, false, false, false));
+        assert!(!sampleable_depth_consumed(false, true, false, false, false));
         // Spill/godrays sample only on presented frames.
-        assert!(sampleable_depth_consumed(true, false, true, false));
-        assert!(!sampleable_depth_consumed(false, false, true, false));
+        assert!(sampleable_depth_consumed(true, false, true, false, false));
+        assert!(!sampleable_depth_consumed(false, false, true, false, false));
     }
 
     #[test]
