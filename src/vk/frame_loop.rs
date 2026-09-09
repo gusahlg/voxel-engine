@@ -177,6 +177,11 @@ impl Renderer {
             }
         }
 
+        if self.empty_submit {
+            self.draw_empty_submit();
+            return;
+        }
+
         let slot = self.slot;
         use crate::profile::{Meter, scope};
         crate::profile::count(crate::profile::Counter::Rendered);
@@ -319,6 +324,38 @@ impl Renderer {
             }
         }
 
+        self.slot = (self.slot + 1) % FRAMES_IN_FLIGHT as usize;
+    }
+
+    /// Empty command-buffer submit used by `VOXEL_BENCH_EMPTY`: wait the slot,
+    /// begin/end with no work or timestamps, submit on the usual timeline, skip
+    /// present. Slot wait + timeline signal keep shutdown and FIF reuse intact.
+    fn draw_empty_submit(&mut self) {
+        let slot = self.slot;
+        crate::profile::count(crate::profile::Counter::Rendered);
+        self.wait_slot_and_reclaim(slot);
+        let cmd = self.slots[FrameSlot::new(slot)].cmd;
+        let rs = self.timeline.begin_render(cmd);
+        unsafe {
+            let device = &self.device.device;
+            device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                .expect("command buffer reset failed");
+            device
+                .begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .expect("begin command buffer failed");
+            device
+                .end_command_buffer(cmd)
+                .expect("end command buffer failed");
+        }
+        {
+            let _p = crate::profile::scope(crate::profile::Meter::Submit);
+            self.submit_render(rs, slot);
+        }
         self.slot = (self.slot + 1) % FRAMES_IN_FLIGHT as usize;
     }
 

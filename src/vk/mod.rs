@@ -211,6 +211,8 @@ pub(crate) struct Renderer {
     last_present: std::time::Instant,
     present_interval: std::time::Duration,
     gpu_timer: GpuTimer,
+    /// `VOXEL_BENCH_EMPTY=1`: empty command-buffer submit, no present.
+    empty_submit: bool,
 }
 
 impl Renderer {
@@ -503,6 +505,7 @@ impl Renderer {
             last_present: std::time::Instant::now(),
             present_interval,
             gpu_timer,
+            empty_submit: empty_submit_requested(),
         };
         Ok((renderer, reply))
     }
@@ -743,6 +746,15 @@ impl Renderer {
             device: self.device,
         }
     }
+}
+
+/// Profiling experiment: `VOXEL_BENCH_EMPTY=1` records an empty command buffer
+/// per frame (begin/end only), still submits/signals/waits on the usual
+/// timeline, and skips present. Measures the per-submission floor of the
+/// driver + our sync. Read once at renderer creation. Not a public API.
+fn empty_submit_requested() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| std::env::var("VOXEL_BENCH_EMPTY").is_ok_and(|v| v != "0"))
 }
 
 /// Clamp range for render-resolution scale (0.25x to 2.0x). Re-exported from
