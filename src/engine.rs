@@ -468,8 +468,9 @@ impl Engine {
     pub(crate) fn finish_frame(&mut self) {
         // Recycle returned buffers/allocations, submit the recorded snapshot,
         // then take a fresh pooled one to record into. Submit first so the
-        // render thread can start (and recycle a box) while we wait; with a
-        // pool of FRAMES_IN_FLIGHT + 1 that wait is rare.
+        // render thread can start (and recycle a box) while we wait. The pool
+        // is sized so main stays at most one frame ahead; `take_frame` parks
+        // when every box is in flight.
         self.client.drain_returns();
         if let Some(next) = self.client.pop_idle_frame() {
             let filled = std::mem::replace(&mut self.lists, next);

@@ -25,8 +25,7 @@ use winit::window::Window;
 
 use super::alloc::{Allocation, DEVICE_SHRINK_SETTLE_TICKS, GpuAllocator};
 use super::buffers::{
-    DrawDyn, FRAMES_IN_FLIGHT, GpuResident, MeshHandles, MeshRecord, PlacementState,
-    build_mesh_resident,
+    DrawDyn, GpuResident, MeshHandles, MeshRecord, PlacementState, build_mesh_resident,
 };
 use super::device::{Device, MemoryBudget};
 use super::image::{AllocError, render_target_oom_message};
@@ -144,12 +143,17 @@ pub(crate) struct DeviceLeftovers {
     pub device: Device,
 }
 
-/// Recording snapshots in circulation. GPU frames-in-flight is
-/// [`FRAMES_IN_FLIGHT`]; the extra box is the one the main thread records into.
-/// Slack is therefore `FRAMES_IN_FLIGHT` (the GPU-depth boxes plus last_drawn
-/// parking), which is at least `FRAMES_IN_FLIGHT - 1` so main does not serialize
-/// on the render thread's slot wait.
-const FRAME_POOL_SIZE: usize = FRAMES_IN_FLIGHT as usize + 1;
+/// Recording snapshots in circulation between main and the render thread.
+///
+/// The render thread's own slot ring ([`FRAMES_IN_FLIGHT`]) is what keeps the
+/// GPU fed. Main only needs **one** queued frame so the render thread never
+/// starves, plus the box it is recording into and [`FramePool::last_drawn`].
+/// Hence 3, independent of `FRAMES_IN_FLIGHT`.
+///
+/// A larger pool lets main run more than one frame ahead. The render loop then
+/// coalesces (`RenderCmd::Frame` keeps only the newest queued snapshot) whenever
+/// the game is uncapped and faster than the GPU, silently dropping game frames.
+const FRAME_POOL_SIZE: usize = 3;
 
 /// Pooled [`DrawLists`] boxes plus the most recently completed snapshot, used
 /// so a blocking capture can re-present the last scene without cloning it
@@ -742,15 +746,16 @@ fn render_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{FRAME_POOL_SIZE, FRAMES_IN_FLIGHT, FramePool};
+    use super::super::buffers::FRAMES_IN_FLIGHT;
+    use super::{FRAME_POOL_SIZE, FramePool};
 
     #[test]
-    fn frame_pool_is_one_ahead_of_gpu_slots() {
-        assert_eq!(FRAME_POOL_SIZE, FRAMES_IN_FLIGHT as usize + 1);
-        assert!(
-            FRAME_POOL_SIZE >= FRAMES_IN_FLIGHT as usize,
-            "slack (pool minus the recording box) must be at least FRAMES_IN_FLIGHT - 1"
-        );
+    fn frame_pool_keeps_main_at_most_one_ahead() {
+        assert_eq!(FRAME_POOL_SIZE, 3);
+        // Recording + one queued/being-rendered + last_drawn. Must not grow
+        // with FRAMES_IN_FLIGHT: extra slack lets main queue ahead of render
+        // and coalesces under uncapped pacing.
+        assert_ne!(FRAME_POOL_SIZE, FRAMES_IN_FLIGHT as usize + 1);
     }
 
     #[test]
