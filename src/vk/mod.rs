@@ -47,7 +47,7 @@ use block_textures::BlockTextures;
 use buffers::{DrawIndexedIndirect, FRAMES_IN_FLIGHT, GpuResident, HostBuffer, MeshResidency};
 use device::Device;
 use frame_loop::{DrawEntry, DrawRun};
-use gpu_timer::GpuTimer;
+use gpu_timer::{GpuPipeStats, GpuTimer};
 use image::AllocError;
 use instance::InstanceBundle;
 use minimap::MinimapTexture;
@@ -211,6 +211,7 @@ pub(crate) struct Renderer {
     last_present: std::time::Instant,
     present_interval: std::time::Duration,
     gpu_timer: GpuTimer,
+    pipe_stats: GpuPipeStats,
     /// `VOXEL_BENCH_EMPTY=K` (K ≥ 1): that many empty command buffers per
     /// frame in one submit, no present. Zero disables the experiment.
     empty_submit: u32,
@@ -444,6 +445,16 @@ impl Renderer {
             device.timestamps_supported && crate::profile::is_enabled(),
             device.timestamp_period_ns,
         );
+        let pipe_stats = GpuPipeStats::new(
+            &device.device,
+            device.pipeline_statistics_query && crate::profile::is_enabled(),
+            device.host_query_reset,
+        );
+        if crate::profile::is_enabled() && !device.pipeline_statistics_query {
+            log::warn!(
+                "profiler: pipelineStatisticsQuery unsupported; skipping frag/prims/overdraw gauges"
+            );
+        }
 
         let caps = DeviceCaps {
             max_msaa: device.max_msaa(),
@@ -526,6 +537,7 @@ impl Renderer {
             last_present: std::time::Instant::now(),
             present_interval,
             gpu_timer,
+            pipe_stats,
             empty_submit,
             empty_extra,
         };
@@ -745,6 +757,7 @@ impl Renderer {
             self.retired_textures
                 .collect_all(|mut tex| tex.destroy(device));
             self.gpu_timer.destroy(device);
+            self.pipe_stats.destroy(device);
             self.targets.destroy(device);
             self.records.destroy(device);
             self.cull.destroy(device);

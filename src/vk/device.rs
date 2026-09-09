@@ -87,6 +87,11 @@ pub struct Device {
     pub cull_wave_atomics: bool,
     pub timestamp_period_ns: f32,
     pub timestamps_supported: bool,
+    /// `pipelineStatisticsQuery`. Optional; profiler skips pipe-stat gauges.
+    pub pipeline_statistics_query: bool,
+    /// `hostQueryReset` (Vulkan 1.2). Lets the profiler reset query pools on
+    /// the host after a slot fence wait instead of `vkCmdResetQueryPool`.
+    pub host_query_reset: bool,
     pub max_image_array_layers: u32,
 }
 
@@ -102,6 +107,8 @@ struct Candidate {
     draw_indirect_first_instance: bool,
     draw_indirect_count: bool,
     independent_blend: bool,
+    pipeline_statistics_query: bool,
+    host_query_reset: bool,
     memory_budget: bool,
     max_anisotropy: Option<f32>,
     fragment_shading_rate: Option<FragmentShadingRate>,
@@ -202,14 +209,16 @@ impl Device {
             .shader_demote_to_helper_invocation(true);
         let mut vulkan_12_features = vk::PhysicalDeviceVulkan12Features::default()
             .timeline_semaphore(true)
-            .draw_indirect_count(best.draw_indirect_count);
+            .draw_indirect_count(best.draw_indirect_count)
+            .host_query_reset(best.host_query_reset);
         let mut vulkan_11_features =
             vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
         let device_features = vk::PhysicalDeviceFeatures::default()
             .multi_draw_indirect(best.multi_draw_indirect)
             .draw_indirect_first_instance(best.draw_indirect_first_instance)
             .sampler_anisotropy(best.max_anisotropy.is_some())
-            .independent_blend(best.independent_blend);
+            .independent_blend(best.independent_blend)
+            .pipeline_statistics_query(best.pipeline_statistics_query);
         if best.independent_blend {
             log::info!(
                 "fused TAA overlay: independentBlend enabled (HUD in fused two-attachment present)"
@@ -341,6 +350,8 @@ impl Device {
             cull_wave_atomics,
             timestamp_period_ns: best.properties.limits.timestamp_period,
             timestamps_supported: best.properties.limits.timestamp_compute_and_graphics == vk::TRUE,
+            pipeline_statistics_query: best.pipeline_statistics_query,
+            host_query_reset: best.host_query_reset,
             max_image_array_layers: best.properties.limits.max_image_array_layers,
         }
     }
@@ -391,10 +402,12 @@ fn evaluate(
     let multi_draw_indirect = features2.features.multi_draw_indirect == vk::TRUE;
     let draw_indirect_first_instance = features2.features.draw_indirect_first_instance == vk::TRUE;
     let independent_blend = features2.features.independent_blend == vk::TRUE;
+    let pipeline_statistics_query = features2.features.pipeline_statistics_query == vk::TRUE;
     let max_anisotropy = (features2.features.sampler_anisotropy == vk::TRUE)
         .then_some(properties.limits.max_sampler_anisotropy);
     // Required for GPU-driven culling; reject devices that lack it.
     let draw_indirect_count = vulkan_12_features.draw_indirect_count == vk::TRUE;
+    let host_query_reset = vulkan_12_features.host_query_reset == vk::TRUE;
     // shaderDemoteToHelperInvocation is mandatory in Vulkan 1.3 and the
     // shipped SPIR-V 1.6 fragment modules rely on it (see Device::new).
     if vulkan_13_features.dynamic_rendering != vk::TRUE
@@ -501,6 +514,8 @@ fn evaluate(
         draw_indirect_first_instance,
         draw_indirect_count,
         independent_blend,
+        pipeline_statistics_query,
+        host_query_reset,
         memory_budget,
         max_anisotropy,
         fragment_shading_rate,

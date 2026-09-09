@@ -332,10 +332,16 @@ pub enum Gauge {
     Vrs1x1,
     Vrs2x2,
     Vrs4x4,
+    FragFull,
+    FragLod,
+    FragCutout,
+    FragBlend,
+    FragSky,
+    PrimsFull,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 15] = [
+    const ALL: [Gauge; 21] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
@@ -351,6 +357,12 @@ impl Gauge {
         Gauge::Vrs1x1,
         Gauge::Vrs2x2,
         Gauge::Vrs4x4,
+        Gauge::FragFull,
+        Gauge::FragLod,
+        Gauge::FragCutout,
+        Gauge::FragBlend,
+        Gauge::FragSky,
+        Gauge::PrimsFull,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -371,17 +383,33 @@ impl Gauge {
             Gauge::Vrs1x1 => "vrs.1x1",
             Gauge::Vrs2x2 => "vrs.2x2",
             Gauge::Vrs4x4 => "vrs.4x4",
+            Gauge::FragFull => "frag.full",
+            Gauge::FragLod => "frag.lod",
+            Gauge::FragCutout => "frag.cutout",
+            Gauge::FragBlend => "frag.blend",
+            Gauge::FragSky => "frag.sky",
+            Gauge::PrimsFull => "prims.full",
         }
     }
 }
 
 /// Last-set value per gauge (overwritten each frame, never accumulated).
 static GAUGES: [AtomicU64; Gauge::COUNT] = [const { AtomicU64::new(0) }; Gauge::COUNT];
+/// Full-res overdraw (`frag.full / pixels`), stored as f64 bits. Printed with
+/// two decimals on the `sets` line. Zero when pipe stats are unpublished.
+static OVERDRAW_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Record the current value of a gauge. Cheap no-op when profiling is off.
 pub fn gauge(g: Gauge, value: u64) {
     if enabled() {
         GAUGES[g as usize].store(value, Ordering::Relaxed);
+    }
+}
+
+/// Record full-res overdraw (`frag.full / render-extent pixels`).
+pub fn overdraw_full(ratio: f64) {
+    if enabled() && ratio.is_finite() {
+        OVERDRAW_FULL.store(ratio.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -817,6 +845,10 @@ fn report(frames: u64) {
             GAUGES[g as usize].load(Ordering::Relaxed)
         ));
     }
+    sline.push_str(&format!(
+        " overdraw.full {:.2}",
+        f64::from_bits(OVERDRAW_FULL.load(Ordering::Relaxed))
+    ));
     eprintln!("{sline}");
 }
 

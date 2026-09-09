@@ -11,7 +11,7 @@ use crate::skeleton::FrameSlot;
 use super::buffers::{self, DrawIndexedIndirect};
 use super::cull;
 use super::frame_loop::{ImmOffsets, jittered_clip};
-use super::gpu_timer::GpuPass;
+use super::gpu_timer::{GpuPass, PipeStatPass};
 use super::pipeline;
 use super::{HdrReadable, Renderer, color_range, depth_range};
 
@@ -522,6 +522,7 @@ impl<'a> RenderPass<'a> {
     /// Always closes the group's GPU timestamp, including empty groups, so
     /// skipped draws do not leak into the next span.
     unsafe fn record_group_indirect_count(&self, group: cull::Group, pipeline: vk::Pipeline) {
+        self.pipe_begin_group(group);
         if let Some(frame) = &self.r.cull_frame {
             let span = frame.arena_count * cull::BUCKETS;
             let base = group as usize * span;
@@ -568,6 +569,7 @@ impl<'a> RenderPass<'a> {
             }
         }
         self.stamp_group(group);
+        self.pipe_end_group(group);
     }
 
     /// GPU timestamp closing `group`'s draws. No-op when profiling is off.
@@ -584,6 +586,42 @@ impl<'a> RenderPass<'a> {
             self.r
                 .gpu_timer
                 .mark(&self.r.device.device, self.cmd, self.slot, pass);
+        }
+    }
+
+    fn pipe_stat_pass(group: cull::Group) -> PipeStatPass {
+        match group {
+            cull::Group::Opaque => PipeStatPass::OpaqueFull,
+            cull::Group::OpaqueLod => PipeStatPass::OpaqueLod,
+            cull::Group::Cutout => PipeStatPass::Cutout,
+        }
+    }
+
+    fn pipe_begin_group(&self, group: cull::Group) {
+        if !crate::profile::is_enabled() {
+            return;
+        }
+        unsafe {
+            self.r.pipe_stats.begin_pass(
+                &self.r.device.device,
+                self.cmd,
+                self.slot,
+                Self::pipe_stat_pass(group),
+            );
+        }
+    }
+
+    fn pipe_end_group(&self, group: cull::Group) {
+        if !crate::profile::is_enabled() {
+            return;
+        }
+        unsafe {
+            self.r.pipe_stats.end_pass(
+                &self.r.device.device,
+                self.cmd,
+                self.slot,
+                Self::pipe_stat_pass(group),
+            );
         }
     }
 

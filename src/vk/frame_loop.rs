@@ -9,7 +9,7 @@ use crate::mesh::Pass;
 use crate::skeleton::FrameSlot;
 
 use super::buffers::{DrawIndexedIndirect, FRAMES_IN_FLIGHT, MESH_CONSUMER_STAGES};
-use super::gpu_timer::GpuPass;
+use super::gpu_timer::{GpuPass, PipeStatPass};
 use super::pipeline;
 use super::present::{HdrReadable, OverlayPresent};
 use super::render_client::RenderReturn;
@@ -539,6 +539,26 @@ impl Renderer {
         crate::profile::gauge(crate::profile::Gauge::TrisLod, u64::from(i2 / 3));
     }
 
+    fn publish_pipe_stats(&mut self, slot: usize) {
+        use crate::profile::Gauge;
+        let Some((frag, prims_full)) =
+            (unsafe { self.pipe_stats.read_into(&self.device.device, slot) })
+        else {
+            return;
+        };
+        crate::profile::gauge(Gauge::FragFull, frag[PipeStatPass::OpaqueFull as usize]);
+        crate::profile::gauge(Gauge::FragLod, frag[PipeStatPass::OpaqueLod as usize]);
+        crate::profile::gauge(Gauge::FragCutout, frag[PipeStatPass::Cutout as usize]);
+        crate::profile::gauge(Gauge::FragBlend, frag[PipeStatPass::Transparent as usize]);
+        crate::profile::gauge(Gauge::FragSky, frag[PipeStatPass::Sky as usize]);
+        crate::profile::gauge(Gauge::PrimsFull, prims_full);
+        crate::profile::overdraw_full(super::gpu_timer::overdraw_ratio(
+            frag[PipeStatPass::OpaqueFull as usize],
+            self.render_extent.width,
+            self.render_extent.height,
+        ));
+    }
+
     /// Resolves the copy hazard on `slot` before it is rendered into: the
     /// in-flight present copy may still be reading this slot's offscreen
     /// image, which the render below overwrites. Rare (the copy usually
@@ -961,6 +981,7 @@ impl Renderer {
                     crate::profile::gpu_gap_ms(gap, total);
                 }
             }
+            self.publish_pipe_stats(slot);
         }
         // Begin render submission; this gets the timeline value to stamp mesh copies.
         let rs = self.timeline.begin_render(cmd);
@@ -981,6 +1002,7 @@ impl Renderer {
             // attributed (the `Copies` stamp closes this first span).
             if profiling {
                 self.gpu_timer.begin(device, cmd, slot);
+                self.pipe_stats.prepare(device, cmd, slot);
             }
 
             // Last frame's separate-queue copies: this submission is the first
@@ -1152,8 +1174,16 @@ impl Renderer {
                 // Debug geometry and transparent water both composite over the sky.
                 {
                     let _g = scope(Meter::RecSky);
+                    if profiling {
+                        self.pipe_stats
+                            .begin_pass(device, cmd, slot, PipeStatPass::Sky);
+                    }
                     if self.flags.sky {
                         pass.record_sky();
+                    }
+                    if profiling {
+                        self.pipe_stats
+                            .end_pass(device, cmd, slot, PipeStatPass::Sky);
                     }
                 }
                 stamp(GpuPass::Sky);
@@ -1170,7 +1200,15 @@ impl Renderer {
                 stamp(GpuPass::Shadows);
                 {
                     let _g = scope(Meter::RecMesh);
+                    if profiling {
+                        self.pipe_stats
+                            .begin_pass(device, cmd, slot, PipeStatPass::Transparent);
+                    }
                     pass.record_mesh_indirect(Pass::Blend);
+                    if profiling {
+                        self.pipe_stats
+                            .end_pass(device, cmd, slot, PipeStatPass::Transparent);
+                    }
                 }
                 stamp(GpuPass::Transparent);
             }
@@ -1248,6 +1286,9 @@ impl Renderer {
                     .mark(&self.device.device, cmd, slot, GpuPass::Bloom)
             };
             self.gpu_timer.finish(slot);
+            if lists.scene.is_some() {
+                self.pipe_stats.finish(slot);
+            }
         }
         unsafe {
             self.device
