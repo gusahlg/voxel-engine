@@ -119,7 +119,13 @@ float3 sun_disc(float3 ray, float3 sun_dir, float3 tint, float radius)
 // pick. Only caller is mesh3d.frag.
 float3 light_eval(float3 sky, float3 block, float ao, FrameUniforms frame)
 {
-    return max(frame.ambient_glow.rgb * ao + sky, candle_curve(block) * ao);
+    // Uniform branch: RenderFlags::blocklight rides shadow_bounce.w bit 1.
+    // Off already zeroes candle.rgb on the host, so candle_curve(0) == 0;
+    // skip the pow/sqrt when the lane is clear.
+    float3 block_term = ((asuint(frame.shadow_bounce.w) & 2u) == 0u)
+        ? float3(0.0, 0.0, 0.0)
+        : candle_curve(block) * ao;
+    return max(frame.ambient_glow.rgb * ao + sky, block_term);
 }
 
 // Far-field shadow fallback beyond shadow-map cascades. Uses baked sky-visibility

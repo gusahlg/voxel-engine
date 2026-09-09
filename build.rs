@@ -1333,7 +1333,7 @@ fn derived_lane_table() -> Vec<Lane> {
         },
         Lane {
             name: "shadow_bounce",
-            doc: "Engine-derived. rgb = SHADOW_SKY_AMBIENT * lerp(light.rgb, zenith.rgb *\nluma709(light)/luma709(zenith), SHADOW_BOUNCE_TINT); light.rgb when zenith\nluma is 0. w reserved 0.",
+            doc: "Engine-derived. rgb = SHADOW_SKY_AMBIENT * lerp(light.rgb, zenith.rgb *\nluma709(light)/luma709(zenith), SHADOW_BOUNCE_TINT); light.rgb when zenith\nluma is 0. w = asfloat lane-enable bits (shadows=1, blocklight=2, ambient=4).",
         },
     ]
 }

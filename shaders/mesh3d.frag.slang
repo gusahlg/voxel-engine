@@ -178,6 +178,11 @@ float shadow_map_term(float3 world, float3 N, float ndl, uint c)
 // `ndl` = the day/night-flipped N·L the direct term is shaped by.
 float sun_shadow(float3 world, float3 N, float raw_ndl, float ndl, float dist, float visible_sky)
 {
+    // Uniform branch: RenderFlags::shadows rides shadow_bounce.w bit 0.
+    // Off matches the all-lit cascade (PCF would return 1.0, fade is 0 at
+    // shadow_limit = MAX), so this is bit-identical to sampling the map.
+    if ((asuint(frame.shadow_bounce.w) & 1u) == 0u)
+        return 1.0;
     float fallback = shadow_fallback(frame, visible_sky);
     float limit = cascade.splits_fade.w;
     float band = cascade.splits_fade.z;

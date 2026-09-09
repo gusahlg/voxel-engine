@@ -44,6 +44,6 @@ struct FrameUniforms
     float4 glow_day;
     // Engine-derived. rgb = SHADOW_SKY_AMBIENT * lerp(light.rgb, zenith.rgb *
     // luma709(light)/luma709(zenith), SHADOW_BOUNCE_TINT); light.rgb when zenith
-    // luma is 0. w reserved 0.
+    // luma is 0. w = asfloat lane-enable bits (shadows=1, blocklight=2, ambient=4).
     float4 shadow_bounce;
 };
