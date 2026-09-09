@@ -2,10 +2,19 @@
 //! bump/ring, plus timeline-keyed reclaim.
 //!
 //! Game workers acquire a region, write vertices straight into the mapped
-//! bytes, and hand the region to the main thread. Main only installs the mesh
-//! record (and, when the pool is not a vertex-resident BAR/ReBAR heap, records
-//! one copy through the existing transfer lane). Stale builds [`Drop`] the
-//! region; reclaim never GPU-waits.
+//! bytes, and hand the region to the main thread. Main copies those bytes into
+//! a mesh arena block (host memcpy when the arena is mapped, otherwise one
+//! `vkCmdCopyBuffer` through the transfer lane) and stamps the region so
+//! reclaim can recycle it. Stale builds [`Drop`] the region; reclaim never
+//! GPU-waits.
+//!
+//! The ring is a FIFO (`reclaim` advances `tail` only past a contiguous ready
+//! prefix) and therefore holds only **transient** data. A live mesh must never
+//! pin a region: that stalls the tail, and after ~one pool of cumulative
+//! uploads `acquire` returns `None` forever. Zero-copy residency (binding the
+//! pool as the vertex buffer) would need a general-purpose allocator over the
+//! pool (free-list, not FIFO) and is future work. `vertex_resident` in the
+//! create log is informational only.
 //!
 //! Cost: uploads are many and small, so the ring is the only per-acquire work
 //! on the worker. Reclaim, copies, and barriers stay batched on the render
@@ -374,8 +383,8 @@ impl Drop for MeshStaging {
     }
 }
 
-/// Pool-owned region that outlives [`MeshStaging`]: either the mesh's final
-/// backing (zero-copy resident path) or the source of a pending transfer copy.
+/// Pool-owned region that outlives [`MeshStaging`]: the source of a pending
+/// host memcpy or `vkCmdCopyBuffer`. Always stamped before the mesh is kept.
 pub(crate) struct StagingLease {
     pool: Arc<MeshStagingPool>,
     region: StagingRegion,
@@ -405,9 +414,6 @@ pub(crate) struct MeshStagingPool {
     memory: vk::DeviceMemory,
     mapped: Option<NonNull<u8>>,
     bar_bytes: u64,
-    /// True when the buffer lives in a large DEVICE_LOCAL|HOST_VISIBLE heap
-    /// (unified / ReBAR) and can be bound as the mesh's vertex buffer.
-    vertex_resident: bool,
     destroyed: AtomicBool,
     /// Host-only backing for unit tests (the pointer in `mapped` aliases this).
     #[allow(dead_code)]
@@ -504,7 +510,6 @@ impl MeshStagingPool {
             memory,
             mapped: NonNull::new(mapped),
             bar_bytes,
-            vertex_resident,
             destroyed: AtomicBool::new(false),
             _pin: None,
         })
@@ -517,7 +522,6 @@ impl MeshStagingPool {
             memory: vk::DeviceMemory::null(),
             mapped: None,
             bar_bytes: 0,
-            vertex_resident: false,
             destroyed: AtomicBool::new(true),
             _pin: None,
         }
@@ -531,10 +535,6 @@ impl MeshStagingPool {
 
     pub(crate) fn buffer(&self) -> vk::Buffer {
         self.buffer
-    }
-
-    pub(crate) fn vertex_resident(&self) -> bool {
-        self.vertex_resident
     }
 
     fn acquire(pool: &Arc<Self>, bytes: usize) -> Option<MeshStaging> {
@@ -582,7 +582,6 @@ impl MeshStagingPool {
             memory: vk::DeviceMemory::null(),
             mapped,
             bar_bytes: 0,
-            vertex_resident: true,
             destroyed: AtomicBool::new(true),
             _pin: Some(pin),
         })
@@ -671,6 +670,36 @@ mod tests {
         // Both drain in order once the head's stamp is reached.
         let c = r.acquire(16).unwrap();
         assert_eq!(c.offset, 0);
+    }
+
+    #[test]
+    fn resident_mode_submit_reclaims_at_render_zero() {
+        // Vertex-resident installs stamp Render(0); one reclaim at 0 must free
+        // the region. A FIFO that pinned live meshes would fail the 1000-upload
+        // loop below after ~one pool of cumulative traffic.
+        let r = ring(64);
+        let a = r.acquire(64).unwrap();
+        r.submit(a, 0);
+        assert!(r.acquire(8).is_none(), "submitted region occupies the ring");
+        r.reclaim(0, None);
+        let b = r
+            .acquire(64)
+            .expect("Render(0) region reclaimed at render value 0");
+        assert_eq!(b.offset, 0);
+        r.release(b);
+        r.reclaim(0, None);
+
+        let r = ring(MESH_STAGING_BYTES);
+        const CHUNK: usize = 32 << 10;
+        for i in 0..1000 {
+            let region = r
+                .acquire(CHUNK)
+                .unwrap_or_else(|| panic!("ring exhausted at upload {i}"));
+            r.submit(region, 0);
+            if (i + 1) % 8 == 0 {
+                r.reclaim(0, None);
+            }
+        }
     }
 
     #[test]

@@ -410,14 +410,11 @@ struct PendingCopy {
 /// deferred staging copy. `Send` because [`Allocation`] is now `Send`.
 pub(crate) struct GpuResident {
     buffer: vk::Buffer,
-    /// Device-arena suballocation to return to [`GpuAllocator`]. `None` when
-    /// the mesh lives in the staging pool (zero-copy resident path).
-    arena: Option<Allocation>,
+    /// Device-arena suballocation to return to [`GpuAllocator`].
+    arena: Allocation,
     copy: Option<PendingCopy>,
     /// Timeline value ordering copy before reads; `None` while budget-deferred.
     arrived_at: Option<TimelineValue>,
-    /// Staging region used as the mesh's final backing (zero-copy path).
-    staging: Option<StagingLease>,
 }
 
 impl GpuResident {
@@ -553,10 +550,9 @@ pub(crate) unsafe fn build_mesh_resident(
         meta,
         GpuResident {
             buffer: alloc.buffer,
-            arena: Some(alloc),
+            arena: alloc,
             copy,
             arrived_at,
-            staging: None,
         },
     ))
 }
@@ -572,10 +568,13 @@ fn aabb_from_vertices(verts: &[crate::mesh::MeshVertex]) -> (Vec3, Vec3) {
     (aabb_min, aabb_max)
 }
 
-/// Installs a worker-written staging region as a mesh: the region is the final
-/// vertex block when the pool is a vertex-resident BAR/ReBAR heap, otherwise
-/// one device-arena allocation plus a pending `vkCmdCopyBuffer` (batched with
-/// every other copy of the frame by [`MeshResidency::flush_copies`]).
+/// Installs a worker-written staging region as a mesh: always one device-arena
+/// allocation. When the arena is host-mapped (unified / ReBAR) the vertex bytes
+/// are copied with one `copy_nonoverlapping` and the region is stamped
+/// `Stamp::Render(0)` so the next reclaim frees it. Otherwise one pending
+/// `vkCmdCopyBuffer` is batched with the rest of the frame by
+/// [`MeshResidency::flush_copies`] and the region is stamped with the transfer
+/// timeline. The staging ring is transient in both modes.
 pub(crate) unsafe fn build_mesh_resident_staged(
     device: &ash::Device,
     allocator: &mut GpuAllocator,
@@ -609,49 +608,42 @@ pub(crate) unsafe fn build_mesh_resident_staged(
     );
 
     let total = vertex_bytes_len as u64;
-    let lease = staging.into_lease();
+    let alloc = match unsafe { allocator.alloc_device(device, total, MESH_ALIGN) } {
+        Ok(alloc) => alloc,
+        Err(err) => {
+            log::error!("mesh allocation failed: {err:?}");
+            return None;
+        }
+    };
+    debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
 
-    let (buffer, offset, arena, copy, staging_lease, arrived_at) = if pool.vertex_resident() {
-        const _: () =
-            assert!(MESH_ALIGN.is_multiple_of(VERTEX_STRIDE) && MESH_ALIGN.is_multiple_of(256));
-        (
-            pool.buffer(),
-            lease.offset(),
-            None,
-            None,
-            Some(lease),
-            Some(TimelineValue::START),
-        )
+    let copy = if let Some(mapped) = alloc.mapped {
+        // Unified / ReBAR: both the ring region and the arena block are
+        // host-mapped (~5 KB per chunk). One memcpy, then free the region
+        // at the next reclaim — the FIFO must not pin live meshes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                staging.as_bytes().as_ptr(),
+                mapped.as_ptr(),
+                vertex_bytes_len,
+            );
+        }
+        staging.into_lease().stamp(Stamp::Render(0));
+        None
     } else {
-        let alloc = match unsafe { allocator.alloc_device(device, total, MESH_ALIGN) } {
-            Ok(alloc) => alloc,
-            Err(err) => {
-                log::error!("mesh allocation failed: {err:?}");
-                lease.stamp(Stamp::Render(0));
-                return None;
-            }
-        };
-        debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
-        let copy = PendingCopy {
+        let lease = staging.into_lease();
+        Some(PendingCopy {
             src_buffer: pool.buffer(),
             src_offset: lease.offset(),
             dst_buffer: alloc.buffer,
             dst_offset: alloc.offset,
             size: total,
             source: CopySource::Pool(lease),
-        };
-        (
-            alloc.buffer,
-            alloc.offset,
-            Some(alloc),
-            Some(copy),
-            None,
-            None,
-        )
+        })
     };
 
-    debug_assert_eq!(offset % VERTEX_STRIDE, 0);
-    let vertex_offset = (offset / VERTEX_STRIDE) as i32;
+    let arrived_at = copy.is_none().then_some(TimelineValue::START);
+    let vertex_offset = (alloc.offset / VERTEX_STRIDE) as i32;
     let meta = MeshMeta {
         aabb_min,
         aabb_max,
@@ -664,11 +656,10 @@ pub(crate) unsafe fn build_mesh_resident_staged(
     Some((
         meta,
         GpuResident {
-            buffer,
-            arena,
+            buffer: alloc.buffer,
+            arena: alloc,
             copy,
             arrived_at,
-            staging: staging_lease,
         },
     ))
 }
@@ -750,17 +741,12 @@ impl MeshResidency {
             return;
         }
         if let Some(res) = self.slots.get_mut(i).and_then(Option::take) {
-            if let Some(arena) = res.arena {
-                self.retire.push(done_at, arena);
-            }
+            self.retire.push(done_at, res.arena);
             if let Some(copy) = res.copy {
                 match copy.source {
                     CopySource::Alloc(alloc) => self.retire.push(done_at, alloc),
                     CopySource::Pool(lease) => lease.stamp(Stamp::Render(done_at.raw())),
                 }
-            }
-            if let Some(lease) = res.staging {
-                lease.stamp(Stamp::Render(done_at.raw()));
             }
             self.live -= 1;
         }
@@ -1056,16 +1042,13 @@ impl MeshResidency {
     pub fn destroy_all(&mut self, recycle: &mut impl FnMut(Allocation)) {
         for slot in self.slots.iter_mut() {
             if let Some(res) = slot.take() {
-                if let Some(arena) = res.arena {
-                    recycle(arena);
-                }
+                recycle(res.arena);
                 if let Some(copy) = res.copy {
                     match copy.source {
                         CopySource::Alloc(alloc) => recycle(alloc),
                         CopySource::Pool(lease) => drop(lease),
                     }
                 }
-                drop(res.staging);
             }
         }
         self.retire.collect_all(|alloc| recycle(alloc));
