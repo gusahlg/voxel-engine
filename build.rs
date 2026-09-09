@@ -144,6 +144,13 @@ const SHADERS: &[Shader] = &[
         entry: "downsample",
         dst: "bloom_downsample.comp.spv",
     },
+    // Quarter-res bloom-composite + godrays, sampled once by tonemap.
+    Shader {
+        src: "shaders/spill.comp.slang",
+        stage: "compute",
+        entry: "computeMain",
+        dst: "spill.comp.spv",
+    },
 ];
 
 /// Second mesh3d.frag variant: the water depth-absorption path. Declares the
@@ -957,7 +964,7 @@ fn build_table() -> Vec<Def> {
             doc: "Ceiling on the exposure multiplier so a near-black frame can't blow up unbounded.",
             val: Val::Scalar(8.0),
         },
-        // Bloom: threshold → downsample → golden-spiral upsample in tonemap.frag.
+        // Bloom: threshold → downsample → quarter-res spill (golden-spiral + godrays).
         Def {
             name: "BLOOM_THRESHOLD_LO",
             doc: "Bloom soft-knee low edge on exposed luma (luma·exposure). Below this the\npixel contributes no spill. Read by vk/bloom.rs → bloom.comp.",
@@ -990,7 +997,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "BLOOM_MAX_MIPS",
-            doc: "Bloom pyramid mip cap. Tonemap samples only BLOOM_SPIRAL_LOD, so the chain\nstops at that level (base + LOD). CPU (vk/targets.rs) must agree.",
+            doc: "Bloom pyramid mip cap. The spill pass samples only BLOOM_SPIRAL_LOD, so the\nchain stops at that level (base + LOD). CPU (vk/targets.rs) must agree.",
             val: Val::UInt(3),
         },
         Def {
@@ -998,7 +1005,17 @@ fn build_table() -> Vec<Def> {
             doc: "Bloom spiral radius in output uv (isotropic). Small — the mip chain already\ncarries the wide blur, so this only softens the seams between taps.",
             val: Val::Scalar(0.08),
         },
-        // Screen-space godrays: dithered march toward sun, composite veil in tonemap.
+        Def {
+            name: "SPILL_FACTOR",
+            doc: "Spill image is 1/SPILL_FACTOR of the render extent on each axis (quarter-res\nat 4). CPU image create (vk/targets.rs) and the spill dispatch must agree.",
+            val: Val::UInt(4),
+        },
+        Def {
+            name: "SPILL_WG",
+            doc: "Spill compute workgroup edge. CPU dispatch divides the spill extent by this;\nthe shader's [numthreads] uses the same value.",
+            val: Val::UInt(8),
+        },
+        // Screen-space godrays: dithered march toward sun, composite veil in the spill pass.
         Def {
             name: "GODRAY_SAMPLES",
             doc: "March taps from each pixel toward the sun's screen position. Low (4); a\nfixed half-step start-offset centres the first sample.\nCast to int in the shader.",
@@ -1011,7 +1028,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "GODRAY_STRENGTH",
-            doc: "Godray veil composite weight before tonemap sigmoid (after bloom).",
+            doc: "Godray veil composite weight in the quarter-res spill (before tonemap sigmoid).",
             val: Val::Scalar(0.6),
         },
         Def {

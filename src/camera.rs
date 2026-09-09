@@ -129,9 +129,9 @@ impl WarpMap {
     }
 
     /// GPU push bytes for tonemap remap. Identity yields `s = 0` so the frag skips
-    /// remapping. Godray carries sun's screen position; all-zero disables march.
+    /// remapping. Godray march inputs live on the quarter-res spill pass, not here.
     #[inline]
-    pub fn push(&self, exposure: f32, godray: Godray, vignette: f32) -> WarpPush {
+    pub fn push(&self, exposure: f32, vignette: f32) -> WarpPush {
         let (s, atan_s) = match self {
             WarpMap::Identity => (0.0, 0.0),
             WarpMap::Active { s, atan_s } => (*s, *atan_s),
@@ -140,20 +140,6 @@ impl WarpMap {
             exposure,
             s,
             atan_s,
-            _pad0: 0.0,
-            // Godray jitter correction in .w lanes.
-            godray0: [
-                godray.sun_uv[0],
-                godray.sun_uv[1],
-                godray.strength,
-                godray.jitter_uv[0],
-            ],
-            godray1: [
-                godray.tint[0],
-                godray.tint[1],
-                godray.tint[2],
-                godray.jitter_uv[1],
-            ],
             vignette,
         }
     }
@@ -214,21 +200,15 @@ impl Godray {
 }
 
 /// GPU push constant for the tonemap resample: exposure plus the warp coefficients
-/// (`s <= 0` = rectilinear no-op). `exposure` is first for ABI stability with the
-/// current single-`f32` tonemap push. Layout mirrored one-to-one in Slang.
+/// (`s <= 0` = rectilinear no-op) and vignette. Layout mirrored one-to-one in Slang.
+/// Bloom composite and godrays are in the quarter-res spill image, not this push.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WarpPush {
     pub exposure: f32,
     pub s: f32,
     pub atan_s: f32,
-    /// Pad aligning the following `godray0` float4 to 16 bytes.
-    pub _pad0: f32,
-    /// Godray march: sun screen uv (xy), strength gate (z, 0 = no rays), jitter.x (w).
-    pub godray0: [f32; 4],
-    /// Godray sun tint: veil colour (rgb), jitter.y (w).
-    pub godray1: [f32; 4],
-    /// Vignette strength (0 = off). Trailing lane (ABI-appended).
+    /// Vignette strength (0 = off).
     pub vignette: f32,
 }
 

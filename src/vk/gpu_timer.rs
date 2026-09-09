@@ -38,8 +38,9 @@ pub(super) enum GpuPass {
     Taa,
     /// Exposure metering reduce + finalize (stamped only when it runs).
     Exposure,
-    /// The bloom chain — the render-command tail. Without this closing stamp
-    /// everything after the last boundary silently vanishes from the report.
+    /// The bloom chain + quarter-res spill dispatch — the render-command tail.
+    /// Without this closing stamp everything after the last boundary silently
+    /// vanishes from the report.
     Bloom,
 }
 

@@ -22,7 +22,7 @@ pub const PUSH_BYTES_DEBUG: u32 = size_of::<DebugPush>() as u32;
 pub const PUSH_BYTES_2D: u32 = size_of::<[f32; 2]>() as u32; // pixels_to_ndc
 pub const PUSH_BYTES_SKY: u32 = size_of::<SkyParams>() as u32; // inv_view_proj + disc cosines
 const _: () = assert!(size_of::<SkyParams>() <= 128);
-// exposure + wide-FOV remap coefficients (s, atan_s); see camera::WarpPush.
+// exposure + wide-FOV remap coefficients (s, atan_s) + vignette; see camera::WarpPush.
 pub const PUSH_BYTES_TONEMAP: u32 = size_of::<crate::camera::WarpPush>() as u32;
 
 /// Frame camera eye split: exact integer block + fractional part.
@@ -187,15 +187,14 @@ pub struct Pipelines {
     pub sky_set_layout: vk::DescriptorSetLayout,
     /// Linear-clamp sampler pushed with the octahedral cloud LUT.
     pub sky_lut_sampler: vk::Sampler,
-    /// Fullscreen AgX tonemap: samples the HDR offscreen (set 0 push descriptor,
-    /// `tonemap_set_layout`) and writes the LDR swapchain image.
+    /// Fullscreen tonemap: samples the HDR offscreen and the quarter-res spill
+    /// (set 0 push descriptor, `tonemap_set_layout`) and writes the LDR swapchain.
     pub tonemap: vk::Pipeline,
     pub layout_tonemap: vk::PipelineLayout,
     pub tonemap_set_layout: vk::DescriptorSetLayout,
-    /// Linear-clamp sampler pushed with the HDR image for the tonemap draw.
+    /// Linear-clamp sampler pushed with the HDR image and the spill image
+    /// for the tonemap draw.
     pub tonemap_sampler: vk::Sampler,
-    /// Point-clamp sampler pushed with the scene depth for the godray sky mask.
-    pub tonemap_depth_sampler: vk::Sampler,
     /// `Some` exactly when attachment VRS is enabled (`fsr.is_some()`).
     pub vrs_compute: Option<VrsCompute>,
 }
@@ -299,9 +298,9 @@ impl Pipelines {
                 .expect("Failed to create 2D pipeline layout")
         };
 
-        // Tonemap: set 0 binding 0 = the HDR offscreen, binding 1 = the bloom mip
-        // pyramid, both combined image samplers pushed at record time. Plus
-        // the tonemap push constant.
+        // Tonemap: set 0 binding 0 = the HDR offscreen, binding 1 = the
+        // quarter-res spill (bloom composite + godrays). Both combined image
+        // samplers pushed at record time. Plus the tonemap push constant.
         let tonemap_binding = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -310,12 +309,6 @@ impl Pipelines {
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            // Binding 2: scene depth for the godray sky mask.
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(2)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
@@ -342,21 +335,6 @@ impl Pipelines {
                     None,
                 )
                 .expect("Failed to create tonemap sampler")
-        };
-        // NEAREST for depth; D32 linear isn't guaranteed, and threshold tests need
-        // no interpolation.
-        let tonemap_depth_sampler = unsafe {
-            device
-                .create_sampler(
-                    &vk::SamplerCreateInfo::default()
-                        .mag_filter(vk::Filter::NEAREST)
-                        .min_filter(vk::Filter::NEAREST)
-                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
-                    None,
-                )
-                .expect("Failed to create tonemap depth sampler")
         };
         let push_tonemap = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
@@ -671,7 +649,6 @@ impl Pipelines {
             layout_tonemap,
             tonemap_set_layout,
             tonemap_sampler,
-            tonemap_depth_sampler,
         }
     }
 
@@ -728,7 +705,6 @@ impl Pipelines {
             device.destroy_pipeline_layout(self.layout_tonemap, None);
             device.destroy_descriptor_set_layout(self.tonemap_set_layout, None);
             device.destroy_sampler(self.tonemap_sampler, None);
-            device.destroy_sampler(self.tonemap_depth_sampler, None);
         }
     }
 }

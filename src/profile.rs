@@ -108,10 +108,12 @@ pub enum Meter {
     GpuTaa,
     /// Exposure metering reduce + finalize.
     GpuExposure,
-    /// The bloom chain — the render-command tail.
+    /// The bloom chain + quarter-res spill (bloom composite + godrays) — the
+    /// render-command tail.
     GpuBloom,
-    /// The present copy (tonemap + godrays + warp + 2D overlay) — a separate
-    /// submit that runs only on presented frames.
+    /// The present copy (tonemap + warp + 2D overlay) — a separate submit that
+    /// runs only on presented frames. Bloom composite and godrays now live in
+    /// the bloom span's spill dispatch.
     GpuTonemap,
     /// Device-time gap before this render submit: idle GPU plus submit /
     /// command-processor overhead (`start(N) - end(N-1)` on the device clock).
