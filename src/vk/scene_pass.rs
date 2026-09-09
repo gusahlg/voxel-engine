@@ -436,6 +436,7 @@ impl<'a> RenderPass<'a> {
             return;
         }
         if !self.r.draw_runs.iter().any(|run| run.pass == pass) {
+            crate::profile::gauge(crate::profile::Gauge::CallsBlend, 0);
             return;
         }
         self.r.gpu_timer.recorded(self.slot);
@@ -489,6 +490,7 @@ impl<'a> RenderPass<'a> {
         }
         let device = &self.r.device.device;
         let cmd = self.cmd;
+        let mut blend_calls = 0u64;
         unsafe {
             let indirect_buffer = self.r.slots[FrameSlot::new(self.slot)]
                 .indirect
@@ -512,6 +514,7 @@ impl<'a> RenderPass<'a> {
                         run.count,
                         STRIDE as u32,
                     );
+                    blend_calls += 1;
                 } else if self.r.device.draw_indirect_first_instance {
                     // Fall back to single-draw indirect calls.
                     for i in run.first..run.first + run.count {
@@ -523,6 +526,7 @@ impl<'a> RenderPass<'a> {
                             STRIDE as u32,
                         );
                     }
+                    blend_calls += u64::from(run.count);
                 } else {
                     // Fall back to direct draws; replay commands CPU-side.
                     let range = run.first as usize..(run.first + run.count) as usize;
@@ -536,12 +540,14 @@ impl<'a> RenderPass<'a> {
                             c.first_instance,
                         );
                     }
+                    blend_calls += u64::from(run.count);
                 }
             }
         }
         if pass == Pass::Blend && absorb_active {
             unsafe { self.set_input_attachment_mapping(false) };
         }
+        crate::profile::gauge(crate::profile::Gauge::CallsBlend, blend_calls);
     }
 
     /// GPU-culled variant of [`record_mesh_indirect`](Self::record_mesh_indirect):
@@ -574,6 +580,7 @@ impl<'a> RenderPass<'a> {
     /// groups account 0 instead of a BOTTOM_OF_PIPE stamp.
     unsafe fn record_group_indirect_count(&self, group: cull::Group, pipeline: vk::Pipeline) {
         self.pipe_begin_group(group);
+        let mut calls = 0u32;
         if let Some(frame) = &self.r.cull_frame {
             let span = frame.arena_count * cull::BUCKETS;
             let base = group as usize * span;
@@ -603,6 +610,8 @@ impl<'a> RenderPass<'a> {
                         for bucket in 0..cull::BUCKETS {
                             let idx = first + bucket;
                             let part = frame.partitions[idx];
+                            // Bucket trimming already zeros unreachable buckets
+                            // (and empty live lanes); skip the empty call.
                             if part.capacity == 0 {
                                 continue;
                             }
@@ -615,10 +624,26 @@ impl<'a> RenderPass<'a> {
                                 part.capacity,
                                 cull::CMD_STRIDE as u32,
                             );
+                            calls += 1;
                         }
                     }
                 }
             }
+        }
+        if let Some(frame) = &self.r.cull_frame {
+            debug_assert_eq!(
+                calls,
+                cull::group_indirect_calls(&frame.partitions, group, frame.arena_count)
+            );
+        }
+        match group {
+            cull::Group::Opaque => {
+                crate::profile::gauge(crate::profile::Gauge::CallsFull, u64::from(calls));
+            }
+            cull::Group::OpaqueLod => {
+                crate::profile::gauge(crate::profile::Gauge::CallsLod, u64::from(calls));
+            }
+            cull::Group::Cutout => {}
         }
         self.stamp_group(group);
         self.pipe_end_group(group);

@@ -326,6 +326,16 @@ pub enum Gauge {
     DrawsFull,
     DrawsCutout,
     DrawsLod,
+    DrawsBlend,
+    /// `vkCmdDrawIndexedIndirectCount` calls recorded for full-res opaque
+    /// (partitions with capacity > 0; GPU count may still be zero).
+    CallsFull,
+    /// Same for coarse-LOD opaque.
+    CallsLod,
+    /// Draw calls recorded for Blend (CPU-sorted indirect / multi-draw).
+    CallsBlend,
+    /// Live arena rows in the directory this frame.
+    Arenas,
     TrisFull,
     TrisCutout,
     TrisLod,
@@ -350,7 +360,7 @@ pub enum Gauge {
 }
 
 impl Gauge {
-    const ALL: [Gauge; 25] = [
+    const ALL: [Gauge; 30] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
@@ -360,6 +370,11 @@ impl Gauge {
         Gauge::DrawsFull,
         Gauge::DrawsCutout,
         Gauge::DrawsLod,
+        Gauge::DrawsBlend,
+        Gauge::CallsFull,
+        Gauge::CallsLod,
+        Gauge::CallsBlend,
+        Gauge::Arenas,
         Gauge::TrisFull,
         Gauge::TrisCutout,
         Gauge::TrisLod,
@@ -390,6 +405,11 @@ impl Gauge {
             Gauge::DrawsFull => "draws.full",
             Gauge::DrawsCutout => "draws.cutout",
             Gauge::DrawsLod => "draws.lod",
+            Gauge::DrawsBlend => "draws.blend",
+            Gauge::CallsFull => "calls.full",
+            Gauge::CallsLod => "calls.lod",
+            Gauge::CallsBlend => "calls.blend",
+            Gauge::Arenas => "arenas",
             Gauge::TrisFull => "tris.full",
             Gauge::TrisCutout => "tris.cutout",
             Gauge::TrisLod => "tris.lod",
@@ -915,6 +935,15 @@ mod tests {
         for (i, g) in Gauge::ALL.into_iter().enumerate() {
             assert_eq!(g as usize, i, "{} is out of order in Gauge::ALL", g.label());
         }
+    }
+
+    #[test]
+    fn gauge_labels_are_unique() {
+        let mut labels: Vec<&str> = Gauge::ALL.into_iter().map(Gauge::label).collect();
+        let n = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), n, "duplicate Gauge label");
     }
 
     #[test]

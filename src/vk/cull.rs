@@ -376,6 +376,30 @@ pub(crate) fn partition_count(arena_count: usize) -> usize {
     arena_count * (CAMERA_GROUPS * BUCKETS + SHADOW_GROUPS)
 }
 
+/// Indirect-count draw calls a recorder would issue for `group`: partitions
+/// with `capacity > 0`. Zero-capacity buckets (unreachable distance, empty
+/// live lane) are skipped — including those the GPU still writes a 0 count
+/// into. Matches [`super::scene_pass`] `record_group_indirect_count`.
+pub(crate) fn group_indirect_calls(
+    partitions: &[PartitionGpu],
+    group: Group,
+    arena_count: usize,
+) -> u32 {
+    if arena_count == 0 {
+        return 0;
+    }
+    let span = arena_count * BUCKETS;
+    let base = group as usize * span;
+    let end = base + span;
+    if end > partitions.len() {
+        return 0;
+    }
+    partitions[base..end]
+        .iter()
+        .filter(|p| p.capacity > 0)
+        .count() as u32
+}
+
 /// GPU Partition struct.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -2003,6 +2027,24 @@ mod tests {
         assert_eq!(parts[shadow_part(1, 0, 1)].capacity, 1);
         // One camera slot + two unbucketed shadow slots.
         assert_eq!(total, 3);
+        assert_eq!(group_indirect_calls(&parts, Group::Opaque, 1), 1);
+        assert_eq!(group_indirect_calls(&parts, Group::Cutout, 1), 0);
+        assert_eq!(group_indirect_calls(&parts, Group::OpaqueLod, 1), 0);
+    }
+
+    #[test]
+    fn group_indirect_calls_counts_nonzero_capacity_partitions() {
+        let mut dir = ArenaDirectory::new();
+        dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL, UNIT);
+        dir.note_upload(1, G1, buf(2), Pass::Opaque, LOD, UNIT);
+        let (parts, _) = partitions_at(&mut dir, origin_eye());
+        // Two arenas: near full-res + near LOD. Each keeps bucket 0 only.
+        assert_eq!(dir.arena_count(), 2);
+        assert_eq!(group_indirect_calls(&parts, Group::Opaque, 2), 1);
+        assert_eq!(group_indirect_calls(&parts, Group::OpaqueLod, 2), 1);
+        assert_eq!(group_indirect_calls(&parts, Group::Cutout, 2), 0);
+        // Empty table / zero arenas.
+        assert_eq!(group_indirect_calls(&[], Group::Opaque, 0), 0);
     }
 
     #[test]
