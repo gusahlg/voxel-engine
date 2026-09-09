@@ -485,19 +485,21 @@ impl Renderer {
 
     /// The layout the scene-pass *attachment* (MS depth, or the single-sample
     /// depth when not multisampled) lives in *during* the pass. With the
-    /// water-absorption path active it is `RENDERING_LOCAL_READ` — the one
-    /// layout valid simultaneously as depth attachment and as the blend pass's
-    /// input attachment (mid-pass transitions are illegal, so a single
-    /// in-pass layout is the only coherent design). Every in-pass depth
-    /// barrier and attachment info reads this ONE function, so the two
-    /// configurations cannot drift apart.
+    /// water-absorption path *this frame* (`absorb`) it is `RENDERING_LOCAL_READ`
+    /// — the one layout valid simultaneously as depth attachment and as the
+    /// blend pass's input attachment (mid-pass transitions are illegal, so a
+    /// single in-pass layout is the only coherent design). Frames that have
+    /// the absorb pipeline but no Blend draw use `DEPTH_ATTACHMENT_OPTIMAL`
+    /// and the plain depth barriers. Every in-pass depth barrier and
+    /// attachment info reads this ONE function, so the two configurations
+    /// cannot drift apart.
     ///
     /// After `RenderPass::end`, if a later pass this frame samples it, the
     /// *sampleable* single-sample image leaves this layout and rests in
     /// [`SAMPLEABLE_DEPTH_REST_LAYOUT`]. The next scene pass of this slot
     /// begins from `UNDEFINED` either way.
-    pub(super) fn depth_pass_layout(&self) -> vk::ImageLayout {
-        if self.pipelines.mesh3d_transparent_absorb.is_some() {
+    pub(super) fn depth_pass_layout(absorb: bool) -> vk::ImageLayout {
+        if absorb {
             vk::ImageLayout::RENDERING_LOCAL_READ_KHR
         } else {
             vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
@@ -514,8 +516,9 @@ impl Renderer {
     /// the contract.
     pub(super) fn sampleable_depth_attachment_state(
         &self,
+        absorb: bool,
     ) -> (vk::ImageLayout, vk::PipelineStageFlags2, vk::AccessFlags2) {
-        sampleable_depth_attachment_state(self.targets.samples, self.depth_pass_layout())
+        sampleable_depth_attachment_state(self.targets.samples, Self::depth_pass_layout(absorb))
     }
 
     /// Scene-pass → rest: sampleable depth becomes [`SAMPLEABLE_DEPTH_REST_LAYOUT`].
@@ -526,8 +529,12 @@ impl Renderer {
     /// without a further transition: VRS compute, the quarter-res spill compute
     /// (godrays), and the present-time tonemap fragment (fused TAA). The present
     /// copy is a later submit that waits on the render timeline.
-    pub(super) fn sampleable_depth_rest_barrier(&self, slot: usize) -> vk::ImageMemoryBarrier2<'_> {
-        let (src_layout, src_stage, src_access) = self.sampleable_depth_attachment_state();
+    pub(super) fn sampleable_depth_rest_barrier(
+        &self,
+        slot: usize,
+        absorb: bool,
+    ) -> vk::ImageMemoryBarrier2<'_> {
+        let (src_layout, src_stage, src_access) = self.sampleable_depth_attachment_state(absorb);
         vk::ImageMemoryBarrier2::default()
             .src_stage_mask(src_stage)
             .src_access_mask(src_access)
@@ -1309,6 +1316,12 @@ impl Renderer {
         let spill_live = self.flags.bloom || godray.strength > 0.0;
         let sample_depth =
             sampleable_depth_consumed(will_present, self.flags.taa, spill_live, classify_vrs);
+        // Absorb (water depth-input) needs RENDERING_LOCAL_READ for the whole
+        // scene pass. Only frames that actually draw Blend pay that layout;
+        // otherwise depth stays DEPTH_ATTACHMENT_OPTIMAL. Known here because
+        // `prepare_blend_draws` already filled `draw_runs`.
+        let absorb_this_frame = self.pipelines.mesh3d_transparent_absorb.is_some()
+            && self.draw_runs.iter().any(|run| run.pass == Pass::Blend);
         // HDR colour is only read by bloom/exposure/spill/tonemap, all of which
         // run on presented frames. Minimap is a separate texture; screenshots
         // copy the swapchain after tonemap; VRS classify reads depth not colour.
@@ -1331,6 +1344,7 @@ impl Renderer {
                     do_vrs,
                     sample_depth,
                     will_present,
+                    absorb_this_frame,
                 )
             }
         };
