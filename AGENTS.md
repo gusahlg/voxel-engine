@@ -5,9 +5,12 @@
 This is a Rust 2024 Vulkan renderer library using `ash` and `winit`. The public
 API starts in `src/lib.rs`, the runnable example is `src/bin/demo.rs`, and Vulkan
 implementation modules live under `src/vk/`. Slang sources are in `shaders/`;
-`build.rs` compiles them into Cargo's output directory and uses `shaders_spv/`
+`build.rs` compiles them via the workspace member `crates/slang-build`
+(`voxel_slang_build`) into Cargo's output directory and uses `shaders_spv/`
 only as a checked-in fallback. Refresh that fallback explicitly as documented
-in the README.
+in the README. The game crate can depend on `voxel_slang_build` as a
+build-dependency to compile its own Slang with the same pinned `slangc` and
+fallback rules.
 
 ## Build, Test, and Development Commands
 

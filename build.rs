@@ -1,256 +1,212 @@
 use std::{
-    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
-    thread,
 };
 
-const REFRESH_SHADER_FALLBACKS: &str = "VOXEL_ENGINE_REFRESH_SHADER_FALLBACKS";
+use voxel_slang_build::{Options, ShaderJob, Stage, compile_all, detect_toolchain, env_flag};
 
-/// Shipping SPIR-V profile. Vulkan 1.3 guarantees SPIR-V 1.6, and at 1.6 Slang
-/// lowers `discard` to `OpDemoteToHelperInvocation` (the quad keeps its
-/// derivatives; core-1.3 feature `shaderDemoteToHelperInvocation`, enabled in
-/// `vk/device.rs`) instead of `OpKill`.
-const SPIRV_PROFILE: &str = "spirv_1_6";
-/// `spirv-val` environment for freshly compiled modules; must match the API
-/// version `vk/device.rs` requires.
-const SPIRV_VAL_TARGET_ENV: &str = "vulkan1.3";
-/// Slang optimisation level. With the pinned toolchain (2025.22.1) `-O3`
-/// emits byte-identical modules to `-O2`, so take the cheaper compile.
-const SLANG_OPT_LEVEL: &str = "-O2";
-
-struct Shader<'a> {
-    src: &'a str,
-    stage: &'a str,
-    entry: &'a str,
-    dst: &'a str,
+fn job(
+    src: &'static str,
+    stage: Stage,
+    entry: &'static str,
+    out: &'static str,
+) -> ShaderJob<'static> {
+    ShaderJob::new(Path::new(src), stage, entry, out)
 }
 
-const SHADERS: &[Shader] = &[
-    Shader {
-        src: "shaders/mesh3d.vert.slang",
-        stage: "vertex",
-        entry: "vertexMain",
-        dst: "mesh3d.vert.spv",
-    },
-    Shader {
-        src: "shaders/mesh3d.frag.slang",
-        stage: "fragment",
-        entry: "fragmentMain",
-        dst: "mesh3d.frag.spv",
-    },
-    Shader {
-        src: "shaders/debug.vert.slang",
-        stage: "vertex",
-        entry: "vertexMain",
-        dst: "debug.vert.spv",
-    },
-    Shader {
-        src: "shaders/debug.frag.slang",
-        stage: "fragment",
-        entry: "fragmentMain",
-        dst: "debug.frag.spv",
-    },
-    Shader {
-        src: "shaders/sky.vert.slang",
-        stage: "vertex",
-        entry: "vertexMain",
-        dst: "sky.vert.spv",
-    },
-    Shader {
-        src: "shaders/sky.frag.slang",
-        stage: "fragment",
-        entry: "fragmentMain",
-        dst: "sky.frag.spv",
-    },
-    Shader {
-        src: "shaders/sky_cloud.comp.slang",
-        stage: "compute",
-        entry: "computeMain",
-        dst: "sky_cloud.comp.spv",
-    },
-    Shader {
-        src: "shaders/tonemap.vert.slang",
-        stage: "vertex",
-        entry: "vertexMain",
-        dst: "tonemap.vert.spv",
-    },
-    Shader {
-        src: "shaders/tonemap.frag.slang",
-        stage: "fragment",
-        entry: "fragmentMain",
-        dst: "tonemap.frag.spv",
-    },
-    Shader {
-        src: "shaders/tris2d.vert.slang",
-        stage: "vertex",
-        entry: "vertexMain",
-        dst: "tris2d.vert.spv",
-    },
-    Shader {
-        src: "shaders/tris2d.frag.slang",
-        stage: "fragment",
-        entry: "fragmentMain",
-        dst: "tris2d.frag.spv",
-    },
-    Shader {
-        src: "shaders/tris2d_tex.frag.slang",
-        stage: "fragment",
-        entry: "fragmentMain",
-        dst: "tris2d_tex.frag.spv",
-    },
-    Shader {
-        src: "shaders/vrs.comp.slang",
-        stage: "compute",
-        entry: "computeMain",
-        dst: "vrs.comp.spv",
-    },
-    Shader {
-        src: "shaders/shadow_depth.vert.slang",
-        stage: "vertex",
-        entry: "vertexMain",
-        dst: "shadow_depth.vert.spv",
-    },
-    Shader {
-        src: "shaders/exposure_reduce.comp.slang",
-        stage: "compute",
-        entry: "computeMain",
-        dst: "exposure_reduce.comp.spv",
-    },
-    Shader {
-        src: "shaders/cull.comp.slang",
-        stage: "compute",
-        entry: "computeMain",
-        dst: "cull.comp.spv",
-    },
-    // Bloom: two entry points from one source (threshold + downsample-chain).
-    Shader {
-        src: "shaders/bloom.comp.slang",
-        stage: "compute",
-        entry: "threshold",
-        dst: "bloom_threshold.comp.spv",
-    },
-    Shader {
-        src: "shaders/bloom.comp.slang",
-        stage: "compute",
-        entry: "downsample",
-        dst: "bloom_downsample.comp.spv",
-    },
-    // Quarter-res bloom-composite + godrays, sampled once by tonemap.
-    Shader {
-        src: "shaders/spill.comp.slang",
-        stage: "compute",
-        entry: "computeMain",
-        dst: "spill.comp.spv",
-    },
-];
-
-/// Second mesh3d.frag variant: the water depth-absorption path. Declares the
-/// depth input attachment (set 0 binding 5) + Δd-driven body tint, compiled
-/// only into `mesh3d_transparent_absorb` (dynamic_rendering_local_read, MSAA
-/// off). The default variant in SHADERS stays the interim-tint fallback.
-const MESH3D_WATER: Shader = Shader {
-    src: "shaders/mesh3d.frag.slang",
-    stage: "fragment",
-    entry: "fragmentMain",
-    dst: "mesh3d_water.frag.spv",
-};
-
-/// Opaque-only mesh3d.frag: strips water/absorb and the LOD-slab `discard`, so
-/// the full-res opaque module carries no OpKill (early depth write stays on).
-const MESH3D_OPAQUE: Shader = Shader {
-    src: "shaders/mesh3d.frag.slang",
-    stage: "fragment",
-    entry: "fragmentMain",
-    dst: "mesh3d_opaque.frag.spv",
-};
-
-/// Coarse-LOD opaque mesh3d.frag: opaque ALU diet plus the slab-clip `discard`.
-const MESH3D_LOD: Shader = Shader {
-    src: "shaders/mesh3d.frag.slang",
-    stage: "fragment",
-    entry: "fragmentMain",
-    dst: "mesh3d_lod.frag.spv",
-};
-
-/// Full-res opaque with every optional lane compiled out (no cascade/candle/fog).
-const MESH3D_OPAQUE_LEAN: Shader = Shader {
-    src: "shaders/mesh3d.frag.slang",
-    stage: "fragment",
-    entry: "fragmentMain",
-    dst: "mesh3d_opaque_lean.frag.spv",
-};
-
-/// Coarse-LOD opaque plus the same lane-off diet as `MESH3D_OPAQUE_LEAN`.
-const MESH3D_LOD_LEAN: Shader = Shader {
-    src: "shaders/mesh3d.frag.slang",
-    stage: "fragment",
-    entry: "fragmentMain",
-    dst: "mesh3d_lod_lean.frag.spv",
-};
-
-/// Present-time TAA tonemap fragment (`-DTAA_FUSED`): two color attachments
-/// (swapchain + history) and the larger fused push block. The default variant
-/// in SHADERS stays the one-output TAA-off path.
-const TONEMAP_TAA: Shader = Shader {
-    src: "shaders/tonemap.frag.slang",
-    stage: "fragment",
-    entry: "fragmentMain",
-    dst: "tonemap_taa.frag.spv",
-};
-
-/// One compile unit: a shader plus its `-D` defines and extra slangc args.
-struct Job<'a> {
-    shader: &'a Shader<'a>,
-    defines: &'a [&'a str],
-    extra_args: &'a [&'a str],
-}
-
-/// The shader toolchain found on PATH. `None` when `slangc` is missing, in
-/// which case the checked-in `shaders_spv/` fallbacks are used verbatim.
-struct Toolchain {
-    /// `slangc -v` banner; part of the compile-cache key so a toolchain bump
-    /// recompiles everything even when no source changed.
-    slangc_version: String,
-    /// `spirv-val` on PATH (vulkan-tools in the nix shell): every freshly
-    /// compiled module is validated and the build fails on invalid SPIR-V.
-    spirv_val: bool,
-}
-
-fn detect_toolchain() -> Option<Toolchain> {
-    let output = Command::new("slangc").arg("-v").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    // slangc prints its version on stderr; take both streams to be safe.
-    let mut slangc_version = String::from_utf8_lossy(&output.stdout).into_owned();
-    slangc_version.push_str(&String::from_utf8_lossy(&output.stderr));
-    let spirv_val = Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    Some(Toolchain {
-        slangc_version: slangc_version.trim().to_owned(),
-        spirv_val,
-    })
-}
-
-fn env_flag(name: &str) -> bool {
-    match env::var(name) {
-        Err(env::VarError::NotPresent) => false,
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => panic!("{name} must be 0 or 1, got {value:?}"),
-        Err(env::VarError::NotUnicode(_)) => panic!("{name} must be valid UTF-8 and either 0 or 1"),
-    }
+/// Engine shader list plus the define-gated variants. Output names in
+/// `OUT_DIR` / `shaders_spv/` must stay stable.
+fn shipping_jobs() -> Vec<ShaderJob<'static>> {
+    let mut jobs = vec![
+        job(
+            "shaders/mesh3d.vert.slang",
+            Stage::Vertex,
+            "vertexMain",
+            "mesh3d.vert.spv",
+        ),
+        job(
+            "shaders/mesh3d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "mesh3d.frag.spv",
+        ),
+        job(
+            "shaders/debug.vert.slang",
+            Stage::Vertex,
+            "vertexMain",
+            "debug.vert.spv",
+        ),
+        job(
+            "shaders/debug.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "debug.frag.spv",
+        ),
+        job(
+            "shaders/sky.vert.slang",
+            Stage::Vertex,
+            "vertexMain",
+            "sky.vert.spv",
+        ),
+        job(
+            "shaders/sky.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "sky.frag.spv",
+        ),
+        job(
+            "shaders/sky_cloud.comp.slang",
+            Stage::Compute,
+            "computeMain",
+            "sky_cloud.comp.spv",
+        ),
+        job(
+            "shaders/tonemap.vert.slang",
+            Stage::Vertex,
+            "vertexMain",
+            "tonemap.vert.spv",
+        ),
+        job(
+            "shaders/tonemap.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "tonemap.frag.spv",
+        ),
+        job(
+            "shaders/tris2d.vert.slang",
+            Stage::Vertex,
+            "vertexMain",
+            "tris2d.vert.spv",
+        ),
+        job(
+            "shaders/tris2d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "tris2d.frag.spv",
+        ),
+        job(
+            "shaders/tris2d_tex.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "tris2d_tex.frag.spv",
+        ),
+        job(
+            "shaders/vrs.comp.slang",
+            Stage::Compute,
+            "computeMain",
+            "vrs.comp.spv",
+        ),
+        job(
+            "shaders/shadow_depth.vert.slang",
+            Stage::Vertex,
+            "vertexMain",
+            "shadow_depth.vert.spv",
+        ),
+        job(
+            "shaders/exposure_reduce.comp.slang",
+            Stage::Compute,
+            "computeMain",
+            "exposure_reduce.comp.spv",
+        ),
+        job(
+            "shaders/cull.comp.slang",
+            Stage::Compute,
+            "computeMain",
+            "cull.comp.spv",
+        ),
+        // Bloom: two entry points from one source (threshold + downsample-chain).
+        job(
+            "shaders/bloom.comp.slang",
+            Stage::Compute,
+            "threshold",
+            "bloom_threshold.comp.spv",
+        ),
+        job(
+            "shaders/bloom.comp.slang",
+            Stage::Compute,
+            "downsample",
+            "bloom_downsample.comp.spv",
+        ),
+        // Quarter-res bloom-composite + godrays, sampled once by tonemap.
+        job(
+            "shaders/spill.comp.slang",
+            Stage::Compute,
+            "computeMain",
+            "spill.comp.spv",
+        ),
+    ];
+    // Water depth-absorption path. Declares the depth input attachment
+    // (set 0 binding 5) + Δd-driven body tint, compiled only into
+    // `mesh3d_transparent_absorb`. The default variant stays the interim-tint
+    // fallback.
+    jobs.push(ShaderJob {
+        defines: &[("WATER_DEPTH_ABSORPTION", None)],
+        ..job(
+            "shaders/mesh3d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "mesh3d_water.frag.spv",
+        )
+    });
+    // Opaque-only mesh3d.frag: strips water/absorb and the LOD-slab `discard`.
+    jobs.push(ShaderJob {
+        defines: &[("MESH3D_OPAQUE", None)],
+        ..job(
+            "shaders/mesh3d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "mesh3d_opaque.frag.spv",
+        )
+    });
+    // Coarse-LOD opaque mesh3d.frag: opaque ALU diet plus the slab-clip `discard`.
+    jobs.push(ShaderJob {
+        defines: &[("MESH3D_OPAQUE", None), ("MESH3D_LOD", None)],
+        ..job(
+            "shaders/mesh3d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "mesh3d_lod.frag.spv",
+        )
+    });
+    // Opaque mesh3d.frag with every optional lighting lane compiled out.
+    jobs.push(ShaderJob {
+        defines: &[("MESH3D_OPAQUE", None), ("MESH3D_LEAN", None)],
+        ..job(
+            "shaders/mesh3d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "mesh3d_opaque_lean.frag.spv",
+        )
+    });
+    // Coarse-LOD opaque plus the same lane-off diet as the opaque lean variant.
+    jobs.push(ShaderJob {
+        defines: &[
+            ("MESH3D_OPAQUE", None),
+            ("MESH3D_LOD", None),
+            ("MESH3D_LEAN", None),
+        ],
+        ..job(
+            "shaders/mesh3d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "mesh3d_lod_lean.frag.spv",
+        )
+    });
+    // Present-time TAA tonemap fragment (`-DTAA_FUSED`).
+    jobs.push(ShaderJob {
+        defines: &[("TAA_FUSED", None)],
+        ..job(
+            "shaders/tonemap.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "tonemap_taa.frag.spv",
+        )
+    });
+    jobs
 }
 
 fn main() {
     println!("cargo:rerun-if-changed=shaders");
-    println!("cargo:rerun-if-changed=shaders_spv");
-    println!("cargo:rerun-if-env-changed={REFRESH_SHADER_FALLBACKS}");
     println!("cargo:rerun-if-env-changed=VOXEL_BUILD_PROBE");
     println!("cargo:rerun-if-env-changed=VOXEL_LIGHT_LEGACY");
     // Emitting any rerun-if-changed replaces cargo's default "rerun if any
@@ -259,156 +215,87 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let refresh_fallbacks = env_flag(REFRESH_SHADER_FALLBACKS);
-    let toolchain = detect_toolchain();
-    assert!(
-        !refresh_fallbacks || toolchain.is_some(),
-        "{REFRESH_SHADER_FALLBACKS}=1 requires slangc"
-    );
+    let mut opts = Options::new(out_dir.clone(), "shaders_spv");
+    opts.refresh = env_flag(opts.refresh_env);
 
     // Single-source the constants shared by Rust and Slang BEFORE compiling any
     // shader: common.slang `#include`s the generated .slang, so it must exist
     // first. See generate_shared_constants for the drift-kill rationale.
     generate_shared_constants(&out_dir);
 
-    // Checked-in fallback so the crate builds without a Slang toolchain
-    // (e.g. inside `nix build` sandboxes). Ordinary builds never rewrite these
-    // fallback artifacts: refresh them explicitly with the pinned toolchain.
-    let fallback_dir = Path::new("shaders_spv");
-    if refresh_fallbacks {
-        fs::create_dir_all(fallback_dir).expect("create shader fallback directory");
-    }
-
     // Ensure tunables use generated includes, not hand-written constants.
     lint_slang_constants();
 
-    let mut jobs: Vec<Job> = SHADERS
-        .iter()
-        .map(|shader| Job {
-            shader,
-            defines: &[],
-            extra_args: &[],
-        })
-        .collect();
-    jobs.push(Job {
-        shader: &MESH3D_WATER,
-        defines: &["-DWATER_DEPTH_ABSORPTION"],
-        extra_args: &[],
-    });
-    jobs.push(Job {
-        shader: &MESH3D_OPAQUE,
-        defines: &["-DMESH3D_OPAQUE"],
-        extra_args: &[],
-    });
-    jobs.push(Job {
-        shader: &MESH3D_LOD,
-        defines: &["-DMESH3D_OPAQUE", "-DMESH3D_LOD"],
-        extra_args: &[],
-    });
-    jobs.push(Job {
-        shader: &MESH3D_OPAQUE_LEAN,
-        defines: &["-DMESH3D_OPAQUE", "-DMESH3D_LEAN"],
-        extra_args: &[],
-    });
-    jobs.push(Job {
-        shader: &MESH3D_LOD_LEAN,
-        defines: &["-DMESH3D_OPAQUE", "-DMESH3D_LOD", "-DMESH3D_LEAN"],
-        extra_args: &[],
-    });
-    jobs.push(Job {
-        shader: &TONEMAP_TAA,
-        defines: &["-DTAA_FUSED"],
-        extra_args: &[],
-    });
-    compile_all(toolchain.as_ref(), &out_dir, fallback_dir, &jobs);
+    let jobs = shipping_jobs();
+    compile_all(&jobs, &opts).unwrap_or_else(|e| panic!("{e}"));
     // Wave-aggregated InterlockedAdd variant of the cull shader. Not in SHADERS:
     // shaders_spv/ keeps the plain-atomic module (no subgroup caps) as the
     // no-slangc fallback; this file lives only in OUT_DIR. See compile_cull_wave.
-    compile_cull_wave(toolchain.as_ref(), &out_dir);
+    compile_cull_wave(&opts);
 
     // Substrate probe: compute shaders for BDA, QUAD, STORAGE, and occupancy tests.
     // Gated behind VOXEL_BUILD_PROBE to avoid requiring extended SPIR-V profile.
     if env::var("VOXEL_BUILD_PROBE").is_ok() {
-        compile_probe(toolchain.is_some(), &out_dir);
-    }
-
-    // Defer every source-tree write until all requested shaders have compiled,
-    // so a compiler failure cannot leave a half-refreshed fallback inventory.
-    if refresh_fallbacks {
-        for job in &jobs {
-            copy_if_changed(
-                &out_dir.join(job.shader.dst),
-                &fallback_dir.join(job.shader.dst),
-            );
-        }
+        compile_probe(&opts);
     }
 }
 
-/// Compile probe shaders at higher SPIR-V profile for BDA and subgroup-quad ops.
-fn compile_probe(slangc: bool, out_dir: &Path) {
-    assert!(slangc, "VOXEL_BUILD_PROBE requires slangc");
-    const PROBE_SHADERS: &[Shader] = &[
-        Shader {
-            src: "shaders/probe_bda.comp.slang",
-            stage: "compute",
-            entry: "computeMain",
-            dst: "probe_bda.comp.spv",
+/// Compile probe shaders at SPIR-V 1.5 for BDA and subgroup-quad ops.
+fn compile_probe(base: &Options) {
+    assert!(
+        detect_toolchain().is_some(),
+        "VOXEL_BUILD_PROBE requires slangc"
+    );
+    const PROBE_CAPS: &[&str] = &[
+        "-capability",
+        "spvGroupNonUniformQuad",
+        "-capability",
+        "spvPhysicalStorageBufferAddresses",
+    ];
+    let probe_shaders = [
+        ShaderJob {
+            extra_args: PROBE_CAPS,
+            ..job(
+                "shaders/probe_bda.comp.slang",
+                Stage::Compute,
+                "computeMain",
+                "probe_bda.comp.spv",
+            )
         },
-        Shader {
-            src: "shaders/probe_quad.comp.slang",
-            stage: "compute",
-            entry: "computeMain",
-            dst: "probe_quad.comp.spv",
+        ShaderJob {
+            extra_args: PROBE_CAPS,
+            ..job(
+                "shaders/probe_quad.comp.slang",
+                Stage::Compute,
+                "computeMain",
+                "probe_quad.comp.spv",
+            )
         },
-        Shader {
-            src: "shaders/probe_storage.comp.slang",
-            stage: "compute",
-            entry: "computeMain",
-            dst: "probe_storage.comp.spv",
+        ShaderJob {
+            extra_args: PROBE_CAPS,
+            ..job(
+                "shaders/probe_storage.comp.slang",
+                Stage::Compute,
+                "computeMain",
+                "probe_storage.comp.spv",
+            )
         },
-        Shader {
-            src: "shaders/probe_occupancy.comp.slang",
-            stage: "compute",
-            entry: "computeMain",
-            dst: "probe_occupancy.comp.spv",
+        ShaderJob {
+            extra_args: PROBE_CAPS,
+            ..job(
+                "shaders/probe_occupancy.comp.slang",
+                Stage::Compute,
+                "computeMain",
+                "probe_occupancy.comp.spv",
+            )
         },
     ];
-    for shader in PROBE_SHADERS {
-        let out_path = out_dir.join(shader.dst);
-        let output = Command::new("slangc")
-            .args([
-                shader.src,
-                "-target",
-                "spirv",
-                "-profile",
-                "spirv_1_5",
-                "-entry",
-                shader.entry,
-                "-stage",
-                shader.stage,
-                "-matrix-layout-column-major",
-                "-capability",
-                "spvGroupNonUniformQuad",
-                "-capability",
-                "spvPhysicalStorageBufferAddresses",
-            ])
-            .arg("-o")
-            .arg(&out_path)
-            .output()
-            .expect("failed to run slangc for probe shader");
-        if !output.status.success() {
-            eprintln!("slangc failed while compiling probe {}", shader.src);
-            eprintln!(
-                "--- stdout ---\n{}",
-                String::from_utf8_lossy(&output.stdout)
-            );
-            eprintln!(
-                "--- stderr ---\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            panic!("probe shader compilation failed");
-        }
-    }
+    let mut opts = base.clone();
+    opts.refresh = false;
+    opts.spirv_profile = "spirv_1_5";
+    opts.opt_level = None;
+    opts.validate = false;
+    compile_all(&probe_shaders, &opts).unwrap_or_else(|e| panic!("{e}"));
 }
 
 // Slang constant lint: prevent duplicates of tunable values.
@@ -501,127 +388,6 @@ fn lint_slang_file(path: &Path, violations: &mut Vec<String>) {
     }
 }
 
-/// Compile every job on a bounded worker pool (one `slangc` process each).
-/// Failures are collected and reported together so one broken shader does not
-/// hide the diagnostics of another.
-fn compile_all(toolchain: Option<&Toolchain>, out_dir: &Path, fallback_dir: &Path, jobs: &[Job]) {
-    let workers = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(jobs.len())
-        .max(1);
-    let next = AtomicUsize::new(0);
-    let failures: Vec<String> = thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut errors = Vec::new();
-                    loop {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(job) = jobs.get(index) else {
-                            break;
-                        };
-                        if let Err(e) = compile(toolchain, out_dir, fallback_dir, job) {
-                            errors.push(e);
-                        }
-                    }
-                    errors
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("shader compile worker panicked"))
-            .collect()
-    });
-    assert!(
-        failures.is_empty(),
-        "shader compilation failed:\n\n{}",
-        failures.join("\n\n")
-    );
-}
-
-fn slangc_args(shader: &Shader, defines: &[&str], extra_args: &[&str]) -> Vec<String> {
-    let mut args = vec![
-        shader.src.to_owned(),
-        "-target".into(),
-        "spirv".into(),
-        "-profile".into(),
-        SPIRV_PROFILE.into(),
-        "-entry".into(),
-        shader.entry.to_owned(),
-        "-stage".into(),
-        shader.stage.to_owned(),
-        "-matrix-layout-column-major".into(),
-        SLANG_OPT_LEVEL.into(),
-    ];
-    args.extend(defines.iter().map(|d| (*d).to_owned()));
-    args.extend(extra_args.iter().map(|a| (*a).to_owned()));
-    args
-}
-
-/// Transitive `#include "..."` closure of `src` (Slang resolves quoted includes
-/// relative to the including file), in deterministic first-visit order. Files
-/// that do not exist are skipped: slangc reports those itself.
-fn include_closure(src: &Path) -> Vec<PathBuf> {
-    let mut order = Vec::new();
-    let mut seen = HashSet::new();
-    let mut stack = vec![src.to_path_buf()];
-    while let Some(path) = stack.pop() {
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        let dir = path.parent().unwrap_or(Path::new(""));
-        // Push in reverse so includes are visited in source order.
-        let mut includes: Vec<PathBuf> = text
-            .lines()
-            .filter_map(|line| {
-                let rest = line.trim_start().strip_prefix("#include")?.trim_start();
-                let rest = rest.strip_prefix('"')?;
-                let (name, _) = rest.split_once('"')?;
-                Some(dir.join(name))
-            })
-            .collect();
-        includes.reverse();
-        stack.extend(includes);
-        order.push(path);
-    }
-    order
-}
-
-/// 64-bit FNV-1a: stable across Rust versions (unlike `DefaultHasher`), so a
-/// cache written by one toolchain stays meaningful to the next.
-fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// Cache key for one compile: toolchain banner, exact argv, validator, and the
-/// path + contents of the source and every transitive include.
-fn fingerprint(toolchain: &Toolchain, args: &[String], src: &Path) -> String {
-    let mut hash = fnv1a(toolchain.slangc_version.as_bytes(), 0xcbf2_9ce4_8422_2325);
-    hash = fnv1a(SPIRV_VAL_TARGET_ENV.as_bytes(), hash);
-    hash = fnv1a(&[u8::from(toolchain.spirv_val)], hash);
-    for arg in args {
-        hash = fnv1a(arg.as_bytes(), hash);
-        hash = fnv1a(b"\0", hash);
-    }
-    for path in include_closure(src) {
-        hash = fnv1a(path.to_string_lossy().as_bytes(), hash);
-        hash = fnv1a(b"\0", hash);
-        let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        hash = fnv1a(&bytes, hash);
-        hash = fnv1a(b"\0", hash);
-    }
-    format!("{hash:016x}")
-}
-
 /// Wave-aggregated InterlockedAdd variant of the cull shader. Lives only in
 /// OUT_DIR: shaders_spv/ keeps the plain-atomic module (no subgroup caps).
 ///
@@ -635,117 +401,28 @@ fn fingerprint(toolchain: &Toolchain, args: &[String], src: &Path) -> String {
 /// copy does not declare GroupNonUniform, so validation does not require
 /// subgroup features. A dedicated `shaders_spv/cull_wave.comp.spv` is not
 /// needed; unlike `-DTAA_FUSED`, a plain clone is not a different interface.
-fn compile_cull_wave(toolchain: Option<&Toolchain>, out_dir: &Path) {
-    const CULL_WAVE: Shader = Shader {
-        src: "shaders/cull.comp.slang",
-        stage: "compute",
-        entry: "computeMain",
-        dst: "cull_wave.comp.spv",
+fn compile_cull_wave(base: &Options) {
+    let cull_wave = ShaderJob {
+        defines: &[("USE_WAVE_ATOMICS", None)],
+        extra_args: &["-capability", "subgroup_basic_ballot"],
+        ..job(
+            "shaders/cull.comp.slang",
+            Stage::Compute,
+            "computeMain",
+            "cull_wave.comp.spv",
+        )
     };
-    if toolchain.is_some() {
-        compile_all(
-            toolchain,
-            out_dir,
-            Path::new("shaders_spv"),
-            &[Job {
-                shader: &CULL_WAVE,
-                defines: &["-DUSE_WAVE_ATOMICS"],
-                extra_args: &["-capability", "subgroup_basic_ballot"],
-            }],
-        );
+    if detect_toolchain().is_some() {
+        let mut opts = base.clone();
+        opts.refresh = false;
+        compile_all(&[cull_wave], &opts).unwrap_or_else(|e| panic!("{e}"));
         return;
     }
     // Plain-atomic clone: see the safety argument on this function.
-    let plain = out_dir.join("cull.comp.spv");
-    let wave = out_dir.join(CULL_WAVE.dst);
+    let plain = base.out_dir.join("cull.comp.spv");
+    let wave = base.out_dir.join(cull_wave.out_name);
     fs::copy(&plain, &wave)
         .unwrap_or_else(|e| panic!("copy plain cull module to {}: {e}", wave.display()));
-}
-
-fn compile(
-    toolchain: Option<&Toolchain>,
-    out_dir: &Path,
-    fallback_dir: &Path,
-    job: &Job,
-) -> Result<(), String> {
-    let shader = job.shader;
-    let out_path = out_dir.join(shader.dst);
-    let fallback_path = fallback_dir.join(shader.dst);
-    // Fingerprint of the last successful (compiled + validated) build of
-    // `out_path`; skip the compile when nothing feeding it has changed.
-    let stamp_path = out_dir.join(format!("{}.fingerprint", shader.dst));
-
-    let Some(toolchain) = toolchain else {
-        assert!(
-            fallback_path.exists(),
-            "slangc not found and no prebuilt {} — install Slang or restore shaders_spv/",
-            fallback_path.display()
-        );
-        fs::copy(&fallback_path, &out_path).unwrap();
-        // The fallback is not a compile of the current source: forget any
-        // stamp so a later toolchain install rebuilds instead of trusting it.
-        let _ = fs::remove_file(&stamp_path);
-        return Ok(());
-    };
-
-    let args = slangc_args(shader, job.defines, job.extra_args);
-    let fingerprint = fingerprint(toolchain, &args, Path::new(shader.src));
-    if out_path.exists() && fs::read_to_string(&stamp_path).is_ok_and(|s| s == fingerprint) {
-        return Ok(());
-    }
-    // Never leave a stale stamp next to a module we are about to rewrite.
-    let _ = fs::remove_file(&stamp_path);
-
-    let output = Command::new("slangc")
-        .args(&args)
-        .arg("-o")
-        .arg(&out_path)
-        .output()
-        .map_err(|e| format!("failed to run slangc for {}: {e}", shader.src))?;
-    if !output.status.success() {
-        return Err(format!(
-            "slangc failed while compiling {} (entry {})\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            shader.src,
-            shader.entry,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    if toolchain.spirv_val {
-        let output = Command::new("spirv-val")
-            .arg("--target-env")
-            .arg(SPIRV_VAL_TARGET_ENV)
-            .arg(&out_path)
-            .output()
-            .map_err(|e| format!("failed to run spirv-val for {}: {e}", shader.dst))?;
-        if !output.status.success() {
-            return Err(format!(
-                "spirv-val rejected {} ({} from {}):\n{}",
-                shader.dst,
-                shader.entry,
-                shader.src,
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-    }
-
-    fs::write(&stamp_path, fingerprint)
-        .map_err(|e| format!("write {}: {e}", stamp_path.display()))?;
-    Ok(())
-}
-
-fn copy_if_changed(compiled: &Path, fallback: &Path) {
-    let fresh = fs::read(compiled)
-        .unwrap_or_else(|e| panic!("read compiled shader {}: {e}", compiled.display()));
-    match fs::read(fallback) {
-        Ok(existing) if existing == fresh => return,
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => panic!("read shader fallback {}: {e}", fallback.display()),
-    }
-    fs::write(fallback, fresh)
-        .unwrap_or_else(|e| panic!("write shader fallback {}: {e}", fallback.display()));
 }
 
 // Shared constants: single source of truth for Rust and Slang.

@@ -1523,8 +1523,13 @@ dependencies = [
  "log",
  "png",
  "raw-window-handle",
+ "voxel_slang_build",
  "winit",
 ]
+
+[[package]]
+name = "voxel_slang_build"
+version = "0.1.0"
 
 [[package]]
 name = "walkdir"

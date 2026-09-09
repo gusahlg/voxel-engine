@@ -1,0 +1,9 @@
+[package]
+name = "voxel_slang_build"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Pinned Slang-to-SPIR-V compile, fallback, and validation helpers for voxel_engine and downstream games."
+repository = "https://github.com/gusahlg/voxel-engine"
+keywords = ["slang", "spirv", "vulkan", "shaders"]
+categories = ["rendering", "development-tools::build-utils"]
