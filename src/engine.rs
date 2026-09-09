@@ -21,6 +21,8 @@ use crate::mesh::{MeshData, MeshHandle, MeshPlacement, Pass};
 use crate::vk::mesh_staging::{MeshStager, MeshStaging};
 use crate::vk::render_client::{Capture, RenderClient};
 
+pub use crate::vk::gpu_timer::GpuLoad;
+
 #[derive(Clone)]
 pub struct Config {
     pub title: String,
@@ -171,6 +173,8 @@ pub struct Engine {
     /// The render thread's published exposure, read by
     /// [`Engine::exposure_for_compose`] each frame.
     pub(crate) exposure_shared: crate::vk::exposure::ExposureShared,
+    /// Last completed frame GPU busy / inter-submit gap (slot-delayed).
+    pub(crate) gpu_load: crate::vk::gpu_timer::GpuLoadShared,
     /// The window lives on the main thread; only the `Renderer` moved to the
     /// render thread. Window-touching methods read this directly.
     pub(crate) window: winit::window::Window,
@@ -200,9 +204,11 @@ impl Engine {
         let (window, mut client) = RenderClient::spawn(event_loop, config)?;
         let lists = client.take_frame(!config.vsync && config.target_fps == 0);
         let exposure_shared = client.exposure();
+        let gpu_load = client.gpu_load();
         Ok(Self {
             client,
             exposure_shared,
+            gpu_load,
             window,
             input: InputState::new(),
             lists,
@@ -253,6 +259,18 @@ impl Engine {
     /// `RenderCmd::Frame`). Monotonic.
     pub fn frames_coalesced(&self) -> u64 {
         self.client.frames_coalesced()
+    }
+
+    /// GPU busy time of the last completed render submit and the idle gap
+    /// before it (`start(N) - end(N-1)`). Slot-delayed: the values are from
+    /// the slot whose fence was waited this frame. `None` until the first
+    /// timestamp readback (or when the device has no timestamps).
+    ///
+    /// Two extra timestamps per frame, host-reset when available. Not gated:
+    /// they should sit in noise on the Minimum preset; if they do not, gate
+    /// behind an `enable_gpu_load` switch (default off).
+    pub fn gpu_load(&self) -> Option<GpuLoad> {
+        self.gpu_load.load()
     }
 
     pub fn set_target_fps(&mut self, fps: u32) {

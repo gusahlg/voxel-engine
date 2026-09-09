@@ -1089,6 +1089,9 @@ impl Renderer {
         // Read the prior render-pass GPU time for this slot before its queries
         // are reset below (the slot's fence was already waited this frame).
         let profiling = crate::profile::is_enabled();
+        unsafe {
+            self.gpu_timer.read_load(&self.device.device, slot);
+        }
         if profiling {
             let mut passes = [0.0f64; GpuPass::COUNT];
             if let Some((total, gap)) = unsafe {
@@ -1134,6 +1137,7 @@ impl Renderer {
                 .expect("begin command buffer failed");
             // Start timing before the staged copies so the whole buffer is
             // attributed (the `Copies` stamp closes this first span).
+            self.gpu_timer.begin_load(device, cmd, slot);
             if profiling {
                 self.gpu_timer.begin(device, cmd, slot);
                 self.pipe_stats.prepare(device, cmd, slot);
@@ -1497,6 +1501,7 @@ impl Renderer {
             }
         }
         unsafe {
+            self.gpu_timer.end_load(&self.device.device, cmd, slot);
             self.device
                 .device
                 .end_command_buffer(cmd)

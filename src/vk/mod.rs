@@ -454,7 +454,7 @@ impl Renderer {
 
         let gpu_timer = GpuTimer::new(
             &device.device,
-            device.timestamps_supported && crate::profile::is_enabled(),
+            device.timestamps_supported,
             device.timestamp_period_ns,
             device.host_query_reset,
         );
@@ -482,9 +482,10 @@ impl Renderer {
             },
             device_local_bytes: Device::device_local_bytes(&memory_props),
             supports_vrs: device.fragment_shading_rate.is_some(),
-            vrs_texel_size: device.fragment_shading_rate.as_ref().map(|fsr| {
-                (fsr.texel_size.width, fsr.texel_size.height)
-            }),
+            vrs_texel_size: device
+                .fragment_shading_rate
+                .as_ref()
+                .map(|fsr| (fsr.texel_size.width, fsr.texel_size.height)),
             supports_pipeline_stats: device.pipeline_statistics_query,
         };
         let mesh_staging = unsafe {
@@ -502,6 +503,7 @@ impl Renderer {
             device: device.device.clone(),
             caps,
             exposure: exposure.shared(),
+            gpu_load: gpu_timer.load_shared(),
             mesh_staging: Arc::clone(&mesh_staging),
         };
 

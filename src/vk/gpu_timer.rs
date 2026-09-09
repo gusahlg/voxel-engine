@@ -2,6 +2,9 @@
 //! Split out of `mod.rs` so later work can touch profiling without opening
 //! the renderer setup.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
 use ash::vk;
 
 use super::buffers::FRAMES_IN_FLIGHT;
@@ -117,7 +120,58 @@ const GPU_STAMPS: usize = GpuPass::COUNT + 1;
 /// One pair suffices: a new copy is only recorded once the previous one has
 /// retired (`decide_present` probes/waits it), so its stamps are read first.
 const COPY_STAMP_BASE: u32 = (GPU_STAMPS * FRAMES_IN_FLIGHT as usize) as u32;
-const QUERY_COUNT: u32 = COPY_STAMP_BASE + 2;
+/// Two frame-boundary stamps per slot (TOP / BOTTOM), after the copy pair.
+/// Written even when the profiler is off so [`GpuLoadShared`] has a cheap
+/// GPU busy time and inter-submit gap.
+const LOAD_STAMP_BASE: u32 = COPY_STAMP_BASE + 2;
+const LOAD_STAMPS: u32 = 2;
+const QUERY_COUNT: u32 = LOAD_STAMP_BASE + LOAD_STAMPS * FRAMES_IN_FLIGHT as u32;
+
+fn load_query(slot: usize, i: u32) -> u32 {
+    LOAD_STAMP_BASE + slot as u32 * LOAD_STAMPS + i
+}
+
+/// Last completed frame's GPU busy time and idle gap before that submit.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuLoad {
+    pub frame_ms: f32,
+    pub gap_ms: f32,
+}
+
+/// Published by the render thread, read by [`crate::Engine::gpu_load`].
+/// Two `f32` bit-patterns, same pattern as [`super::exposure::ExposureShared`].
+#[derive(Clone)]
+pub struct GpuLoadShared {
+    frame: Arc<AtomicU32>,
+    gap: Arc<AtomicU32>,
+    ready: Arc<AtomicBool>,
+}
+
+impl GpuLoadShared {
+    fn new() -> Self {
+        Self {
+            frame: Arc::new(AtomicU32::new(0)),
+            gap: Arc::new(AtomicU32::new(0)),
+            ready: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn store(&self, frame_ms: f32, gap_ms: f32) {
+        self.frame.store(frame_ms.to_bits(), Ordering::Relaxed);
+        self.gap.store(gap_ms.to_bits(), Ordering::Relaxed);
+        self.ready.store(true, Ordering::Release);
+    }
+
+    pub fn load(&self) -> Option<GpuLoad> {
+        if !self.ready.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(GpuLoad {
+            frame_ms: f32::from_bits(self.frame.load(Ordering::Relaxed)),
+            gap_ms: f32::from_bits(self.gap.load(Ordering::Relaxed)),
+        })
+    }
+}
 
 /// Per-pass GPU timing via a timestamp query pool: a start timestamp plus one
 /// after each recorded pass. Only the passes that actually run write a stamp,
@@ -155,6 +209,9 @@ pub(super) struct GpuTimer {
     /// compute the idle gap before the next readable frame. Cleared when a
     /// readback is unavailable so a later start is not compared across a hole.
     prev_end: Option<u64>,
+    load_primed: [bool; FRAMES_IN_FLIGHT as usize],
+    load_prev_end: Option<u64>,
+    load: GpuLoadShared,
 }
 
 /// Device-time gap (ms) from the previous render submit's last stamp to this
@@ -202,7 +259,14 @@ impl GpuTimer {
             pending: std::array::from_fn(|_| std::cell::Cell::new(false)),
             copy_primed: false,
             prev_end: None,
+            load_primed: [false; FRAMES_IN_FLIGHT as usize],
+            load_prev_end: None,
+            load: GpuLoadShared::new(),
         }
+    }
+
+    pub(super) fn load_shared(&self) -> GpuLoadShared {
+        self.load.clone()
     }
 
     fn enabled(&self) -> bool {
@@ -321,6 +385,78 @@ impl GpuTimer {
         }
         self.label[slot][i as usize].set(pass);
         self.count[slot].set(i + 1);
+    }
+
+    /// Reads this slot's previous load pair (TOP/BOTTOM) after its fence wait
+    /// and publishes [`GpuLoadShared`]. `None` until the first successful
+    /// readback; a hole drops `load_prev_end` so the next gap is not invented.
+    pub(super) unsafe fn read_load(&mut self, device: &ash::Device, slot: usize) {
+        if !self.enabled() || !self.load_primed[slot] {
+            return;
+        }
+        let mut ts = [0u64; 2];
+        let read = unsafe {
+            device.get_query_pool_results(
+                self.pool,
+                load_query(slot, 0),
+                &mut ts,
+                vk::QueryResultFlags::TYPE_64,
+            )
+        };
+        if read.is_err() {
+            self.load_prev_end = None;
+            return;
+        }
+        let frame_ms = ts[1].wrapping_sub(ts[0]) as f64 * self.period_ns as f64 / 1.0e6;
+        let gap_ms = self
+            .load_prev_end
+            .map(|end| idle_gap_ms(end, ts[0], self.period_ns))
+            .unwrap_or(0.0);
+        self.load_prev_end = Some(ts[1]);
+        self.load.store(frame_ms as f32, gap_ms as f32);
+    }
+
+    /// Resets the load pair and writes TOP_OF_PIPE. Always recorded when
+    /// timestamps exist — two stamps, host query reset when available.
+    pub(super) unsafe fn begin_load(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        self.reset_queries(device, cmd, load_query(slot, 0), LOAD_STAMPS);
+        unsafe {
+            device.cmd_write_timestamp2(
+                cmd,
+                vk::PipelineStageFlags2::TOP_OF_PIPE,
+                self.pool,
+                load_query(slot, 0),
+            );
+        }
+    }
+
+    /// Writes BOTTOM_OF_PIPE and marks the pair readable next cycle.
+    pub(super) unsafe fn end_load(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        unsafe {
+            device.cmd_write_timestamp2(
+                cmd,
+                vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                self.pool,
+                load_query(slot, 1),
+            );
+        }
+        self.load_primed[slot] = true;
     }
 
     /// Marks `slot` readable next cycle. Call after the render pass ends.
@@ -589,7 +725,7 @@ mod tests {
         assert_eq!(GPU_STAMPS, GpuPass::COUNT + 1);
         assert_eq!(
             QUERY_COUNT as usize,
-            GPU_STAMPS * FRAMES_IN_FLIGHT as usize + 2
+            GPU_STAMPS * FRAMES_IN_FLIGHT as usize + 2 + 2 * FRAMES_IN_FLIGHT as usize
         );
         // Opaque split: stamped after each camera group, in draw order
         // (full-res, coarse LOD, then cutout). Combined `opaque` is summed

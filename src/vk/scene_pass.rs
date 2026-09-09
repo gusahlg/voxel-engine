@@ -926,7 +926,9 @@ impl<'a> RenderPass<'a> {
             // Sampleable depth rest: see `sampleable_depth_rest_barrier`.
             // Skipped when nothing samples; the next begin is UNDEFINED.
             if self.sample_depth {
-                images[n] = self.r.sampleable_depth_rest_barrier(self.slot, self.absorb_this_frame);
+                images[n] = self
+                    .r
+                    .sampleable_depth_rest_barrier(self.slot, self.absorb_this_frame);
                 n += 1;
             }
             if classify_vrs {

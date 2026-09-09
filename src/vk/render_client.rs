@@ -142,6 +142,8 @@ pub(crate) struct InitReply {
     pub caps: DeviceCaps,
     /// Render thread's published exposure cell for Engine's compose().
     pub exposure: super::exposure::ExposureShared,
+    /// Last completed frame GPU busy / inter-submit gap.
+    pub gpu_load: super::gpu_timer::GpuLoadShared,
     /// Shared with the render thread; workers clone [`MeshStager`] from it.
     pub mesh_staging: Arc<MeshStagingPool>,
 }
@@ -244,6 +246,7 @@ pub(crate) struct RenderClient {
     cull_faces: bool,
     /// The render thread's published exposure cell, cloned into `Engine`.
     exposure: super::exposure::ExposureShared,
+    gpu_load: super::gpu_timer::GpuLoadShared,
     /// `None` once joined (shutdown is idempotent).
     join: Option<JoinHandle<Option<DeviceLeftovers>>>,
     /// Render-thread completed `draw_frame` calls (monotonic).
@@ -372,6 +375,7 @@ impl RenderClient {
             msaa,
             cull_faces: true,
             exposure: reply.exposure,
+            gpu_load: reply.gpu_load,
             join: Some(join),
             frames_rendered,
             frames_coalesced,
@@ -382,6 +386,10 @@ impl RenderClient {
     /// The render thread's published exposure cell, for `Engine`'s compose path.
     pub(crate) fn exposure(&self) -> super::exposure::ExposureShared {
         self.exposure.clone()
+    }
+
+    pub(crate) fn gpu_load(&self) -> super::gpu_timer::GpuLoadShared {
+        self.gpu_load.clone()
     }
 
     // ---- meshes ----
