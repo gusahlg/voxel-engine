@@ -1103,6 +1103,10 @@ impl CullState {
         self.face_cull = on;
     }
 
+    pub fn face_cull(&self) -> bool {
+        self.face_cull
+    }
+
     /// Last completed histogram for `slot`: `[draws0, idx0, draws1, idx1, draws2, idx2]`.
     pub fn stats(&self, slot: usize) -> [u32; STATS_COUNT] {
         unsafe {
@@ -1122,7 +1126,7 @@ impl CullState {
     /// live end); `visible` must cover it. `partitions` is last frame's table
     /// handed back for reuse (its contents are discarded). `clip` / `clip_v`
     /// are the full-res slab extents (`DrawLists::lod_clip`, `lod_clip_v`);
-    /// 0 disables, matching the mesh3d push constants.
+    /// 0 disables, matching the mesh3d frame-UBO clip lanes.
     ///
     /// When the directory's camera-group live count is at most `CPU_CULL_MAX`
     /// (or `VOXEL_CPU_CULL_MAX`), commands and counts are written to host-visible

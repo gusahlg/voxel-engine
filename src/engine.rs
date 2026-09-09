@@ -67,7 +67,7 @@ impl Default for Config {
 /// are CPU-side: they neutralize a `FrameUniforms` lane (`frame::gate_uniforms`,
 /// applied to `Lighting::Composed`) or skip a pass's work (vk/mod.rs,
 /// vk/shadow.rs) — no shader variants.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RenderFlags {
     /// Camera jitter + TAA resolve at present time (output/swapchain
     /// resolution). Always coupled: jitter is injected every rendered frame;

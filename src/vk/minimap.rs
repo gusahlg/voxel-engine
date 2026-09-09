@@ -92,6 +92,11 @@ impl MinimapTexture {
         self.version += 1;
     }
 
+    /// True when [`Self::sync`] would record a buffer-to-image upload for `slot`.
+    pub fn slot_stale(&self, slot: usize) -> bool {
+        self.uploaded[slot] != self.version
+    }
+
     /// Returns whether this recorded a buffer-to-image upload.
     pub unsafe fn sync(
         &mut self,

@@ -84,6 +84,17 @@ impl SkyCloudState {
         self.last_key = [None; FRAMES_IN_FLIGHT as usize];
     }
 
+    /// True when [`super::Renderer::record_sky_cloud_lut`] would dispatch or clear.
+    pub(crate) fn would_record(&self, slot: usize, u: &FrameUniformsGpu, force: bool) -> bool {
+        force || self.last_key[slot] != Some(LutKey::of(u))
+    }
+
+    /// CPU-side LUT identity after a reused command buffer that already marches
+    /// (or skipped) this slot's image.
+    pub(crate) fn note_key(&mut self, slot: usize, u: &FrameUniformsGpu) {
+        self.last_key[slot] = Some(LutKey::of(u));
+    }
+
     pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
         unsafe {
             device.destroy_pipeline(self.pipeline, None);

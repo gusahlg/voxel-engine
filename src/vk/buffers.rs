@@ -1205,6 +1205,11 @@ impl QuadIbo {
         self.required = self.required.max(quads);
     }
 
+    /// True when [`Self::ensure`] would stage a grow copy into the command buffer.
+    pub fn needs_grow(&self) -> bool {
+        self.required > self.capacity
+    }
+
     /// Grows the buffer to cover `required` quads if needed, staging the
     /// pattern via the transfer lane (mirrors `MeshResidency::flush_copies`'s
     /// tier/barrier handling) and retiring the old buffer past `done_at`.

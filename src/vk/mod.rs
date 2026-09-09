@@ -102,6 +102,9 @@ struct SlotState {
     vrs_ready: bool,
     /// History image holds a raw classification from a previous VRS dispatch.
     vrs_history: bool,
+    /// Last reusable recorded-stream key for `cmd`. `None` until a reusable
+    /// frame is recorded, and after any invalidation (recreate, flags, …).
+    recorded_key: Option<frame_loop::RecordedStreamKey>,
 }
 
 /// Minimap texture edge length in texels.
@@ -222,6 +225,12 @@ pub(crate) struct Renderer {
     pending_submits: Vec<PendingSubmit>,
     /// Runtime batch limit (`VOXEL_SUBMIT_BATCH`, default [`crate::rev::SUBMIT_BATCH_MAX`]).
     submit_batch_limit: usize,
+    /// Bumped when render targets / extent / MSAA / scale change.
+    target_gen: u64,
+    /// Bumped when graphics pipelines are rebuilt.
+    pipeline_gen: u64,
+    /// Bumped on mesh upload/free/`set_record`/block-texture replacement.
+    resource_gen: u64,
 }
 
 impl Renderer {
@@ -422,6 +431,7 @@ impl Renderer {
             indirect: HostBuffer::new(vk::BufferUsageFlags::INDIRECT_BUFFER),
             vrs_ready: false,
             vrs_history: false,
+            recorded_key: None,
         }));
 
         let present_semaphores = create_present_semaphores(&device.device, swapchain.images.len());
@@ -547,6 +557,9 @@ impl Renderer {
             empty_extra,
             pending_submits: Vec::with_capacity(crate::rev::SUBMIT_BATCH_MAX),
             submit_batch_limit: frame_loop::submit_batch_limit(),
+            target_gen: 1,
+            pipeline_gen: 1,
+            resource_gen: 1,
         };
         Ok((renderer, reply))
     }
@@ -599,12 +612,29 @@ impl Renderer {
             }
         }
         self.flags = flags;
+        self.invalidate_recorded_streams();
     }
 
     /// GPU face-run culling. Takes effect at the next cull prepare so partition
     /// capacity and the cull-params flag always agree for a frame.
     pub fn set_cull_faces(&mut self, on: bool) {
         self.cull.set_face_cull(on);
+        self.invalidate_recorded_streams();
+    }
+
+    /// Drop every slot's cached command-buffer key so the next frame re-records.
+    pub(crate) fn invalidate_recorded_streams(&mut self) {
+        for slot in 0..FRAMES_IN_FLIGHT as usize {
+            self.slots[FrameSlot::new(slot)].recorded_key = None;
+        }
+    }
+
+    fn bump_resource_gen(&mut self) {
+        self.resource_gen = self.resource_gen.wrapping_add(1);
+        if self.resource_gen == 0 {
+            self.resource_gen = 1;
+        }
+        self.invalidate_recorded_streams();
     }
 
     /// Set render scale; returns clamped value.
@@ -640,6 +670,7 @@ impl Renderer {
         );
         self.mesh_res.apply_upload(slot, generation, resident);
         self.records.install(slot, record);
+        self.bump_resource_gen();
     }
 
     /// Replaces a mover's recomposed record, keeping the cull lane counts in
@@ -652,6 +683,7 @@ impl Renderer {
             cull::MeshAabb::from_record(&record),
         );
         self.records.set_record(slot, record);
+        self.bump_resource_gen();
     }
 
     /// Set one word of the visibility mask.
@@ -672,6 +704,7 @@ impl Renderer {
         self.records.clear_arena(slot);
         self.mesh_res
             .apply_free(slot, generation, self.last_render_value);
+        self.bump_resource_gen();
     }
 
     /// Queue screenshot capture to path.
@@ -730,6 +763,7 @@ impl Renderer {
         // Old array may be sampled by in-flight frames; retire past max timeline.
         let done_at = self.timeline.last_reserved();
         self.retired_textures.push(done_at, old_textures);
+        self.bump_resource_gen();
         log::debug!(
             "block textures swapped: {} layers of {}x{}",
             self.block_textures.layers,
@@ -750,6 +784,7 @@ impl Renderer {
     /// buffers and then `vkDestroyDevice` in the correct order. Consuming `self`
     /// (rather than `Drop`) is what lets those fields move out to main.
     pub(crate) fn teardown(mut self) -> DeviceLeftovers {
+        self.invalidate_recorded_streams();
         self.flush_pending_submits();
         unsafe {
             let device = &self.device.device;

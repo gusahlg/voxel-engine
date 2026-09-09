@@ -87,6 +87,9 @@ impl Renderer {
                 // gated at arena word 0 forever once the window is restored.
                 let arrived = self.mesh_res.take_arrived();
                 self.records.mark_arrived(&arrived);
+                // Slot 0's command buffer was reset and re-recorded as a
+                // one-time copy flush; drop every cached stream key.
+                self.invalidate_recorded_streams();
             }
 
             // GPU idle + copies flushed: everything retired returns to main.
@@ -259,6 +262,10 @@ impl Renderer {
                     self.device.dynamic_rendering_local_read,
                     self.device.independent_blend,
                 );
+                self.pipeline_gen = self.pipeline_gen.wrapping_add(1);
+                if self.pipeline_gen == 0 {
+                    self.pipeline_gen = 1;
+                }
             }
 
             for &sem in &self.present_semaphores {
@@ -267,6 +274,11 @@ impl Renderer {
             self.present_semaphores =
                 create_present_semaphores(&self.device.device, self.swapchain.images.len());
 
+            self.target_gen = self.target_gen.wrapping_add(1);
+            if self.target_gen == 0 {
+                self.target_gen = 1;
+            }
+            self.invalidate_recorded_streams();
             self.needs_recreate = false;
         }
     }

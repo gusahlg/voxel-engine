@@ -132,6 +132,157 @@ pub(super) fn submit_batch_limit() -> usize {
     })
 }
 
+/// `VOXEL_CB_REUSE=0` disables per-slot command-buffer reuse (A/B kill-switch).
+/// Unset / any other value keeps reuse on. Read once at first use.
+pub(super) fn cb_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VOXEL_CB_REUSE") {
+        Ok(v) if v == "0" => false,
+        _ => true,
+    })
+}
+
+/// FNV-1a of partition offsets/capacities baked into `vkCmdDrawIndexedIndirectCount`.
+fn hash_partitions(parts: &[super::cull::PartitionGpu]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for p in parts {
+        h ^= u64::from(p.offset);
+        h = h.wrapping_mul(0x100000001b3);
+        h ^= u64::from(p.capacity);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn hash_blend_runs(runs: &[DrawRun]) -> u64 {
+    use ash::vk::Handle;
+    let mut h = 0xcbf29ce484222325u64;
+    for r in runs {
+        h ^= r.buffer.as_raw();
+        h = h.wrapping_mul(0x100000001b3);
+        h ^= u64::from(r.pass as u8);
+        h = h.wrapping_mul(0x100000001b3);
+        h ^= u64::from(r.first);
+        h = h.wrapping_mul(0x100000001b3);
+        h ^= u64::from(r.count);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn flags_bits(f: crate::engine::RenderFlags) -> u16 {
+    (u16::from(f.taa))
+        | (u16::from(f.fog) << 1)
+        | (u16::from(f.blocklight) << 2)
+        | (u16::from(f.ambient) << 3)
+        | (u16::from(f.sunlight) << 4)
+        | (u16::from(f.exposure) << 5)
+        | (u16::from(f.bloom) << 6)
+        | (u16::from(f.godrays) << 7)
+        | (u16::from(f.shadows) << 8)
+        | (u16::from(f.sky) << 9)
+        | (u16::from(f.vrs) << 10)
+        | (u16::from(f.water_anim) << 11)
+        | (u16::from(f.vignette) << 12)
+        | (u16::from(f.stars) << 13)
+}
+
+/// Inputs that decide whether the recorded primary for a slot is byte-identical
+/// to a previous recording (camera / frame-UBO values are *not* here: they
+/// live in per-slot uniform memory rewritten after the fence wait).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StreamKeyInput {
+    pub flags: crate::engine::RenderFlags,
+    pub will_present: bool,
+    pub target_gen: u64,
+    pub pipeline_gen: u64,
+    pub resource_gen: u64,
+    pub partitions: u64,
+    pub face_cull: bool,
+    pub profiling: bool,
+    /// Pending transfers, immediates, 2D/overlay, capture, minimap upload, IBO grow.
+    pub busy: bool,
+    pub vrs_ready: bool,
+    pub vrs_history: bool,
+    pub do_vrs: bool,
+    pub classify_vrs: bool,
+    pub vrs_d_threshold: u32,
+    pub shadow_gen: u64,
+    pub shadow_rebuild: bool,
+    pub empty_submit: bool,
+    pub lut_record: bool,
+    pub cull_cpu: bool,
+    pub has_scene: bool,
+    pub sky: bool,
+    pub blend: u64,
+    pub sample_depth: bool,
+}
+
+/// Per-slot recorded-stream identity. Equal keys ⇒ the previously recorded
+/// primary for this slot can be resubmitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedStreamKey {
+    flags: u16,
+    will_present: bool,
+    target_gen: u64,
+    pipeline_gen: u64,
+    resource_gen: u64,
+    partitions: u64,
+    face_cull: bool,
+    profiling: bool,
+    busy: bool,
+    vrs_ready: bool,
+    vrs_history: bool,
+    do_vrs: bool,
+    classify_vrs: bool,
+    vrs_d_threshold: u32,
+    shadow_gen: u64,
+    shadow_rebuild: bool,
+    empty_submit: bool,
+    lut_record: bool,
+    cull_cpu: bool,
+    has_scene: bool,
+    sky: bool,
+    blend: u64,
+    sample_depth: bool,
+}
+
+impl RecordedStreamKey {
+    pub(crate) fn compose(i: StreamKeyInput) -> Self {
+        Self {
+            flags: flags_bits(i.flags),
+            will_present: i.will_present,
+            target_gen: i.target_gen,
+            pipeline_gen: i.pipeline_gen,
+            resource_gen: i.resource_gen,
+            partitions: i.partitions,
+            face_cull: i.face_cull,
+            profiling: i.profiling,
+            busy: i.busy,
+            vrs_ready: i.vrs_ready,
+            vrs_history: i.vrs_history,
+            do_vrs: i.do_vrs,
+            classify_vrs: i.classify_vrs,
+            vrs_d_threshold: i.vrs_d_threshold,
+            shadow_gen: i.shadow_gen,
+            shadow_rebuild: i.shadow_rebuild,
+            empty_submit: i.empty_submit,
+            lut_record: i.lut_record,
+            cull_cpu: i.cull_cpu,
+            has_scene: i.has_scene,
+            sky: i.sky,
+            blend: i.blend,
+            sample_depth: i.sample_depth,
+        }
+    }
+
+    /// Frames that may cache and later resubmit this key's command buffer.
+    /// Presented / profiled / busy / empty-submit streams are never reused.
+    pub(crate) fn reusable(&self) -> bool {
+        !self.will_present && !self.profiling && !self.busy && !self.empty_submit
+    }
+}
+
 /// Applies sub-pixel jitter to the view-proj matrix. Jitter only exists at
 /// record time; the returned matrix is consumed immediately and never stored.
 pub(super) fn jittered_clip(
@@ -1054,6 +1205,91 @@ impl Renderer {
         );
     }
 
+    fn stream_key(
+        &self,
+        slot: usize,
+        lists: &DrawLists,
+        will_present: bool,
+        profiling: bool,
+        godray: crate::camera::Godray,
+    ) -> RecordedStreamKey {
+        let busy = self.mesh_res.has_pending()
+            || self.mesh_res.has_deferred()
+            || self.quad_ibo.needs_grow()
+            || self.minimap.slot_stale(slot)
+            || !lists.cube_verts.is_empty()
+            || !lists.line_verts.is_empty()
+            || !lists.shadow_verts.is_empty()
+            || !lists.verts_2d.is_empty()
+            || !lists.tex_verts_2d.is_empty()
+            || self.pending_capture.is_some();
+        let vrs_on = lists.scene.is_some() && self.flags.vrs && self.targets.vrs.is_some();
+        let do_vrs = vrs_on && self.slots[FrameSlot::new(slot)].vrs_ready;
+        let classify_vrs = vrs_on;
+        let spill_live = self.flags.bloom || godray.strength > 0.0;
+        let sample_depth =
+            sampleable_depth_consumed(will_present, self.flags.taa, spill_live, classify_vrs);
+        let vrs_d_threshold = lists
+            .scene
+            .as_ref()
+            .map(|s| {
+                let focal_px = 0.5 * self.render_extent.height as f32 / s.fovy_tan_half.max(1e-4);
+                (crate::camera::Z_NEAR / focal_px).to_bits()
+            })
+            .unwrap_or(0);
+        let lut_record = self.flags.sky
+            && lists.sky.is_some()
+            && lists.scene.as_ref().is_some_and(|s| {
+                self.sky_cloud
+                    .would_record(slot, &s.frame_uniforms, self.pending_capture.is_some())
+            });
+        RecordedStreamKey::compose(StreamKeyInput {
+            flags: self.flags,
+            will_present,
+            target_gen: self.target_gen,
+            pipeline_gen: self.pipeline_gen,
+            resource_gen: self.resource_gen,
+            partitions: self
+                .cull_frame
+                .as_ref()
+                .map_or(0, |f| hash_partitions(&f.partitions)),
+            face_cull: self.cull.face_cull(),
+            profiling,
+            busy,
+            vrs_ready: self.slots[FrameSlot::new(slot)].vrs_ready,
+            vrs_history: self.slots[FrameSlot::new(slot)].vrs_history,
+            do_vrs,
+            classify_vrs,
+            vrs_d_threshold,
+            shadow_gen: self.shadow_cache.uniforms_gen(),
+            shadow_rebuild: self.shadow_cache.pending_rebuild(),
+            empty_submit: self.empty_submit > 0,
+            lut_record,
+            cull_cpu: self.cull_frame.as_ref().is_some_and(|f| f.cpu),
+            has_scene: lists.scene.is_some(),
+            sky: lists.sky.is_some() && self.flags.sky,
+            blend: hash_blend_runs(&self.draw_runs),
+            sample_depth,
+        })
+    }
+
+    /// CPU work that still runs when a cached command buffer is resubmitted:
+    /// arrived-mesh reveal, cascade UBO, and the sky LUT identity.
+    fn apply_reuse_cpu(&mut self, slot: usize, lists: &DrawLists) {
+        let arrived = self.mesh_res.take_arrived();
+        self.records.mark_arrived(&arrived);
+        if let Some(cu) = self.shadow_cache.uniforms() {
+            self.shadow
+                .write_uniforms(slot, cu, self.shadow_cache.uniforms_gen());
+        }
+        if self.flags.sky
+            && lists.sky.is_some()
+            && let Some(scene) = lists.scene.as_ref()
+        {
+            self.sky_cloud.note_key(slot, &scene.frame_uniforms);
+        }
+    }
+
     /// Records the command buffer: mesh copies, render pass, and transitions.
     fn record_render(
         &mut self,
@@ -1092,6 +1328,19 @@ impl Renderer {
             self.publish_pipe_stats(slot);
         }
 
+        let key = self.stream_key(slot, lists, will_present, profiling, godray);
+        let reuse = cb_reuse_enabled()
+            && key.reusable()
+            && self.slots[FrameSlot::new(slot)].recorded_key.as_ref() == Some(&key);
+        if reuse {
+            debug_assert!(!will_present, "reuse is only for unpresented frames");
+            debug_assert!(!profiling, "reuse is off while VOXEL_PROFILE is on");
+            crate::profile::count(crate::profile::Counter::Reused);
+            self.apply_reuse_cpu(slot, lists);
+            let rs = self.timeline.begin_render(cmd);
+            return (rs, HdrReadable::new(slot));
+        }
+
         // Begin render submission; this gets the timeline value to stamp mesh copies.
         let rs = self.timeline.begin_render(cmd);
         let done_at = rs.value();
@@ -1100,12 +1349,10 @@ impl Renderer {
             device
                 .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
                 .expect("command buffer reset failed");
+            // Reusable: omit ONE_TIME_SUBMIT so a later matching slot can
+            // resubmit this primary after its fence wait.
             device
-                .begin_command_buffer(
-                    cmd,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
+                .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
                 .expect("begin command buffer failed");
             // Start timing before the staged copies so the whole buffer is
             // attributed (the `Copies` stamp closes this first span).
@@ -1444,6 +1691,7 @@ impl Renderer {
                 .end_command_buffer(cmd)
                 .expect("end command buffer failed");
         }
+        self.slots[FrameSlot::new(slot)].recorded_key = key.reusable().then_some(key);
         (rs, readable)
     }
 
@@ -1699,5 +1947,74 @@ mod tests {
             !pending_blocks_wait(slack.iter().copied(), fif - 1),
             "a batch of FIF-1 leaves the next ring slot free"
         );
+    }
+
+    fn stream_key_fixture() -> super::StreamKeyInput {
+        super::StreamKeyInput {
+            flags: crate::engine::RenderFlags::default(),
+            will_present: false,
+            target_gen: 1,
+            pipeline_gen: 1,
+            resource_gen: 1,
+            partitions: 0,
+            face_cull: true,
+            profiling: false,
+            busy: false,
+            vrs_ready: false,
+            vrs_history: false,
+            do_vrs: false,
+            classify_vrs: false,
+            vrs_d_threshold: 0,
+            shadow_gen: 1,
+            shadow_rebuild: false,
+            empty_submit: false,
+            lut_record: false,
+            cull_cpu: true,
+            has_scene: true,
+            sky: true,
+            blend: 0,
+            sample_depth: false,
+        }
+    }
+
+    #[test]
+    fn camera_or_uniform_only_frames_share_a_stream_key() {
+        // Camera / frame-UBO values are rewritten after the fence wait and are
+        // not part of the recorded stream; two otherwise-identical frames match.
+        let a = super::RecordedStreamKey::compose(stream_key_fixture());
+        let b = super::RecordedStreamKey::compose(stream_key_fixture());
+        assert_eq!(a, b);
+        assert!(a.reusable());
+    }
+
+    #[test]
+    fn partition_table_change_changes_the_stream_key() {
+        let mut input = stream_key_fixture();
+        let a = super::RecordedStreamKey::compose(input);
+        input.partitions = super::hash_partitions(&[super::super::cull::PartitionGpu {
+            offset: 0,
+            capacity: 4,
+        }]);
+        let b = super::RecordedStreamKey::compose(input);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn flag_change_changes_the_stream_key() {
+        let mut input = stream_key_fixture();
+        let a = super::RecordedStreamKey::compose(input);
+        input.flags.sky = !input.flags.sky;
+        let b = super::RecordedStreamKey::compose(input);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn will_present_changes_the_stream_key_and_is_not_reusable() {
+        let mut input = stream_key_fixture();
+        let a = super::RecordedStreamKey::compose(input);
+        input.will_present = true;
+        let b = super::RecordedStreamKey::compose(input);
+        assert_ne!(a, b);
+        assert!(!b.reusable());
     }
 }
