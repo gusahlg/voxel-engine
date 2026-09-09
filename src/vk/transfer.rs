@@ -7,11 +7,12 @@ use super::timeline::{Timeline, TimelineValue};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Tier {
-    /// A queue family with `TRANSFER` set and `GRAPHICS` unset.
+    /// A queue family with the specialized flag set (`TRANSFER` for the
+    /// transfer lane, `COMPUTE` for the compute lane) and `GRAPHICS` unset.
     DedicatedFamily,
-    /// A second queue index within the graphics family.
+    /// A second (or third) queue index within the graphics family.
     SecondQueueSameFamily,
-    /// No spare queue; copies recorded inline on caller's command buffer.
+    /// No spare queue; work recorded inline on the caller's command buffer.
     SameQueueFallback,
 }
 
@@ -26,11 +27,15 @@ impl LaneRecording {
     pub fn cmd(&self) -> vk::CommandBuffer {
         self.cmd
     }
+
+    pub(crate) fn from_cmd(cmd: vk::CommandBuffer) -> Self {
+        Self { cmd }
+    }
 }
 
 /// Recycling state of one per-batch command buffer in a [`BatchRing`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BatchState {
+pub(crate) enum BatchState {
     /// Never submitted, or its last batch was observed complete.
     Free,
     /// Handed out by `begin`, not yet submitted or discarded.
@@ -48,19 +53,21 @@ enum BatchState {
 /// lane's counter at or past `v`. Pure bookkeeping (no Vulkan calls) so the
 /// recycling rule is host-testable; the ring only ever grows (steady state
 /// is two or three buffers) and the pool frees them all at destroy.
-struct BatchRing<T> {
+///
+/// Shared with the compute lane, which has the same reset-while-pending trap.
+pub(crate) struct BatchRing<T> {
     entries: Vec<(T, BatchState)>,
 }
 
 impl<T: Copy + PartialEq> BatchRing<T> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             entries: Vec::new(),
         }
     }
 
     /// Hands out a `Free` buffer (marking it `Recording`), if any.
-    fn take_free(&mut self) -> Option<T> {
+    pub(crate) fn take_free(&mut self) -> Option<T> {
         let entry = self
             .entries
             .iter_mut()
@@ -70,7 +77,7 @@ impl<T: Copy + PartialEq> BatchRing<T> {
     }
 
     /// Frees every `Pending` buffer whose batch the lane has completed.
-    fn reclaim(&mut self, completed: TimelineValue) {
+    pub(crate) fn reclaim(&mut self, completed: TimelineValue) {
         for (_, state) in &mut self.entries {
             if let BatchState::Pending(value) = *state
                 && value <= completed
@@ -81,7 +88,7 @@ impl<T: Copy + PartialEq> BatchRing<T> {
     }
 
     /// Registers a freshly allocated buffer, already handed out.
-    fn push_recording(&mut self, handle: T) {
+    pub(crate) fn push_recording(&mut self, handle: T) {
         self.entries.push((handle, BatchState::Recording));
     }
 
@@ -96,16 +103,16 @@ impl<T: Copy + PartialEq> BatchRing<T> {
     }
 
     /// The batch on `handle` was submitted and signals `value` when done.
-    fn submitted(&mut self, handle: T, value: TimelineValue) {
+    pub(crate) fn submitted(&mut self, handle: T, value: TimelineValue) {
         self.set_state(handle, BatchState::Pending(value));
     }
 
     /// The batch on `handle` was ended without a submit: idle right away.
-    fn discarded(&mut self, handle: T) {
+    pub(crate) fn discarded(&mut self, handle: T) {
         self.set_state(handle, BatchState::Free);
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 }

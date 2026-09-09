@@ -66,6 +66,10 @@ pub struct Device {
     pub transfer_queue: vk::Queue,
     pub transfer_family: u32,
     pub transfer_tier: crate::vk::transfer::Tier,
+    pub compute_queue: vk::Queue,
+    pub compute_family: u32,
+    pub compute_tier: crate::vk::transfer::Tier,
+    pub min_storage_buffer_offset_alignment: u64,
     pub command_pool: vk::CommandPool,
     pub push_descriptor: khr::push_descriptor::Device,
     pub memory_budget: Option<MemoryBudget>,
@@ -101,6 +105,10 @@ struct Candidate {
     present_family: u32,
     /// Separate transfer family, if available.
     transfer_family: Option<u32>,
+    transfer_queue_count: u32,
+    /// COMPUTE && !GRAPHICS family, if available.
+    compute_family: Option<u32>,
+    compute_queue_count: u32,
     graphics_queue_count: u32,
     properties: vk::PhysicalDeviceProperties,
     multi_draw_indirect: bool,
@@ -167,20 +175,31 @@ impl Device {
         } else {
             crate::vk::transfer::Tier::SameQueueFallback
         };
+        let transfer_family_used = best.transfer_family.unwrap_or(best.graphics_family);
+        let compute_pick = crate::vk::compute::pick_compute_queue(
+            best.graphics_family,
+            best.graphics_queue_count,
+            transfer_tier,
+            transfer_family_used,
+            best.transfer_queue_count,
+            best.compute_family.map(|f| (f, best.compute_queue_count)),
+        );
+        let compute_tier = compute_pick.tier;
 
-        // Create queues: one per family, plus second graphics queue if needed.
+        // Create queues: one per family, plus extra graphics queues if the
+        // transfer and/or compute lanes take second-queue-same-family.
         let single_priority = [1.0_f32];
         let dual_priority = [1.0_f32, 1.0_f32];
+        let triple_priority = [1.0_f32, 1.0_f32, 1.0_f32];
+        let gfx_priorities = match compute_pick.graphics_queues {
+            3 => &triple_priority[..],
+            2 => &dual_priority[..],
+            _ => &single_priority[..],
+        };
         let mut queue_infos = vec![
             vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(best.graphics_family)
-                .queue_priorities(
-                    if transfer_tier == crate::vk::transfer::Tier::SecondQueueSameFamily {
-                        &dual_priority[..]
-                    } else {
-                        &single_priority[..]
-                    },
-                ),
+                .queue_priorities(gfx_priorities),
         ];
         if best.present_family != best.graphics_family {
             queue_infos.push(
@@ -193,11 +212,36 @@ impl Device {
             && family != best.graphics_family
             && family != best.present_family
         {
+            let n = if compute_pick.tier == crate::vk::transfer::Tier::DedicatedFamily
+                && compute_pick.family == family
+                && compute_pick.queue_index == 1
+            {
+                2
+            } else {
+                1
+            };
             queue_infos.push(
                 vk::DeviceQueueCreateInfo::default()
                     .queue_family_index(family)
-                    .queue_priorities(&single_priority),
+                    .queue_priorities(if n == 2 {
+                        &dual_priority[..]
+                    } else {
+                        &single_priority[..]
+                    }),
             );
+        }
+        if compute_pick.tier == crate::vk::transfer::Tier::DedicatedFamily {
+            let cf = compute_pick.family;
+            let already = cf == best.graphics_family
+                || cf == best.present_family
+                || best.transfer_family == Some(cf);
+            if !already {
+                queue_infos.push(
+                    vk::DeviceQueueCreateInfo::default()
+                        .queue_family_index(cf)
+                        .queue_priorities(&single_priority),
+                );
+            }
         }
 
         // shaderDemoteToHelperInvocation: SPIR-V 1.6 modules (build.rs
@@ -279,6 +323,16 @@ impl Device {
             crate::vk::transfer::Tier::SameQueueFallback => (best.graphics_family, graphics_queue),
         };
 
+        let (compute_family, compute_queue) = match compute_tier {
+            crate::vk::transfer::Tier::DedicatedFamily => (compute_pick.family, unsafe {
+                device.get_device_queue(compute_pick.family, compute_pick.queue_index)
+            }),
+            crate::vk::transfer::Tier::SecondQueueSameFamily => (best.graphics_family, unsafe {
+                device.get_device_queue(best.graphics_family, compute_pick.queue_index)
+            }),
+            crate::vk::transfer::Tier::SameQueueFallback => (best.graphics_family, graphics_queue),
+        };
+
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(best.graphics_family)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -335,6 +389,13 @@ impl Device {
             transfer_queue,
             transfer_family,
             transfer_tier,
+            compute_queue,
+            compute_family,
+            compute_tier,
+            min_storage_buffer_offset_alignment: best
+                .properties
+                .limits
+                .min_storage_buffer_offset_alignment,
             command_pool,
             push_descriptor,
             memory_budget,
@@ -481,8 +542,9 @@ fn evaluate(
     let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
     let mut graphics_family = None;
     let mut present_family = None;
-    // Look for dedicated TRANSFER-only family.
+    // Look for dedicated TRANSFER-only and COMPUTE-only families.
     let mut transfer_family = None;
+    let mut compute_family = None;
     for (index, family) in families.iter().enumerate() {
         let index = index as u32;
         if family.queue_flags.contains(vk::QueueFlags::GRAPHICS) && graphics_family.is_none() {
@@ -493,6 +555,12 @@ fn evaluate(
             && transfer_family.is_none()
         {
             transfer_family = Some(index);
+        }
+        if family.queue_flags.contains(vk::QueueFlags::COMPUTE)
+            && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            && compute_family.is_none()
+        {
+            compute_family = Some(index);
         }
         let supports_present = unsafe {
             surface_loader
@@ -509,6 +577,12 @@ fn evaluate(
     let graphics_queue_count = graphics_family
         .map(|f| families[f as usize].queue_count)
         .unwrap_or(0);
+    let transfer_queue_count = transfer_family
+        .map(|f| families[f as usize].queue_count)
+        .unwrap_or(0);
+    let compute_queue_count = compute_family
+        .map(|f| families[f as usize].queue_count)
+        .unwrap_or(0);
 
     let score = match properties.device_type {
         vk::PhysicalDeviceType::DISCRETE_GPU => 100,
@@ -522,6 +596,9 @@ fn evaluate(
         graphics_family: graphics_family?,
         present_family: present_family?,
         transfer_family,
+        transfer_queue_count,
+        compute_family,
+        compute_queue_count,
         graphics_queue_count,
         properties,
         multi_draw_indirect,

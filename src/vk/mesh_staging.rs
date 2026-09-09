@@ -80,7 +80,7 @@ fn parse_mesh_staging_mb(s: &str) -> Option<u64> {
 /// `HOST_VISIBLE | HOST_COHERENT | HOST_CACHED` without `DEVICE_LOCAL` so
 /// resident-mode memcpy (ring → mapped arena) is a cached load. Falls back
 /// to any host-coherent type.
-fn sysmem_staging_type(
+pub(crate) fn sysmem_staging_type(
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     type_filter: u32,
 ) -> Option<u32> {
