@@ -886,7 +886,7 @@ impl Renderer {
                         &self.instance.instance,
                         &self.device.device,
                         self.device.physical,
-                        &self.arena_dir,
+                        &mut self.arena_dir,
                         records,
                         slot_count,
                         camera,

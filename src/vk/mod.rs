@@ -617,6 +617,7 @@ impl Renderer {
             resident.buffer(),
             record.pass(),
             record.detail_scale() > 1.0,
+            cull::MeshAabb::from_record(&record),
         );
         self.mesh_res.apply_upload(slot, generation, resident);
         self.records.install(slot, record);
@@ -625,8 +626,12 @@ impl Renderer {
     /// Replaces a mover's recomposed record, keeping the cull lane counts in
     /// step should its detail (LOD lane) have changed.
     pub(crate) fn apply_set_record(&mut self, slot: u32, record: buffers::MeshRecord) {
-        self.arena_dir
-            .note_record(slot, record.pass(), record.detail_scale() > 1.0);
+        self.arena_dir.note_record(
+            slot,
+            record.pass(),
+            record.detail_scale() > 1.0,
+            cull::MeshAabb::from_record(&record),
+        );
         self.records.set_record(slot, record);
     }
 
