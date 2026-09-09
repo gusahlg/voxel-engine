@@ -19,7 +19,7 @@ struct MeshRecord
     float3 aabb_max;
     int vertex_offset;
     uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
-    uint flags; // bit 0 = packed face-runs valid; clear → whole-mesh draw
+    uint flags; // bit 0 = packed face-runs valid; bit 1 = uploaded this frame
 };
 
 // Mirrors vk::cull::PartitionGpu (std430).
@@ -52,6 +52,11 @@ struct CullParams
     uint flags; // bit 0 = per-direction face-run culling
     float clip;   // full-res slab radius; 0 = disabled (same as mesh3d push)
     float clip_v; // full-res slab half-height; 0 = disabled
+    float4x4 prev_view_proj; // previous frame's view-proj, origin-shifted to this eye
+    uint hiz_mips;
+    uint hiz_w;  // pyramid level-0 width (half render-res)
+    uint hiz_h;
+    uint occ_flags; // bit 0 = test against the previous pyramid
 };
 
 [[vk::binding(0, 0)]]
@@ -83,6 +88,9 @@ StructuredBuffer<uint> visible;
 // Written only when the stats push flag is set (profiling).
 [[vk::binding(7, 0)]]
 RWStructuredBuffer<uint> stats;
+
+// Previous frame's Hi-Z pyramid (SHADER_READ_ONLY). Unused when occ_flags bit 0 is clear.
+[[vk::binding(8, 0)]] Sampler2D hizTex;
 
 struct Push
 {
@@ -119,6 +127,81 @@ uint distance_bucket(float dist)
 // Horizontal test uses the farthest xz corner (max |x|, max |z|) so a skip is
 // exact for the per-fragment `length(world.xz) < clip` test. Host mirror:
 // `lod_aabb_inside_slab` in vk/cull.rs.
+// Host twin: `occ_mip_for_rect` in vk/cull.rs. Mip where the UV rect spans
+// at most 2x2 texels of the pyramid (ceil so we go coarser on a split).
+uint occ_mip_for_rect(float2 span_uv, uint2 level0, uint mip_count)
+{
+    float span_tex = max(span_uv.x * float(level0.x), span_uv.y * float(level0.y));
+    float mip_f = ceil(log2(max(span_tex * 0.5, 1.0)));
+    return min(uint(mip_f), mip_count - 1u);
+}
+
+// Host twin: `occ_hidden` in vk/cull.rs.
+bool occ_hidden_z(float nearest_z, float occ_min)
+{
+    return nearest_z < occ_min - CULL_OCC_EPS;
+}
+
+// Project the 8 camera-relative AABB corners with the previous view-proj.
+// Any corner with w <= 0 (crosses the previous near plane) → not occluded.
+// Degenerate screen rect → not occluded. Else gather the 4 pyramid texels
+// covering the clamped UV rect at a mip where the rect is at most 2x2, take
+// their MIN (farthest reversed-Z occluder), and hide iff nearest_z is farther.
+bool occlusion_hidden(float3 mn, float3 mx)
+{
+    if ((params.occ_flags & 1u) == 0u)
+        return false;
+    float nearest_z = 0.0;
+    float2 uv_min = float2(1.0, 1.0);
+    float2 uv_max = float2(0.0, 0.0);
+    [unroll]
+    for (int z = 0; z < 2; z++)
+    {
+        [unroll]
+        for (int y = 0; y < 2; y++)
+        {
+            [unroll]
+            for (int x = 0; x < 2; x++)
+            {
+                float3 p = float3(
+                    x != 0 ? mx.x : mn.x,
+                    y != 0 ? mx.y : mn.y,
+                    z != 0 ? mx.z : mn.z);
+                float4 clip = mul(params.prev_view_proj, float4(p, 1.0));
+                if (clip.w <= 0.0)
+                    return false;
+                float3 ndc = clip.xyz / clip.w;
+                float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+                uv_min = min(uv_min, uv);
+                uv_max = max(uv_max, uv);
+                nearest_z = max(nearest_z, ndc.z);
+            }
+        }
+    }
+    uv_min = saturate(uv_min);
+    uv_max = saturate(uv_max);
+    float2 span = uv_max - uv_min;
+    if (span.x <= 0.0 || span.y <= 0.0)
+        return false;
+
+    uint mip = occ_mip_for_rect(span, uint2(params.hiz_w, params.hiz_h), params.hiz_mips);
+    float2 mip_size = max(float2(params.hiz_w, params.hiz_h) / exp2(float(mip)), float2(1.0, 1.0));
+    int2 i0 = int2(floor(uv_min * mip_size));
+    int2 i1 = int2(ceil(uv_max * mip_size) - 1.0);
+    i1 = max(i1, i0);
+    int2 dim = int2(mip_size);
+    i0 = clamp(i0, int2(0, 0), dim - 1);
+    i1 = clamp(i1, int2(0, 0), dim - 1);
+
+    float2 inv = 1.0 / mip_size;
+    float occ = min(
+        min(hizTex.SampleLevel((float2(i0) + 0.5) * inv, mip).x,
+            hizTex.SampleLevel((float2(i1.x, i0.y) + 0.5) * inv, mip).x),
+        min(hizTex.SampleLevel((float2(i0.x, i1.y) + 0.5) * inv, mip).x,
+            hizTex.SampleLevel((float2(i1) + 0.5) * inv, mip).x));
+    return occ_hidden_z(nearest_z, occ);
+}
+
 bool lod_aabb_inside_slab(float3 mn, float3 mx, float clip, float clip_v)
 {
     if (!(clip > 0.0 && clip_v > 0.0))
@@ -202,6 +285,18 @@ void computeMain(uint3 id: SV_DispatchThreadID)
             in_frustum = in_frustum && !outside_plane(params.cam_planes[p], mn, mx);
         if (in_frustum)
         {
+            // Uploaded this frame: last frame has no depth for this mesh.
+            bool skip_occ = (rec.flags & 2u) != 0u;
+            if (!skip_occ && occlusion_hidden(mn, mx))
+            {
+                if ((pc.flags & 1u) != 0)
+                {
+                    uint unused;
+                    InterlockedAdd(stats[6], 1u, unused);
+                }
+            }
+            else
+            {
             // Camera group: the pass index, except coarse-LOD opaque → group 2.
             uint group = (pass == 0u && scale > 1.0) ? 2u : pass;
             // Group 2 fully inside the slab would discard every fragment.
@@ -285,6 +380,7 @@ void computeMain(uint3 id: SV_DispatchThreadID)
                         }
                     }
                 }
+            }
             }
         }
     }

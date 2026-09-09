@@ -343,10 +343,11 @@ pub enum Gauge {
     FragBlend,
     FragSky,
     PrimsFull,
+    CulledOcc,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 21] = [
+    const ALL: [Gauge; 22] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
@@ -368,6 +369,7 @@ impl Gauge {
         Gauge::FragBlend,
         Gauge::FragSky,
         Gauge::PrimsFull,
+        Gauge::CulledOcc,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -394,6 +396,7 @@ impl Gauge {
             Gauge::FragBlend => "frag.blend",
             Gauge::FragSky => "frag.sky",
             Gauge::PrimsFull => "prims.full",
+            Gauge::CulledOcc => "culled.occ",
         }
     }
 }

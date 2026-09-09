@@ -925,6 +925,11 @@ fn build_table() -> Vec<Def> {
             val: Val::Scalar(256.0),
         },
         Def {
+            name: "CULL_OCC_EPS",
+            doc: "Reversed-Z Hi-Z compare margin: cull a mesh iff its nearest z/w is\nstrictly farther (smaller) than the farthest occluder in the rect by this.\nFavours drawing. Twin: occ_hidden in vk/cull.rs.",
+            val: Val::Scalar(1.0e-4),
+        },
+        Def {
             name: "EXPOSURE_TILE",
             doc: "Exposure metering tile edge in HDR texels. The CPU-side tile-grid dimensions\n(vk/exposure.rs) are ceil(hdr_dim / EXPOSURE_TILE) and must agree.",
             val: Val::UInt(16),

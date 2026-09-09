@@ -8,9 +8,35 @@
 
 use ash::vk;
 
+use glam::Mat4;
+
 use super::pass;
+use super::pipeline::EyeSplit;
 use super::targets::HizChain;
 use super::{SAMPLEABLE_DEPTH_REST_LAYOUT, color_range};
+
+/// Camera of the frame that last built a pyramid (any slot). The next cull
+/// samples that slot's pyramid with this view-proj, origin-shifted to the
+/// current eye so camera-relative AABB corners land in last frame's clip.
+#[derive(Clone, Copy)]
+pub(crate) struct HizHistory {
+    pub slot: usize,
+    pub view_proj: Mat4,
+    pub eye: EyeSplit,
+}
+
+impl HizHistory {
+    /// `prev_view_proj * T(current_eye - prev_eye)`: maps this frame's
+    /// camera-relative positions into the clip space the pyramid was built in.
+    pub(crate) fn view_proj_for(&self, eye: EyeSplit) -> Mat4 {
+        let delta = [
+            (eye.block[0] - self.eye.block[0]) as f32 + (eye.frac[0] - self.eye.frac[0]),
+            (eye.block[1] - self.eye.block[1]) as f32 + (eye.frac[1] - self.eye.frac[1]),
+            (eye.block[2] - self.eye.block[2]) as f32 + (eye.frac[2] - self.eye.frac[2]),
+        ];
+        self.view_proj * Mat4::from_translation(glam::Vec3::from_array(delta))
+    }
+}
 
 const HIZ_DEPTH_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hiz_depth.comp.spv"));
 const HIZ_MIP_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hiz_mip.comp.spv"));
@@ -28,6 +54,8 @@ pub(crate) struct HizState {
     layout: vk::PipelineLayout,
     set_layout: vk::DescriptorSetLayout,
     depth_sampler: vk::Sampler,
+    /// Nearest-mip sampler the cull compute uses to gather pyramid texels.
+    pub(crate) sample_sampler: vk::Sampler,
 }
 
 impl HizState {
@@ -66,12 +94,28 @@ impl HizState {
                 )
                 .expect("create Hi-Z depth sampler")
         };
+        let sample_sampler = unsafe {
+            device
+                .create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::NEAREST)
+                        .min_filter(vk::Filter::NEAREST)
+                        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                        .max_lod(vk::LOD_CLAMP_NONE)
+                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                    None,
+                )
+                .expect("create Hi-Z sample sampler")
+        };
         Self {
             depth,
             mip,
             layout,
             set_layout,
             depth_sampler,
+            sample_sampler,
         }
     }
 
@@ -82,11 +126,48 @@ impl HizState {
             device.destroy_pipeline_layout(self.layout, None);
             device.destroy_descriptor_set_layout(self.set_layout, None);
             device.destroy_sampler(self.depth_sampler, None);
+            device.destroy_sampler(self.sample_sampler, None);
         }
     }
 }
 
 impl super::Renderer {
+    /// Cull-side occlusion params from the last pyramid build. Disabled when
+    /// the flag is off or there is no history (first frame / after resize).
+    pub(super) fn occ_params(&self, eye: super::pipeline::EyeSplit) -> super::cull::OccParams {
+        let chain = &self.targets.hiz[0];
+        let level0 = chain.mip_extents[0];
+        let mips = chain.mip_views.len() as u32;
+        if !self.flags.occlusion {
+            return super::cull::OccParams::disabled(level0, mips);
+        }
+        match self.hiz_history {
+            Some(h) => super::cull::OccParams {
+                view_proj: h.view_proj_for(eye),
+                mips,
+                level0,
+                enabled: true,
+            },
+            None => super::cull::OccParams::disabled(level0, mips),
+        }
+    }
+
+    /// Bindable pyramid for this frame's cull. Clears the sampled slot to 0
+    /// when it has never been reduced (first frame / after resize).
+    pub(super) unsafe fn hiz_sample_for_cull(
+        &mut self,
+        cmd: vk::CommandBuffer,
+    ) -> super::cull::HizSample {
+        let slot = self.hiz_history.map(|h| h.slot).unwrap_or(0);
+        if !self.targets.hiz[slot].ready {
+            unsafe { self.record_hiz_clear(cmd, slot) };
+        }
+        super::cull::HizSample {
+            view: self.targets.hiz[slot].sample_view,
+            sampler: self.hiz.sample_sampler,
+        }
+    }
+
     /// Pyramid → GENERAL for the end-of-frame reduce.
     ///
     /// Fully overwritten, so UNDEFINED is a valid old layout. When this slot
@@ -123,7 +204,6 @@ impl super::Renderer {
     /// Fill one slot's pyramid with 0 (reversed-Z far / empty). Used so the
     /// first cull after create, resize, or a flag toggle samples a pyramid
     /// that never occludes. Leaves the image in `SHADER_READ_ONLY`.
-    #[allow(dead_code)] // sampled by the next-frame cull (occlusion test).
     pub(super) unsafe fn record_hiz_clear(&mut self, cmd: vk::CommandBuffer, slot: usize) {
         let device = &self.device.device;
         let image = self.targets.hiz[slot].image;
@@ -313,6 +393,33 @@ mod tests {
     #[test]
     fn push_layout_is_two_uint2s() {
         assert_eq!(size_of::<HizPush>(), 16);
+    }
+
+    #[test]
+    fn view_proj_for_translates_by_eye_delta() {
+        use super::super::pipeline::EyeSplit;
+        let prev = EyeSplit {
+            block: [0; 3],
+            _pad0: 0,
+            frac: [0.0; 3],
+            _pad1: 0.0,
+        };
+        let cur = EyeSplit {
+            block: [1, 0, 0],
+            _pad0: 0,
+            frac: [0.5, 0.0, 0.0],
+            _pad1: 0.0,
+        };
+        let h = HizHistory {
+            slot: 0,
+            view_proj: Mat4::IDENTITY,
+            eye: prev,
+        };
+        let p = glam::Vec3::ZERO;
+        let clip = h.view_proj_for(cur) * p.extend(1.0);
+        assert!((clip.x - 1.5).abs() < 1e-5);
+        assert_eq!(clip.y, 0.0);
+        assert_eq!(clip.w, 1.0);
     }
 
     #[test]

@@ -237,6 +237,9 @@ impl Renderer {
                     s.vrs_ready = false;
                     s.vrs_history = false;
                 }
+                // New pyramids are UNDEFINED; the first cull after recreate
+                // samples a cleared-to-0 image (nothing culled).
+                self.hiz_history = None;
                 // Shared shadow map is UNDEFINED after recreate: force a rewrite.
                 self.shadow_cache.invalidate();
                 // LUT images are UNDEFINED after recreate.

@@ -149,6 +149,11 @@ static const float CULL_BUCKET_SPLIT_1 = 64.0f;
 // Camera-distance edge (metres) between cull buckets 2 and 3 (farthest).
 static const float CULL_BUCKET_SPLIT_2 = 256.0f;
 
+// Reversed-Z Hi-Z compare margin: cull a mesh iff its nearest z/w is
+// strictly farther (smaller) than the farthest occluder in the rect by this.
+// Favours drawing. Twin: occ_hidden in vk/cull.rs.
+static const float CULL_OCC_EPS = 0.0001f;
+
 // Exposure metering tile edge in HDR texels. The CPU-side tile-grid dimensions
 // (vk/exposure.rs) are ceil(hdr_dim / EXPOSURE_TILE) and must agree.
 static const uint EXPOSURE_TILE = 16;

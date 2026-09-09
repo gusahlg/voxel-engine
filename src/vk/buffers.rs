@@ -1436,12 +1436,16 @@ pub struct MeshRecord {
     pub face_quads: [u32; 3],
     /// Bit 0 ([`MESH_FLAG_FACE_RUNS`]): `face_quads` are valid u16 counts.
     /// Clear → the cull shader emits a whole-mesh draw for this record.
+    /// Bit 1 ([`MESH_FLAG_OCC_NEW`]): uploaded this frame; skip Hi-Z.
     pub flags: u32,
 }
 
 /// `MeshRecord::flags` bit 0: packed `face_quads` fit in u16. Clear on overflow
 /// so GPU face-run culling falls back to a whole-mesh command for that mesh.
 pub(crate) const MESH_FLAG_FACE_RUNS: u32 = 1;
+/// `MeshRecord::flags` bit 1: the mesh was uploaded this frame, so last
+/// frame's pyramid has no depth for it. The GPU occ test skips these.
+pub(crate) const MESH_FLAG_OCC_NEW: u32 = 2;
 
 // Stride must match the vertex shaders exactly; layout drift corrupts every draw.
 const _: () = assert!(std::mem::size_of::<MeshRecord>() == 80);
@@ -1529,6 +1533,7 @@ impl RecordTable {
             self.dyns.resize(n, DrawDyn::resting());
         }
         self.records[slot as usize] = record;
+        self.records[slot as usize].flags |= MESH_FLAG_OCC_NEW;
         self.dyns[slot as usize] = DrawDyn::resting();
         self.occluder_rev += 1;
         self.mark(slot);
@@ -1561,6 +1566,23 @@ impl RecordTable {
     /// cull reads this; dead slots are skipped via the directory's arena word.
     pub fn records(&self) -> &[MeshRecord] {
         &self.records
+    }
+
+    /// Drop [`MESH_FLAG_OCC_NEW`] on every record. The GPU copy flushed this
+    /// frame still has the bit (this dispatch skips those meshes); the next
+    /// flush writes the cleared flag.
+    pub fn clear_occ_new(&mut self) {
+        let dirty: Vec<u32> = self
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, rec)| rec.flags & MESH_FLAG_OCC_NEW != 0)
+            .map(|(i, _)| i as u32)
+            .collect();
+        for &slot in &dirty {
+            self.records[slot as usize].flags &= !MESH_FLAG_OCC_NEW;
+            self.mark(slot);
+        }
     }
 
     /// Replaces a mover's record (recomposed main-side); the dyn lane is

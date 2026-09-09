@@ -620,13 +620,14 @@ impl Renderer {
     /// `draws.cutout` / `tris.cutout` are group 1; `draws.lod` / `tris.lod`
     /// are group 2 (coarse LOD). Gauges no-op when profiling is off.
     fn publish_cull_stats(&self, slot: usize) {
-        let [d0, i0, d1, i1, d2, i2] = self.cull.stats(slot);
+        let [d0, i0, d1, i1, d2, i2, occ] = self.cull.stats(slot);
         crate::profile::gauge(crate::profile::Gauge::DrawsFull, d0 as u64);
         crate::profile::gauge(crate::profile::Gauge::DrawsCutout, d1 as u64);
         crate::profile::gauge(crate::profile::Gauge::DrawsLod, d2 as u64);
         crate::profile::gauge(crate::profile::Gauge::TrisFull, u64::from(i0 / 3));
         crate::profile::gauge(crate::profile::Gauge::TrisCutout, u64::from(i1 / 3));
         crate::profile::gauge(crate::profile::Gauge::TrisLod, u64::from(i2 / 3));
+        crate::profile::gauge(crate::profile::Gauge::CulledOcc, occ as u64);
     }
 
     fn publish_pipe_stats(&mut self, slot: usize) {
@@ -990,6 +991,7 @@ impl Renderer {
                 if self.visible_mask.len() < need {
                     self.visible_mask.resize(need, 0);
                 }
+                let occ = self.occ_params(*eye);
                 unsafe {
                     self.cull.prepare(
                         slot,
@@ -1008,6 +1010,7 @@ impl Renderer {
                         lists.lod_clip_v,
                         &self.visible_mask[..need],
                         recycled,
+                        occ,
                     )
                 }
             } else {
@@ -1016,6 +1019,7 @@ impl Renderer {
         } else {
             None
         };
+        self.records.clear_occ_new();
 
         let indirect_bytes: &[u8] = bytemuck::cast_slice(&self.draw_commands);
         unsafe {
@@ -1147,20 +1151,25 @@ impl Renderer {
         // the persistent record set, BEFORE any pass that consumes them (the
         // shadow occluders below and the mesh passes). Outside any rendering
         // scope; its trailing barrier orders the writes against DRAW_INDIRECT.
-        if lists.scene.is_some()
-            && let Some(frame) = &self.cull_frame
-            && let Some(records) = self.record_buffers
-        {
+        if lists.scene.is_some() && self.cull_frame.is_some() && self.record_buffers.is_some() {
             let _g = crate::profile::scope(crate::profile::Meter::RecCull);
+            let cpu = self.cull_frame.as_ref().expect("checked").cpu;
+            let hiz = (!cpu).then(|| unsafe { self.hiz_sample_for_cull(cmd) });
+            let frame = self.cull_frame.as_ref().expect("checked");
+            let records = self.record_buffers.expect("checked");
             unsafe {
-                let cull_gpu = self.cull.record(
-                    &self.device.device,
-                    &self.device.push_descriptor,
-                    cmd,
-                    slot,
-                    records,
-                    frame,
-                );
+                let cull_gpu = match hiz {
+                    None => false,
+                    Some(hiz) => self.cull.record(
+                        &self.device.device,
+                        &self.device.push_descriptor,
+                        cmd,
+                        slot,
+                        records,
+                        frame,
+                        hiz,
+                    ),
+                };
                 if profiling {
                     if cull_gpu {
                         self.gpu_timer.recorded(slot);
@@ -1455,8 +1464,13 @@ impl Renderer {
         if !build {
             return;
         }
-        let _ = lists.scene.as_ref().expect("build_hiz implies a 3D scene");
+        let scene = lists.scene.as_ref().expect("build_hiz implies a 3D scene");
         unsafe { self.record_hiz_generate(cmd, slot) };
+        self.hiz_history = Some(super::hiz::HizHistory {
+            slot,
+            view_proj: scene.view_proj,
+            eye: super::pipeline::EyeSplit::of(scene.eye),
+        });
         if crate::profile::is_enabled() {
             unsafe {
                 self.gpu_timer.recorded(slot);

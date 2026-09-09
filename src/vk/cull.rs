@@ -1,8 +1,10 @@
 //! GPU draw-command emission: cull compute shader + indirect-count.
 //! One dispatch per frame frustum-tests each mesh and appends commands
 //! per-(camera-group, arena, distance-bucket) and per-(cascade, arena) for
-//! shadows. Blend uses CPU path; immediates untouched. A small live camera-group
-//! count skips the dispatch and writes the same commands on the host.
+//! shadows. When occlusion is on, camera draws are also tested against the
+//! previous frame's Hi-Z pyramid (shadow emission is unaffected). Blend uses
+//! CPU path; immediates untouched. A small live camera-group count skips the
+//! dispatch and writes the same commands on the host.
 //!
 //! Camera groups (bucketed): full-res Opaque, Cutout, coarse-LOD Opaque
 //! (`scale > 1`). The LOD split exists so full-res opaque draws bind a
@@ -16,7 +18,7 @@ use std::num::NonZeroU32;
 
 use ash::vk;
 
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 
 use super::alloc::{find_memory_type, try_find_memory_type};
 use super::buffers::{
@@ -62,8 +64,11 @@ const LANES: usize = CAMERA_GROUPS;
 /// Size of VkDrawIndexedIndirectCommand.
 pub(crate) const CMD_STRIDE: u64 = 20;
 const WORKGROUP: u32 = crate::genconst::CULL_WORKGROUP;
-/// Profiling-only geometry histogram: per camera group `[draws, index_count]`.
-const STATS_COUNT: usize = CAMERA_GROUPS * 2;
+/// Profiling-only geometry histogram: per camera group `[draws, index_count]`,
+/// then a trailing occluded-mesh count.
+const STATS_COUNT: usize = CAMERA_GROUPS * 2 + 1;
+const STATS_OCC: usize = CAMERA_GROUPS * 2;
+const _: () = assert!(STATS_OCC + 1 == STATS_COUNT);
 const STATS_BYTES: u64 = (STATS_COUNT * size_of::<u32>()) as u64;
 const FLAG_STATS: u32 = 1;
 /// Live camera-group records at or below this count skip the GPU cull and
@@ -100,6 +105,104 @@ fn lod_aabb_inside_slab(mn: [f32; 3], mx: [f32; 3], clip: f32, clip_v: f32) -> b
 }
 
 /// Camera-distance bucket of an AABB centre, matching `cull.comp.slang`.
+/// Favour drawing: cull only when the mesh's nearest reversed-Z is strictly
+/// farther than the farthest occluder in the rect by this margin. Twin of
+/// `CULL_OCC_EPS` in `cull.comp.slang`.
+const OCC_EPS: f32 = crate::genconst::CULL_OCC_EPS;
+
+/// Mip where the UV rect spans at most 2×2 texels of the pyramid. `ceil` so
+/// a split goes coarser (safer: a larger footprint's MIN is farther). Twin of
+/// `occ_mip_for_rect` in `cull.comp.slang`.
+pub(crate) fn occ_mip_for_rect(span_uv: [f32; 2], level0: [u32; 2], mip_count: u32) -> u32 {
+    let span_tex = (span_uv[0] * level0[0] as f32).max(span_uv[1] * level0[1] as f32);
+    let mip_f = (span_tex * 0.5).max(1.0).log2().ceil();
+    (mip_f as u32).min(mip_count.saturating_sub(1))
+}
+
+/// Reversed-Z compare: hide iff `nearest_z` is farther than `occ_min` by
+/// [`OCC_EPS`]. Twin of `occ_hidden_z` in `cull.comp.slang`.
+pub(crate) fn occ_hidden(nearest_z: f32, occ_min: f32) -> bool {
+    nearest_z < occ_min - OCC_EPS
+}
+
+/// Project 8 camera-relative AABB corners with `view_proj`. `None` (keep the
+/// mesh) if any corner has w ≤ 0 or the clamped UV rect is degenerate.
+/// Otherwise `(uv_min, uv_max, nearest_z)` with uv in [0,1] and nearest_z the
+/// max of z/w (reversed-Z nearer).
+pub(crate) fn occ_screen_rect(
+    mn: [f32; 3],
+    mx: [f32; 3],
+    view_proj: &Mat4,
+) -> Option<([f32; 2], [f32; 2], f32)> {
+    let mut nearest_z = 0.0f32;
+    let mut uv_min = [1.0f32, 1.0];
+    let mut uv_max = [0.0f32, 0.0];
+    for z in 0..2 {
+        for y in 0..2 {
+            for x in 0..2 {
+                let p = Vec3::new(
+                    if x != 0 { mx[0] } else { mn[0] },
+                    if y != 0 { mx[1] } else { mn[1] },
+                    if z != 0 { mx[2] } else { mn[2] },
+                );
+                let clip = *view_proj * p.extend(1.0);
+                if clip.w <= 0.0 {
+                    return None;
+                }
+                let ndc = clip.truncate() / clip.w;
+                let uv = [ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5];
+                uv_min[0] = uv_min[0].min(uv[0]);
+                uv_min[1] = uv_min[1].min(uv[1]);
+                uv_max[0] = uv_max[0].max(uv[0]);
+                uv_max[1] = uv_max[1].max(uv[1]);
+                nearest_z = nearest_z.max(ndc.z);
+            }
+        }
+    }
+    uv_min[0] = uv_min[0].clamp(0.0, 1.0);
+    uv_min[1] = uv_min[1].clamp(0.0, 1.0);
+    uv_max[0] = uv_max[0].clamp(0.0, 1.0);
+    uv_max[1] = uv_max[1].clamp(0.0, 1.0);
+    if uv_max[0] - uv_min[0] <= 0.0 || uv_max[1] - uv_min[1] <= 0.0 {
+        return None;
+    }
+    Some((uv_min, uv_max, nearest_z))
+}
+
+/// Inclusive texel pair covering `uv` at `mip`, plus the MIN of those four
+/// samples (the farthest occluder). Host twin of the shader gather.
+pub(crate) fn occ_gather_min(
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
+    level0: [u32; 2],
+    mip: u32,
+    sample: impl Fn(i32, i32) -> f32,
+) -> f32 {
+    let mip_size = [
+        ((level0[0] as f32) / 2f32.powi(mip as i32)).max(1.0),
+        ((level0[1] as f32) / 2f32.powi(mip as i32)).max(1.0),
+    ];
+    let mut i0 = [
+        (uv_min[0] * mip_size[0]).floor() as i32,
+        (uv_min[1] * mip_size[1]).floor() as i32,
+    ];
+    let mut i1 = [
+        (uv_max[0] * mip_size[0]).ceil() as i32 - 1,
+        (uv_max[1] * mip_size[1]).ceil() as i32 - 1,
+    ];
+    i1[0] = i1[0].max(i0[0]);
+    i1[1] = i1[1].max(i0[1]);
+    let dim = [mip_size[0] as i32, mip_size[1] as i32];
+    i0[0] = i0[0].clamp(0, dim[0] - 1);
+    i0[1] = i0[1].clamp(0, dim[1] - 1);
+    i1[0] = i1[0].clamp(0, dim[0] - 1);
+    i1[1] = i1[1].clamp(0, dim[1] - 1);
+    sample(i0[0], i0[1])
+        .min(sample(i1[0], i0[1]))
+        .min(sample(i0[0], i1[1]))
+        .min(sample(i1[0], i1[1]))
+}
+
 fn distance_bucket(dist: f32) -> u32 {
     let mut b = 0u32;
     if dist >= crate::genconst::CULL_BUCKET_SPLIT_0 {
@@ -401,9 +504,14 @@ struct CullParamsGpu {
     flags: u32,
     clip: f32,
     clip_v: f32,
+    prev_view_proj: [[f32; 4]; 4],
+    hiz_mips: u32,
+    hiz_w: u32,
+    hiz_h: u32,
+    occ_flags: u32,
 }
-// std140: clip/clip_v occupy the former pad tail (same 288-byte size).
-const _: () = assert!(size_of::<CullParamsGpu>() == 288);
+// std140: prev_view_proj is 16-aligned after clip_v (288); occ tail is 16 bytes.
+const _: () = assert!(size_of::<CullParamsGpu>() == 368);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, cam_planes) == 0);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, shadow_planes) == 80);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, cam_block) == 240);
@@ -414,6 +522,41 @@ const _: () = assert!(std::mem::offset_of!(CullParamsGpu, shadow_enabled) == 272
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, flags) == 276);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, clip) == 280);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, clip_v) == 284);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, prev_view_proj) == 288);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, hiz_mips) == 352);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, hiz_w) == 356);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, hiz_h) == 360);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, occ_flags) == 364);
+
+/// Occlusion inputs for one GPU cull dispatch. `enabled` is false on the
+/// first frame after create/resize/invalidation (pyramid is cleared to 0,
+/// which never culls) and when the occlusion flag is off.
+#[derive(Clone, Copy)]
+pub(crate) struct OccParams {
+    pub view_proj: Mat4,
+    pub mips: u32,
+    pub level0: vk::Extent2D,
+    pub enabled: bool,
+}
+
+impl OccParams {
+    pub fn disabled(level0: vk::Extent2D, mips: u32) -> Self {
+        Self {
+            view_proj: Mat4::IDENTITY,
+            mips: mips.max(1),
+            level0,
+            enabled: false,
+        }
+    }
+}
+
+/// Pyramid view+sampler bound at cull set 0 binding 8. Always a valid
+/// `SHADER_READ_ONLY` image (cleared to 0 when history is empty).
+#[derive(Clone, Copy)]
+pub(crate) struct HizSample {
+    pub view: vk::ImageView,
+    pub sampler: vk::Sampler,
+}
 
 /// Mesh AABB in world/block space: `aabb_min/max * scale + local_off`, relative
 /// to `block`. The GPU cull buckets by AABB-centre distance; a centre always
@@ -1028,6 +1171,11 @@ impl CullState {
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             storage(6),
             storage(7),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(8)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
         let set_layout = unsafe {
             device
@@ -1103,7 +1251,7 @@ impl CullState {
         self.face_cull = on;
     }
 
-    /// Last completed histogram for `slot`: `[draws0, idx0, draws1, idx1, draws2, idx2]`.
+    /// Last completed histogram for `slot`: `[draws0, idx0, draws1, idx1, draws2, idx2, occ]`.
     pub fn stats(&self, slot: usize) -> [u32; STATS_COUNT] {
         unsafe {
             let p = self.stats[slot].mapped;
@@ -1146,6 +1294,7 @@ impl CullState {
         clip_v: f32,
         visible: &[u32],
         mut partitions: Vec<PartitionGpu>,
+        occ: OccParams,
     ) -> Option<CullFrame> {
         debug_assert!(slot_count <= records.slots, "slot_count exceeds the table");
         debug_assert!(visible.len() >= slot_count.div_ceil(32) as usize);
@@ -1209,6 +1358,11 @@ impl CullState {
             flags: u32::from(face_cull),
             clip,
             clip_v,
+            prev_view_proj: occ.view_proj.to_cols_array_2d(),
+            hiz_mips: occ.mips.max(1),
+            hiz_w: occ.level0.width.max(1),
+            hiz_h: occ.level0.height.max(1),
+            occ_flags: u32::from(occ.enabled),
         };
         if let Some(frusta) = shadow {
             for (c, f) in frusta.iter().enumerate() {
@@ -1260,6 +1414,7 @@ impl CullState {
         slot: usize,
         records: RecordBuffers,
         frame: &CullFrame,
+        hiz: HizSample,
     ) -> bool {
         if frame.cpu {
             return false;
@@ -1310,7 +1465,11 @@ impl CullState {
                 ),
                 info(self.stats[slot].gpu),
             ];
-            let writes: [vk::WriteDescriptorSet; 8] = std::array::from_fn(|i| {
+            let hiz_info = [vk::DescriptorImageInfo::default()
+                .sampler(hiz.sampler)
+                .image_view(hiz.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let mut writes: [vk::WriteDescriptorSet; 9] = std::array::from_fn(|i| {
                 vk::WriteDescriptorSet::default()
                     .dst_binding(i as u32)
                     .descriptor_type(if i == 5 {
@@ -1318,8 +1477,12 @@ impl CullState {
                     } else {
                         vk::DescriptorType::STORAGE_BUFFER
                     })
-                    .buffer_info(std::slice::from_ref(&infos[i]))
+                    .buffer_info(std::slice::from_ref(&infos[i.min(7)]))
             });
+            writes[8] = vk::WriteDescriptorSet::default()
+                .dst_binding(8)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&hiz_info);
             push.cmd_push_descriptor_set(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
@@ -1910,17 +2073,20 @@ mod tests {
 
     #[test]
     fn stats_histogram_is_two_u32s_per_camera_group() {
-        assert_eq!(STATS_COUNT, 6);
-        assert_eq!(STATS_BYTES, 24);
+        assert_eq!(STATS_COUNT, 7);
+        assert_eq!(STATS_OCC, 6);
+        assert_eq!(STATS_BYTES, 28);
         assert_eq!(FLAG_STATS, 1);
     }
 
     #[test]
     fn cull_params_std140_tail_is_slab_extents() {
-        assert_eq!(size_of::<CullParamsGpu>(), 288);
+        assert_eq!(size_of::<CullParamsGpu>(), 368);
         assert_eq!(std::mem::offset_of!(CullParamsGpu, flags), 276);
         assert_eq!(std::mem::offset_of!(CullParamsGpu, clip), 280);
         assert_eq!(std::mem::offset_of!(CullParamsGpu, clip_v), 284);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, prev_view_proj), 288);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, occ_flags), 364);
     }
 
     #[test]
@@ -2478,5 +2644,81 @@ mod tests {
         assert_eq!(dir.camera_live(), 3);
         dir.note_free(0, G1);
         assert_eq!(dir.camera_live(), 2);
+    }
+
+    #[test]
+    fn occ_mip_picks_a_level_where_the_rect_is_at_most_2x2() {
+        let level0 = [64, 64];
+        // 2 texels at mip 0 → mip 0 (exactly 2×2).
+        assert_eq!(occ_mip_for_rect([2.0 / 64.0, 2.0 / 64.0], level0, 7), 0);
+        // Just over 2 texels → mip 1.
+        assert_eq!(occ_mip_for_rect([2.1 / 64.0, 1.0 / 64.0], level0, 7), 1);
+        // 4 texels → mip 1 (2 texels there).
+        assert_eq!(occ_mip_for_rect([4.0 / 64.0, 4.0 / 64.0], level0, 7), 1);
+        // 4.1 texels → mip 2.
+        assert_eq!(occ_mip_for_rect([4.1 / 64.0, 1.0 / 64.0], level0, 7), 2);
+        // Tiny rect stays at mip 0; oversize clamps to last mip.
+        assert_eq!(occ_mip_for_rect([0.5 / 64.0, 0.5 / 64.0], level0, 7), 0);
+        assert_eq!(occ_mip_for_rect([1.0, 1.0], level0, 3), 2);
+    }
+
+    #[test]
+    fn occ_hidden_culls_behind_a_nearer_occluder_and_keeps_empty_depth() {
+        // Reversed-Z: 0.9 nearer than 0.4. Mesh nearest 0.4 is farther than
+        // occluder 0.9 → culled.
+        assert!(occ_hidden(0.4, 0.9));
+        // Empty pyramid (cleared to 0 = far) never culls.
+        assert!(!occ_hidden(0.4, 0.0));
+        assert!(!occ_hidden(0.0, 0.0));
+    }
+
+    #[test]
+    fn occ_hidden_epsilon_favours_drawing() {
+        let occ = 0.5;
+        // Exactly occ - eps is NOT strictly farther → keep.
+        assert!(!occ_hidden(occ - OCC_EPS, occ));
+        // A hair past the margin → cull.
+        assert!(occ_hidden(occ - OCC_EPS - 1.0e-6, occ));
+        // Equal depths → keep.
+        assert!(!occ_hidden(occ, occ));
+    }
+
+    #[test]
+    fn occ_screen_rect_keeps_a_box_that_crosses_the_near_plane() {
+        // Identity clip: w = 1 for every corner, so this path is the
+        // w <= 0 keep. A translation that puts one corner behind the
+        // viewer (w <= 0 after a perspective-like row) uses w = z of the
+        // homogeneous result: the last row of this matrix copies z into w.
+        let behind = Mat4::from_cols_array_2d(&[
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ]);
+        // Corners at z = ±1: z = -1 gives w = -1.
+        assert_eq!(
+            occ_screen_rect([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0], &behind),
+            None
+        );
+    }
+
+    #[test]
+    fn occ_gather_then_compare_culls_a_box_fully_behind_a_nearer_occluder() {
+        // Unit box in front, projected by a matrix that maps to a small
+        // on-screen rect at z/w = 0.2. A 1-texel occluder of 0.9 is nearer.
+        let vp = Mat4::from_cols_array_2d(&[
+            [0.1, 0.0, 0.0, 0.0],
+            [0.0, 0.1, 0.0, 0.0],
+            [0.0, 0.0, 0.2, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]);
+        let (uv_min, uv_max, nearest_z) =
+            occ_screen_rect([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0], &vp).expect("in front");
+        assert!((nearest_z - 0.2).abs() < 1e-5);
+        let mip = occ_mip_for_rect([uv_max[0] - uv_min[0], uv_max[1] - uv_min[1]], [64, 64], 7);
+        let occ_min = occ_gather_min(uv_min, uv_max, [64, 64], mip, |_x, _y| 0.9);
+        assert!(occ_hidden(nearest_z, occ_min));
+        let empty = occ_gather_min(uv_min, uv_max, [64, 64], mip, |_x, _y| 0.0);
+        assert!(!occ_hidden(nearest_z, empty));
     }
 }

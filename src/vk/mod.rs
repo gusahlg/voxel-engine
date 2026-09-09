@@ -167,6 +167,9 @@ pub(crate) struct Renderer {
     bloom: bloom::BloomState,
     /// Hi-Z pyramid compute.
     hiz: hiz::HizState,
+    /// Camera of the last pyramid build; `None` until the first reduce (and
+    /// after resize / history invalidation).
+    hiz_history: Option<hiz::HizHistory>,
     /// Cloud-LUT compute pipeline.
     sky_cloud: sky::SkyCloudState,
     /// TAA state.
@@ -524,6 +527,7 @@ impl Renderer {
             exposure,
             bloom,
             hiz,
+            hiz_history: None,
             sky_cloud,
             taa,
             draw_scratch: Vec::new(),
