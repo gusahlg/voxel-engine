@@ -32,6 +32,8 @@ pub(super) struct RenderPass<'a> {
     scene_state: Option<(glam::Mat4, pipeline::EyeSplit)>,
     mesh_push_bound: std::cell::Cell<bool>,
     index_bound: std::cell::Cell<bool>,
+    /// A later pass this frame samples the sampleable depth (VRS / spill / TAA).
+    sample_depth: bool,
 }
 
 impl<'a> RenderPass<'a> {
@@ -43,6 +45,7 @@ impl<'a> RenderPass<'a> {
         lists: &'a DrawLists,
         offsets: ImmOffsets,
         do_vrs: bool,
+        sample_depth: bool,
     ) -> RenderPass<'a> {
         let device = &r.device.device;
         let extent = r.render_extent;
@@ -99,8 +102,9 @@ impl<'a> RenderPass<'a> {
             // (Vulkan runs depth resolves at color-output). Dst COLOR_ATTACHMENT_OUTPUT
             // / COLOR_ATTACHMENT_WRITE. Old UNDEFINED → DEPTH_ATTACHMENT_OPTIMAL.
             // The MS `depth` attachment above is never sampled; only this image
-            // rests in SAMPLEABLE_DEPTH_REST_LAYOUT after `end`.
-            if let Some(resolved) = &r.targets.resolved_depth[slot] {
+            // rests in SAMPLEABLE_DEPTH_REST_LAYOUT after `end` when a later
+            // pass samples it. Skip the resolve-target barrier when nothing does.
+            if sample_depth && let Some(resolved) = &r.targets.resolved_depth[slot] {
                 image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .src_access_mask(vk::AccessFlags2::NONE)
@@ -178,14 +182,17 @@ impl<'a> RenderPass<'a> {
             let color_attachments = [color_attachment];
 
             // Reversed-Z: clear depth to 0.0, GREATER_OR_EQUAL test. Single-
-            // sampled: store the depth so the end-of-frame classify (and
-            // spill-godrays / present TAA) can sample it after it rests in SAMPLEABLE_DEPTH_REST_LAYOUT.
-            // MSAA: DONT_CARE the MS store — its single-sample SAMPLE_ZERO
-            // resolve into `resolved_depth` is what feeds VRS/spill/present TAA.
-            let depth_store = if r.targets.msaa.is_some() {
-                vk::AttachmentStoreOp::DONT_CARE
-            } else {
+            // sampled: store the depth so later consumers (end-of-frame
+            // classify, spill-godrays, present TAA) can sample it after it
+            // rests in SAMPLEABLE_DEPTH_REST_LAYOUT. MSAA: DONT_CARE the MS
+            // store — its single-sample SAMPLE_ZERO resolve into
+            // `resolved_depth` is what those consumers read. When nothing
+            // samples depth this frame, DONT_CARE the store and skip the
+            // resolve; the next begin discards from UNDEFINED.
+            let depth_store = if sample_depth && r.targets.msaa.is_none() {
                 vk::AttachmentStoreOp::STORE
+            } else {
+                vk::AttachmentStoreOp::DONT_CARE
             };
             let mut depth_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(r.targets.depth[slot].view())
@@ -198,7 +205,7 @@ impl<'a> RenderPass<'a> {
                         stencil: 0,
                     },
                 });
-            if let Some(resolved) = &r.targets.resolved_depth[slot] {
+            if sample_depth && let Some(resolved) = &r.targets.resolved_depth[slot] {
                 depth_attachment = depth_attachment
                     .resolve_mode(vk::ResolveModeFlags::SAMPLE_ZERO)
                     .resolve_image_view(resolved.view())
@@ -276,6 +283,7 @@ impl<'a> RenderPass<'a> {
             scene_state,
             mesh_push_bound: std::cell::Cell::new(false),
             index_bound: std::cell::Cell::new(false),
+            sample_depth,
         }
     }
 
@@ -819,9 +827,9 @@ impl<'a> RenderPass<'a> {
     /// `SHADER_READ_ONLY_OPTIMAL`, and returns the [`HdrReadable`] proof. The
     /// timeline orders later submits; this barrier owns layout and visibility.
     /// Use when no later pass writes the offscreen, so this pass owns the final
-    /// transition for tonemapping. Sampleable depth always rests here (see
-    /// [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]); `classify_vrs` joins the rate
-    /// and history images into the same barrier.
+    /// transition for tonemapping. Sampleable depth rests here when a later
+    /// pass samples it (see [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]);
+    /// `classify_vrs` joins the rate and history images into the same barrier.
     pub(super) unsafe fn end_sampled(self, classify_vrs: bool) -> HdrReadable {
         let slot = self.slot;
         unsafe { self.end(true, classify_vrs) };
@@ -831,8 +839,9 @@ impl<'a> RenderPass<'a> {
     /// Ends dynamic rendering WITHOUT the offscreen sampled transition: a later
     /// offscreen writer (exposure metering) runs after this and owns the
     /// finalization instead (its barrier would otherwise race the write).
-    /// Sampleable depth still rests in [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`].
-    /// Yields no proof — the deferred finalizer produces it.
+    /// Sampleable depth still rests in [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]
+    /// when a later pass samples it. Yields no proof — the deferred finalizer
+    /// produces it.
     pub(super) unsafe fn end_deferred(self, classify_vrs: bool) {
         unsafe { self.end(false, classify_vrs) };
     }
@@ -850,8 +859,9 @@ impl<'a> RenderPass<'a> {
             let mix_filled = classify_vrs && self.r.record_vrs_mix_fill(cmd, self.slot);
 
             // One vkCmdPipelineBarrier2: offscreen (optional) + sampleable-depth
-            // rest + (if classifying) rate/history → GENERAL. No extra VRS
-            // pipeline barrier beyond the two the frame already has.
+            // rest (only when a later pass samples it) + (if classifying)
+            // rate/history → GENERAL. No extra VRS pipeline barrier beyond the
+            // two the frame already has.
             let mut images = [vk::ImageMemoryBarrier2::default(); 4];
             let mut n = 0;
             if transition_offscreen {
@@ -872,8 +882,11 @@ impl<'a> RenderPass<'a> {
                 n += 1;
             }
             // Sampleable depth rest: see `sampleable_depth_rest_barrier`.
-            images[n] = self.r.sampleable_depth_rest_barrier(self.slot);
-            n += 1;
+            // Skipped when nothing samples; the next begin is UNDEFINED.
+            if self.sample_depth {
+                images[n] = self.r.sampleable_depth_rest_barrier(self.slot);
+                n += 1;
+            }
             if classify_vrs {
                 images[n] = self.r.vrs_rate_to_general_barrier(self.slot);
                 n += 1;
@@ -883,12 +896,14 @@ impl<'a> RenderPass<'a> {
 
             let mix_mem = [super::Renderer::vrs_mix_fill_memory_barrier()];
             let mem: &[vk::MemoryBarrier2] = if mix_filled { &mix_mem } else { &[] };
-            device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default()
-                    .memory_barriers(mem)
-                    .image_memory_barriers(&images[..n]),
-            );
+            if n > 0 || mix_filled {
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default()
+                        .memory_barriers(mem)
+                        .image_memory_barriers(&images[..n]),
+                );
+            }
         }
     }
 }

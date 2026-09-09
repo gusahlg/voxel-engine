@@ -20,6 +20,7 @@ use super::shadow;
 use super::timeline::{RenderSubmit, TimelineValue, acquire_next_image};
 use super::{
     Env, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, depth_range, sampleable_depth_attachment_state,
+    sampleable_depth_consumed,
 };
 
 /// Token returned by `acquire_slot` proving the slot is safe to render into
@@ -467,9 +468,10 @@ impl Renderer {
     /// barrier and attachment info reads this ONE function, so the two
     /// configurations cannot drift apart.
     ///
-    /// After `RenderPass::end` the *sampleable* single-sample image leaves this
-    /// layout and rests in [`SAMPLEABLE_DEPTH_REST_LAYOUT`] until the next
-    /// scene pass of this slot begins from `UNDEFINED`.
+    /// After `RenderPass::end`, if a later pass this frame samples it, the
+    /// *sampleable* single-sample image leaves this layout and rests in
+    /// [`SAMPLEABLE_DEPTH_REST_LAYOUT`]. The next scene pass of this slot
+    /// begins from `UNDEFINED` either way.
     pub(super) fn depth_pass_layout(&self) -> vk::ImageLayout {
         if self.pipelines.mesh3d_transparent_absorb.is_some() {
             vk::ImageLayout::RENDERING_LOCAL_READ_KHR
@@ -483,8 +485,9 @@ impl Renderer {
     /// With MSAA this is a resolve attachment: Vulkan executes dynamic-rendering
     /// resolves at COLOR_ATTACHMENT_OUTPUT, even for depth. Treating it as an
     /// ordinary depth-test write leaves the resolve unordered on drivers that
-    /// implement those stages independently. After that barrier the image rests
-    /// in [`SAMPLEABLE_DEPTH_REST_LAYOUT`]; see that const for the contract.
+    /// implement those stages independently. After that barrier (when issued)
+    /// the image rests in [`SAMPLEABLE_DEPTH_REST_LAYOUT`]; see that const for
+    /// the contract.
     pub(super) fn sampleable_depth_attachment_state(
         &self,
     ) -> (vk::ImageLayout, vk::PipelineStageFlags2, vk::AccessFlags2) {
@@ -493,11 +496,12 @@ impl Renderer {
 
     /// Scene-pass → rest: sampleable depth becomes [`SAMPLEABLE_DEPTH_REST_LAYOUT`].
     ///
-    /// Src is the attachment-write scope (depth tests, or COLOR_ATTACHMENT_OUTPUT
-    /// for the MSAA SAMPLE_ZERO resolve). Dst covers every consumer that samples
-    /// it without a further transition: VRS compute, the quarter-res spill
-    /// compute (godrays), and the present-time tonemap fragment (fused TAA).
-    /// The present copy is a later submit that waits on the render timeline.
+    /// Issued only when [`sampleable_depth_consumed`] is true. Src is the
+    /// attachment-write scope (depth tests, or COLOR_ATTACHMENT_OUTPUT for the
+    /// MSAA SAMPLE_ZERO resolve). Dst covers every consumer that samples it
+    /// without a further transition: VRS compute, the quarter-res spill compute
+    /// (godrays), and the present-time tonemap fragment (fused TAA). The present
+    /// copy is a later submit that waits on the render timeline.
     pub(super) fn sampleable_depth_rest_barrier(&self, slot: usize) -> vk::ImageMemoryBarrier2<'_> {
         let (src_layout, src_stage, src_access) = self.sampleable_depth_attachment_state();
         vk::ImageMemoryBarrier2::default()
@@ -1222,6 +1226,11 @@ impl Renderer {
         let vrs_on = lists.scene.is_some() && self.flags.vrs && self.targets.vrs.is_some();
         let do_vrs = vrs_on && self.slots[FrameSlot::new(slot)].vrs_ready;
         let classify_vrs = vrs_on;
+        // Depth consumers after the scene pass, computed once: VRS classify,
+        // spill/godrays (presented + bloom or a live march), fused TAA.
+        let spill_live = self.flags.bloom || godray.strength > 0.0;
+        let sample_depth =
+            sampleable_depth_consumed(will_present, self.flags.taa, spill_live, classify_vrs);
 
         let device = &self.device.device;
         let stamp = |p| {
@@ -1231,7 +1240,7 @@ impl Renderer {
         };
         let pass = {
             let _g = crate::profile::scope(crate::profile::Meter::RecTransitions);
-            unsafe { RenderPass::begin(self, cmd, slot, lists, offsets, do_vrs) }
+            unsafe { RenderPass::begin(self, cmd, slot, lists, offsets, do_vrs, sample_depth) }
         };
         if lists.scene.is_some() {
             use crate::profile::{Meter, scope};
@@ -1343,8 +1352,8 @@ impl Renderer {
             } else {
                 // Unpresented, no later HDR writer: skip the sampled transition;
                 // the next begin discards the offscreen from UNDEFINED. Depth
-                // still rests so the classifier (and a later present of a
-                // different slot) can sample it.
+                // rests only when this frame samples it (classifier); a later
+                // present uses a different slot's depth.
                 unsafe { pass.end_deferred(classify_vrs) };
                 self.finish_vrs_classify(cmd, slot, classify_vrs, lists);
                 HdrReadable::new(slot)

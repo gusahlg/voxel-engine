@@ -606,8 +606,9 @@ impl RenderTargets {
 
     /// The single-sample depth VRS/spill-godrays/present-TAA sample: the MSAA resolve target
     /// when multisampled, else the (already single-sample) `depth`. After the
-    /// scene pass this image rests in [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`];
-    /// during the pass its write scope is [`super::sampleable_depth_attachment_state`].
+    /// scene pass this image rests in [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]
+    /// when a later pass samples it; during the pass its write scope is
+    /// [`super::sampleable_depth_attachment_state`].
     pub(crate) fn sampleable_depth(&self, slot: usize) -> &ImageResource {
         self.resolved_depth[slot]
             .as_ref()

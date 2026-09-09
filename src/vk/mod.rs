@@ -1079,20 +1079,46 @@ fn depth_range() -> vk::ImageSubresourceRange {
 
 /// Resting layout of the single-sample sampleable depth after the scene pass.
 ///
-/// Contract: [`scene_pass::RenderPass::end`] transitions that image (the MSAA
-/// resolve target when multisampled, else the depth image) from the scene-pass
-/// write scope ([`sampleable_depth_attachment_state`]) to this layout in the
-/// same `vkCmdPipelineBarrier2` as the offscreen HDR finalize, with dst stage
-/// `COMPUTE_SHADER | FRAGMENT_SHADER` and access `SHADER_SAMPLED_READ`. From
-/// then on it RESTS here: the quarter-res spill pass (godray sampler) and the
-/// VRS classifier sample it in the same submit with no further transition; the
-/// present-time fused TAA tonemap samples it in the later copy submit (the
-/// render timeline wait covers that fragment shader). The next scene pass of
-/// this slot begins the image from `UNDEFINED` (contents are cleared every
-/// frame, so the discard is free). The multisampled `depth` attachment is
-/// unchanged: it still begins from UNDEFINED and is never sampled.
+/// Contract: when a later pass *this frame* samples that image (see
+/// [`sampleable_depth_consumed`]), [`scene_pass::RenderPass::end`] transitions
+/// it (the MSAA resolve target when multisampled, else the depth image) from
+/// the scene-pass write scope ([`sampleable_depth_attachment_state`]) to this
+/// layout in the same `vkCmdPipelineBarrier2` as the offscreen HDR finalize,
+/// with dst stage `COMPUTE_SHADER | FRAGMENT_SHADER` and access
+/// `SHADER_SAMPLED_READ`. From then on it RESTS here: the quarter-res spill
+/// pass (godray sampler) and the VRS classifier sample it in the same submit
+/// with no further transition; the present-time fused TAA tonemap samples it
+/// in the later copy submit (the render timeline wait covers that fragment
+/// shader).
+///
+/// When nothing samples it, `end` skips that rest transition and the scene
+/// pass stores depth with `DONT_CARE` (and skips the MSAA SAMPLE_ZERO resolve).
+/// The next scene pass of this slot begins the image from `UNDEFINED` in
+/// either case (contents are cleared every frame, so the discard is free).
+/// The multisampled `depth` attachment is unchanged: it still begins from
+/// UNDEFINED and is never sampled.
 pub(super) const SAMPLEABLE_DEPTH_REST_LAYOUT: vk::ImageLayout =
     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+
+/// True when a later pass this frame samples the scene's sampleable depth.
+///
+/// Consumers, computed once per frame:
+/// - VRS classify (same submit), even on unpresented frames;
+/// - quarter-res spill/godrays (same submit), on presented frames with bloom
+///   or a live godray march;
+/// - fused TAA tonemap (later present submit), on presented frames with TAA.
+///
+/// Water's in-pass depth input-attachment read is not a rest-layout consumer
+/// (`store_op` is after the pass). Minimap and screenshot capture do not
+/// sample depth.
+pub(super) fn sampleable_depth_consumed(
+    will_present: bool,
+    taa: bool,
+    spill_live: bool,
+    classify_vrs: bool,
+) -> bool {
+    classify_vrs || (will_present && (taa || spill_live))
+}
 
 /// Synchronization state of the depth image sampled by post-processing *during
 /// the scene pass* (the source scope of the rest-layout barrier).
@@ -1171,6 +1197,22 @@ mod tests {
             SAMPLEABLE_DEPTH_REST_LAYOUT,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
         );
+    }
+
+    #[test]
+    fn sampleable_depth_consumed_gates_on_actual_consumers() {
+        // Nothing samples: TAA off, no spill, no VRS — even if presenting.
+        assert!(!sampleable_depth_consumed(false, false, false, false));
+        assert!(!sampleable_depth_consumed(true, false, false, false));
+        // VRS classify samples in the same submit, presented or not.
+        assert!(sampleable_depth_consumed(false, false, false, true));
+        assert!(sampleable_depth_consumed(true, false, false, true));
+        // Fused TAA tonemap samples only on presented frames.
+        assert!(sampleable_depth_consumed(true, true, false, false));
+        assert!(!sampleable_depth_consumed(false, true, false, false));
+        // Spill/godrays sample only on presented frames.
+        assert!(sampleable_depth_consumed(true, false, true, false));
+        assert!(!sampleable_depth_consumed(false, false, true, false));
     }
 
     #[test]
