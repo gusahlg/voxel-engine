@@ -46,7 +46,9 @@ impl MinimapTexture {
                     aspect: vk::ImageAspectFlags::COLOR,
                     samples: vk::SampleCountFlags::TYPE_1,
                 },
+                "minimap",
             )
+            .expect("minimap image")
         };
         let images = [make_img(), make_img()];
 

@@ -5,9 +5,13 @@
 /// offscreen image. Recreated on resize and on MSAA changes.
 use ash::vk;
 
-use super::alloc::find_memory_type;
 use super::buffers::FRAMES_IN_FLIGHT;
-use super::image::{ImageDesc, ImageResource};
+use super::image::{
+    AllocError, ImageDesc, ImageResource, allocate_and_bind_image, create_image_array,
+    image_purpose,
+};
+
+const SLOTS: usize = FRAMES_IN_FLIGHT as usize;
 
 /// Mandatory linear-HDR format (`R16G16B16A16_SFLOAT`) for the bloom pyramid,
 /// quarter-res spill, sky-cloud LUT, and the 1×1 black bloom fallback.
@@ -61,12 +65,23 @@ pub(crate) struct ShadowMap {
 }
 
 impl ShadowMap {
-    fn new(device: &ash::Device, memory_props: &vk::PhysicalDeviceMemoryProperties) -> Self {
+    fn new(
+        device: &ash::Device,
+        memory_props: &vk::PhysicalDeviceMemoryProperties,
+    ) -> Result<Self, AllocError> {
         let extent = vk::Extent3D {
             width: SHADOW_RESOLUTION,
             height: SHADOW_RESOLUTION,
             depth: 1,
         };
+        let purpose = image_purpose(
+            "shadow map",
+            vk::Extent2D {
+                width: SHADOW_RESOLUTION,
+                height: SHADOW_RESOLUTION,
+            },
+            vk::SampleCountFlags::TYPE_1,
+        );
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(SHADOW_FORMAT)
@@ -85,25 +100,13 @@ impl ShadowMap {
                 .expect("Failed to create shadow map image")
         };
 
-        let requirements = unsafe { device.get_image_memory_requirements(image) };
-        let memory_type = find_memory_type(
-            memory_props,
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-        let memory = unsafe {
-            device
-                .allocate_memory(&alloc_info, None)
-                .expect("Failed to allocate shadow map memory")
+        let memory = match allocate_and_bind_image(device, memory_props, image, &purpose) {
+            Ok(memory) => memory,
+            Err(err) => {
+                unsafe { device.destroy_image(image, None) };
+                return Err(err);
+            }
         };
-        unsafe {
-            device
-                .bind_image_memory(image, memory, 0)
-                .expect("Failed to bind shadow map memory");
-        }
 
         let sample_view = unsafe {
             device
@@ -161,13 +164,13 @@ impl ShadowMap {
                 .expect("Failed to create shadow comparison sampler")
         };
 
-        Self {
+        Ok(Self {
             image,
             memory,
             sample_view,
             layer_views,
             sampler,
-        }
+        })
     }
 
     unsafe fn destroy(&self, device: &ash::Device) {
@@ -205,12 +208,13 @@ impl BloomChain {
         device: &ash::Device,
         memory_props: &vk::PhysicalDeviceMemoryProperties,
         extent: vk::Extent2D,
-    ) -> BloomChain {
+    ) -> Result<BloomChain, AllocError> {
         // Half-res base; each mip halves (rounding up) to a floor of 1 texel.
         let base = vk::Extent2D {
             width: extent.width.div_ceil(2).max(1),
             height: extent.height.div_ceil(2).max(1),
         };
+        let purpose = image_purpose("bloom pyramid", base, vk::SampleCountFlags::TYPE_1);
         let mut mip_extents = Vec::new();
         let mut e = base;
         loop {
@@ -257,26 +261,13 @@ impl BloomChain {
                 )
                 .expect("create bloom image")
         };
-        let reqs = unsafe { device.get_image_memory_requirements(image) };
-        let memory = unsafe {
-            device
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(reqs.size)
-                        .memory_type_index(find_memory_type(
-                            memory_props,
-                            reqs.memory_type_bits,
-                            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                        )),
-                    None,
-                )
-                .expect("allocate bloom memory")
+        let memory = match allocate_and_bind_image(device, memory_props, image, &purpose) {
+            Ok(memory) => memory,
+            Err(err) => {
+                unsafe { device.destroy_image(image, None) };
+                return Err(err);
+            }
         };
-        unsafe {
-            device
-                .bind_image_memory(image, memory, 0)
-                .expect("bind bloom memory");
-        }
 
         let view = |base_mip: u32, count: u32| unsafe {
             device
@@ -299,14 +290,14 @@ impl BloomChain {
         let sample_view = view(0, levels);
         let mip_views = (0..levels).map(|m| view(m, 1)).collect();
 
-        BloomChain {
+        Ok(BloomChain {
             image,
             memory,
             sample_view,
             mip_views,
             mip_extents,
             cleared: false,
-        }
+        })
     }
 
     unsafe fn destroy(&self, device: &ash::Device) {
@@ -362,6 +353,89 @@ pub struct RenderTargets {
     pub(crate) sky_cloud: [ImageResource; FRAMES_IN_FLIGHT as usize],
 }
 
+/// In-progress `RenderTargets::new`. Drop destroys anything already created
+/// unless [`TargetBuild::finish`] disarms it.
+struct TargetBuild<'a> {
+    device: &'a ash::Device,
+    depth: [Option<ImageResource>; SLOTS],
+    resolved_depth: [Option<ImageResource>; SLOTS],
+    msaa: Option<ImageResource>,
+    offscreen: [Option<ImageResource>; SLOTS],
+    vrs: Option<super::vrs::Vrs>,
+    shadow: Option<ShadowMap>,
+    bloom: [Option<BloomChain>; SLOTS],
+    spill: [Option<ImageResource>; SLOTS],
+    sky_cloud: [Option<ImageResource>; SLOTS],
+    live: bool,
+}
+
+impl Drop for TargetBuild<'_> {
+    fn drop(&mut self) {
+        if !self.live {
+            return;
+        }
+        let device = self.device;
+        unsafe {
+            for img in self.depth.iter().flatten() {
+                img.destroy(device);
+            }
+            for img in self.resolved_depth.iter().flatten() {
+                img.destroy(device);
+            }
+            if let Some(msaa) = &self.msaa {
+                msaa.destroy(device);
+            }
+            for img in self.offscreen.iter().flatten() {
+                img.destroy(device);
+            }
+            if let Some(vrs) = &mut self.vrs {
+                vrs.destroy(device);
+            }
+            if let Some(shadow) = &self.shadow {
+                shadow.destroy(device);
+            }
+            for chain in self.bloom.iter().flatten() {
+                chain.destroy(device);
+            }
+            for img in self.spill.iter().flatten() {
+                img.destroy(device);
+            }
+            for img in self.sky_cloud.iter().flatten() {
+                img.destroy(device);
+            }
+        }
+    }
+}
+
+impl TargetBuild<'_> {
+    fn finish(
+        mut self,
+        depth_format: vk::Format,
+        samples: vk::SampleCountFlags,
+        color_format: vk::Format,
+    ) -> RenderTargets {
+        self.live = false;
+        RenderTargets {
+            depth: take_filled(&mut self.depth),
+            resolved_depth: self.resolved_depth.each_mut().map(Option::take),
+            depth_format,
+            msaa: self.msaa.take(),
+            offscreen: take_filled(&mut self.offscreen),
+            samples,
+            color_format,
+            vrs: self.vrs.take(),
+            shadow: self.shadow.take().expect("shadow map"),
+            bloom: take_filled(&mut self.bloom),
+            spill: take_filled(&mut self.spill),
+            sky_cloud: take_filled(&mut self.sky_cloud),
+        }
+    }
+}
+
+fn take_filled<T, const N: usize>(slots: &mut [Option<T>; N]) -> [T; N] {
+    std::array::from_fn(|i| slots[i].take().expect("slot filled"))
+}
+
 impl RenderTargets {
     pub fn new(
         instance: &ash::Instance,
@@ -370,14 +444,29 @@ impl RenderTargets {
         extent: vk::Extent2D,
         samples: super::SampleCount,
         fsr: Option<&super::device::FragmentShadingRate>,
-    ) -> Self {
+    ) -> Result<Self, AllocError> {
         let color_format = pick_hdr_color_format(instance, physical);
         let samples = samples.as_flags();
         let depth_format = pick_depth_format(instance, physical);
         // Queried once and shared by every render-target image below.
         let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
 
-        let depth = std::array::from_fn(|_| {
+        let mut build = TargetBuild {
+            device,
+            depth: std::array::from_fn(|_| None),
+            resolved_depth: std::array::from_fn(|_| None),
+            msaa: None,
+            offscreen: std::array::from_fn(|_| None),
+            vrs: None,
+            shadow: None,
+            bloom: std::array::from_fn(|_| None),
+            spill: std::array::from_fn(|_| None),
+            sky_cloud: std::array::from_fn(|_| None),
+            live: true,
+        };
+
+        let depth_purpose = image_purpose("depth", extent, samples);
+        build.depth = create_image_array(device, || {
             ImageResource::create(
                 device,
                 &memory_props,
@@ -392,11 +481,15 @@ impl RenderTargets {
                     aspect: vk::ImageAspectFlags::DEPTH,
                     samples,
                 },
+                &depth_purpose,
             )
-        });
+        })?
+        .map(Some);
 
-        let resolved_depth = std::array::from_fn(|_| {
-            (samples != vk::SampleCountFlags::TYPE_1).then(|| {
+        if samples != vk::SampleCountFlags::TYPE_1 {
+            let resolved_purpose =
+                image_purpose("resolved depth", extent, vk::SampleCountFlags::TYPE_1);
+            build.resolved_depth = create_image_array(device, || {
                 ImageResource::create(
                     device,
                     &memory_props,
@@ -410,12 +503,11 @@ impl RenderTargets {
                         aspect: vk::ImageAspectFlags::DEPTH,
                         samples: vk::SampleCountFlags::TYPE_1,
                     },
+                    &resolved_purpose,
                 )
-            })
-        });
-
-        let msaa = (samples != vk::SampleCountFlags::TYPE_1).then(|| {
-            ImageResource::create(
+            })?
+            .map(Some);
+            build.msaa = Some(ImageResource::create(
                 device,
                 &memory_props,
                 &ImageDesc {
@@ -427,10 +519,12 @@ impl RenderTargets {
                     aspect: vk::ImageAspectFlags::COLOR,
                     samples,
                 },
-            )
-        });
+                &image_purpose("HDR colour", extent, samples),
+            )?);
+        }
 
-        let offscreen = std::array::from_fn(|_| {
+        let offscreen_purpose = image_purpose("HDR colour", extent, vk::SampleCountFlags::TYPE_1);
+        build.offscreen = create_image_array(device, || {
             ImageResource::create(
                 device,
                 &memory_props,
@@ -446,19 +540,26 @@ impl RenderTargets {
                     aspect: vk::ImageAspectFlags::COLOR,
                     samples: vk::SampleCountFlags::TYPE_1,
                 },
+                &offscreen_purpose,
             )
-        });
+        })?
+        .map(Some);
 
         // Rate images exist whenever the device supports attachment FSR.
         // `RenderFlags::vrs` (default off) is the runtime switch: off skips the
         // classify dispatch and the rate attachment, shading 1×1 everywhere.
-        let vrs = fsr.map(|f| super::vrs::Vrs::new(device, &memory_props, f, extent));
+        if let Some(f) = fsr {
+            build.vrs = Some(super::vrs::Vrs::new(device, &memory_props, f, extent)?);
+        }
 
-        let shadow = ShadowMap::new(device, &memory_props);
+        build.shadow = Some(ShadowMap::new(device, &memory_props)?);
 
-        let bloom = std::array::from_fn(|_| BloomChain::new(device, &memory_props, extent));
+        for chain in &mut build.bloom {
+            *chain = Some(BloomChain::new(device, &memory_props, extent)?);
+        }
         let spill_extent = spill_extent(extent);
-        let spill = std::array::from_fn(|_| {
+        let spill_purpose = image_purpose("spill", spill_extent, vk::SampleCountFlags::TYPE_1);
+        build.spill = create_image_array(device, || {
             ImageResource::create(
                 device,
                 &memory_props,
@@ -471,18 +572,22 @@ impl RenderTargets {
                     aspect: vk::ImageAspectFlags::COLOR,
                     samples: vk::SampleCountFlags::TYPE_1,
                 },
+                &spill_purpose,
             )
-        });
+        })?
+        .map(Some);
         let lut = crate::genconst::SKY_CLOUD_LUT_SIZE;
-        let sky_cloud = std::array::from_fn(|_| {
+        let lut_extent = vk::Extent2D {
+            width: lut,
+            height: lut,
+        };
+        let lut_purpose = image_purpose("sky cloud LUT", lut_extent, vk::SampleCountFlags::TYPE_1);
+        build.sky_cloud = create_image_array(device, || {
             ImageResource::create(
                 device,
                 &memory_props,
                 &ImageDesc {
-                    extent: vk::Extent2D {
-                        width: lut,
-                        height: lut,
-                    },
+                    extent: lut_extent,
                     format: HDR_COLOR_FORMAT,
                     usage: vk::ImageUsageFlags::STORAGE
                         | vk::ImageUsageFlags::SAMPLED
@@ -491,23 +596,12 @@ impl RenderTargets {
                     aspect: vk::ImageAspectFlags::COLOR,
                     samples: vk::SampleCountFlags::TYPE_1,
                 },
+                &lut_purpose,
             )
-        });
+        })?
+        .map(Some);
 
-        Self {
-            depth,
-            resolved_depth,
-            depth_format,
-            msaa,
-            offscreen,
-            samples,
-            color_format,
-            vrs,
-            shadow,
-            bloom,
-            spill,
-            sky_cloud,
-        }
+        Ok(build.finish(depth_format, samples, color_format))
     }
 
     /// The single-sample depth VRS/spill-godrays/present-TAA sample: the MSAA resolve target

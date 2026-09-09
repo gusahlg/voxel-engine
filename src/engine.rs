@@ -164,10 +164,11 @@ pub struct Engine {
 }
 
 impl Engine {
-    fn new(window: winit::window::Window, mut client: RenderClient, config: &Config) -> Self {
+    fn new(event_loop: &ActiveEventLoop, config: &Config) -> Result<Self, String> {
+        let (window, mut client) = RenderClient::spawn(event_loop, config)?;
         let lists = client.take_frame();
         let exposure_shared = client.exposure();
-        Self {
+        Ok(Self {
             client,
             exposure_shared,
             window,
@@ -181,7 +182,7 @@ impl Engine {
             fps_window_frames: 0,
             fps_cached: 0,
             should_close: false,
-        }
+        })
     }
 
     // ---- window / timing ----
@@ -551,6 +552,7 @@ pub fn run(config: Config, frame_callback: impl FnMut(&mut Engine) -> bool) {
         callback: frame_callback,
         finished: false,
         ran_this_cycle: false,
+        init_failed: false,
     };
     if let Err(err) = event_loop.run_app(&mut app) {
         log::error!(
@@ -566,6 +568,10 @@ pub fn run(config: Config, frame_callback: impl FnMut(&mut Engine) -> bool) {
         drop(app);
         std::process::exit(1);
     }
+    if app.init_failed {
+        drop(app);
+        std::process::exit(1);
+    }
 }
 
 struct EngineApp<F> {
@@ -578,6 +584,9 @@ struct EngineApp<F> {
     /// One frame per event-loop cycle: an OS-delivered RedrawRequested
     /// (expose, live-resize) and about_to_wait must not both run a frame.
     ran_this_cycle: bool,
+    /// Renderer construction failed (logged); `run` exits non-zero after the
+    /// event loop returns so this is not a panic and not a silent close.
+    init_failed: bool,
 }
 
 impl<F: FnMut(&mut Engine) -> bool> EngineApp<F> {
@@ -625,8 +634,14 @@ impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
         // Window + instance + surface are created on main; the render thread is
         // spawned and builds the Renderer, then replies so the client can build
         // its allocator. The window stays on main (in `Engine`).
-        let (window, client) = RenderClient::spawn(event_loop, &self.config);
-        self.engine = Some(Engine::new(window, client, &self.config));
+        match Engine::new(event_loop, &self.config) {
+            Ok(engine) => self.engine = Some(engine),
+            Err(_) => {
+                // `RenderClient::spawn` already logged the readable error.
+                self.init_failed = true;
+                event_loop.exit();
+            }
+        }
     }
 
     fn window_event(

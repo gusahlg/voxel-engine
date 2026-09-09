@@ -5,7 +5,7 @@ use ash::vk;
 use super::alloc::{find_memory_type, try_find_memory_type};
 use super::buffers::FRAMES_IN_FLIGHT;
 use super::device::FragmentShadingRate;
-use super::image::{ImageDesc, ImageResource};
+use super::image::{AllocError, ImageDesc, ImageResource, create_image_array, image_purpose};
 use super::{SAMPLEABLE_DEPTH_REST_LAYOUT, color_range};
 use crate::skeleton::FrameSlot;
 
@@ -61,32 +61,49 @@ impl Vrs {
         memory_props: &vk::PhysicalDeviceMemoryProperties,
         fsr: &FragmentShadingRate,
         render_extent: vk::Extent2D,
-    ) -> Vrs {
+    ) -> Result<Vrs, AllocError> {
         let texel_size = fsr.texel_size;
         let tiles = vk::Extent2D {
             width: render_extent.width.div_ceil(texel_size.width).max(1),
             height: render_extent.height.div_ceil(texel_size.height).max(1),
         };
-        let images = std::array::from_fn(|_| {
+        let rate_purpose = image_purpose("VRS rate", tiles, vk::SampleCountFlags::TYPE_1);
+        let history_purpose = image_purpose("VRS history", tiles, vk::SampleCountFlags::TYPE_1);
+        let images = create_image_array(device, || {
             create_r8_image(
                 device,
                 memory_props,
                 tiles,
                 vk::ImageUsageFlags::STORAGE
                     | vk::ImageUsageFlags::FRAGMENT_SHADING_RATE_ATTACHMENT_KHR,
+                &rate_purpose,
             )
-        });
-        let history = std::array::from_fn(|_| {
-            create_r8_image(device, memory_props, tiles, vk::ImageUsageFlags::STORAGE)
-        });
+        })?;
+        let history = match create_image_array(device, || {
+            create_r8_image(
+                device,
+                memory_props,
+                tiles,
+                vk::ImageUsageFlags::STORAGE,
+                &history_purpose,
+            )
+        }) {
+            Ok(history) => history,
+            Err(err) => {
+                for img in &images {
+                    unsafe { img.destroy(device) };
+                }
+                return Err(err);
+            }
+        };
         let mix = std::array::from_fn(|_| MixReadback::new(device, memory_props));
-        Vrs {
+        Ok(Vrs {
             texel_size,
             tiles,
             images,
             history,
             mix,
-        }
+        })
     }
 
     pub fn tiles(&self) -> vk::Extent2D {
@@ -182,7 +199,8 @@ fn create_r8_image(
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     tiles: vk::Extent2D,
     usage: vk::ImageUsageFlags,
-) -> ImageResource {
+    purpose: &str,
+) -> Result<ImageResource, AllocError> {
     ImageResource::create(
         device,
         memory_props,
@@ -194,6 +212,7 @@ fn create_r8_image(
             aspect: vk::ImageAspectFlags::COLOR,
             samples: vk::SampleCountFlags::TYPE_1,
         },
+        purpose,
     )
 }
 

@@ -48,6 +48,7 @@ use buffers::{DrawIndexedIndirect, FRAMES_IN_FLIGHT, GpuResident, HostBuffer, Me
 use device::Device;
 use frame_loop::{DrawEntry, DrawRun};
 use gpu_timer::GpuTimer;
+use image::AllocError;
 use instance::InstanceBundle;
 use minimap::MinimapTexture;
 use pipeline::Pipelines;
@@ -217,13 +218,16 @@ impl Renderer {
     /// surface (a `!Send` window handle never crosses). Returns the renderer and
     /// the [`InitReply`] main uses to build its allocator. The window itself
     /// stays on main.
+    ///
+    /// Render-target allocation failure is returned (not panicked) so the
+    /// render thread can send [`Err`] to main instead of dying.
     pub(crate) fn build(
         instance: InstanceBundle,
         surface_loader: khr::surface::Instance,
         surface: vk::SurfaceKHR,
         cfg: RenderConfig,
         ret: Sender<RenderReturn>,
-    ) -> (Self, InitReply) {
+    ) -> Result<(Self, InitReply), AllocError> {
         let RenderConfig {
             vsync,
             msaa,
@@ -271,14 +275,50 @@ impl Renderer {
 
         let msaa = resolve_msaa(msaa, device.max_msaa(), "requested");
         let render_extent = scaled_extent(swapchain.extent, render_scale);
-        let targets = RenderTargets::new(
+        let memory_props = unsafe {
+            instance
+                .instance
+                .get_physical_device_memory_properties(device.physical)
+        };
+        let targets = match RenderTargets::new(
             &instance.instance,
             &device.device,
             device.physical,
             render_extent,
             msaa,
             device.fragment_shading_rate.as_ref(),
-        );
+        ) {
+            Ok(targets) => targets,
+            Err(err) => {
+                abort_build(
+                    instance,
+                    surface_loader,
+                    surface,
+                    device,
+                    transfer_lane,
+                    swapchain,
+                    None,
+                    None,
+                );
+                return Err(err);
+            }
+        };
+        let taa = match taa::TaaState::new(&device.device, &memory_props, swapchain.extent) {
+            Ok(taa) => taa,
+            Err(err) => {
+                abort_build(
+                    instance,
+                    surface_loader,
+                    surface,
+                    device,
+                    transfer_lane,
+                    swapchain,
+                    Some(targets),
+                    None,
+                );
+                return Err(err);
+            }
+        };
         log::info!("HDR color format: {:?}", targets.color_format);
 
         let atlas = FontAtlas::new(
@@ -367,18 +407,12 @@ impl Renderer {
             pipelines.layout_3d,
             pipelines.layout_debug,
         );
-        let memory_props = unsafe {
-            instance
-                .instance
-                .get_physical_device_memory_properties(device.physical)
-        };
         let exposure = exposure::ExposureState::new(
             &device.device,
             &memory_props,
             render_extent,
             pipeline_cache,
         );
-        let taa = taa::TaaState::new(&device.device, &memory_props, swapchain.extent);
         let bloom = bloom::BloomState::new(&device.device, &memory_props, pipeline_cache);
         let sky_cloud = sky::SkyCloudState::new(&device.device, pipeline_cache);
 
@@ -470,7 +504,7 @@ impl Renderer {
             present_interval,
             gpu_timer,
         };
-        (renderer, reply)
+        Ok((renderer, reply))
     }
 
     /// Handle window resize and flag swapchain rebuild.
@@ -896,6 +930,35 @@ fn create_present_semaphores(device: &ash::Device, count: usize) -> Vec<BinarySe
     (0..count)
         .map(|_| unsafe { BinarySemaphore::new(device) })
         .collect()
+}
+
+/// Tear down Vulkan objects created before a render-target allocation failure
+/// in [`Renderer::build`]. The render thread owns instance/surface/device at
+/// this point; main never sees them.
+#[allow(clippy::too_many_arguments)]
+fn abort_build(
+    mut instance: InstanceBundle,
+    surface_loader: khr::surface::Instance,
+    surface: vk::SurfaceKHR,
+    mut device: Device,
+    mut transfer_lane: TransferLane,
+    mut swapchain: Swapchain,
+    mut targets: Option<RenderTargets>,
+    taa: Option<taa::TaaState>,
+) {
+    unsafe {
+        if let Some(taa) = &taa {
+            taa.destroy(&device.device);
+        }
+        if let Some(targets) = &mut targets {
+            targets.destroy(&device.device);
+        }
+        swapchain.destroy(&device.device);
+        transfer_lane.destroy(&device.device);
+        device.destroy();
+        surface_loader.destroy_surface(surface, None);
+        instance.destroy();
+    }
 }
 
 /// Clamps an MSAA request to a supported {1,2,4,8} sample count (as a `u32`),

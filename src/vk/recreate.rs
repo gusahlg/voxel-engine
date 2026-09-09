@@ -7,11 +7,12 @@ use ash::vk;
 use crate::skeleton::FrameSlot;
 
 use super::buffers::{FRAMES_IN_FLIGHT, MESH_CONSUMER_STAGES};
+use super::image::render_target_oom_message;
 use super::pipeline::Pipelines;
 use super::render_client::RenderReturn;
 use super::swapchain::Swapchain;
 use super::targets::RenderTargets;
-use super::{Renderer, create_present_semaphores, scaled_extent};
+use super::{Renderer, SampleCount, create_present_semaphores, scaled_extent};
 
 impl Renderer {
     /// While no frames are being submitted (minimized window): waits out the
@@ -123,52 +124,122 @@ impl Renderer {
             let format_changed = new_swapchain.format != self.swapchain.format;
             self.swapchain = new_swapchain;
 
-            let msaa_changed = self.msaa.commit();
+            let prev_msaa = self.msaa.current();
+            let prev_scale = self.render_scale.current();
+            let prev_extent = self.render_extent;
+            let prev_samples = self.targets.samples;
+            self.msaa.commit();
             self.render_scale.commit();
-            self.render_extent =
-                scaled_extent(self.swapchain.extent, self.render_scale.effective());
+            let requested_msaa = self.msaa.current();
+            let requested_scale = self.render_scale.current();
+            let requested_extent = scaled_extent(self.swapchain.extent, requested_scale);
 
-            self.targets.destroy(&self.device.device);
-            self.targets = RenderTargets::new(
+            let mut replaced_targets = false;
+            match RenderTargets::new(
                 &self.instance.instance,
                 &self.device.device,
                 self.device.physical,
-                self.render_extent,
-                self.msaa.effective(),
+                requested_extent,
+                requested_msaa,
                 self.device.fragment_shading_rate.as_ref(),
-            );
-            // Exposure's tile grid tracks the render extent: rebuild its GPU
-            // resources in place (the published `ExposureShared` cell the main
-            // thread holds is preserved, so `compose()` keeps reading it).
+            ) {
+                Ok(new_targets) => {
+                    self.targets.destroy(&self.device.device);
+                    self.targets = new_targets;
+                    self.render_extent = requested_extent;
+                    replaced_targets = true;
+                }
+                Err(err) => {
+                    log::error!("{}", render_target_oom_message(&err));
+                    let fallback_msaa = SampleCount::X1;
+                    let fallback_scale = 1.0;
+                    let fallback_extent = scaled_extent(self.swapchain.extent, fallback_scale);
+                    let already_fallback = requested_msaa == fallback_msaa
+                        && (requested_scale - fallback_scale).abs() <= f32::EPSILON;
+                    let fallback_is_previous = prev_msaa == fallback_msaa
+                        && (prev_scale - fallback_scale).abs() <= f32::EPSILON
+                        && prev_extent.width == fallback_extent.width
+                        && prev_extent.height == fallback_extent.height;
+                    let fallback = if already_fallback || fallback_is_previous {
+                        None
+                    } else {
+                        log::warn!("renderer: retrying render targets at MSAA 1 / render scale 1");
+                        match RenderTargets::new(
+                            &self.instance.instance,
+                            &self.device.device,
+                            self.device.physical,
+                            fallback_extent,
+                            fallback_msaa,
+                            self.device.fragment_shading_rate.as_ref(),
+                        ) {
+                            Ok(new_targets) => Some(new_targets),
+                            Err(err) => {
+                                log::error!("{}", render_target_oom_message(&err));
+                                None
+                            }
+                        }
+                    };
+                    if let Some(new_targets) = fallback {
+                        self.targets.destroy(&self.device.device);
+                        self.targets = new_targets;
+                        self.msaa = super::Pending::new(fallback_msaa);
+                        self.render_scale = super::Pending::new(fallback_scale);
+                        self.render_extent = fallback_extent;
+                        replaced_targets = true;
+                    } else {
+                        // Previous targets still exist: keep them and revert
+                        // MSAA / scale so the next frame matches live GPU state.
+                        self.msaa = super::Pending::new(prev_msaa);
+                        self.render_scale = super::Pending::new(prev_scale);
+                        self.render_extent = prev_extent;
+                    }
+                }
+            }
+
             let memory_props = self
                 .instance
                 .instance
                 .get_physical_device_memory_properties(self.device.physical);
-            self.exposure
-                .recreate(&self.device.device, &memory_props, self.render_extent);
+            // Exposure's tile grid tracks the render extent: rebuild its GPU
+            // resources in place (the published `ExposureShared` cell the main
+            // thread holds is preserved, so `compose()` keeps reading it).
+            if self.render_extent.width != prev_extent.width
+                || self.render_extent.height != prev_extent.height
+            {
+                self.exposure
+                    .recreate(&self.device.device, &memory_props, self.render_extent);
+            }
             // History is swapchain-sized. Recreate rebuilds the images only
             // when that extent changed; a render-scale-only apply still
             // invalidates temporal state (new reconstruction kernel / sample
             // grid must not mix with the previous present's history).
-            self.taa
-                .recreate(&self.device.device, &memory_props, self.swapchain.extent);
-
-            // Offscreen images recreated; clear copy tracking.
-            self.clear_copy();
-            // Depth and rate images recreated (layout UNDEFINED): skip VRS until
-            // a classify at the end of the first post-recreate use primes the
-            // rate image. Sampleable depth begins from UNDEFINED regardless.
-            for slot in 0..FRAMES_IN_FLIGHT as usize {
-                let s = &mut self.slots[FrameSlot::new(slot)];
-                s.vrs_ready = false;
-                s.vrs_history = false;
+            if let Err(err) =
+                self.taa
+                    .recreate(&self.device.device, &memory_props, self.swapchain.extent)
+            {
+                log::error!("{}", render_target_oom_message(&err));
             }
-            // Shared shadow map is UNDEFINED after recreate: force a rewrite.
-            self.shadow_cache.invalidate();
-            // LUT images are UNDEFINED after recreate.
-            self.sky_cloud.invalidate();
 
-            if msaa_changed || format_changed {
+            // Offscreen images recreated; clear copy tracking. Always, because
+            // the swapchain images themselves were replaced.
+            self.clear_copy();
+            if replaced_targets {
+                // Depth and rate images recreated (layout UNDEFINED): skip VRS until
+                // a classify at the end of the first post-recreate use primes the
+                // rate image. Sampleable depth begins from UNDEFINED regardless.
+                for slot in 0..FRAMES_IN_FLIGHT as usize {
+                    let s = &mut self.slots[FrameSlot::new(slot)];
+                    s.vrs_ready = false;
+                    s.vrs_history = false;
+                }
+                // Shared shadow map is UNDEFINED after recreate: force a rewrite.
+                self.shadow_cache.invalidate();
+                // LUT images are UNDEFINED after recreate.
+                self.sky_cloud.invalidate();
+            }
+
+            let samples_changed = self.targets.samples != prev_samples;
+            if samples_changed || format_changed {
                 self.pipelines.destroy(&self.device.device);
                 self.pipelines = Pipelines::new(
                     &self.device.device,

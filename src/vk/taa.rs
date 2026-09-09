@@ -29,7 +29,9 @@
 use ash::vk;
 use glam::{DMat4, DVec3, Mat4, Vec2};
 
-use super::image::{ImageDesc, ImageResource, LayoutUse};
+use super::image::{
+    AllocError, ImageDesc, ImageResource, LayoutUse, create_image_array, image_purpose,
+};
 
 /// The view-projection without jitter. Jittered matrix is applied privately
 /// at push-constant packing only so culling and TAA reprojection stay stable.
@@ -124,7 +126,7 @@ fn create_history_image(
     device: &ash::Device,
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     extent: vk::Extent2D,
-) -> ImageResource {
+) -> Result<ImageResource, AllocError> {
     let desc = ImageDesc {
         extent,
         format: TAA_HISTORY_FORMAT,
@@ -133,7 +135,12 @@ fn create_history_image(
         aspect: vk::ImageAspectFlags::COLOR,
         samples: vk::SampleCountFlags::TYPE_1,
     };
-    ImageResource::create(device, memory_props, &desc)
+    ImageResource::create(
+        device,
+        memory_props,
+        &desc,
+        &image_purpose("TAA history", extent, vk::SampleCountFlags::TYPE_1),
+    )
 }
 
 /// Render-thread owner of the swapchain-sized history pair and the previous
@@ -180,40 +187,52 @@ impl TaaState {
         device: &ash::Device,
         memory_props: &vk::PhysicalDeviceMemoryProperties,
         swapchain_extent: vk::Extent2D,
-    ) -> TaaState {
-        TaaState {
-            history: std::array::from_fn(|_| {
+    ) -> Result<TaaState, AllocError> {
+        Ok(TaaState {
+            history: create_image_array(device, || {
                 create_history_image(device, memory_props, swapchain_extent)
-            }),
+            })?,
             read_idx: 0,
             extent: swapchain_extent,
             valid: false,
             prev: None,
-        }
+        })
     }
 
     /// Rebuild history images after swapchain recreate/resize (contents
     /// discarded, reconverges). Same swapchain extent (render-scale-only
     /// apply) keeps the images and only invalidates temporal state.
+    ///
+    /// On allocation failure the previous images are left in place and
+    /// temporal state is invalidated so the next present does not sample
+    /// a mismatched history.
     pub(crate) fn recreate(
         &mut self,
         device: &ash::Device,
         memory_props: &vk::PhysicalDeviceMemoryProperties,
         swapchain_extent: vk::Extent2D,
-    ) {
+    ) -> Result<(), AllocError> {
         if self.extent.width != swapchain_extent.width
             || self.extent.height != swapchain_extent.height
         {
+            let history = match create_image_array(device, || {
+                create_history_image(device, memory_props, swapchain_extent)
+            }) {
+                Ok(history) => history,
+                Err(err) => {
+                    self.invalidate_history();
+                    return Err(err);
+                }
+            };
             for h in &self.history {
                 unsafe { h.destroy(device) };
             }
-            self.history = std::array::from_fn(|_| {
-                create_history_image(device, memory_props, swapchain_extent)
-            });
+            self.history = history;
             self.read_idx = 0;
             self.extent = swapchain_extent;
         }
         self.invalidate_history();
+        Ok(())
     }
 
     /// Reset temporal state (called on TAA toggle to prevent history ghosting).

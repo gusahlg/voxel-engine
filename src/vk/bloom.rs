@@ -227,7 +227,9 @@ impl BloomState {
                 aspect: vk::ImageAspectFlags::COLOR,
                 samples: vk::SampleCountFlags::TYPE_1,
             },
-        );
+            "bloom black",
+        )
+        .expect("bloom black image");
 
         BloomState {
             threshold,

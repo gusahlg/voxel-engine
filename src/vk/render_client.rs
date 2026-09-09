@@ -29,6 +29,7 @@ use super::buffers::{
     build_mesh_resident,
 };
 use super::device::{Device, MemoryBudget};
+use super::image::{AllocError, render_target_oom_message};
 use super::instance::InstanceBundle;
 use super::{Renderer, Scale, clamp_msaa, display_refresh_interval};
 use crate::engine::Config;
@@ -212,12 +213,18 @@ pub(crate) struct RenderClient {
     /// The render thread's published exposure cell, cloned into `Engine`.
     exposure: super::exposure::ExposureShared,
     /// `None` once joined (shutdown is idempotent).
-    join: Option<JoinHandle<DeviceLeftovers>>,
+    join: Option<JoinHandle<Option<DeviceLeftovers>>>,
 }
 
 impl RenderClient {
     /// Create window, spawn render thread, build main-side allocator.
-    pub(crate) fn spawn(event_loop: &ActiveEventLoop, config: &Config) -> (Window, RenderClient) {
+    ///
+    /// Render-target allocation failure is an `Err` with a readable message
+    /// (logged here) rather than a render-thread panic + `RecvError`.
+    pub(crate) fn spawn(
+        event_loop: &ActiveEventLoop,
+        config: &Config,
+    ) -> Result<(Window, RenderClient), String> {
         let mut attrs = winit::window::WindowAttributes::default()
             .with_title(&config.title)
             .with_inner_size(winit::dpi::LogicalSize::new(config.width, config.height))
@@ -260,19 +267,39 @@ impl RenderClient {
 
         let (cmd_tx, cmd_rx) = sync_channel::<RenderCmd>(1024);
         let (ret_tx, ret_rx) = channel::<RenderReturn>();
-        let (init_tx, init_rx) = channel::<InitReply>();
+        let (init_tx, init_rx) = channel::<Result<InitReply, AllocError>>();
         let ret_for_renderer = ret_tx.clone();
         let join = std::thread::Builder::new()
             .name("render".into())
             .spawn(move || {
-                let (renderer, reply) =
-                    Renderer::build(instance, surface_loader, surface, cfg, ret_for_renderer);
-                let _ = init_tx.send(reply);
-                render_loop(renderer, cmd_rx, ret_tx)
+                match Renderer::build(instance, surface_loader, surface, cfg, ret_for_renderer) {
+                    Ok((renderer, reply)) => {
+                        let _ = init_tx.send(Ok(reply));
+                        Some(render_loop(renderer, cmd_rx, ret_tx))
+                    }
+                    Err(err) => {
+                        let _ = init_tx.send(Err(err));
+                        None
+                    }
+                }
             })
             .expect("Failed to spawn render thread");
 
-        let reply = init_rx.recv().expect("render thread init failed");
+        let reply = match init_rx.recv() {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(err)) => {
+                let msg = render_target_oom_message(&err);
+                log::error!("{msg}");
+                let _ = join.join();
+                return Err(msg);
+            }
+            Err(_) => {
+                let msg = "renderer: render thread failed during initialization".to_string();
+                log::error!("{msg}");
+                let _ = join.join();
+                return Err(msg);
+            }
+        };
         let mesh_alloc =
             unsafe { GpuAllocator::new(&reply.instance, reply.physical, reply.memory_budget) };
         if mesh_alloc.unified_memory() {
@@ -300,7 +327,7 @@ impl RenderClient {
             exposure: reply.exposure,
             join: Some(join),
         };
-        (window, client)
+        Ok((window, client))
     }
 
     /// The render thread's published exposure cell, for `Engine`'s compose path.
@@ -628,16 +655,16 @@ impl RenderClient {
     /// correct order (allocator buffers first). Idempotent via `join.take()`.
     pub(crate) fn shutdown(&mut self) {
         let _ = self.tx.send(RenderCmd::Shutdown);
-        if let Some(join) = self.join.take() {
-            if let Ok(mut lo) = join.join() {
-                log::debug!("GPU memory at shutdown: {:?}", self.mesh_alloc.stats());
-                unsafe {
-                    // GPU is idle (the thread's teardown waited it) and stopped.
-                    self.mesh_alloc.destroy(&lo.device.device);
-                    lo.device.destroy();
-                    lo.surface_loader.destroy_surface(lo.surface, None);
-                    lo.instance.destroy();
-                }
+        if let Some(join) = self.join.take()
+            && let Ok(Some(mut lo)) = join.join()
+        {
+            log::debug!("GPU memory at shutdown: {:?}", self.mesh_alloc.stats());
+            unsafe {
+                // GPU is idle (the thread's teardown waited it) and stopped.
+                self.mesh_alloc.destroy(&lo.device.device);
+                lo.device.destroy();
+                lo.surface_loader.destroy_surface(lo.surface, None);
+                lo.instance.destroy();
             }
         }
     }
