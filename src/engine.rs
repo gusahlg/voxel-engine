@@ -264,13 +264,24 @@ impl Engine {
     /// GPU busy time of the last completed render submit and the idle gap
     /// before it (`start(N) - end(N-1)`). Slot-delayed: the values are from
     /// the slot whose fence was waited this frame. `None` until the first
-    /// timestamp readback (or when the device has no timestamps).
+    /// timestamp readback, when the device has no timestamps, or while
+    /// [`Self::enable_gpu_load`] is off (the default).
     ///
-    /// Two extra timestamps per frame, host-reset when available. Not gated:
-    /// they should sit in noise on the Minimum preset; if they do not, gate
-    /// behind an `enable_gpu_load` switch (default off).
+    /// The two extra timestamps cost ~1.5% at the game's Minimum preset, so
+    /// they are recorded only after `enable_gpu_load(true)`. The profiler's
+    /// own stamps and `VOXEL_PROFILE` are unaffected.
     pub fn gpu_load(&self) -> Option<GpuLoad> {
         self.gpu_load.load()
+    }
+
+    /// Record the two extra per-frame timestamps that feed [`Self::gpu_load`].
+    /// Off by default. No-op when `on` matches the current state. The
+    /// profiler's own stamps and `VOXEL_PROFILE` are unaffected.
+    pub fn enable_gpu_load(&mut self, on: bool) {
+        if on == self.gpu_load.is_enabled() {
+            return;
+        }
+        self.gpu_load.set_enabled(on);
     }
 
     pub fn set_target_fps(&mut self, fps: u32) {
