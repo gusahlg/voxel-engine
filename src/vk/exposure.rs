@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use ash::vk;
 
-use super::alloc::{find_memory_type, try_find_memory_type};
+use super::alloc::create_mapped_buffer;
 use super::buffers::FRAMES_IN_FLIGHT;
 use super::pass;
 use crate::engine::Engine;
@@ -96,49 +96,16 @@ impl TileMeans {
         memory_props: &vk::PhysicalDeviceMemoryProperties,
         tile_count: usize,
     ) -> TileMeans {
-        let size = (tile_count.max(1) * size_of::<f32>()) as u64;
-        let buffer = unsafe {
-            device
-                .create_buffer(
-                    &vk::BufferCreateInfo::default()
-                        .size(size)
-                        // Written by the compute reduction, read back by the CPU.
-                        .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                    None,
-                )
-                .expect("create exposure tile-mean buffer")
-        };
-        let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
-        // Prefer HOST_CACHED for performance; fall back to HOST_COHERENT.
-        let cached = vk::MemoryPropertyFlags::HOST_VISIBLE
-            | vk::MemoryPropertyFlags::HOST_COHERENT
-            | vk::MemoryPropertyFlags::HOST_CACHED;
-        let plain = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let type_index = try_find_memory_type(memory_props, reqs.memory_type_bits, cached)
-            .unwrap_or_else(|| find_memory_type(memory_props, reqs.memory_type_bits, plain));
-        let memory = unsafe {
-            device
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(reqs.size)
-                        .memory_type_index(type_index),
-                    None,
-                )
-                .expect("allocate exposure tile-mean memory")
-        };
-        unsafe {
-            device
-                .bind_buffer_memory(buffer, memory, 0)
-                .expect("bind exposure tile-mean memory");
-        }
-        let mapped = unsafe {
-            device
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                .expect("map exposure tile-mean memory") as *mut f32
-        };
+        let count = tile_count.max(1);
+        // Written by the compute reduction, read back by the CPU.
         // Start neutral (log2(1.0) == 0) so the very first frame reads a sane value.
-        unsafe { std::ptr::write_bytes(mapped, 0, tile_count.max(1)) };
+        let (buffer, memory, mapped) = create_mapped_buffer(
+            device,
+            memory_props,
+            count,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            "exposure tile-mean buffer",
+        );
         TileMeans {
             buffer,
             memory,

@@ -18,7 +18,7 @@ use ash::vk;
 
 use glam::Vec3;
 
-use super::alloc::{find_memory_type, try_find_memory_type};
+use super::alloc::{GpuCpuReadback, find_memory_type};
 use super::buffers::{
     DrawIndexedIndirect, FRAMES_IN_FLIGHT, HostBuffer, MESH_FLAG_FACE_RUNS, MeshRecord,
     RecordBuffers,
@@ -1045,12 +1045,13 @@ pub(crate) struct CullState {
 
 /// Host-visible copy of the per-slot geometry histogram, fence-safe to read
 /// after the slot's timeline wait. Same mechanism as the VRS mix buffer.
-struct StatsReadback {
-    gpu: vk::Buffer,
-    gpu_memory: vk::DeviceMemory,
-    cpu: vk::Buffer,
-    cpu_memory: vk::DeviceMemory,
-    mapped: *mut u32,
+struct StatsReadback(GpuCpuReadback);
+
+impl std::ops::Deref for StatsReadback {
+    type Target = GpuCpuReadback;
+    fn deref(&self) -> &GpuCpuReadback {
+        &self.0
+    }
 }
 
 impl CullState {
@@ -1461,128 +1462,18 @@ impl CullState {
 
 impl StatsReadback {
     fn new(device: &ash::Device, memory_props: &vk::PhysicalDeviceMemoryProperties) -> Self {
-        let gpu = create_buffer(
+        Self(GpuCpuReadback::new(
             device,
             memory_props,
-            STATS_BYTES,
-            vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::TRANSFER_DST,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
-        let (cpu, cpu_memory, mapped) = create_mapped_buffer(
-            device,
-            memory_props,
-            STATS_BYTES,
-            vk::BufferUsageFlags::TRANSFER_DST,
-        );
-        Self {
-            gpu: gpu.0,
-            gpu_memory: gpu.1,
-            cpu,
-            cpu_memory,
-            mapped,
-        }
+            STATS_COUNT,
+            "cull stats buffer",
+            "cull stats readback",
+        ))
     }
 
     unsafe fn destroy(&self, device: &ash::Device) {
-        unsafe {
-            device.unmap_memory(self.cpu_memory);
-            device.destroy_buffer(self.cpu, None);
-            device.free_memory(self.cpu_memory, None);
-            device.destroy_buffer(self.gpu, None);
-            device.free_memory(self.gpu_memory, None);
-        }
+        unsafe { self.0.destroy(device) };
     }
-}
-
-fn create_buffer(
-    device: &ash::Device,
-    memory_props: &vk::PhysicalDeviceMemoryProperties,
-    size: u64,
-    usage: vk::BufferUsageFlags,
-    props: vk::MemoryPropertyFlags,
-) -> (vk::Buffer, vk::DeviceMemory) {
-    let buffer = unsafe {
-        device
-            .create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(size)
-                    .usage(usage)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
-            .expect("create cull stats buffer")
-    };
-    let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let memory = unsafe {
-        device
-            .allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(reqs.size)
-                    .memory_type_index(find_memory_type(
-                        memory_props,
-                        reqs.memory_type_bits,
-                        props,
-                    )),
-                None,
-            )
-            .expect("allocate cull stats buffer")
-    };
-    unsafe {
-        device
-            .bind_buffer_memory(buffer, memory, 0)
-            .expect("bind cull stats buffer");
-    }
-    (buffer, memory)
-}
-
-fn create_mapped_buffer(
-    device: &ash::Device,
-    memory_props: &vk::PhysicalDeviceMemoryProperties,
-    size: u64,
-    usage: vk::BufferUsageFlags,
-) -> (vk::Buffer, vk::DeviceMemory, *mut u32) {
-    let buffer = unsafe {
-        device
-            .create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(size)
-                    .usage(usage)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
-            .expect("create cull stats readback")
-    };
-    let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let cached = vk::MemoryPropertyFlags::HOST_VISIBLE
-        | vk::MemoryPropertyFlags::HOST_COHERENT
-        | vk::MemoryPropertyFlags::HOST_CACHED;
-    let plain = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-    let type_index = try_find_memory_type(memory_props, reqs.memory_type_bits, cached)
-        .unwrap_or_else(|| find_memory_type(memory_props, reqs.memory_type_bits, plain));
-    let memory = unsafe {
-        device
-            .allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(reqs.size)
-                    .memory_type_index(type_index),
-                None,
-            )
-            .expect("allocate cull stats readback")
-    };
-    unsafe {
-        device
-            .bind_buffer_memory(buffer, memory, 0)
-            .expect("bind cull stats readback");
-    }
-    let mapped = unsafe {
-        device
-            .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-            .expect("map cull stats readback") as *mut u32
-    };
-    unsafe { std::ptr::write_bytes(mapped, 0, STATS_COUNT) };
-    (buffer, memory, mapped)
 }
 
 #[cfg(test)]

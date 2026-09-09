@@ -13,6 +13,10 @@
 //!
 //! Host-visible blocks are mapped once at creation and never unmapped;
 //! `Allocation::mapped` points at the allocation's first byte.
+//!
+//! Standalone (non-pooled) create/map helpers and the GPU+CPU
+//! [`GpuCpuReadback`] pair also live here. The pooled allocator and
+//! BAR-capped host buffers are unchanged.
 
 use std::ptr::NonNull;
 
@@ -730,6 +734,149 @@ pub fn try_find_memory_type(
     })
 }
 
+/// HOST_VISIBLE | HOST_COHERENT, preferring HOST_CACHED when a matching type exists.
+pub(crate) fn host_mapped_memory_type(
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    type_filter: u32,
+) -> u32 {
+    let cached = vk::MemoryPropertyFlags::HOST_VISIBLE
+        | vk::MemoryPropertyFlags::HOST_COHERENT
+        | vk::MemoryPropertyFlags::HOST_CACHED;
+    let plain = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    try_find_memory_type(memory_props, type_filter, cached)
+        .unwrap_or_else(|| find_memory_type(memory_props, type_filter, plain))
+}
+
+fn create_bound_buffer(
+    device: &ash::Device,
+    size: u64,
+    usage: vk::BufferUsageFlags,
+    purpose: &str,
+    pick_type: impl FnOnce(u32) -> u32,
+) -> (vk::Buffer, vk::DeviceMemory) {
+    let buffer = unsafe {
+        device
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(usage)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("create {purpose}: {e:?}"))
+    };
+    let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let type_index = pick_type(reqs.memory_type_bits);
+    let memory = unsafe {
+        device
+            .allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(reqs.size)
+                    .memory_type_index(type_index),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("allocate {purpose}: {e:?}"))
+    };
+    unsafe {
+        device
+            .bind_buffer_memory(buffer, memory, 0)
+            .unwrap_or_else(|e| panic!("bind {purpose}: {e:?}"));
+    }
+    (buffer, memory)
+}
+
+pub(crate) fn create_buffer(
+    device: &ash::Device,
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+    usage: vk::BufferUsageFlags,
+    props: vk::MemoryPropertyFlags,
+    purpose: &str,
+) -> (vk::Buffer, vk::DeviceMemory) {
+    create_bound_buffer(device, size, usage, purpose, |bits| {
+        find_memory_type(memory_props, bits, props)
+    })
+}
+
+pub(crate) fn create_mapped_buffer<T>(
+    device: &ash::Device,
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    count: usize,
+    usage: vk::BufferUsageFlags,
+    purpose: &str,
+) -> (vk::Buffer, vk::DeviceMemory, *mut T) {
+    let size = (count * size_of::<T>()) as u64;
+    let (buffer, memory) = create_bound_buffer(device, size, usage, purpose, |bits| {
+        host_mapped_memory_type(memory_props, bits)
+    });
+    let mapped = unsafe {
+        device
+            .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            .unwrap_or_else(|e| panic!("map {purpose}: {e:?}"))
+            .cast::<T>()
+    };
+    unsafe { std::ptr::write_bytes(mapped, 0, count) };
+    (buffer, memory, mapped)
+}
+
+/// Device-local GPU buffer plus a persistently-mapped host-visible copy.
+///
+/// Init-time only. The mapped CPU side is fence-safe to read after the
+/// slot's timeline wait. Shared by cull stats and VRS mix histograms.
+pub(crate) struct GpuCpuReadback {
+    pub(crate) gpu: vk::Buffer,
+    pub(crate) gpu_memory: vk::DeviceMemory,
+    pub(crate) cpu: vk::Buffer,
+    pub(crate) cpu_memory: vk::DeviceMemory,
+    pub(crate) mapped: *mut u32,
+}
+
+impl GpuCpuReadback {
+    pub(crate) fn new(
+        device: &ash::Device,
+        memory_props: &vk::PhysicalDeviceMemoryProperties,
+        count: usize,
+        gpu_purpose: &str,
+        cpu_purpose: &str,
+    ) -> Self {
+        let size = (count * size_of::<u32>()) as u64;
+        let (gpu, gpu_memory) = create_buffer(
+            device,
+            memory_props,
+            size,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            gpu_purpose,
+        );
+        let (cpu, cpu_memory, mapped) = create_mapped_buffer(
+            device,
+            memory_props,
+            count,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            cpu_purpose,
+        );
+        Self {
+            gpu,
+            gpu_memory,
+            cpu,
+            cpu_memory,
+            mapped,
+        }
+    }
+
+    pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.unmap_memory(self.cpu_memory);
+            device.destroy_buffer(self.cpu, None);
+            device.free_memory(self.cpu_memory, None);
+            device.destroy_buffer(self.gpu, None);
+            device.free_memory(self.gpu_memory, None);
+        }
+    }
+}
+
 fn pick_memory_type(
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     type_prefs: &[u32],
@@ -783,8 +930,8 @@ fn pick_memory_type(
 mod tests {
     use super::super::device::BudgetSnapshot;
     use super::{
-        Block, FreeList, FreeRange, empty_blocks_beyond_first, pick_memory_type,
-        settled_empty_blocks,
+        Block, FreeList, FreeRange, empty_blocks_beyond_first, host_mapped_memory_type,
+        pick_memory_type, settled_empty_blocks,
     };
     use ash::vk;
 
@@ -802,6 +949,30 @@ mod tests {
         };
         props.memory_heap_count = 2;
         props
+    }
+
+    #[test]
+    fn host_mapped_prefers_cached_else_coherent() {
+        let coherent = two_heap_props();
+        assert_eq!(
+            host_mapped_memory_type(&coherent, 0b11),
+            1,
+            "falls back to HOST_COHERENT when HOST_CACHED is absent"
+        );
+
+        let mut cached = two_heap_props();
+        cached.memory_type_count = 3;
+        cached.memory_types[2] = vk::MemoryType {
+            property_flags: vk::MemoryPropertyFlags::HOST_VISIBLE
+                | vk::MemoryPropertyFlags::HOST_COHERENT
+                | vk::MemoryPropertyFlags::HOST_CACHED,
+            heap_index: 1,
+        };
+        assert_eq!(
+            host_mapped_memory_type(&cached, 0b111),
+            2,
+            "prefers HOST_CACHED when present"
+        );
     }
 
     #[test]
