@@ -9,12 +9,16 @@
 // attachment 0 is the LDR swapchain, attachment 1 is the swapchain-sized
 // RGBA16F history. Raster jitter means render texel t (centre t+0.5) holds
 // the unjittered scene at s_t = t + 0.5 - jitter_px; each output pixel is
-// reconstructed from a 3×3 of those texels (Gaussian σ = 0.47·max(1, ratio)
-// render pixels) and blended with presented-space history sampled with a
-// 5-tap Catmull-Rom (Jimenez 2016 Filmic SMAA) plus velocity-weighted
-// current-frame feedback (Karis 2014), so render_scale < 1 converges sharp
-// under motion instead of accumulating bilinear-resample blur. The off
-// variant has no second attachment and no TAA ALU.
+// reconstructed from a 3×3 of those texels with a Gaussian in OUTPUT pixels
+// (UE σ = 0.47, w = exp(-2.29 |d_out|²), d_out = (s_t - p) * (output/render)
+// per axis). At ratio 1 this matches the previous 0.47-render-px kernel; when
+// upsampling the kernel stays 0.47 output px so `cur` is not a 2×-wide
+// low-pass (which also kept w_max ≈ 1 and overwrote history). History is a
+// 5-tap Catmull-Rom (Jimenez 2016 Filmic SMAA). Current-frame weight is
+// (1-blend)*w_max; a Karis 2014 velocity boost is a runtime push-constant
+// (default boost 1.0 = off) so camera rotation does not re-inject the
+// low-res `cur` at ~30%/present. The off variant has no second attachment
+// and no TAA ALU.
 
 #include "common.slang"
 
@@ -38,7 +42,8 @@ struct PushConstants
     float blend;
     uint history_valid; // 0 first present, after resize, or after TAA toggle
     uint depth_valid;
-    uint _pad;
+    float motion_boost; // 1 = off (Karis velocity feedback disabled)
+    float motion_px;    // saturate(v / motion_px) lerp factor
 };
 #else
 struct PushConstants
@@ -149,17 +154,16 @@ float3 historyCatmullRom(float2 uv)
     return result / (wT + wL + wC + wR + wB);
 }
 
-// 3×3 Gaussian reconstruction + unweighted YCoCg variance clamp + depth-aware
-// reprojection. `source_uv` is in render/HDR space (after warpSampleUv);
-// `presented_uv` is swapchain uv (input.uv). History is Catmull-Rom sampled
-// in presented space; current-frame weight rises with pixel-space velocity.
+// 3×3 Gaussian reconstruction in output pixels + unweighted YCoCg variance
+// clamp + depth-aware reprojection. `source_uv` is in render/HDR space (after
+// warpSampleUv); `presented_uv` is swapchain uv (input.uv). History is
+// Catmull-Rom sampled in presented space. Current-frame weight is
+// (1-blend)*w_max, optionally raised with pixel-space velocity when
+// `pc.motion_boost` > 1 (default 1 = off).
 float3 taaResolve(float2 source_uv, float2 presented_uv)
 {
     float2 p = source_uv * pc.render_extent;
-    float2 scale = pc.render_extent / pc.output_extent;
-    float ratio = max(scale.x, scale.y);
-    float sigma = 0.47 * max(1.0, ratio);
-    float k = 0.5 / (sigma * sigma);
+    float2 to_output = pc.output_extent / pc.render_extent;
 
     // Nearest texel whose unjittered sample s_t ≈ p. Identical to the old
     // depth rule `dp = floor(px + jitter + 0.5)` with `px = p - 0.5`.
@@ -180,8 +184,8 @@ float3 taaResolve(float2 source_uv, float2 presented_uv)
             // Texel-centre sample: one texel, not a bilinear mix of neighbours.
             float2 uv = (float2(t) + 0.5) / pc.render_extent;
             float3 c = rgb_to_ycocg(hdrTex.SampleLevel(uv, 0).rgb);
-            float2 d = (float2(t) + 0.5 - pc.jitter_px) - p;
-            float w = exp(-k * dot(d, d));
+            float2 d_out = ((float2(t) + 0.5 - pc.jitter_px) - p) * to_output;
+            float w = exp(-2.29 * dot(d_out, d_out));
             acc += w * c;
             w_sum += w;
             w_max = max(w_max, w);
@@ -214,7 +218,7 @@ float3 taaResolve(float2 source_uv, float2 presented_uv)
                 float2 hp = prevPresentedUv * pc.output_extent;
                 float v = length(hp - presented_uv * pc.output_extent);
                 float cur_w = (1.0 - pc.blend) * w_max;
-                cur_w = lerp(cur_w, min(1.0, cur_w * TAA_MOTION_BOOST), saturate(v / TAA_MOTION_PX));
+                cur_w = lerp(cur_w, min(1.0, cur_w * pc.motion_boost), saturate(v / pc.motion_px));
                 resolved = lerp(hist, cur, cur_w);
             }
         }

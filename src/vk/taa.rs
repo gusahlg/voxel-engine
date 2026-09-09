@@ -6,12 +6,15 @@
 //! `t` (centre `t+0.5`) holds the scene at the unjittered position
 //! `s_t = t + 0.5 - jitter_px`. The fused present-time tonemap (`-DTAA_FUSED`)
 //! reconstructs each output pixel from a 3×3 of those texels with a Gaussian
-//! whose σ is 0.47 render pixels (widened when supersampling), neighbourhood-
-//! clamps in YCoCg, reprojects the previous *presented* frame with 5-tap
-//! Catmull-Rom history (Jimenez 2016), and blends with a current-frame weight
-//! scaled by the peak reconstruction weight and by pixel-space velocity (Karis
-//! 2014) so `render_scale < 1` converges sharp — a static camera keeps the long
-//! history; motion refreshes faster instead of accumulating bilinear blur.
+//! in output pixels (UE σ = 0.47, `w = exp(-2.29 |d_out|²)`, `d_out` is
+//! `(s_t - p)` scaled by `output_extent / render_extent` per axis). At ratio 1
+//! that is the previous 0.47-render-px kernel; when upsampling it stays 0.47
+//! output px so `cur` is not a 2×-wide low-pass. Neighbourhood-clamps in YCoCg,
+//! reprojects the previous *presented* frame with 5-tap Catmull-Rom history
+//! (Jimenez 2016), and blends with current-frame weight `(1-blend)*w_max`. A
+//! Karis 2014 velocity-weighted boost is a runtime push-constant defaulting to
+//! 1.0 (off) so camera rotation does not re-inject the low-res `cur`; override
+//! once at startup with `VOXEL_TAA_MOTION_BOOST` / `VOXEL_TAA_MOTION_PX`.
 //!
 //! No full-resolution TAA compute pass runs per rendered frame. TAA work happens
 //! only on presented frames (mailbox drops skip it). History at swapchain extent
@@ -92,6 +95,22 @@ fn compose_reproj(prev_vp: Mat4, camera_delta: DVec3, cur: Mat4) -> Mat4 {
 /// each present.
 use crate::genconst::HISTORY_BLEND;
 
+/// Default Karis velocity-weighted current-frame boost. 1.0 disables the
+/// term (`lerp(cur_w, cur_w, …)` is a no-op). Override with
+/// `VOXEL_TAA_MOTION_BOOST`.
+const DEFAULT_MOTION_BOOST: f32 = 1.0;
+/// Output-pixel velocity at which the (optional) motion boost saturates.
+/// Override with `VOXEL_TAA_MOTION_PX`.
+const DEFAULT_MOTION_PX: f32 = 8.0;
+
+fn parse_f32_or(raw: Option<&str>, default: f32) -> f32 {
+    raw.and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+fn env_f32(name: &str, default: f32) -> f32 {
+    parse_f32_or(std::env::var(name).ok().as_deref(), default)
+}
+
 /// Camera of the frame being presented, used to compose the reprojection
 /// matrix against the previously *presented* camera.
 pub(crate) struct TaaPresent {
@@ -116,12 +135,14 @@ pub(crate) struct TonemapTaaPush {
     pub blend: f32,
     pub history_valid: u32,
     pub depth_valid: u32,
-    pub _pad: u32,
+    pub motion_boost: f32,
+    pub motion_px: f32,
 }
 
 const _: () = assert!(size_of::<TonemapTaaPush>() <= 128);
-const _: () = assert!(size_of::<TonemapTaaPush>() == 120);
+const _: () = assert!(size_of::<TonemapTaaPush>() == 124);
 const _: () = assert!(std::mem::offset_of!(TonemapTaaPush, output_extent) == 80);
+const _: () = assert!(std::mem::offset_of!(TonemapTaaPush, motion_boost) == 116);
 
 fn create_history_image(
     device: &ash::Device,
@@ -181,6 +202,10 @@ pub(crate) struct TaaState {
     /// Previous *presented* frame's view-proj (without jitter) + render-space-
     /// origin world position (f64), for reprojection.
     prev: Option<(Mat4, DVec3)>,
+    /// Karis velocity-weighted current-frame boost. 1.0 = off (default).
+    motion_boost: f32,
+    /// Output-pixel velocity that saturates `motion_boost`. Default 8.0.
+    motion_px: f32,
 }
 
 impl TaaState {
@@ -197,6 +222,8 @@ impl TaaState {
             extent: swapchain_extent,
             valid: false,
             prev: None,
+            motion_boost: env_f32("VOXEL_TAA_MOTION_BOOST", DEFAULT_MOTION_BOOST),
+            motion_px: env_f32("VOXEL_TAA_MOTION_PX", DEFAULT_MOTION_PX),
         })
     }
 
@@ -335,7 +362,8 @@ impl super::Renderer {
             history_valid: self.taa.history_valid() as u32,
             // Depth is sampleable at every sample count (MSAA resolves it).
             depth_valid: 1,
-            _pad: 0,
+            motion_boost: self.taa.motion_boost,
+            motion_px: self.taa.motion_px,
         }
     }
 }
@@ -394,13 +422,17 @@ mod tests {
     #[test]
     fn fused_push_fits_vulkan_minimum() {
         assert!(size_of::<TonemapTaaPush>() <= 128);
-        assert_eq!(size_of::<TonemapTaaPush>(), 120);
+        assert_eq!(size_of::<TonemapTaaPush>(), 124);
+        assert_eq!(std::mem::offset_of!(TonemapTaaPush, motion_boost), 116);
+        assert_eq!(std::mem::offset_of!(TonemapTaaPush, motion_px), 120);
     }
 
     /// Raster texel `t` holds `s_t = t + 0.5 - jitter_px`. Nearest texel of
-    /// continuous render-space `p` is `tc = floor(p + jitter_px)`, and the
-    /// reconstruction weight is `exp(-k |s_t - p|²)` with
-    /// `k = 0.5 / (0.47 · max(1, ratio))²` (UE's ≈2.29 at ratio 1).
+    /// continuous render-space `p` is `tc = floor(p + jitter_px)`. Sample
+    /// distance is measured in output pixels:
+    /// `d_out = (s_t - p) * (output_extent / render_extent)`;
+    /// `w = exp(-2.29 |d_out|²)` (UE σ = 0.47 output px). At ratio 1, `d_out`
+    /// equals `s_t - p` (bit-identical to the old render-space kernel).
     #[test]
     fn taau_reconstruction_nearest_texel_and_weight() {
         let p = Vec2::new(10.5, 10.5);
@@ -413,16 +445,26 @@ mod tests {
         assert_eq!(dp, tc);
 
         let s_t = tc + Vec2::splat(0.5) - jitter;
-        let d2 = (s_t - p).dot(s_t - p);
+        let d = s_t - p;
+        let d2 = d.dot(d);
         assert!((d2 - 0.125).abs() < 1e-6);
 
-        let sigma = 0.47 * 1.0f32.max(1.0);
-        let k = 0.5 / (sigma * sigma);
-        // UE documents exp(-2.29 d²); 0.5 / 0.47² is that constant.
-        assert!((k - 2.29).abs() < 0.03);
-        let w = (-k * d2).exp();
-        assert!((w - (-2.29f32 * 0.125).exp()).abs() < 1e-2);
+        // Ratio 1: d_out = d. 0.5 / 0.47² is UE's documented 2.29.
+        let k_from_sigma = 0.5 / (0.47f32 * 0.47);
+        assert!((k_from_sigma - 2.29).abs() < 0.03);
+        let w = (-2.29f32 * d2).exp();
+        assert!((w - (-k_from_sigma * d2).exp()).abs() < 1e-2);
         assert!(w > 0.0 && w <= 1.0);
+
+        // Upsample 2×: one render texel is two output px, so a neighbour is
+        // discarded instead of forming a 2×-wide low-pass (w_max ≈ 1).
+        let d_nb = Vec2::new(1.0, 0.0);
+        let w_nb_1x = (-2.29f32 * d_nb.dot(d_nb)).exp();
+        let d_nb_up = d_nb * 2.0;
+        let w_nb_up = (-2.29f32 * d_nb_up.dot(d_nb_up)).exp();
+        assert!(w_nb_1x > 0.05);
+        assert!(w_nb_up < 0.01);
+        assert!(w_nb_up < w_nb_1x);
     }
 
     /// 1D Catmull-Rom (Keys cubic, a = −0.5), matching `historyCatmullRom`.
@@ -454,22 +496,36 @@ mod tests {
         assert!((renorm - 1.0).abs() < 1e-5);
     }
 
-    /// Karis 2014 velocity-weighted feedback: v = 0 keeps the long history;
-    /// v ≥ TAA_MOTION_PX refreshes ~TAA_MOTION_BOOST× faster (clamped to 1).
+    /// Karis 2014 velocity-weighted feedback: boost 1.0 (default) is a no-op
+    /// at any v; boost > 1 with v ≥ motion_px refreshes faster (clamped to 1).
     #[test]
     fn velocity_weighted_feedback_static_vs_moving() {
         let cur_w = 1.0 - crate::genconst::HISTORY_BLEND;
-        let boost = crate::genconst::TAA_MOTION_BOOST;
-        let px = crate::genconst::TAA_MOTION_PX;
-        let apply = |v: f32| {
+        let apply = |v: f32, boost: f32, px: f32| {
             let t = (v / px).clamp(0.0, 1.0);
             let boosted = (cur_w * boost).min(1.0);
             cur_w * (1.0 - t) + boosted * t
         };
-        assert!((apply(0.0) - cur_w).abs() < 1e-6);
-        assert!((apply(px) - (cur_w * boost).min(1.0)).abs() < 1e-6);
-        assert!(apply(px) > apply(0.0));
-        assert!(apply(px) <= 1.0);
-        assert!((boost - 4.0).abs() < 1e-6 && (px - 8.0).abs() < 1e-6);
+        let px = DEFAULT_MOTION_PX;
+        // Default (boost 1.0): identity at any velocity.
+        assert!((apply(0.0, DEFAULT_MOTION_BOOST, px) - cur_w).abs() < 1e-6);
+        assert!((apply(px, DEFAULT_MOTION_BOOST, px) - cur_w).abs() < 1e-6);
+        assert!((apply(100.0, DEFAULT_MOTION_BOOST, px) - cur_w).abs() < 1e-6);
+        // Opt-in boost 4.0: motion refreshes faster, static is unchanged.
+        let boost = 4.0;
+        assert!((apply(0.0, boost, px) - cur_w).abs() < 1e-6);
+        assert!((apply(px, boost, px) - (cur_w * boost).min(1.0)).abs() < 1e-6);
+        assert!(apply(px, boost, px) > apply(0.0, boost, px));
+        assert!(apply(px, boost, px) <= 1.0);
+    }
+
+    #[test]
+    fn motion_env_parse_f32_ignores_invalid() {
+        assert_eq!(parse_f32_or(None, 1.0), 1.0);
+        assert_eq!(parse_f32_or(Some("4.0"), 1.0), 4.0);
+        assert_eq!(parse_f32_or(Some("8"), 1.0), 8.0);
+        assert_eq!(parse_f32_or(Some("nope"), 1.0), 1.0);
+        assert_eq!(parse_f32_or(Some(""), 8.0), 8.0);
+        assert_eq!(parse_f32_or(Some("  "), 8.0), 8.0);
     }
 }

@@ -819,16 +819,6 @@ fn build_table() -> Vec<Def> {
             val: Val::Scalar(1.25),
         },
         Def {
-            name: "TAA_MOTION_BOOST",
-            doc: "TAA velocity-weighted current-frame boost. A static camera keeps the long\nhistory and converges sharp; an 8+ px/present motion refreshes ~4x faster.\nKaris 2014 velocity-weighted feedback. Read by tonemap.frag (TAA_FUSED).",
-            val: Val::Scalar(4.0),
-        },
-        Def {
-            name: "TAA_MOTION_PX",
-            doc: "TAA motion-feedback saturation distance in output pixels. Pixel-space velocity\nv = length(history sample pos - this pixel centre); saturate(v / this) lerps\ncur_w toward min(1, cur_w * TAA_MOTION_BOOST). Read by tonemap.frag (TAA_FUSED).",
-            val: Val::Scalar(8.0),
-        },
-        Def {
             name: "CANDLE_HIGH_MUL",
             doc: "Blocklight candle curve: candle = x*sqrt(x) + (CANDLE_HIGH_MUL*x)^CANDLE_HIGH_POW,\nclamped to CANDLE_CLAMP. x = block light level in [0,1].",
             val: Val::Scalar(1.17),
