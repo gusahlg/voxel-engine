@@ -4,7 +4,9 @@
 //! shadows. When occlusion is on, camera draws are also tested against the
 //! previous frame's Hi-Z pyramid (shadow emission is unaffected). Blend uses
 //! CPU path; immediates untouched. A small live camera-group count skips the
-//! dispatch and writes the same commands on the host.
+//! dispatch and writes the same commands on the host — frustum / LOD-slab /
+//! face-runs only, never Hi-Z (the pyramid lives on the GPU). The CPU/GPU
+//! split stays purely count-based ([`CPU_CULL_MAX`]).
 //!
 //! Camera groups (bucketed): full-res Opaque, Cutout, coarse-LOD Opaque
 //! (`scale > 1`). The LOD split exists so full-res opaque draws bind a
@@ -348,8 +350,13 @@ fn emit_cmd(
     }
 }
 
-/// Host re-implementation of `computeMain` in `cull.comp.slang`. Writes
-/// `DrawCmd`s at partition offsets and per-partition counts.
+/// Host re-implementation of `computeMain` in `cull.comp.slang`, **without**
+/// the Hi-Z occlusion test. The pyramid is a GPU image (built after the
+/// scene pass, sampled by the next cull compute); the CPU path has nothing
+/// to test against, and synthesizing a readback would cost more than the
+/// live-count threshold that selected this path. Camera draws are
+/// frustum + LOD-slab + face-run only; shadow groups match the shader.
+/// Writes `DrawCmd`s at partition offsets and per-partition counts.
 fn cpu_cull(
     records: &[MeshRecord],
     dir: &ArenaDirectory,
@@ -1274,7 +1281,9 @@ impl CullState {
     ///
     /// When the directory's camera-group live count is at most `CPU_CULL_MAX`
     /// (or `VOXEL_CPU_CULL_MAX`), commands and counts are written to host-visible
-    /// buffers here and no compute work is recorded.
+    /// buffers here and no compute work is recorded. That threshold is the only
+    /// CPU/GPU switch — occlusion does not force the GPU path. The CPU emit is
+    /// frustum-only (see [`cpu_cull`]); `occ` is ignored on that branch.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn prepare(
         &mut self,
@@ -1310,6 +1319,7 @@ impl CullState {
             self.spare_parts = partitions;
             return None;
         }
+        // Count-based only: occlusion never overrides this (the pyramid is GPU-only).
         if dir.camera_live() <= cpu_cull_max() {
             let (cmds, counts, stats_hist) = cpu_cull(
                 host_records,
@@ -2619,6 +2629,26 @@ mod tests {
         let (_, _, counts, stats) = run_cpu(&mut dir, &[rec], &[1], &camera, false, 100.0, 100.0);
         assert!(counts.iter().all(|&c| c == 0));
         assert_eq!(stats, [0; STATS_COUNT]);
+    }
+
+    #[test]
+    fn cpu_cull_never_counts_occlusion() {
+        // The host path cannot sample the GPU pyramid; stats[STATS_OCC] stays 0
+        // even for a fully on-screen mesh that a Hi-Z test might hide.
+        let camera = look_neg_z();
+        let rec = opaque_rec([-1.0, -1.0, -11.0], [1.0, 1.0, -9.0]);
+        let mut dir = ArenaDirectory::new();
+        dir.note_upload(
+            0,
+            G1,
+            buf(1),
+            Pass::Opaque,
+            FULL,
+            MeshAabb::from_record(&rec),
+        );
+        let (_, _, _, stats) = run_cpu(&mut dir, &[rec], &[1], &camera, false, 0.0, 0.0);
+        assert_eq!(stats[STATS_OCC], 0);
+        assert_eq!(stats[0], 1);
     }
 
     #[test]
