@@ -115,8 +115,9 @@ pub struct RenderFlags {
     pub stars: bool,
     /// GPU occlusion culling: a Hi-Z depth pyramid is built after the scene
     /// pass and the next frame's cull compute tests camera draws against it.
-    /// Off skips the pyramid pass (and, once wired, the occlusion test).
-    /// Default on.
+    /// Off skips both the pyramid pass and the occlusion test (CPU cull is
+    /// frustum-only either way). Default on. Toggling invalidates history so
+    /// the next cull samples a pyramid cleared to 0 (nothing hidden).
     pub occlusion: bool,
 }
 
@@ -264,7 +265,9 @@ impl Engine {
     /// Replaces the render feature flags at runtime (settings menu / console).
     /// Updates both CPU copies: this thread's gate set and, via the ordered
     /// command stream, the render thread's — so the change lands atomically at
-    /// the next frame boundary.
+    /// the next frame boundary. Toggling [`RenderFlags::occlusion`] invalidates
+    /// the Hi-Z pyramid (next cull uses a cleared image); [`RenderFlags::vrs`]
+    /// likewise skips classify until the next end-of-frame reduce.
     pub fn set_flags(&mut self, flags: RenderFlags) {
         self.flags = flags;
         self.client.set_flags(flags);
@@ -727,5 +730,24 @@ impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
             self.ran_this_cycle = false;
             self.run_frame(event_loop);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn occlusion_defaults_on_and_rides_config_flags() {
+        assert!(RenderFlags::default().occlusion);
+        assert!(Config::default().flags.occlusion);
+        // Opt-in VRS stays off; occlusion is the other GPU-cull default.
+        assert!(!RenderFlags::default().vrs);
+        let off = RenderFlags {
+            occlusion: false,
+            ..RenderFlags::default()
+        };
+        assert!(!off.occlusion);
+        assert!(off.sunlight);
     }
 }

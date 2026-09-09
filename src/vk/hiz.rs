@@ -10,10 +10,10 @@ use ash::vk;
 
 use glam::Mat4;
 
+use super::SAMPLEABLE_DEPTH_REST_LAYOUT;
 use super::pass;
 use super::pipeline::EyeSplit;
 use super::targets::HizChain;
-use super::{SAMPLEABLE_DEPTH_REST_LAYOUT, color_range};
 
 /// Camera of the frame that last built a pyramid (any slot). The next cull
 /// samples that slot's pyramid with this view-proj, origin-shifted to the
@@ -132,6 +132,13 @@ impl HizState {
 }
 
 impl super::Renderer {
+    pub(super) fn invalidate_hiz(&mut self) {
+        self.hiz_history = None;
+        for chain in &mut self.targets.hiz {
+            chain.ready = false;
+        }
+    }
+
     /// Cull-side occlusion params from the last pyramid build. Disabled when
     /// the flag is off or there is no history (first frame / after resize).
     pub(super) fn occ_params(&self, eye: super::pipeline::EyeSplit) -> super::cull::OccParams {
@@ -396,6 +403,21 @@ mod tests {
     }
 
     #[test]
+    fn occ_params_disabled_has_identity_view_and_flag_off() {
+        let p = super::super::cull::OccParams::disabled(
+            ash::vk::Extent2D {
+                width: 8,
+                height: 4,
+            },
+            3,
+        );
+        assert!(!p.enabled);
+        assert_eq!(p.view_proj, Mat4::IDENTITY);
+        assert_eq!(p.level0.width, 8);
+        assert_eq!(p.mips, 3);
+    }
+
+    #[test]
     fn view_proj_for_translates_by_eye_delta() {
         use super::super::pipeline::EyeSplit;
         let prev = EyeSplit {
@@ -420,13 +442,5 @@ mod tests {
         assert!((clip.x - 1.5).abs() < 1e-5);
         assert_eq!(clip.y, 0.0);
         assert_eq!(clip.w, 1.0);
-    }
-
-    #[test]
-    fn unused_color_range_helper_stays_single_mip() {
-        // The pyramid uses `HizChain::all_mips`; the shared colour range is
-        // still the single-mip helper used by every other colour image.
-        let r = color_range();
-        assert_eq!(r.level_count, 1);
     }
 }

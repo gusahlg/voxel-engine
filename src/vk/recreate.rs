@@ -239,7 +239,7 @@ impl Renderer {
                 }
                 // New pyramids are UNDEFINED; the first cull after recreate
                 // samples a cleared-to-0 image (nothing culled).
-                self.hiz_history = None;
+                self.invalidate_hiz();
                 // Shared shadow map is UNDEFINED after recreate: force a rewrite.
                 self.shadow_cache.invalidate();
                 // LUT images are UNDEFINED after recreate.

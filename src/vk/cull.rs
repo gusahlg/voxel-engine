@@ -109,12 +109,15 @@ fn lod_aabb_inside_slab(mn: [f32; 3], mx: [f32; 3], clip: f32, clip_v: f32) -> b
 /// Camera-distance bucket of an AABB centre, matching `cull.comp.slang`.
 /// Favour drawing: cull only when the mesh's nearest reversed-Z is strictly
 /// farther than the farthest occluder in the rect by this margin. Twin of
-/// `CULL_OCC_EPS` in `cull.comp.slang`.
+/// `CULL_OCC_EPS` in `cull.comp.slang`. Host-only; the GPU path lives in the
+/// cull compute shader.
+#[cfg(test)]
 const OCC_EPS: f32 = crate::genconst::CULL_OCC_EPS;
 
 /// Mip where the UV rect spans at most 2×2 texels of the pyramid. `ceil` so
 /// a split goes coarser (safer: a larger footprint's MIN is farther). Twin of
 /// `occ_mip_for_rect` in `cull.comp.slang`.
+#[cfg(test)]
 pub(crate) fn occ_mip_for_rect(span_uv: [f32; 2], level0: [u32; 2], mip_count: u32) -> u32 {
     let span_tex = (span_uv[0] * level0[0] as f32).max(span_uv[1] * level0[1] as f32);
     let mip_f = (span_tex * 0.5).max(1.0).log2().ceil();
@@ -123,6 +126,7 @@ pub(crate) fn occ_mip_for_rect(span_uv: [f32; 2], level0: [u32; 2], mip_count: u
 
 /// Reversed-Z compare: hide iff `nearest_z` is farther than `occ_min` by
 /// [`OCC_EPS`]. Twin of `occ_hidden_z` in `cull.comp.slang`.
+#[cfg(test)]
 pub(crate) fn occ_hidden(nearest_z: f32, occ_min: f32) -> bool {
     nearest_z < occ_min - OCC_EPS
 }
@@ -131,6 +135,7 @@ pub(crate) fn occ_hidden(nearest_z: f32, occ_min: f32) -> bool {
 /// mesh) if any corner has w ≤ 0 or the clamped UV rect is degenerate.
 /// Otherwise `(uv_min, uv_max, nearest_z)` with uv in [0,1] and nearest_z the
 /// max of z/w (reversed-Z nearer).
+#[cfg(test)]
 pub(crate) fn occ_screen_rect(
     mn: [f32; 3],
     mx: [f32; 3],
@@ -173,6 +178,7 @@ pub(crate) fn occ_screen_rect(
 
 /// Inclusive texel pair covering `uv` at `mip`, plus the MIN of those four
 /// samples (the farthest occluder). Host twin of the shader gather.
+#[cfg(test)]
 pub(crate) fn occ_gather_min(
     uv_min: [f32; 2],
     uv_max: [f32; 2],

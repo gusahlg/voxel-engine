@@ -601,6 +601,11 @@ impl Renderer {
         if self.flags.taa != flags.taa {
             self.taa.invalidate_history();
         }
+        if self.flags.occlusion != flags.occlusion {
+            // Next cull samples a cleared-to-0 pyramid (nothing hidden) until
+            // a new reduce runs. Off skips the pass and the test.
+            self.invalidate_hiz();
+        }
         if self.flags.bloom && !flags.bloom {
             // Next presented frame must re-clear the stale pyramid to black.
             for chain in &mut self.targets.bloom {
