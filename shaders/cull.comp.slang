@@ -128,11 +128,12 @@ uint distance_bucket(float dist)
 // exact for the per-fragment `length(world.xz) < clip` test. Host mirror:
 // `lod_aabb_inside_slab` in vk/cull.rs.
 // Host twin: `occ_mip_for_rect` in vk/cull.rs. Mip where the UV rect spans
-// at most 2x2 texels of the pyramid (ceil so we go coarser on a split).
+// at most one texel per axis of the pyramid (ceil so we go coarser on a
+// split). Then the covering texels are at most 2x2, so the gather is exact.
 uint occ_mip_for_rect(float2 span_uv, uint2 level0, uint mip_count)
 {
     float span_tex = max(span_uv.x * float(level0.x), span_uv.y * float(level0.y));
-    float mip_f = ceil(log2(max(span_tex * 0.5, 1.0)));
+    float mip_f = ceil(log2(max(span_tex, 1.0)));
     return min(uint(mip_f), mip_count - 1u);
 }
 
@@ -145,8 +146,9 @@ bool occ_hidden_z(float nearest_z, float occ_min)
 // Project the 8 camera-relative AABB corners with the previous view-proj.
 // Any corner with w <= 0 (crosses the previous near plane) → not occluded.
 // Degenerate screen rect → not occluded. Else gather the 4 pyramid texels
-// covering the clamped UV rect at a mip where the rect is at most 2x2, take
-// their MIN (farthest reversed-Z occluder), and hide iff nearest_z is farther.
+// covering the clamped UV rect at a mip where the rect spans at most one
+// texel per axis (so covering texels are at most 2x2), take their MIN
+// (farthest reversed-Z occluder), and hide iff nearest_z is farther.
 bool occlusion_hidden(float3 mn, float3 mx)
 {
     if ((params.occ_flags & 1u) == 0u)

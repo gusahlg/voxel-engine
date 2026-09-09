@@ -114,13 +114,14 @@ fn lod_aabb_inside_slab(mn: [f32; 3], mx: [f32; 3], clip: f32, clip_v: f32) -> b
 #[cfg(test)]
 const OCC_EPS: f32 = crate::genconst::CULL_OCC_EPS;
 
-/// Mip where the UV rect spans at most 2×2 texels of the pyramid. `ceil` so
+/// Mip where the UV rect spans at most one texel per axis of the pyramid,
+/// so the covering texels are at most 2×2 and the gather is exact. `ceil` so
 /// a split goes coarser (safer: a larger footprint's MIN is farther). Twin of
 /// `occ_mip_for_rect` in `cull.comp.slang`.
 #[cfg(test)]
 pub(crate) fn occ_mip_for_rect(span_uv: [f32; 2], level0: [u32; 2], mip_count: u32) -> u32 {
     let span_tex = (span_uv[0] * level0[0] as f32).max(span_uv[1] * level0[1] as f32);
-    let mip_f = (span_tex * 0.5).max(1.0).log2().ceil();
+    let mip_f = span_tex.max(1.0).log2().ceil();
     (mip_f as u32).min(mip_count.saturating_sub(1))
 }
 
@@ -2683,19 +2684,42 @@ mod tests {
     }
 
     #[test]
-    fn occ_mip_picks_a_level_where_the_rect_is_at_most_2x2() {
+    fn occ_mip_picks_a_level_where_the_rect_spans_at_most_one_texel() {
         let level0 = [64, 64];
-        // 2 texels at mip 0 → mip 0 (exactly 2×2).
-        assert_eq!(occ_mip_for_rect([2.0 / 64.0, 2.0 / 64.0], level0, 7), 0);
-        // Just over 2 texels → mip 1.
-        assert_eq!(occ_mip_for_rect([2.1 / 64.0, 1.0 / 64.0], level0, 7), 1);
-        // 4 texels → mip 1 (2 texels there).
-        assert_eq!(occ_mip_for_rect([4.0 / 64.0, 4.0 / 64.0], level0, 7), 1);
-        // 4.1 texels → mip 2.
-        assert_eq!(occ_mip_for_rect([4.1 / 64.0, 1.0 / 64.0], level0, 7), 2);
+        // 1 texel at mip 0 → mip 0 (covering texels at most 2×2 if unaligned).
+        assert_eq!(occ_mip_for_rect([1.0 / 64.0, 1.0 / 64.0], level0, 7), 0);
+        // Just over 1 texel → mip 1.
+        assert_eq!(occ_mip_for_rect([1.1 / 64.0, 1.0 / 64.0], level0, 7), 1);
+        // 2 texels → mip 1 (1 texel there).
+        assert_eq!(occ_mip_for_rect([2.0 / 64.0, 2.0 / 64.0], level0, 7), 1);
+        // 2.1 texels → mip 2.
+        assert_eq!(occ_mip_for_rect([2.1 / 64.0, 1.0 / 64.0], level0, 7), 2);
         // Tiny rect stays at mip 0; oversize clamps to last mip.
         assert_eq!(occ_mip_for_rect([0.5 / 64.0, 0.5 / 64.0], level0, 7), 0);
         assert_eq!(occ_mip_for_rect([1.0, 1.0], level0, 3), 2);
+    }
+
+    #[test]
+    fn occ_mip_unaligned_width_covers_three_level0_columns() {
+        let level0 = [64, 64];
+        // 0.9..2.4 texels at mip 0: span 1.5, covers columns 0, 1, 2.
+        // Old `ceil(log2(span*0.5))` stayed at mip 0; a 2×2 gather of the
+        // corner indices (0 and 2) skipped the middle column.
+        let uv_min = [0.9 / 64.0, 0.0];
+        let uv_max = [2.4 / 64.0, 1.0 / 64.0];
+        let mip = occ_mip_for_rect(
+            [uv_max[0] - uv_min[0], uv_max[1] - uv_min[1]],
+            level0,
+            7,
+        );
+        assert_eq!(mip, 1);
+        // Mip 1 maps that span onto texels 0 and 1, so the 2×2 gather sees
+        // both (covering all three level-0 columns). A far (smaller reversed-Z)
+        // occluder in mip-1 column 1 is included in occ_min.
+        let occ = occ_gather_min(uv_min, uv_max, level0, mip, |x, _y| {
+            if x == 1 { 0.1 } else { 0.9 }
+        });
+        assert!((occ - 0.1).abs() < 1e-5);
     }
 
     #[test]
