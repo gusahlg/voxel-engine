@@ -83,7 +83,12 @@ pub fn upload_image(
         .array_layers(params.array_layers)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        // TRANSFER_SRC: block-texture grow copies existing layers GPU-side.
+        .usage(
+            vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED,
+        )
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let image = unsafe {
         device
@@ -142,7 +147,11 @@ pub fn upload_image(
         device.unmap_memory(staging_memory);
     }
 
-    let subresource = vk::ImageSubresourceRange {
+    // Barriers cover only the layers the copy writes (capacity-backed arrays
+    // leave unused layers UNDEFINED). The view spans the full image so later
+    // per-layer uploads can fill those slots without recreating it.
+    let copy_range = copy_layer_range(params.regions, params.mip_levels);
+    let view_range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
         level_count: params.mip_levels,
@@ -203,7 +212,7 @@ pub fn upload_image(
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(image)
-            .subresource_range(subresource)];
+            .subresource_range(copy_range)];
         device.cmd_pipeline_barrier2(
             copy_cmd,
             &vk::DependencyInfo::default().image_memory_barriers(&to_transfer),
@@ -244,7 +253,7 @@ pub fn upload_image(
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image(image)
-            .subresource_range(subresource)];
+            .subresource_range(copy_range)];
         device.cmd_pipeline_barrier2(
             copy_cmd,
             &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
@@ -287,7 +296,7 @@ pub fn upload_image(
                         .src_queue_family_index(lane.family())
                         .dst_queue_family_index(graphics_family)
                         .image(image)
-                        .subresource_range(subresource)];
+                        .subresource_range(copy_range)];
                     device.cmd_pipeline_barrier2(
                         acquire_cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&acquire),
@@ -345,7 +354,7 @@ pub fn upload_image(
         .image(image)
         .view_type(params.view_type)
         .format(params.format)
-        .subresource_range(subresource);
+        .subresource_range(view_range);
     let view = unsafe {
         device
             .create_image_view(&view_info, None)
@@ -353,4 +362,26 @@ pub fn upload_image(
     };
 
     (image, memory, view)
+}
+
+/// Tightest COLOR range covering every copy region (all mips, only touched layers).
+fn copy_layer_range(regions: &[vk::BufferImageCopy], mip_levels: u32) -> vk::ImageSubresourceRange {
+    let mut lo = u32::MAX;
+    let mut hi = 0;
+    for r in regions {
+        let s = r.image_subresource;
+        lo = lo.min(s.base_array_layer);
+        hi = hi.max(s.base_array_layer + s.layer_count);
+    }
+    if lo == u32::MAX {
+        lo = 0;
+        hi = 1;
+    }
+    vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: mip_levels,
+        base_array_layer: lo,
+        layer_count: (hi - lo).max(1),
+    }
 }

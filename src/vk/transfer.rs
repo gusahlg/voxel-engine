@@ -214,6 +214,17 @@ impl TransferLane {
 
     /// Submit the batch and return the timeline value to wait on.
     pub unsafe fn submit(&mut self, device: &ash::Device, batch: LaneRecording) -> TimelineValue {
+        unsafe { self.submit_after(device, batch, None) }
+    }
+
+    /// Submit the batch, optionally waiting on another timeline first (e.g.
+    /// graphics sampling of layers this copy will overwrite).
+    pub unsafe fn submit_after(
+        &mut self,
+        device: &ash::Device,
+        batch: LaneRecording,
+        extra_wait: Option<(vk::Semaphore, TimelineValue, vk::PipelineStageFlags2)>,
+    ) -> TimelineValue {
         let res = self
             .resources
             .as_mut()
@@ -225,7 +236,7 @@ impl TransferLane {
         }
         let rs = res.timeline.begin_render(batch.cmd);
         let value = rs.value();
-        let completion = unsafe { rs.submit(device, self.queue, &res.timeline, None) };
+        let completion = unsafe { rs.submit(device, self.queue, &res.timeline, extra_wait) };
         debug_assert_eq!(completion.value(), value);
         res.ring.submitted(batch.cmd, value);
         value
