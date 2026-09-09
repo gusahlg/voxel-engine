@@ -382,6 +382,9 @@ impl Renderer {
                     s.vrs_ready = false;
                     s.vrs_history = false;
                 }
+                // Depth images are new (UNDEFINED): previous-frame absorb
+                // samples are invalid until a subsequent store.
+                self.prev_depth.invalidate();
                 // Shared shadow map is UNDEFINED after recreate: force a rewrite.
                 self.shadow_cache.invalidate();
                 // LUT images are UNDEFINED after recreate.
@@ -401,7 +404,6 @@ impl Renderer {
                     self.atlas.set_layout,
                     self.mesh3d_set_layout,
                     self.device.fragment_shading_rate.as_ref(),
-                    self.device.dynamic_rendering_local_read,
                     self.device.independent_blend,
                 );
             }

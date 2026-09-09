@@ -699,7 +699,7 @@ impl Renderer {
                         view_proj: f.view_proj.0,
                         clip: 0.0,
                         clip_v: 0.0,
-                        _pad: [0.0; 2],
+                        inv_render_extent: [0.0; 2],
                         eye: crate::vk::pipeline::EyeSplit::of(eye),
                     };
                     device.cmd_push_constants(

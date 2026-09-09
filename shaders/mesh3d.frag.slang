@@ -49,6 +49,8 @@ struct PushConstants
     float4x4 view_proj;
     float clip;
     float clip_v;
+    // Spare Mesh3dPush pad: 1/render_extent. xy = 0 when previous depth is invalid.
+    float2 inv_render_extent;
 };
 
 [[vk::push_constant]]
@@ -93,11 +95,13 @@ Sampler2DArrayShadow shadowMap;
 #endif
 
 #ifdef WATER_DEPTH_ABSORPTION
-// Scene depth input attachment for water depth absorption (absorption variant only).
-// SPIR-V OpImageRead requires 4 components; depth in .x.
-[[vk::input_attachment_index(0)]]
+// Previous frame's sampleable depth (NEAREST/clamp at set 0 binding 5).
+// One-frame lag vs the old same-pass input attachment: a static camera
+// produces the same depth every frame, so absorption is pixel-identical
+// after the first frame. TAA jitter differs by a sub-pixel; ignored
+// (absorption is a smooth term).
 [[vk::binding(5, 0)]]
-SubpassInput opaqueDepthInput;
+Sampler2D<float> prevDepth;
 
 // Near plane from genconst (single source with camera.rs).
 static const float WATER_Z_NEAR = Z_NEAR;
@@ -337,14 +341,21 @@ float4 fragmentMain(FragmentInput input) : SV_Target
 #ifndef MESH3D_OPAQUE
     if (((packed >> 14) & 1u) != 0u) {
 #ifdef WATER_DEPTH_ABSORPTION
-        // True depth-difference absorption: opaque forward distance behind the
-        // water (input attachment) minus this fragment's own forward distance,
-        // both reconstructed from reversed-Z depth.
-        // Clamp cleared-depth holes away from 0 to avoid division by zero.
-        float opaque_z = max(opaqueDepthInput.SubpassLoad().x, 1.0e-6);
-        float opaque_d = WATER_Z_NEAR / opaque_z;
-        float water_d = WATER_Z_NEAR / input.position.z;
-        float absorb = water_absorption(opaque_d, water_d);
+        // True depth-difference absorption from the previous frame's stored
+        // depth. `inv_render_extent` is the validity flag: zero on the first
+        // frame, after a swapchain/render-target recreate, when the previous
+        // slot did not store depth, or when the render extent changed — then
+        // the mix matches the non-absorb `WATER_BODY_MIX` path exactly.
+        float2 inv = pc.inv_render_extent;
+        float absorb;
+        if (inv.x > 0.0) {
+            float opaque_z = max(prevDepth.SampleLevel(input.position.xy * inv, 0), 1.0e-6);
+            float opaque_d = WATER_Z_NEAR / opaque_z;
+            float water_d = WATER_Z_NEAR / input.position.z;
+            absorb = water_absorption(opaque_d, water_d);
+        } else {
+            absorb = WATER_BODY_MIX;
+        }
 #else
         float absorb = WATER_BODY_MIX; // interim flat tint (no depth term)
 #endif

@@ -56,8 +56,8 @@ pub struct Mesh3dPush {
     pub clip: f32,
     /// Vertical half-height of the full-res slab.
     pub clip_v: f32,
-    /// Padding to match Mat4 alignment.
-    pub _pad: [f32; 2],
+    /// 1/render_extent for previous-depth UV. Zero when that depth is invalid.
+    pub inv_render_extent: [f32; 2],
     pub eye: EyeSplit,
 }
 
@@ -129,8 +129,8 @@ const MESH3D_OPAQUE_LEAN_FRAG: &[u8] =
 /// Coarse-LOD opaque + the same lane-off diet.
 const MESH3D_LOD_LEAN_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_lod_lean.frag.spv"));
-/// Shader variant with depth input attachment for water absorption; built
-/// when dynamic_rendering_local_read is available and MSAA is off.
+/// Shader variant that samples the previous frame's depth for water absorption;
+/// built when MSAA is off (single-sample depth is directly sampleable).
 const MESH3D_WATER_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_water.frag.spv"));
 
 pub(crate) const DEBUG_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.vert.spv"));
@@ -174,7 +174,7 @@ pub struct Pipelines {
     /// The full fragment module with `layout_3d`, alpha blended, reads (never
     /// writes) depth. Selected for [`Pass::Blend`].
     pub mesh3d_transparent: vk::Pipeline,
-    /// Water-absorption variant when dynamic_rendering_local_read is available and MSAA is off;
+    /// Water-absorption variant when MSAA is off (samples previous-frame depth);
     /// fallback to mesh3d_transparent otherwise.
     pub mesh3d_transparent_absorb: Option<vk::Pipeline>,
     pub debug_tris: vk::Pipeline,
@@ -241,7 +241,6 @@ impl Pipelines {
         atlas_set_layout: vk::DescriptorSetLayout,
         mesh3d_set_layout: vk::DescriptorSetLayout,
         fsr: Option<&FragmentShadingRate>,
-        local_read: bool,
         independent_blend: bool,
     ) -> Self {
         // 3D set 0: binding 0 = offsets SSBO (vertex), binding 1 = texture
@@ -531,12 +530,14 @@ impl Pipelines {
                 depth_bias: None,
             },
         );
-        // Water absorption variant when dynamic_rendering_local_read available + single-sample.
-        let absorb_ok = local_read && samples == vk::SampleCountFlags::TYPE_1;
+        // Water absorption: previous-frame depth sample. Single-sample only
+        // (MSAA stores the sampleable image on a separate resolve target the
+        // absorb path does not read).
+        let absorb_ok = samples == vk::SampleCountFlags::TYPE_1;
         let mesh3d_water_frag =
             absorb_ok.then(|| pass::shader_module(device, MESH3D_WATER_FRAG, "water fragment"));
         let mesh3d_transparent_absorb = mesh3d_water_frag.map(|water_frag| {
-            builder.build_depth_input(
+            builder.build(
                 mesh_vert,
                 water_frag,
                 &bindings_3d,
@@ -848,7 +849,7 @@ impl Pipelines {
     }
 
     /// The pipeline for the transparent [`Pass::Blend`] draw: the water
-    /// depth-absorption variant when available, else the interim-tint fallback.
+    /// previous-depth absorption variant when available, else the interim-tint fallback.
     pub fn blend_pipeline(&self) -> vk::Pipeline {
         self.mesh3d_transparent_absorb
             .unwrap_or(self.mesh3d_transparent)
@@ -940,6 +941,7 @@ struct PipelineConfig {
 }
 
 impl PipelineBuilder<'_> {
+    #[allow(clippy::too_many_arguments)]
     fn build(
         &self,
         vert: vk::ShaderModule,
@@ -948,39 +950,6 @@ impl PipelineBuilder<'_> {
         attributes: &[vk::VertexInputAttributeDescription],
         layout: vk::PipelineLayout,
         cfg: PipelineConfig,
-    ) -> vk::Pipeline {
-        self.build_inner(vert, frag, bindings, attributes, layout, cfg, false)
-    }
-
-    /// Like [`Self::build`], but chains `VkRenderingInputAttachmentIndexInfoKHR`
-    /// so the fragment's input-attachment index 0 maps to the depth attachment
-    /// (dynamic_rendering_local_read). Only for the water-absorption blend
-    /// pipeline. The render-pass instance must set the SAME mapping via
-    /// `vkCmdSetRenderingInputAttachmentIndices` before its draws — the
-    /// command-buffer state defaults to no mapping and must match the
-    /// pipeline's (VUID-vkCmdDrawIndexedIndirect-None-10927).
-    fn build_depth_input(
-        &self,
-        vert: vk::ShaderModule,
-        frag: vk::ShaderModule,
-        bindings: &[vk::VertexInputBindingDescription],
-        attributes: &[vk::VertexInputAttributeDescription],
-        layout: vk::PipelineLayout,
-        cfg: PipelineConfig,
-    ) -> vk::Pipeline {
-        self.build_inner(vert, frag, bindings, attributes, layout, cfg, true)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn build_inner(
-        &self,
-        vert: vk::ShaderModule,
-        frag: vk::ShaderModule,
-        bindings: &[vk::VertexInputBindingDescription],
-        attributes: &[vk::VertexInputAttributeDescription],
-        layout: vk::PipelineLayout,
-        cfg: PipelineConfig,
-        depth_input: bool,
     ) -> vk::Pipeline {
         let PipelineConfig {
             topology,
@@ -1124,18 +1093,6 @@ impl PipelineBuilder<'_> {
             .push_next(&mut rendering_info);
         if vrs && self.fsr_enabled {
             pipeline_info = pipeline_info.push_next(&mut fsr_state);
-        }
-        // Map the fragment's input-attachment index 0 to the depth attachment.
-        // The color list must have ONE entry (it must equal
-        // VkPipelineRenderingCreateInfo::colorAttachmentCount) with the color
-        // attachment marked not-an-input (VUID-…-09531).
-        let depth_input_index = 0u32;
-        let color_input_indices = [vk::ATTACHMENT_UNUSED];
-        let mut input_attachment_info = vk::RenderingInputAttachmentIndexInfoKHR::default()
-            .color_attachment_input_indices(&color_input_indices)
-            .depth_input_attachment_index(&depth_input_index);
-        if depth_input {
-            pipeline_info = pipeline_info.push_next(&mut input_attachment_info);
         }
 
         unsafe {

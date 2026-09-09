@@ -508,10 +508,9 @@ impl RenderTargets {
                 &ImageDesc {
                     extent,
                     format: depth_format,
-                    // Sampled by VRS + input attachment for water absorption.
+                    // Sampled by VRS / TAA / spill / next-frame water absorption.
                     usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                        | vk::ImageUsageFlags::SAMPLED
-                        | vk::ImageUsageFlags::INPUT_ATTACHMENT,
+                        | vk::ImageUsageFlags::SAMPLED,
                     layers: 1,
                     aspect: vk::ImageAspectFlags::DEPTH,
                     samples,
@@ -685,10 +684,9 @@ impl RenderTargets {
 ///
 /// Geometry writes it as a depth attachment (and MSAA `SAMPLE_ZERO` resolve
 /// still needs `DEPTH_STENCIL_ATTACHMENT`). TAA reprojection, the quarter-res
-/// spill/godray pass, and VRS classify sample it (`SAMPLED` usage;
-/// [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]). Water's depth input attachment is
-/// covered by `DEPTH_STENCIL_ATTACHMENT`. There is no transfer or blit of
-/// scene depth.
+/// spill/godray pass, VRS classify, and next-frame water absorption sample it
+/// (`SAMPLED` usage; [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]). There is no
+/// transfer or blit of scene depth.
 /// Experimental `VOXEL_HDR_11BIT=1` switch. Read once at renderer creation
 /// (first [`RenderTargets::new`]); not a public API. Any value other than
 /// `"0"` enables the packed 11-bit offscreen attempt.
