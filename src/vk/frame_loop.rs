@@ -1231,6 +1231,9 @@ impl Renderer {
         let spill_live = self.flags.bloom || godray.strength > 0.0;
         let sample_depth =
             sampleable_depth_consumed(will_present, self.flags.taa, spill_live, classify_vrs);
+        // HDR colour is only read by bloom/exposure/spill/tonemap, all of which
+        // run on presented frames. Minimap is a separate texture; screenshots
+        // copy the swapchain after tonemap; VRS classify reads depth not colour.
 
         let device = &self.device.device;
         let stamp = |p| {
@@ -1240,7 +1243,18 @@ impl Renderer {
         };
         let pass = {
             let _g = crate::profile::scope(crate::profile::Meter::RecTransitions);
-            unsafe { RenderPass::begin(self, cmd, slot, lists, offsets, do_vrs, sample_depth) }
+            unsafe {
+                RenderPass::begin(
+                    self,
+                    cmd,
+                    slot,
+                    lists,
+                    offsets,
+                    do_vrs,
+                    sample_depth,
+                    will_present,
+                )
+            }
         };
         if lists.scene.is_some() {
             use crate::profile::{Meter, scope};

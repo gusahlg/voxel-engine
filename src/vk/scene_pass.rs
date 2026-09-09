@@ -46,6 +46,7 @@ impl<'a> RenderPass<'a> {
         offsets: ImmOffsets,
         do_vrs: bool,
         sample_depth: bool,
+        store_color: bool,
     ) -> RenderPass<'a> {
         let device = &r.device.device;
         let extent = r.render_extent;
@@ -67,16 +68,20 @@ impl<'a> RenderPass<'a> {
             // Offscreen: src COLOR_ATTACHMENT_OUTPUT / NONE (discard).
             // Dst COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE.
             // Old UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
-            image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .image(offscreen_image)
-                .subresource_range(color_range());
-            barrier_count += 1;
+            // MSAA: this image is the AVERAGE resolve target; skip the barrier
+            // when colour is not stored (no resolve this frame).
+            if store_color || r.targets.msaa.is_none() {
+                image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image(offscreen_image)
+                    .subresource_range(color_range());
+                barrier_count += 1;
+            }
             // Depth attachment (MS depth when multisampled, else the
             // single-sample depth): src LATE_FRAGMENT_TESTS / NONE (discard).
             // Dst EARLY|LATE_FRAGMENT_TESTS / DEPTH_STENCIL_ATTACHMENT_{READ,WRITE}.
@@ -162,21 +167,36 @@ impl<'a> RenderPass<'a> {
                 vk::AttachmentLoadOp::CLEAR
             };
             let mut color_attachment = if let Some(msaa) = &r.targets.msaa {
-                vk::RenderingAttachmentInfo::default()
+                // MS store is always DONT_CARE; the offscreen AVERAGE resolve
+                // is the colour that bloom/exposure/spill/tonemap read. Skip
+                // that resolve when this frame will not present (those
+                // consumers are present-only; minimap is a separate texture,
+                // screenshots copy the swapchain after tonemap, VRS reads
+                // depth not colour).
+                let mut att = vk::RenderingAttachmentInfo::default()
                     .image_view(msaa.view())
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .resolve_mode(vk::ResolveModeFlags::AVERAGE)
-                    .resolve_image_view(offscreen_view)
-                    .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .load_op(color_load)
-                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::DONT_CARE);
+                if store_color {
+                    att = att
+                        .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                        .resolve_image_view(offscreen_view)
+                        .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+                }
+                att
             } else {
-                // Offscreen is color target; store contents for present copy.
+                // Offscreen is color target. Store for present-copy consumers;
+                // DONT_CARE when this frame is not presented.
                 vk::RenderingAttachmentInfo::default()
                     .image_view(offscreen_view)
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .load_op(color_load)
-                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .store_op(if store_color {
+                        vk::AttachmentStoreOp::STORE
+                    } else {
+                        vk::AttachmentStoreOp::DONT_CARE
+                    })
             };
             color_attachment = color_attachment.clear_value(clear_color);
             let color_attachments = [color_attachment];
