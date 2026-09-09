@@ -286,6 +286,7 @@ impl Renderer {
                 self.draw_scratch.clear();
                 self.draw_commands.clear();
                 self.draw_runs.clear();
+                crate::profile::gauge(crate::profile::Gauge::DrawsBlend, 0);
             }
         }
 
@@ -665,6 +666,10 @@ impl Renderer {
         crate::profile::gauge(crate::profile::Gauge::TrisFull, u64::from(i0 / 3));
         crate::profile::gauge(crate::profile::Gauge::TrisCutout, u64::from(i1 / 3));
         crate::profile::gauge(crate::profile::Gauge::TrisLod, u64::from(i2 / 3));
+        crate::profile::gauge(
+            crate::profile::Gauge::Arenas,
+            self.arena_dir.arena_count() as u64,
+        );
     }
 
     fn publish_pipe_stats(&mut self, slot: usize) {
@@ -960,6 +965,10 @@ impl Renderer {
                 }),
             }
         }
+        crate::profile::gauge(
+            crate::profile::Gauge::DrawsBlend,
+            self.draw_commands.len() as u64,
+        );
     }
 
     /// GPU-cull prep, shadow fits, and the Blend indirect write. Runs after the
@@ -1356,6 +1365,11 @@ impl Renderer {
                 )
             }
         };
+        if lists.scene.is_none() {
+            crate::profile::gauge(crate::profile::Gauge::CallsFull, 0);
+            crate::profile::gauge(crate::profile::Gauge::CallsLod, 0);
+            crate::profile::gauge(crate::profile::Gauge::CallsBlend, 0);
+        }
         if lists.scene.is_some() {
             use crate::profile::{Meter, scope};
             // Transparency forces an interleave: all opaque geometry (mesh runs
