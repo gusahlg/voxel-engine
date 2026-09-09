@@ -5,11 +5,46 @@
 /// offscreen image. Recreated on resize and on MSAA changes.
 use ash::vk;
 
+use super::SampleCount;
 use super::buffers::FRAMES_IN_FLIGHT;
 use super::image::{
     AllocError, ImageDesc, ImageResource, allocate_and_bind_image, create_image_array,
     image_purpose,
 };
+
+/// Lowest render scale the allocation-failure ladder will try.
+const LADDER_SCALE_FLOOR: f32 = 0.5;
+/// Render-scale step after MSAA has reached 1×.
+const LADDER_SCALE_STEP: f32 = 0.25;
+
+/// Next lower render-target settings after an allocation failure.
+///
+/// Halves MSAA down to 1× at the current scale (8 → 4 → 2 → 1), then lowers
+/// render scale in 0.25 steps rounded to two decimals, down to 0.5. Returns
+/// `None` at MSAA 1× with scale already at (or below) that floor.
+pub(crate) fn next_lower(msaa: SampleCount, scale: f32) -> Option<(SampleCount, f32)> {
+    let lower_msaa = match msaa {
+        SampleCount::X8 => Some(SampleCount::X4),
+        SampleCount::X4 => Some(SampleCount::X2),
+        SampleCount::X2 => Some(SampleCount::X1),
+        SampleCount::X1 => None,
+    };
+    if let Some(msaa) = lower_msaa {
+        return Some((msaa, scale));
+    }
+    if scale <= LADDER_SCALE_FLOOR {
+        return None;
+    }
+    let stepped = ((scale - LADDER_SCALE_STEP) * 100.0).round() / 100.0;
+    Some((
+        SampleCount::X1,
+        if stepped < LADDER_SCALE_FLOOR {
+            LADDER_SCALE_FLOOR
+        } else {
+            stepped
+        },
+    ))
+}
 
 const SLOTS: usize = FRAMES_IN_FLIGHT as usize;
 
@@ -442,7 +477,7 @@ impl RenderTargets {
         device: &ash::Device,
         physical: vk::PhysicalDevice,
         extent: vk::Extent2D,
-        samples: super::SampleCount,
+        samples: SampleCount,
         fsr: Option<&super::device::FragmentShadingRate>,
     ) -> Result<Self, AllocError> {
         let color_format = pick_hdr_color_format(instance, physical);
@@ -962,6 +997,52 @@ mod tests {
         assert!(!color_format_has_alpha(HDR_11BIT_FORMAT));
         assert!(color_format_has_alpha(HDR_COLOR_FORMAT));
         assert!(color_format_has_alpha(vk::Format::B8G8R8A8_UNORM));
+    }
+
+    #[test]
+    fn next_lower_walks_msaa_then_scale_from_8x_2() {
+        let expected = [
+            (SampleCount::X4, 2.0),
+            (SampleCount::X2, 2.0),
+            (SampleCount::X1, 2.0),
+            (SampleCount::X1, 1.75),
+            (SampleCount::X1, 1.5),
+            (SampleCount::X1, 1.25),
+            (SampleCount::X1, 1.0),
+            (SampleCount::X1, 0.75),
+            (SampleCount::X1, 0.5),
+        ];
+        let mut msaa = SampleCount::X8;
+        let mut scale = 2.0;
+        for &(want_msaa, want_scale) in &expected {
+            let (next_msaa, next_scale) =
+                next_lower(msaa, scale).expect("ladder continues before the floor");
+            assert_eq!(next_msaa, want_msaa);
+            assert_eq!(next_scale, want_scale);
+            assert!(
+                next_scale >= LADDER_SCALE_FLOOR,
+                "scale {next_scale} fell below {LADDER_SCALE_FLOOR}"
+            );
+            msaa = next_msaa;
+            scale = next_scale;
+        }
+        assert_eq!(next_lower(msaa, scale), None);
+    }
+
+    #[test]
+    fn next_lower_from_1x_half_scale_is_none() {
+        assert_eq!(next_lower(SampleCount::X1, 0.5), None);
+    }
+
+    #[test]
+    fn next_lower_scale_0_8_steps_to_0_55_then_floor() {
+        let (msaa, scale) = next_lower(SampleCount::X1, 0.8).expect("0.8 is above the floor");
+        assert_eq!(msaa, SampleCount::X1);
+        assert_eq!(scale, 0.55);
+        let (msaa, scale) = next_lower(msaa, scale).expect("0.55 steps to the floor");
+        assert_eq!(msaa, SampleCount::X1);
+        assert_eq!(scale, 0.5);
+        assert_eq!(next_lower(msaa, scale), None);
     }
 
     #[test]

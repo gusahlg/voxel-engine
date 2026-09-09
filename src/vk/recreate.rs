@@ -11,8 +11,8 @@ use super::image::render_target_oom_message;
 use super::pipeline::Pipelines;
 use super::render_client::RenderReturn;
 use super::swapchain::Swapchain;
-use super::targets::RenderTargets;
-use super::{Renderer, SampleCount, create_present_semaphores, scaled_extent};
+use super::targets::{RenderTargets, next_lower};
+use super::{Renderer, create_present_semaphores, scaled_extent};
 
 impl Renderer {
     /// While no frames are being submitted (minimized window): waits out the
@@ -155,41 +155,53 @@ impl Renderer {
                     replaced_targets = true;
                 }
                 Err(err) => {
-                    log::error!("{}", render_target_oom_message(&err));
-                    let fallback_msaa = SampleCount::X1;
-                    let fallback_scale = 1.0;
-                    let fallback_extent = scaled_extent(self.swapchain.extent, fallback_scale);
-                    let already_fallback = requested_msaa == fallback_msaa
-                        && (requested_scale - fallback_scale).abs() <= f32::EPSILON;
-                    let fallback_is_previous = prev_msaa == fallback_msaa
-                        && (prev_scale - fallback_scale).abs() <= f32::EPSILON
-                        && prev_extent.width == fallback_extent.width
-                        && prev_extent.height == fallback_extent.height;
-                    let fallback = if already_fallback || fallback_is_previous {
-                        None
-                    } else {
-                        log::warn!("renderer: retrying render targets at MSAA 1 / render scale 1");
+                    log::warn!("{}", render_target_oom_message(&err));
+                    let mut msaa = requested_msaa;
+                    let mut scale = requested_scale;
+                    let mut found = None;
+                    while let Some((next_msaa, next_scale)) = next_lower(msaa, scale) {
+                        msaa = next_msaa;
+                        scale = next_scale;
+                        let extent = scaled_extent(self.swapchain.extent, scale);
+                        // Live images already match this rung: do not allocate a
+                        // second copy, and do not walk below a working config.
+                        let already_live = next_msaa == prev_msaa
+                            && (next_scale - prev_scale).abs() <= f32::EPSILON
+                            && prev_extent.width == extent.width
+                            && prev_extent.height == extent.height;
+                        if already_live {
+                            break;
+                        }
                         match RenderTargets::new(
                             &self.instance.instance,
                             &self.device.device,
                             self.device.physical,
-                            fallback_extent,
-                            fallback_msaa,
+                            extent,
+                            next_msaa,
                             self.device.fragment_shading_rate.as_ref(),
                         ) {
-                            Ok(new_targets) => Some(new_targets),
+                            Ok(new_targets) => {
+                                found = Some((new_targets, next_msaa, next_scale, extent));
+                                break;
+                            }
                             Err(err) => {
-                                log::error!("{}", render_target_oom_message(&err));
-                                None
+                                log::warn!("{}", render_target_oom_message(&err));
                             }
                         }
-                    };
-                    if let Some(new_targets) = fallback {
+                    }
+                    if let Some((new_targets, msaa, scale, extent)) = found {
+                        log::warn!(
+                            "renderer: render targets fell back to MSAA {} / render scale {} (requested {} / {})",
+                            msaa.as_u32(),
+                            scale,
+                            requested_msaa.as_u32(),
+                            requested_scale,
+                        );
                         self.targets.destroy(&self.device.device);
                         self.targets = new_targets;
-                        self.msaa = super::Pending::new(fallback_msaa);
-                        self.render_scale = super::Pending::new(fallback_scale);
-                        self.render_extent = fallback_extent;
+                        self.msaa = super::Pending::new(msaa);
+                        self.render_scale = super::Pending::new(scale);
+                        self.render_extent = extent;
                         replaced_targets = true;
                     } else {
                         // Previous targets still exist: keep them and revert
