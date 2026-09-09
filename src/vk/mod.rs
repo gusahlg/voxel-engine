@@ -128,7 +128,7 @@ pub(crate) struct Renderer {
     atlas: FontAtlas,
     block_textures: BlockTextures,
     /// Retired textures.
-    retired_textures: buffers::RetireQueue<BlockTextures>,
+    retired_textures: buffers::RetireQueue<block_textures::RetiredBlockTextures>,
     /// Minimap texture.
     minimap: MinimapTexture,
 
@@ -728,29 +728,15 @@ impl Renderer {
             );
             return;
         }
-        // Pending frames sample the old array; submit them so `last_reserved`
-        // is a value the GPU will actually signal.
+        // Pending frames sample the old array; submit them so the grow copy's
+        // graphics-queue barrier (and the retire stamp) covers them. No idle wait.
         self.flush_pending_submits();
-        // Build before swap to avoid double-free on panic.
-        let new_textures = BlockTextures::upload(
-            &self.instance.instance,
-            &self.device.device,
-            self.device.physical,
-            self.device.graphics_queue,
-            self.device.graphics_family,
-            self.device.command_pool,
-            &mut self.transfer_lane,
-            self.device.anisotropy,
-            size,
-            layers,
-            self.device.max_image_array_layers,
-        );
-        let old_textures = std::mem::replace(&mut self.block_textures, new_textures);
-        // Old array may be sampled by in-flight frames; retire past max timeline.
-        let done_at = self.timeline.last_reserved();
-        self.retired_textures.push(done_at, old_textures);
+        self.block_textures.queue_grow(size, layers.to_vec());
         log::debug!(
-            "block textures swapped: {} used / {} cap of {}x{}",
+            "block textures grow queued: {} layers of {}x{} (bound {} used / {} cap of {}x{})",
+            layers.len(),
+            size,
+            size,
             self.block_textures.layers,
             self.block_textures.capacity(),
             self.block_textures.size,

@@ -1149,7 +1149,7 @@ impl Renderer {
                 self.device.graphics_family,
                 done_at,
             );
-            let tex_wait = self.block_textures.flush(
+            let tex = self.block_textures.flush(
                 &self.instance.instance,
                 device,
                 self.device.physical,
@@ -1161,19 +1161,29 @@ impl Renderer {
                 self.last_render_value,
                 done_at,
             );
+            let grew = tex.retire.is_some();
+            if let Some((stamp, retired)) = tex.retire {
+                self.retired_textures.push(stamp, retired);
+            }
             self.pending_transfer_wait = fold_transfer_wait(
                 match (deferred, quad_wait) {
                     (Some(a), Some(b)) => Some((a.max(b), MESH_CONSUMER_STAGES)),
                     (Some(v), None) | (None, Some(v)) => Some((v, MESH_CONSUMER_STAGES)),
                     (None, None) => None,
                 },
-                tex_wait.map(|v| (v, BLOCK_TEXTURE_CONSUMER_STAGES)),
+                tex.transfer_wait
+                    .map(|v| (v, BLOCK_TEXTURE_CONSUMER_STAGES)),
             );
             // Upload this slot's minimap texture (if its version is stale) on the
             // live frame command buffer, before the render pass begins.
             let minimap = self.minimap.sync(device, cmd, slot);
             if profiling {
-                if copies_pending || quad_wait.is_some() || tex_wait.is_some() || minimap {
+                if copies_pending
+                    || quad_wait.is_some()
+                    || tex.transfer_wait.is_some()
+                    || grew
+                    || minimap
+                {
                     self.gpu_timer.recorded(slot);
                 }
                 self.gpu_timer.mark(device, cmd, slot, GpuPass::Copies);

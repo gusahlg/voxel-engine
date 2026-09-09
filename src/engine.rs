@@ -448,7 +448,9 @@ impl Engine {
     /// [`Self::max_texture_array_layers`]). When `size` matches the bound
     /// array and `layers.len()` fits that capacity, only new or changed
     /// layers are uploaded on the transfer lane — no device idle wait. A
-    /// texel-size change or capacity overflow reallocates the image.
+    /// texel-size change or capacity overflow reallocates the image on the
+    /// next frame (GPU-copy of existing layers, no idle wait); the old image
+    /// is freed after the timeline value of the last frame that used it.
     ///
     /// Contract: layer 0 must render pure white — the engine's immediate
     /// cubes/wires always draw with layer 0. Before the first call a default

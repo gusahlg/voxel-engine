@@ -35,6 +35,9 @@ pub struct BlockTextures {
     written: u32,
     pending: Vec<PendingLayer>,
     command_pool: vk::CommandPool,
+    anisotropy: Option<Anisotropy>,
+    max_layers: u32,
+    pending_grow: Option<PendingGrow>,
     staging_retire: RetireQueue<(vk::Buffer, vk::DeviceMemory)>,
     transfer_retire: RetireQueue<(vk::Buffer, vk::DeviceMemory)>,
     /// Dedicated-family overwrite release: throwaway graphics timeline + CB.
@@ -46,6 +49,49 @@ pub struct BlockTextures {
 struct PendingLayer {
     index: u32,
     pixels: Vec<u8>,
+}
+
+struct PendingGrow {
+    size: u32,
+    layers: Vec<Vec<u8>>,
+    /// Layers GPU-copied from the bound image (`0` if the texel size changed).
+    copied: u32,
+    staging: Vec<PendingLayer>,
+}
+
+/// GPU objects of a superseded array; destroyed after the timeline value of
+/// the last frame that sampled (or copied from) it.
+pub(crate) struct RetiredBlockTextures {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+}
+
+impl RetiredBlockTextures {
+    pub unsafe fn destroy(&mut self, device: &ash::Device) {
+        unsafe {
+            device.destroy_sampler(self.sampler, None);
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Result of flushing pending uploads/grows into the next frame's command buffer.
+pub(crate) struct TextureFlush {
+    pub transfer_wait: Option<TimelineValue>,
+    pub retire: Option<(TimelineValue, RetiredBlockTextures)>,
+}
+
+impl TextureFlush {
+    fn none() -> Self {
+        Self {
+            transfer_wait: None,
+            retire: None,
+        }
+    }
 }
 
 /// Allocated array-layer count: next power of two ≥ `requested`, at least
@@ -73,6 +119,34 @@ pub(crate) fn changed_layer_indices(old: &[Vec<u8>], new: &[Vec<u8>]) -> Vec<u32
         }
     }
     out
+}
+
+/// How a grow splits work: GPU-copy `copied` prefix layers (same texel size),
+/// staging-upload the returned indices (tail, plus any changed prefix).
+pub(crate) fn grow_plan(
+    old_size: u32,
+    old_written: u32,
+    old_pixels: &[Vec<u8>],
+    new_size: u32,
+    new_layers: &[Vec<u8>],
+) -> (u32, Vec<u32>) {
+    let copied = if new_size == old_size {
+        old_written.min(new_layers.len() as u32)
+    } else {
+        0
+    };
+    let mut staging = Vec::new();
+    for (i, layer) in new_layers.iter().enumerate() {
+        let idx = i as u32;
+        if idx < copied {
+            if old_pixels.get(i) != Some(layer) {
+                staging.push(idx);
+            }
+        } else {
+            staging.push(idx);
+        }
+    }
+    (copied, staging)
 }
 
 /// Inclusive-contiguous runs `(base, count)` from a set of layer indices.
@@ -265,6 +339,9 @@ impl BlockTextures {
             written: layer_count,
             pending: Vec::new(),
             command_pool,
+            anisotropy,
+            max_layers,
+            pending_grow: None,
             staging_retire: RetireQueue::new(),
             transfer_retire: RetireQueue::new(),
             release_cmds: RetireQueue::new(),
@@ -280,12 +357,12 @@ impl BlockTextures {
     }
 
     /// Same texel size and `layer_count` within the allocated capacity.
+    /// False while a grow is queued so a later set coalesces into that grow.
     pub fn can_update_in_place(&self, size: u32, layer_count: u32) -> bool {
-        size == self.size && layer_count >= 1 && layer_count <= self.capacity
-    }
-
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        self.pending_grow.is_none()
+            && size == self.size
+            && layer_count >= 1
+            && layer_count <= self.capacity
     }
 
     /// Pending writes to layers the GPU already sampled (need overwrite sync).
@@ -320,11 +397,76 @@ impl BlockTextures {
         self.pending.retain(|p| p.index < self.layers);
     }
 
+    /// Queue a realloc (texel-size change or capacity overflow). Applied at
+    /// the next frame: GPU-copy existing layers when the size matches, upload
+    /// the rest, switch the sampled view, retire the old image on the timeline.
+    pub fn queue_grow(&mut self, size: u32, layers: Vec<Vec<u8>>) {
+        assert!(size >= 1, "block texture size must be >= 1");
+        assert!(!layers.is_empty(), "block texture array needs >= 1 layer");
+        let layer_bytes = size as usize * size as usize * 4;
+        for (i, layer) in layers.iter().enumerate() {
+            assert_eq!(
+                layer.len(),
+                layer_bytes,
+                "layer {i}: expected {size}x{size} RGBA8 = {layer_bytes} bytes"
+            );
+        }
+        let (copied, staging_idx) =
+            grow_plan(self.size, self.written, &self.layer_pixels, size, &layers);
+        let staging = staging_idx
+            .into_iter()
+            .map(|index| PendingLayer {
+                index,
+                pixels: layers[index as usize].clone(),
+            })
+            .collect();
+        self.pending.clear();
+        self.layers = layers.len() as u32;
+        self.layer_pixels = layers.clone();
+        self.pending_grow = Some(PendingGrow {
+            size,
+            layers,
+            copied,
+            staging,
+        });
+    }
+
     /// Append `new_layers` at the current texel size. `Ok` if they fit in
     /// capacity (after clamping to `device_limit`). `Err` if a bigger image
     /// is required; the palette is left unchanged so the caller can rebuild.
     pub fn try_append(&mut self, new_layers: &[Vec<u8>], device_limit: u32) -> Result<(), ()> {
         if new_layers.is_empty() {
+            return Ok(());
+        }
+        if let Some(grow) = &mut self.pending_grow {
+            let layer_bytes = grow.size as usize * grow.size as usize * 4;
+            for (i, layer) in new_layers.iter().enumerate() {
+                assert_eq!(
+                    layer.len(),
+                    layer_bytes,
+                    "append layer {i}: expected {}x{} RGBA8 = {layer_bytes} bytes",
+                    grow.size,
+                    grow.size
+                );
+            }
+            let used = grow.layers.len() as u32;
+            let room = device_limit.saturating_sub(used) as usize;
+            if new_layers.len() > room {
+                log::error!(
+                    "append_block_textures: {} layers would exceed the device cap of {device_limit}; truncating",
+                    used as usize + new_layers.len()
+                );
+            }
+            let start = grow.layers.len() as u32;
+            for (i, layer) in new_layers.iter().take(room).enumerate() {
+                grow.staging.push(PendingLayer {
+                    index: start + i as u32,
+                    pixels: layer.clone(),
+                });
+                grow.layers.push(layer.clone());
+            }
+            self.layer_pixels = grow.layers.clone();
+            self.layers = grow.layers.len() as u32;
             return Ok(());
         }
         let layer_bytes = self.size as usize * self.size as usize * 4;
@@ -370,8 +512,9 @@ impl BlockTextures {
     }
 
     /// Record pending per-layer copies on the transfer lane (or the frame
-    /// command buffer on `SameQueueFallback`). Returns the lane value the
-    /// graphics submit must wait on, if any. No host wait.
+    /// command buffer on `SameQueueFallback`). Grows that exceed capacity run
+    /// on the graphics command buffer (`vkCmdCopyImage` of existing layers).
+    /// No host wait.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn flush(
         &mut self,
@@ -385,9 +528,14 @@ impl BlockTextures {
         graphics_timeline: &Timeline,
         last_render_value: TimelineValue,
         done_at: TimelineValue,
-    ) -> Option<TimelineValue> {
+    ) -> TextureFlush {
+        if let Some(grow) = self.pending_grow.take() {
+            return unsafe {
+                self.flush_grow(instance, device, physical, graphics_cmd, done_at, grow)
+            };
+        }
         if self.pending.is_empty() {
-            return None;
+            return TextureFlush::none();
         }
         let mut pending = std::mem::take(&mut self.pending);
         pending.sort_by_key(|p| p.index);
@@ -584,7 +732,144 @@ impl BlockTextures {
         if let Some(max_idx) = pending.iter().map(|p| p.index).max() {
             self.written = self.written.max(max_idx + 1);
         }
-        arrived_at
+        TextureFlush {
+            transfer_wait: arrived_at,
+            retire: None,
+        }
+    }
+
+    /// Create a larger (or differently sized) array, copy existing layers
+    /// GPU-side when the texel size matches, upload the rest from staging,
+    /// and switch the sampled view. Old image is retired after `done_at`.
+    unsafe fn flush_grow(
+        &mut self,
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical: vk::PhysicalDevice,
+        graphics_cmd: vk::CommandBuffer,
+        done_at: TimelineValue,
+        grow: PendingGrow,
+    ) -> TextureFlush {
+        let new_used = grow.layers.len() as u32;
+        let new_capacity = layer_capacity(new_used, self.max_layers);
+        let (new_image, new_memory, new_view, new_sampler, new_mips) = create_gpu_array(
+            instance,
+            device,
+            physical,
+            self.anisotropy,
+            grow.size,
+            new_capacity,
+        );
+
+        let copied = grow.copied.min(new_used);
+        let staging_layers = grow.staging;
+
+        // New image: UNDEFINED → TRANSFER_DST on every layer this grow writes.
+        let mut barriers = vec![
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .image(new_image)
+                .subresource_range(color_range(new_mips, 0, new_used)),
+        ];
+        if copied > 0 {
+            // In-flight frames sample the old array as SHADER_READ. This later
+            // graphics CB's barrier waits that fragment work (same-queue
+            // submission order) before TRANSFER_SRC.
+            barriers.push(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .image(self.image)
+                    .subresource_range(color_range(self.mip_levels, 0, copied)),
+            );
+        }
+        unsafe {
+            device.cmd_pipeline_barrier2(
+                graphics_cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&barriers),
+            );
+            if copied > 0 {
+                let copies = image_copy_mips(self.size, self.mip_levels, copied);
+                device.cmd_copy_image(
+                    graphics_cmd,
+                    self.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    new_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &copies,
+                );
+            }
+        }
+
+        let packed = if staging_layers.is_empty() {
+            None
+        } else {
+            Some(pack_pending(grow.size, new_mips, &staging_layers))
+        };
+        if let Some(packed) = &packed {
+            let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
+            let (staging, staging_mem) =
+                unsafe { create_filled_staging(device, &memory_props, &packed.bytes) };
+            unsafe {
+                for (_index, regions) in &packed.per_layer {
+                    device.cmd_copy_buffer_to_image(
+                        graphics_cmd,
+                        staging,
+                        new_image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        regions,
+                    );
+                }
+            }
+            self.staging_retire.push(done_at, (staging, staging_mem));
+        }
+
+        let to_sampled = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(new_image)
+            .subresource_range(color_range(new_mips, 0, new_used))];
+        unsafe {
+            device.cmd_pipeline_barrier2(
+                graphics_cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
+            );
+        }
+
+        let old = RetiredBlockTextures {
+            image: self.image,
+            memory: self.memory,
+            view: self.view,
+            sampler: self.sampler,
+        };
+        self.image = new_image;
+        self.memory = new_memory;
+        self.view = new_view;
+        self.sampler = new_sampler;
+        self.size = grow.size;
+        self.capacity = new_capacity;
+        self.mip_levels = new_mips;
+        self.layers = new_used;
+        self.layer_pixels = grow.layers;
+        self.written = new_used;
+
+        TextureFlush {
+            transfer_wait: None,
+            retire: Some((done_at, old)),
+        }
     }
 
     /// Dedicated-family overwrite: release sampled layers on graphics so the
@@ -692,6 +977,130 @@ impl BlockTextures {
             device.free_memory(self.memory, None);
         }
     }
+}
+
+fn create_gpu_array(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical: vk::PhysicalDevice,
+    anisotropy: Option<Anisotropy>,
+    size: u32,
+    capacity: u32,
+) -> (vk::Image, vk::DeviceMemory, vk::ImageView, vk::Sampler, u32) {
+    let mip_levels = 32 - size.leading_zeros();
+    let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(vk::Format::R8G8B8A8_SRGB)
+        .extent(vk::Extent3D {
+            width: size,
+            height: size,
+            depth: 1,
+        })
+        .mip_levels(mip_levels)
+        .array_layers(capacity)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(
+            vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED,
+        )
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let image = unsafe {
+        device
+            .create_image(&image_info, None)
+            .expect("Failed to create block texture image")
+    };
+    let requirements = unsafe { device.get_image_memory_requirements(image) };
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(find_memory_type(
+            &memory_props,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ));
+    let memory = unsafe {
+        device
+            .allocate_memory(&alloc_info, None)
+            .expect("Failed to allocate block texture memory")
+    };
+    unsafe {
+        device
+            .bind_image_memory(image, memory, 0)
+            .expect("Failed to bind block texture memory");
+    }
+    let view_range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: mip_levels,
+        base_array_layer: 0,
+        layer_count: capacity,
+    };
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
+        .format(vk::Format::R8G8B8A8_SRGB)
+        .subresource_range(view_range);
+    let view = unsafe {
+        device
+            .create_image_view(&view_info, None)
+            .expect("Failed to create block texture view")
+    };
+    let sampler = create_sampler(device, anisotropy, mip_levels);
+    (image, memory, view, sampler, mip_levels)
+}
+
+fn create_sampler(
+    device: &ash::Device,
+    anisotropy: Option<Anisotropy>,
+    mip_levels: u32,
+) -> vk::Sampler {
+    let mut sampler_info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::NEAREST)
+        .min_filter(vk::Filter::NEAREST)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::REPEAT)
+        .address_mode_v(vk::SamplerAddressMode::REPEAT)
+        .address_mode_w(vk::SamplerAddressMode::REPEAT)
+        .min_lod(0.0)
+        .max_lod(mip_levels as f32);
+    if let Some(a) = anisotropy {
+        sampler_info = sampler_info
+            .anisotropy_enable(true)
+            .max_anisotropy(a.clamp(8.0));
+    }
+    unsafe {
+        device
+            .create_sampler(&sampler_info, None)
+            .expect("Failed to create block texture sampler")
+    }
+}
+
+fn image_copy_mips(size: u32, mip_levels: u32, layer_count: u32) -> Vec<vk::ImageCopy> {
+    (0..mip_levels)
+        .map(|mip| {
+            let extent = (size >> mip).max(1);
+            vk::ImageCopy::default()
+                .src_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: mip,
+                    base_array_layer: 0,
+                    layer_count,
+                })
+                .dst_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: mip,
+                    base_array_layer: 0,
+                    layer_count,
+                })
+                .extent(vk::Extent3D {
+                    width: extent,
+                    height: extent,
+                    depth: 1,
+                })
+        })
+        .collect()
 }
 
 struct PackedUpload {
@@ -820,7 +1229,7 @@ fn build_mip_chain(base: &[u8], size: u32, levels: u32) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_LAYER_CAPACITY, build_mip_chain, changed_layer_indices, consecutive_runs,
+        MIN_LAYER_CAPACITY, build_mip_chain, changed_layer_indices, consecutive_runs, grow_plan,
         layer_capacity,
     };
 
@@ -856,6 +1265,20 @@ mod tests {
             changed_layer_indices(&b, &[vec![0, 0, 0, 0]]),
             vec![0],
             "changed prefix on shrink"
+        );
+    }
+
+    #[test]
+    fn grow_plan_copies_prefix_and_stages_tail_or_size_change() {
+        let old = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]];
+        let append = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 9, 9, 9]];
+        assert_eq!(grow_plan(16, 2, &old, 16, &append), (2, vec![2]));
+        let changed = vec![vec![0, 0, 0, 0], vec![5, 6, 7, 8], vec![9, 9, 9, 9]];
+        assert_eq!(grow_plan(16, 2, &old, 16, &changed), (2, vec![0, 2]));
+        assert_eq!(
+            grow_plan(1, 1, &[vec![255, 255, 255, 255]], 16, &append),
+            (0, vec![0, 1, 2]),
+            "texel-size change cannot GPU-copy"
         );
     }
 
