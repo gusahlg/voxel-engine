@@ -186,7 +186,7 @@ impl ShadowMap {
     }
 }
 
-/// Bloom mip chain (half-res HDR pyramid): compute threshold and downsample
+/// Bloom mip chain (quarter-res HDR pyramid): compute threshold and downsample
 /// passes feed the quarter-res spill composite. Per-slot to avoid races between frames.
 pub(crate) struct BloomChain {
     pub image: vk::Image,
@@ -209,10 +209,10 @@ impl BloomChain {
         memory_props: &vk::PhysicalDeviceMemoryProperties,
         extent: vk::Extent2D,
     ) -> Result<BloomChain, AllocError> {
-        // Half-res base; each mip halves (rounding up) to a floor of 1 texel.
+        // Quarter-res base; each mip halves (rounding up) to a floor of 1 texel.
         let base = vk::Extent2D {
-            width: extent.width.div_ceil(2).max(1),
-            height: extent.height.div_ceil(2).max(1),
+            width: extent.width.div_ceil(4).max(1),
+            height: extent.height.div_ceil(4).max(1),
         };
         let purpose = image_purpose("bloom pyramid", base, vk::SampleCountFlags::TYPE_1);
         let mut mip_extents = Vec::new();
@@ -766,7 +766,7 @@ fn plane_bytes(w: u32, h: u32, bpp: u64, samples: u32, layers: u32) -> u64 {
 }
 
 fn bloom_chain_bytes(render_w: u32, render_h: u32) -> u64 {
-    let mut e = (render_w.div_ceil(2).max(1), render_h.div_ceil(2).max(1));
+    let mut e = (render_w.div_ceil(4).max(1), render_h.div_ceil(4).max(1));
     let mut bytes = 0u64;
     let mut levels = 0u32;
     loop {
@@ -981,8 +981,8 @@ mod tests {
         want += px(1280, 720, HDR_BPP, 3); // HDR offscreen
         want += px(1280, 720, DEPTH_BPP, 3); // depth
         want += px(1280, 720, TAA_BPP, 2); // history pair
-        // Bloom: half-res mip chain, capped at BLOOM_MAX_MIPS.
-        let mut e = (640u32, 360u32);
+        // Bloom: quarter-res mip chain, capped at BLOOM_MAX_MIPS.
+        let mut e = (320u32, 180u32);
         let mut bloom = 0u64;
         let mut levels = 0u32;
         loop {

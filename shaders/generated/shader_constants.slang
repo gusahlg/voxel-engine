@@ -215,11 +215,12 @@ static const float BLOOM_SPIRAL_SAMPLES = 6.0f;
 
 // Mip level the bloom spiral samples the (already downsampled) chain at — the
 // wide soft blur comes from the pyramid; the spiral just spreads and de-aliases it.
-static const float BLOOM_SPIRAL_LOD = 2.0f;
+// Quarter-res chain, so LOD 1 is eighth-res.
+static const float BLOOM_SPIRAL_LOD = 1.0f;
 
 // Bloom pyramid mip cap. The spill pass samples only BLOOM_SPIRAL_LOD, so the
 // chain stops at that level (base + LOD). CPU (vk/targets.rs) must agree.
-static const uint BLOOM_MAX_MIPS = 3;
+static const uint BLOOM_MAX_MIPS = 2;
 
 // Bloom spiral radius in output uv (isotropic). Small — the mip chain already
 // carries the wide blur, so this only softens the seams between taps.

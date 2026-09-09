@@ -1011,13 +1011,13 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "BLOOM_SPIRAL_LOD",
-            doc: "Mip level the bloom spiral samples the (already downsampled) chain at — the\nwide soft blur comes from the pyramid; the spiral just spreads and de-aliases it.",
-            val: Val::Scalar(2.0),
+            doc: "Mip level the bloom spiral samples the (already downsampled) chain at — the\nwide soft blur comes from the pyramid; the spiral just spreads and de-aliases it.\nQuarter-res chain, so LOD 1 is eighth-res.",
+            val: Val::Scalar(1.0),
         },
         Def {
             name: "BLOOM_MAX_MIPS",
             doc: "Bloom pyramid mip cap. The spill pass samples only BLOOM_SPIRAL_LOD, so the\nchain stops at that level (base + LOD). CPU (vk/targets.rs) must agree.",
-            val: Val::UInt(3),
+            val: Val::UInt(2),
         },
         Def {
             name: "BLOOM_SPIRAL_RADIUS",
