@@ -697,13 +697,15 @@ impl Renderer {
 
     /// Retire a freed mesh resident.
     pub(crate) fn apply_free_mesh(&mut self, slot: u32, generation: NonZeroU32) {
-        // Pending frames may still draw this mesh; submit them so
-        // `last_render_value` covers the batch before the free is stamped.
-        self.flush_pending_submits();
+        // Pending frames may still draw this mesh, submitted or not. Stamp
+        // with `last_reserved` so the retire queue covers the newest frame
+        // that could reference it without flushing the submit batch.
+        // `RetireQueue::collect` compares against the completed counter and
+        // leaves a not-yet-signalled stamp queued.
         self.arena_dir.note_free(slot, generation);
         self.records.clear_arena(slot);
         self.mesh_res
-            .apply_free(slot, generation, self.last_render_value);
+            .apply_free(slot, generation, self.timeline.last_reserved());
     }
 
     /// Queue screenshot capture to path.

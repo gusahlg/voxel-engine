@@ -71,6 +71,10 @@ impl<T> RetireQueue<T> {
     }
 
     /// Drains entries whose GPU use has completed, calling `f` on each.
+    ///
+    /// `current` is the completed (signalled) timeline counter. A stamp that
+    /// is reserved but not yet signalled compares greater than `current` and
+    /// stays queued; this never waits.
     pub fn collect(&mut self, current: TimelineValue, mut f: impl FnMut(T)) {
         while let Some((stamp, _)) = self.entries.front() {
             if *stamp > current {
@@ -2184,6 +2188,34 @@ mod tests {
         let mut freed = Vec::new();
         q.collect_all(|x| freed.push(x));
         assert_eq!(freed, vec![103]);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn retire_queue_holds_a_reserved_but_unsubmitted_stamp() {
+        // A free stamped at last_reserved (frame reserved, not yet submitted)
+        // must not reclaim until the completed counter reaches that value.
+        // collect only compares; it must not wait.
+        let v = TimelineValue::from_raw_for_test;
+        let mut q: RetireQueue<u32> = RetireQueue::new();
+        let reserved = v(5);
+        q.push(reserved, 42);
+
+        let mut freed = Vec::new();
+        q.collect(v(3), |x| freed.push(x));
+        assert_eq!(freed, Vec::<u32>::new(), "unsubmitted stamp is not done");
+        assert!(!q.is_empty());
+
+        let mut freed = Vec::new();
+        q.collect(v(4), |x| freed.push(x));
+        assert!(
+            freed.is_empty(),
+            "still waiting for the reserved value itself"
+        );
+
+        let mut freed = Vec::new();
+        q.collect(reserved, |x| freed.push(x));
+        assert_eq!(freed, vec![42]);
         assert!(q.is_empty());
     }
 
