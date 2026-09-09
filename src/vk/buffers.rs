@@ -17,7 +17,7 @@ use super::alloc::{Allocation, GpuAllocator, find_memory_type, try_find_memory_t
 use super::cull::ArenaDirectory;
 use super::timeline::TimelineValue;
 use super::transfer::TransferLane;
-use crate::mesh::{Detail, MeshData, MeshHandle, Pass};
+use crate::mesh::{Detail, FACE_UPLOAD_ORDER, MeshData, MeshHandle, Pass};
 
 /// Mesh-copy staging budget per frame; amortizes bursty uploads.
 const TRANSFER_BUDGET_BYTES_PER_FRAME: u64 = 8 * 1024 * 1024;
@@ -413,11 +413,6 @@ impl GpuResident {
     }
 }
 
-/// Upload order of the six [`crate::mesh::Normal`] buckets: +X,+Y,+Z,−X,−Y,−Z.
-/// An outside camera sees ≤3 of these, and same-sign buckets are adjacent, so
-/// the GPU cull merges them into ~1.75 contiguous runs per mesh instead of 3.
-pub(crate) const FACE_UPLOAD_ORDER: [usize; 6] = [0, 2, 4, 1, 3, 5];
-
 /// Allocates a device buffer for `data`, writes/stages its bytes, and returns
 /// the main-owned [`MeshMeta`] plus render-owned [`GpuResident`]. Main-thread
 /// only: touches the allocator + persistent mapping, never the timeline.
@@ -428,14 +423,11 @@ pub(crate) unsafe fn build_mesh_resident(
     allocator: &mut GpuAllocator,
     data: &MeshData,
 ) -> Option<(MeshMeta, GpuResident)> {
-    let total_indices: usize = data.buckets.iter().map(Vec::len).sum();
-    if total_indices == 0 || data.vertices.is_empty() {
+    if data.is_empty() {
         return None;
     }
 
-    // Permuted pool holds the same vertices reordered by bucket then quad; every
-    // vertex belongs to exactly one quad, so its length equals `data.vertices`.
-    let vertex_bytes_len = data.vertices.len() * VERTEX_STRIDE as usize;
+    let vertex_bytes_len = data.vertex_bytes();
     let total = vertex_bytes_len as u64;
 
     let alloc = unsafe { allocator.alloc_device(device, total, MESH_ALIGN) }
@@ -445,24 +437,15 @@ pub(crate) unsafe fn build_mesh_resident(
     let write_into = |dst: *mut u8| unsafe {
         let mut cursor = 0usize;
         for &dir in &FACE_UPLOAD_ORDER {
-            let bucket = &data.buckets[dir];
-            debug_assert_eq!(bucket.len() % 6, 0, "each quad contributes 6 indices");
-            for quad in bucket.chunks_exact(6) {
-                let b = quad[0];
-                debug_assert_eq!(
-                    *quad,
-                    [b, b + 1, b + 2, b, b + 2, b + 3],
-                    "non-pattern quad indices break the shared-IBO permutation"
-                );
-                let verts: &[u8] = bytemuck::cast_slice(&data.vertices[b as usize..b as usize + 4]);
+            let bucket = &data.vertices[dir];
+            debug_assert_eq!(bucket.len() % 4, 0, "each quad contributes 4 vertices");
+            for quad in bucket.chunks_exact(4) {
+                let verts: &[u8] = bytemuck::cast_slice(quad);
                 std::ptr::copy_nonoverlapping(verts.as_ptr(), dst.add(cursor), verts.len());
                 cursor += verts.len();
             }
         }
-        debug_assert_eq!(
-            cursor, vertex_bytes_len,
-            "permutation must cover every vertex"
-        );
+        debug_assert_eq!(cursor, vertex_bytes_len, "upload must cover every vertex");
     };
 
     let copy = if let Some(mapped) = alloc.mapped {
@@ -492,10 +475,12 @@ pub(crate) unsafe fn build_mesh_resident(
 
     let mut aabb_min = Vec3::splat(f32::INFINITY);
     let mut aabb_max = Vec3::splat(f32::NEG_INFINITY);
-    for v in &data.vertices {
-        let p = Vec3::from_array(v.local_pos());
-        aabb_min = aabb_min.min(p);
-        aabb_max = aabb_max.max(p);
+    for bucket in &data.vertices {
+        for v in bucket {
+            let p = Vec3::from_array(v.local_pos());
+            aabb_min = aabb_min.min(p);
+            aabb_max = aabb_max.max(p);
+        }
     }
 
     const _: () =
@@ -509,9 +494,12 @@ pub(crate) unsafe fn build_mesh_resident(
     // adding the unchanged `vertex_offset` base reproduces the old vertex fetches.
     let mut bounds = [0u32; 7];
     for (k, &dir) in FACE_UPLOAD_ORDER.iter().enumerate() {
-        bounds[k + 1] = bounds[k] + data.buckets[dir].len() as u32;
+        bounds[k + 1] = bounds[k] + data.vertices[dir].len() as u32 / 4 * 6;
     }
-    debug_assert_eq!(bounds[6], total_indices as u32);
+    debug_assert_eq!(
+        bounds[6] as usize / 6 * 4,
+        vertex_bytes_len / VERTEX_STRIDE as usize
+    );
 
     let meta = MeshMeta {
         aabb_min,
