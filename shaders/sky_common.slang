@@ -7,14 +7,6 @@
 
 #include "common.slang"
 
-// Fast hash for procedural stars and cloud value-noise; quality doesn't matter.
-float hash12(float2 p)
-{
-    float3 p3 = frac(float3(p.xyx) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return frac((p3.x + p3.y) * p3.z);
-}
-
 // Upper-hemisphere octahedral: injective for y >= 0. y < 0 aliases xz of -n
 // and must not be sampled (sky.frag skips the LUT tap below CLOUD_HORIZON_OFFSET).
 float2 sky_oct_encode(float3 d)
