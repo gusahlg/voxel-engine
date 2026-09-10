@@ -151,12 +151,26 @@ impl RenderSubmit {
         extra_wait: Option<(vk::Semaphore, TimelineValue, vk::PipelineStageFlags2)>,
     ) -> RenderCompletion {
         let cmd = self.cmd;
-        unsafe { self.submit_bufs(device, queue, timeline, &[cmd], extra_wait) }
+        // Transfer / compute lanes and graphics-queue copies (QFOT release,
+        // overwrite) submit through here. Those queues — or those CBs — may
+        // not support color-out / late-Z, so the signal stays `ALL_COMMANDS`.
+        unsafe {
+            self.submit_bufs(
+                device,
+                queue,
+                timeline,
+                &[cmd],
+                extra_wait,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+            )
+        }
     }
 
     /// One `vkQueueSubmit2` / one timeline signal, with `cmds.len()` command
     /// buffers (`VkCommandBufferSubmitInfo`s). Used by uncapped submit batching
-    /// and `VOXEL_BENCH_EMPTY=K`.
+    /// and `VOXEL_BENCH_EMPTY=K`. `signal_stages` is the first sync scope of
+    /// the timeline signal: [`RENDER_SIGNAL_STAGES`] for a graphics render CB,
+    /// `ALL_COMMANDS` on transfer/compute lanes.
     pub unsafe fn submit_bufs(
         self,
         device: &ash::Device,
@@ -164,9 +178,10 @@ impl RenderSubmit {
         timeline: &Timeline,
         cmds: &[vk::CommandBuffer],
         extra_wait: Option<(vk::Semaphore, TimelineValue, vk::PipelineStageFlags2)>,
+        signal_stages: vk::PipelineStageFlags2,
     ) -> RenderCompletion {
         let value = self.value;
-        unsafe { timeline.submit_render(device, queue, cmds, value, extra_wait) }
+        unsafe { timeline.submit_render(device, queue, cmds, value, extra_wait, signal_stages) }
     }
 
     /// Hold the reservation without submitting: the command buffer joins a
@@ -176,10 +191,43 @@ impl RenderSubmit {
     }
 }
 
+/// Stages that write slot-owned (or same-queue render-CB) resources.
+/// A wait on the render timeline can retire the slot once these complete,
+/// without draining idle pipe (`ALL_COMMANDS` / `BOTTOM_OF_PIPE`).
+///
+/// Only the graphics-queue **render** submit uses this mask. Transfer-lane
+/// and compute-lane submits keep `ALL_COMMANDS`: those queue families do not
+/// support color-out / late-Z (validation: stageMask vs queue flags).
+///
+/// Per-slot / same-queue writers on the render CB:
+/// - `COLOR_ATTACHMENT_OUTPUT`: scene offscreen (and MSAA color / AVERAGE
+///   resolve), sky, debug cubes/lines/contact shadows, color clears.
+/// - `LATE_FRAGMENT_TESTS`: scene depth (early/late Z; late is last), shadow
+///   cascade depth, depth clears. MSAA SAMPLE_ZERO resolve is color-out.
+/// - `COMPUTE_SHADER`: GPU cull, sky-cloud LUT, VRS classify, exposure
+///   reduce, bloom pyramid + spill, same-queue compute-lane jobs.
+/// - `COPY`: same-queue mesh / quad-IBO / block-texture / material copies,
+///   minimap upload, cull-stats and VRS-mix copies, compute-job readback.
+/// - `TRANSFER`: `cmd_fill_buffer` (cull counts/stats, VRS mix) and
+///   `cmd_clear_color_image` (hidden-cloud LUT, bloom-pyramid prime).
+///   `TRANSFER` is `ALL_TRANSFER` (copy|blit|resolve|clear); `COPY` is listed
+///   so the uploads are obvious in the mask.
+pub(crate) const RENDER_SIGNAL_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
+    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT.as_raw()
+        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw()
+        | vk::PipelineStageFlags2::COMPUTE_SHADER.as_raw()
+        | vk::PipelineStageFlags2::COPY.as_raw()
+        | vk::PipelineStageFlags2::TRANSFER.as_raw(),
+);
+
 impl Timeline {
     /// One `vkQueueSubmit2` with `cmds` (in order) and a single timeline signal
     /// at `signal`. Intermediate values reserved for earlier frames in a batch
     /// are holes: a wait for them succeeds once this higher value is signalled.
+    ///
+    /// `signal_stages` is the first sync scope of the timeline signal. Graphics
+    /// render CBs pass [`RENDER_SIGNAL_STAGES`]; transfer/compute lanes pass
+    /// `ALL_COMMANDS`.
     pub unsafe fn submit_render(
         &self,
         device: &ash::Device,
@@ -187,11 +235,12 @@ impl Timeline {
         cmds: &[vk::CommandBuffer],
         signal: TimelineValue,
         extra_wait: Option<(vk::Semaphore, TimelineValue, vk::PipelineStageFlags2)>,
+        signal_stages: vk::PipelineStageFlags2,
     ) -> RenderCompletion {
         let signal_info = [vk::SemaphoreSubmitInfo::default()
             .semaphore(self.sem)
             .value(signal.raw())
-            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+            .stage_mask(signal_stages)];
         let cmd_infos: Vec<vk::CommandBufferSubmitInfo<'_>> = cmds
             .iter()
             .map(|&c| vk::CommandBufferSubmitInfo::default().command_buffer(c))
@@ -330,5 +379,22 @@ pub unsafe fn queue_present(
 impl TimelineValue {
     pub fn from_raw_for_test(n: u64) -> Self {
         TimelineValue(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_signal_stages_are_slot_writers_not_all_commands() {
+        assert!(RENDER_SIGNAL_STAGES.contains(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT));
+        assert!(RENDER_SIGNAL_STAGES.contains(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS));
+        assert!(RENDER_SIGNAL_STAGES.contains(vk::PipelineStageFlags2::COMPUTE_SHADER));
+        assert!(RENDER_SIGNAL_STAGES.contains(vk::PipelineStageFlags2::COPY));
+        assert!(RENDER_SIGNAL_STAGES.contains(vk::PipelineStageFlags2::TRANSFER));
+        assert!(!RENDER_SIGNAL_STAGES.contains(vk::PipelineStageFlags2::ALL_COMMANDS));
+        assert!(!RENDER_SIGNAL_STAGES.contains(vk::PipelineStageFlags2::BOTTOM_OF_PIPE));
+        assert_ne!(RENDER_SIGNAL_STAGES, vk::PipelineStageFlags2::ALL_COMMANDS);
     }
 }

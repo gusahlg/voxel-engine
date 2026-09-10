@@ -8,7 +8,7 @@ use crate::skeleton::FrameSlot;
 use super::Renderer;
 use super::buffers::{FRAMES_IN_FLIGHT, SUBMIT_BATCH_MAX};
 use super::render_client::RenderReturn;
-use super::timeline::{RenderSubmit, TimelineValue};
+use super::timeline::{RENDER_SIGNAL_STAGES, RenderSubmit, TimelineValue};
 
 /// Slot whose `render_value` [`Renderer::wait_slot_and_reclaim`] waits before
 /// recording into `slot`.
@@ -186,6 +186,7 @@ impl Renderer {
                     &self.timeline,
                     &cmds,
                     extra_wait,
+                    RENDER_SIGNAL_STAGES,
                 )
             };
             self.slots[FrameSlot::new(slot)].render_value = completion.value();
@@ -361,6 +362,7 @@ impl Renderer {
                 &cmds,
                 signal,
                 extra_wait,
+                RENDER_SIGNAL_STAGES,
             )
         };
         crate::profile::count(crate::profile::Counter::Submits);
