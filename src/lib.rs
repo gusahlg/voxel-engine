@@ -30,7 +30,9 @@ pub use camera::{
 };
 pub use capture::{Screenshot, load_png, screenshot_to};
 pub use color::{Color, LinearRgb};
-pub use engine::{Config, Engine, GpuCaps, GpuLoad, RenderFlags, RenderTargetConfig, run};
+pub use engine::{
+    Config, Engine, GpuCaps, GpuLoad, MeshStats, RenderFlags, RenderTargetConfig, run,
+};
 pub use frame::{CoverageVolume, FadeStyle, Frame, Frame3D, Lighting, SkyDesc};
 pub use glam::{DVec2, DVec3, IVec2, IVec3, Mat3, Mat4, Vec2, Vec3};
 pub use input::{Key, MouseButton};

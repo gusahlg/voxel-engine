@@ -142,6 +142,8 @@ pub(crate) struct MeshResidency {
     /// Staging for separate transfer queue (lane-Rev).
     transfer_retire: RetireQueue<Allocation>,
     live: usize,
+    /// Sum of live `GpuResident::arena.size` (device suballoc bytes in use).
+    bytes_used: u64,
     /// Slots with just-submitted copies, ready to expose in arena word.
     arrived_since_flush: Vec<u32>,
     /// The last separate-queue batch's wait value + ACQUIRE barriers, owed
@@ -163,6 +165,7 @@ impl MeshResidency {
             retire: RetireQueue::new(),
             transfer_retire: RetireQueue::new(),
             live: 0,
+            bytes_used: 0,
             arrived_since_flush: Vec::new(),
             deferred: None,
             frame: 0,
@@ -175,6 +178,11 @@ impl MeshResidency {
     /// [`Self::flush_copies`].
     pub fn note_frame(&mut self) {
         self.frame = self.frame.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    pub fn live_count(&self) -> usize {
+        self.live
     }
 
     /// Check if slot's bytes are visible to the cull dispatch.
@@ -205,9 +213,12 @@ impl MeshResidency {
         if resident.copy.is_some() {
             self.pending.push((slot, self.frame));
         }
-        if self.slots[i].is_none() {
+        if let Some(old) = self.slots[i].take() {
+            self.bytes_used = self.bytes_used.saturating_sub(old.arena.size);
+        } else {
             self.live += 1;
         }
+        self.bytes_used = self.bytes_used.saturating_add(resident.arena.size);
         self.slots[i] = Some(resident);
         self.generations[i] = generation;
     }
@@ -220,6 +231,7 @@ impl MeshResidency {
             return;
         }
         if let Some(res) = self.slots.get_mut(i).and_then(Option::take) {
+            self.bytes_used = self.bytes_used.saturating_sub(res.arena.size);
             self.retire.push(done_at, res.arena);
             if let Some(copy) = res.copy {
                 match copy.source {
@@ -587,6 +599,7 @@ impl MeshResidency {
         self.transfer_retire.collect_all(|alloc| recycle(alloc));
         self.pending.clear();
         self.live = 0;
+        self.bytes_used = 0;
     }
 }
 
@@ -704,5 +717,47 @@ mod tests {
             pool.stager().acquire(8).is_some(),
             "reclaimed one deferred frame later, no GPU wait"
         );
+    }
+
+    #[test]
+    fn residency_live_count_tracks_upload_free_and_regenerate() {
+        use super::super::alloc::Allocation;
+        use super::super::mesh_resident::GpuResident;
+        use super::MeshResidency;
+        use std::num::NonZeroU32;
+
+        let dummy = || GpuResident {
+            buffer: vk::Buffer::null(),
+            arena: Allocation::dummy(),
+            copy: None,
+            arrived_at: None,
+        };
+        let mut res = MeshResidency::new();
+        res.apply_upload(0, NonZeroU32::MIN, dummy());
+        assert_eq!(res.live_count(), 1);
+        assert_eq!(res.bytes_used, 0);
+        // Overwrite same slot (regenerate without a free): live stays 1.
+        res.apply_upload(0, NonZeroU32::new(2).unwrap(), dummy());
+        assert_eq!(res.live_count(), 1);
+        res.apply_free(
+            0,
+            NonZeroU32::new(2).unwrap(),
+            TimelineValue::from_raw_for_test(1),
+        );
+        assert_eq!(res.live_count(), 0);
+        res.apply_upload(0, NonZeroU32::new(3).unwrap(), dummy());
+        assert_eq!(res.live_count(), 1);
+        res.apply_free(0, NonZeroU32::MIN, TimelineValue::from_raw_for_test(1));
+        assert_eq!(
+            res.live_count(),
+            1,
+            "stale free must not drop the new occupant"
+        );
+        res.apply_free(
+            0,
+            NonZeroU32::new(3).unwrap(),
+            TimelineValue::from_raw_for_test(2),
+        );
+        assert_eq!(res.live_count(), 0);
     }
 }
