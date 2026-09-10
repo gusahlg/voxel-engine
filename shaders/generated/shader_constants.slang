@@ -413,3 +413,7 @@ static const float LUMA_FLOOR = 0.0001f;
 // 4-bit detail field of MeshRecord.detail_pass. Decode: 2^k = exp2(bits - bias).
 static const uint DETAIL_GPU_BIAS = 2;
 
+// HDR emissive scale for MaterialDesc.glow: after lighting, add
+// (glow/255) * GLOW_SCALE * albedo. Default 4.0. Read by mesh3d.frag via material.slang.
+static const float GLOW_SCALE = 4.0f;
+

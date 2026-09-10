@@ -332,7 +332,7 @@ impl<'a> RenderPass<'a> {
 
     /// Pushes the `layout_3d` constants (view_proj + sky lighting/fog) and the
     /// push descriptors (per-draw offsets SSBO at binding 0, block-texture array
-    /// at binding 1) shared by both mesh passes. Called at the head of each mesh
+    /// at binding 1, material table at binding 7) shared by both mesh passes. Called at the head of each mesh
     /// pass rather than once up front, because interleaved passes bind
     /// incompatible layouts that disturb this state. Only sound when at least
     /// one mesh run exists (else the offsets SSBO can be a null buffer).
@@ -396,6 +396,7 @@ impl<'a> RenderPass<'a> {
             r.shadow.ubo(self.slot),
             r.targets.shadow.sampler,
             r.targets.shadow.sample_view,
+            r.materials.buffer(),
         );
         self.mesh_desc_bound.set(true);
     }

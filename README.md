@@ -42,7 +42,7 @@ See the maintained [demo](src/bin/demo.rs) for a complete API example.
 ## Building
 
 - `cargo run --release --bin demo` — spinning demo scene (F fullscreen,
-  V vsync, M MSAA cycle, Esc quit).
+  V vsync, A MSAA cycle, M materials array/procedural, Esc quit).
 - Shaders are Slang (`shaders/`), compiled by `build.rs` through the
   `voxel_slang_build` workspace crate (`crates/slang-build`) with `slangc`
   (`-O2`, SPIR-V 1.6 — the Vulkan 1.3 baseline) and embedded into the binary.

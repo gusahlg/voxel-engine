@@ -19,6 +19,7 @@
 //     + MESH3D_LEAN              coarse-LOD opaque + the same lane-off diet.
 
 #include "common.slang"
+#include "material.slang"
 #ifndef MESH3D_OPAQUE
 #include "water.slang"
 #endif
@@ -264,8 +265,12 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     uint layer = packed & 0x3FFFu;
     uint face = (packed >> 16) & 7u;
 
-    // Base albedo: flat far material or texture-sampled.
-    // block texture. Only the albedo changes — light_eval/fog stay identical.
+    // Base albedo: flat far material, per-layer procedural, or texture-sampled.
+    // The default material table is ARRAY_LAYER + alpha 255 + glow 0: the
+    // identity guard takes the existing sample/flat path with no extra
+    // multiply so goldens stay bit-identical.
+    MaterialDesc mat = load_material(layer);
+    bool mat_identity = material_is_identity(mat);
     float3 base;
     float alpha;
     if ((packed & (1u << 15)) != 0u) { // FLAT_COLOR
@@ -273,11 +278,21 @@ float4 fragmentMain(FragmentInput input) : SV_Target
         float3 srgb = float3(c & 0xFFu, (c >> 8) & 0xFFu, (c >> 16) & 0xFFu) / 255.0;
         base = srgb_to_linear(srgb); // match the sRGB-view texture path
         alpha = 1.0;                 // coarse far material is opaque
-    } else {
+        if (!mat_identity)
+            alpha *= float(mat.alpha) * (1.0 / 255.0);
+    } else if (mat_identity) {
         // Texture sampled through an sRGB view, so tex.rgb is already linear.
         float4 tex = blockTex.Sample(float3(input.uv, float(layer)));
         base = tex.rgb;
         alpha = tex.a;
+    } else if (material_is_procedural(mat)) {
+        float dist_m = length(input.world);
+        base = procedural_albedo(mat, input.uv, dist_m, layer);
+        alpha = float(mat.alpha) * (1.0 / 255.0);
+    } else {
+        float4 tex = blockTex.Sample(float3(input.uv, float(layer)));
+        base = tex.rgb;
+        alpha = tex.a * float(mat.alpha) * (1.0 / 255.0);
     }
 
     float sky_amount = input.light_lv.x;
@@ -364,6 +379,11 @@ float4 fragmentMain(FragmentInput input) : SV_Target
         alpha = w.a;
     }
 #endif
+
+    // HDR emissive from the descriptor, after lighting (and water), before fog.
+    // Identity (glow 0) skips the add so the default table stays bit-identical.
+    if (mat.glow != 0u)
+        rgb += float(mat.glow) * (1.0 / 255.0) * GLOW_SCALE * base;
 
 #ifndef MESH3D_LEAN
     // Fog: fade toward sky radiance along the view ray. Uniform-density gate:

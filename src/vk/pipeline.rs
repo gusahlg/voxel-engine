@@ -244,8 +244,9 @@ impl Pipelines {
         independent_blend: bool,
     ) -> Self {
         // 3D set 0: binding 0 = offsets SSBO (vertex), binding 1 = texture
-        // array (fragment) — one push set (Vulkan allows at most one per
-        // layout). 2D layout uses its own set 0 for the atlas.
+        // array (fragment), binding 7 = material-desc SSBO (fragment) — one
+        // push set (Vulkan allows at most one per layout). 2D layout uses
+        // its own set 0 for the atlas.
         let push_3d = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
@@ -1201,6 +1202,34 @@ mod tests {
 
     const OP_KILL: u32 = 252;
     const OP_DEMOTE: u32 = 5380;
+    const OP_DECORATE: u32 = 71;
+    const DECORATION_BINDING: u32 = 33;
+
+    fn spirv_has_binding(bytes: &[u8], binding: u32) -> bool {
+        assert!(bytes.len() >= 20 && bytes.len().is_multiple_of(4));
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(words[0], 0x0723_0203, "missing SPIR-V magic");
+        let mut i = 5usize;
+        while i < words.len() {
+            let wc = (words[i] >> 16) as usize;
+            let op = words[i] & 0xffff;
+            if wc == 0 || i + wc > words.len() {
+                break;
+            }
+            if op == OP_DECORATE
+                && wc >= 4
+                && words[i + 2] == DECORATION_BINDING
+                && words[i + 3] == binding
+            {
+                return true;
+            }
+            i += wc;
+        }
+        false
+    }
 
     #[test]
     fn packed_11bit_hdr_write_mask_has_no_alpha() {
@@ -1244,5 +1273,23 @@ mod tests {
                 || spirv_has_opcode(super::MESH3D_FRAG, OP_DEMOTE),
             "Blend mesh3d.frag must keep the slab-clip discard"
         );
+    }
+
+    #[test]
+    fn mesh3d_frags_declare_material_ssbo_binding() {
+        let binding = super::super::mesh3d_desc::MESH3D_BINDING_MATERIALS;
+        for (name, bytes) in [
+            ("mesh3d.frag", super::MESH3D_FRAG),
+            ("mesh3d_opaque.frag", super::MESH3D_OPAQUE_FRAG),
+            ("mesh3d_lod.frag", super::MESH3D_LOD_FRAG),
+            ("mesh3d_opaque_lean.frag", super::MESH3D_OPAQUE_LEAN_FRAG),
+            ("mesh3d_lod_lean.frag", super::MESH3D_LOD_LEAN_FRAG),
+            ("mesh3d_water.frag", super::MESH3D_WATER_FRAG),
+        ] {
+            assert!(
+                spirv_has_binding(bytes, binding),
+                "{name} must declare the material SSBO at binding {binding}"
+            );
+        }
     }
 }

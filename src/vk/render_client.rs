@@ -99,6 +99,12 @@ pub(crate) enum RenderCmd {
     AppendBlockTextures {
         layers: Box<[Vec<u8>]>,
     },
+    SetMaterialDescs {
+        descs: Box<[crate::MaterialDesc]>,
+    },
+    AppendMaterialDescs {
+        descs: Box<[crate::MaterialDesc]>,
+    },
     UpdateMinimap(Box<[u8]>),
     UpdateMinimapRect {
         x: u32,
@@ -633,6 +639,18 @@ impl RenderClient {
         });
     }
 
+    pub(crate) fn set_material_descs(&mut self, descs: &[crate::MaterialDesc]) {
+        let _ = self.tx.send(RenderCmd::SetMaterialDescs {
+            descs: descs.to_vec().into_boxed_slice(),
+        });
+    }
+
+    pub(crate) fn append_material_descs(&mut self, descs: &[crate::MaterialDesc]) {
+        let _ = self.tx.send(RenderCmd::AppendMaterialDescs {
+            descs: descs.to_vec().into_boxed_slice(),
+        });
+    }
+
     pub(crate) fn update_minimap(&mut self, rgba: &[u8]) {
         let _ = self
             .tx
@@ -1032,6 +1050,8 @@ fn render_loop(
                 RenderCmd::AppendBlockTextures { layers } => {
                     renderer.append_block_textures(&layers)
                 }
+                RenderCmd::SetMaterialDescs { descs } => renderer.set_material_descs(&descs),
+                RenderCmd::AppendMaterialDescs { descs } => renderer.append_material_descs(&descs),
                 RenderCmd::UpdateMinimap(px) => renderer.update_minimap(&px),
                 RenderCmd::UpdateMinimapRect { x, y, w, h, pixels } => {
                     renderer.update_minimap_rect(x, y, w, h, &pixels)

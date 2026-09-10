@@ -1,8 +1,9 @@
 /// Smoke test: packed-vertex mesh via typed API, 2×2 grid with offset-per-draw,
-/// flat floor, orbiting camera, debug overlay. Keys: F fullscreen, V vsync, M MSAA, Esc quit.
+/// flat floor, orbiting camera, debug overlay. Keys: F fullscreen, V vsync,
+/// A MSAA, M materials (array vs procedural), Esc quit.
 use voxel_engine::{
-    Ao, Camera3D, Color, Config, Detail, Key, Light, MeshData, MeshVertex, Normal, Pass, SkyDesc,
-    Vec3,
+    Ao, Camera3D, Color, Config, Detail, Key, Light, MATERIAL_FLAG_PROCEDURAL, MaterialDesc,
+    MeshData, MeshVertex, Normal, Pass, SkyDesc, Vec3,
 };
 
 const CHUNK: u8 = 16;
@@ -114,6 +115,41 @@ fn block_texture_layers(size: u32) -> Vec<Vec<u8>> {
     vec![white, checker, water]
 }
 
+fn demo_array_materials() -> [MaterialDesc; 3] {
+    [MaterialDesc::ARRAY_LAYER; 3]
+}
+
+fn demo_procedural_materials() -> [MaterialDesc; 3] {
+    [
+        // Layer 0: immediate cubes stay white (rgb == rgb2).
+        MaterialDesc {
+            rgb: [255, 255, 255],
+            rgb2: [255, 255, 255],
+            flags: MATERIAL_FLAG_PROCEDURAL,
+            ..MaterialDesc::ARRAY_LAYER
+        },
+        // Layer 1: two-tone grey matching the checker texels, with grain.
+        MaterialDesc {
+            rgb: [255, 255, 255],
+            rgb2: [150, 150, 150],
+            frequency: 48,
+            roughness: 160,
+            flags: MATERIAL_FLAG_PROCEDURAL,
+            ..MaterialDesc::ARRAY_LAYER
+        },
+        // Layer 2: water — same sRGB/alpha as the uploaded texture layer.
+        MaterialDesc {
+            rgb: [40, 90, 200],
+            rgb2: [20, 50, 140],
+            frequency: 24,
+            roughness: 96,
+            alpha: 120,
+            flags: MATERIAL_FLAG_PROCEDURAL,
+            ..MaterialDesc::ARRAY_LAYER
+        },
+    ]
+}
+
 /// Sun direction shared by the sky disc ([`SkyDesc`]) and the lighting UBO, so
 /// the disc and the terrain shading agree.
 const SUN_DIR: Vec3 = Vec3::new(0.6, 0.35, 0.2);
@@ -147,6 +183,7 @@ fn main() {
     // Upload meshes once; GPU records drive draws while resident+visible.
     // `big` exercises upload_mesh (Tracked) with set_mesh_placement.
     let mut uploaded = false;
+    let mut procedural_mats = false;
     let mut angle = 0.0f32;
     // High-FOV cylindrical warp strength, cycled with G. Seeded from VOXEL_WARP
     // so headless screenshot runs can pick a value without a keypress.
@@ -195,13 +232,21 @@ fn main() {
                 let now = !eng.vsync();
                 eng.set_vsync(now);
             }
-            if eng.is_key_pressed(Key::M) {
+            if eng.is_key_pressed(Key::A) {
                 let next = if eng.msaa() >= eng.max_msaa() {
                     1
                 } else {
                     eng.msaa() * 2
                 };
                 eng.set_msaa(next);
+            }
+            if eng.is_key_pressed(Key::M) {
+                procedural_mats = !procedural_mats;
+                if procedural_mats {
+                    eng.set_material_descs(&demo_procedural_materials());
+                } else {
+                    eng.set_material_descs(&demo_array_materials());
+                }
             }
             if eng.is_key_pressed(Key::C) {
                 let now = !eng.cull_faces();
@@ -273,6 +318,7 @@ fn main() {
             let fullscreen = eng.fullscreen();
             let cull = eng.cull_faces();
             let fps = eng.fps();
+            let mats = if procedural_mats { "proc" } else { "array" };
 
             let mut frame = eng.begin_frame(Color::SKYBLUE.to_linear());
             {
@@ -305,17 +351,21 @@ fn main() {
                     Color::BLACK,
                 );
             }
-            frame.draw_rect(8, 8, 360, 76, Color::new(0, 0, 0, 150));
+            frame.draw_rect(8, 8, 420, 76, Color::new(0, 0, 0, 150));
             frame.draw_text(&format!("{fps} FPS"), 16, 14, 20, Color::LIME);
             frame.draw_text(
-                &format!("vsync {vsync} msaa {msaa}x fullscreen {fullscreen} cull {cull}"),
+                &format!(
+                    "vsync {vsync} msaa {msaa}x fullscreen {fullscreen} cull {cull} mats {mats}"
+                ),
                 16,
                 38,
                 16,
                 Color::RAYWHITE,
             );
             frame.draw_text(
-                &format!("F fullscreen  V vsync  M msaa  C cull  G warp {warp_ratio:.1}  Esc quit"),
+                &format!(
+                    "F fullscreen  V vsync  A msaa  M mats  C cull  G warp {warp_ratio:.1}  Esc quit"
+                ),
                 16,
                 60,
                 16,

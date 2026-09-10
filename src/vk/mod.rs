@@ -22,6 +22,7 @@ pub(crate) mod host_buffer;
 pub(crate) mod image;
 pub(crate) mod image_upload;
 pub(crate) mod instance;
+pub(crate) mod materials;
 pub(crate) mod mesh3d_desc;
 pub(crate) mod mesh_residency;
 pub(crate) mod mesh_resident;
@@ -64,6 +65,7 @@ use frame_loop::{DrawEntry, DrawRun, PendingSubmit};
 use gpu_timer::{GpuPipeStats, GpuTimer};
 use image::{AllocError, ImageDesc, ImageResource, render_target_oom_message};
 use instance::InstanceBundle;
+use materials::MaterialTable;
 use mesh_staging::MeshStagingPool;
 use minimap::MinimapTexture;
 use pipeline::Pipelines;
@@ -144,6 +146,8 @@ pub(crate) struct Renderer {
     block_textures: BlockTextures,
     /// Retired textures.
     retired_textures: buffers::RetireQueue<block_textures::RetiredBlockTextures>,
+    /// Per-layer material descriptors (fixed 16384-entry SSBO).
+    materials: MaterialTable,
     /// Minimap texture.
     minimap: MinimapTexture,
 
@@ -420,6 +424,15 @@ impl Renderer {
             device.anisotropy,
             device.max_image_array_layers,
         );
+        let materials = materials::MaterialTable::new(
+            &instance.instance,
+            &device.device,
+            device.physical,
+            device.graphics_queue,
+            device.graphics_family,
+            device.command_pool,
+            &mut transfer_lane,
+        );
         let mesh3d_set_layout = buffers::create_mesh3d_set_layout(&device.device);
 
         let minimap = MinimapTexture::new(
@@ -648,6 +661,7 @@ impl Renderer {
             atlas,
             block_textures: block_tex,
             retired_textures: buffers::RetireQueue::new(),
+            materials,
             minimap,
             slots,
             present_semaphores,
@@ -900,6 +914,29 @@ impl Renderer {
         );
     }
 
+    /// Replace the per-layer material table. Index = layer id; unused tail
+    /// slots return to the array-layer default. Transfer-lane upload, no idle
+    /// wait; the buffer is fixed at 16384 entries.
+    pub fn set_material_descs(&mut self, descs: &[crate::MaterialDesc]) {
+        self.materials.queue_set(descs);
+        log::debug!(
+            "material descs set: {} used / {} cap",
+            self.materials.used(),
+            crate::MATERIAL_DESC_CAPACITY,
+        );
+    }
+
+    /// Append descriptors at the current used count. Excess past the 14-bit
+    /// layer cap is dropped.
+    pub fn append_material_descs(&mut self, descs: &[crate::MaterialDesc]) {
+        self.materials.queue_append(descs);
+        log::debug!(
+            "material descs append: {} used / {} cap",
+            self.materials.used(),
+            crate::MATERIAL_DESC_CAPACITY,
+        );
+    }
+
     /// Append layers at the current texel size. Fits-in-capacity uploads only
     /// the new layers; overflow reallocates through [`Self::set_block_textures`].
     pub fn append_block_textures(&mut self, layers: &[Vec<u8>]) {
@@ -960,6 +997,7 @@ impl Renderer {
             self.block_textures.destroy(device);
             self.retired_textures
                 .collect_all(|mut tex| tex.destroy(device));
+            self.materials.destroy(device);
             self.gpu_timer.destroy(device);
             self.pipe_stats.destroy(device);
             self.targets.destroy(device);

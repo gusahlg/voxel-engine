@@ -2,7 +2,8 @@
 //!
 //! Features: raylib-style API with winit + ash, unlit textured rendering
 //! (8-byte packed mesh vertices, shader-derived UV + face shade),
-//! runtime-swappable block texture arrays, device-local
+//! runtime-swappable block texture arrays, per-layer material descriptors
+//! (texture-array sample or a procedural two-colour pattern), device-local
 //! mesh memory with same-frame uploads and deferred frees, reversed-Z depth,
 //! frustum culling, an embedded 8x8 font for 2D overlay, and runtime graphics
 //! settings (fullscreen, vsync, MSAA).
@@ -17,6 +18,7 @@ mod font;
 mod frame;
 pub mod genconst;
 mod input;
+mod material;
 mod mesh;
 pub mod producer;
 pub mod profile;
@@ -36,6 +38,10 @@ pub use engine::{
 pub use frame::{CoverageVolume, FadeStyle, Frame, Frame3D, Lighting, SkyDesc};
 pub use glam::{DVec2, DVec3, IVec2, IVec3, Mat3, Mat4, Vec2, Vec3};
 pub use input::{Key, MouseButton};
+pub use material::{
+    MATERIAL_DESC_CAPACITY, MATERIAL_FLAG_EMISSIVE_ONLY_NIGHT, MATERIAL_FLAG_PROCEDURAL,
+    MaterialDesc,
+};
 pub use mesh::{
     Ao, DebugVertex, Detail, Light, MeshData, MeshHandle, MeshPlacement, MeshVertex, Normal, Pass,
 };

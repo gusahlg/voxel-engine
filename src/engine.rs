@@ -682,6 +682,25 @@ impl Engine {
         self.client.append_block_textures(layers);
     }
 
+    /// Replaces the per-layer material table. Index in `descs` is the 14-bit
+    /// [`crate::MeshVertex`] `layer` id. Excess entries past
+    /// [`crate::MATERIAL_DESC_CAPACITY`] (16384) are dropped. Unused tail
+    /// slots return to [`crate::MaterialDesc::ARRAY_LAYER`] so layers the
+    /// game never describes keep the texture-array sample.
+    ///
+    /// Uploaded on the transfer lane (no device idle wait). The table is
+    /// fixed-capacity — there is no grow path.
+    pub fn set_material_descs(&mut self, descs: &[crate::MaterialDesc]) {
+        self.client.set_material_descs(descs);
+    }
+
+    /// Appends descriptors at the current used count (the length of the last
+    /// [`Self::set_material_descs`], or 0 before the first call). Excess past
+    /// [`crate::MATERIAL_DESC_CAPACITY`] is dropped.
+    pub fn append_material_descs(&mut self, descs: &[crate::MaterialDesc]) {
+        self.client.append_material_descs(descs);
+    }
+
     /// Uploads minimap pixels (synced per-slot, version-gated). Copies `rgba`.
     pub fn update_minimap(&mut self, rgba: &[u8]) {
         self.client.update_minimap(rgba);
