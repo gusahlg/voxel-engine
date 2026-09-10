@@ -278,10 +278,6 @@ impl Pipelines {
         // binding 0 = cloud LUT, binding 1 = FrameUniforms. Dedicated rather than
         // sharing mesh3d_set_layout: the LUT is a sampled image the mesh pass
         // never touches.
-        let push_sky = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-            .offset(0)
-            .size(PUSH_BYTES_SKY)];
         let sky_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -294,25 +290,13 @@ impl Pipelines {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
-        let sky_set_layout = unsafe {
-            device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default()
-                        .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
-                        .bindings(&sky_bindings),
-                    None,
-                )
-                .expect("Failed to create sky set layout")
-        };
-        let set_layouts_sky = [sky_set_layout];
-        let layout_sky_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts_sky)
-            .push_constant_ranges(&push_sky);
-        let layout_sky = unsafe {
-            device
-                .create_pipeline_layout(&layout_sky_info, None)
-                .expect("Failed to create sky pipeline layout")
-        };
+        let (sky_set_layout, layout_sky) = pass::push_descriptor_layouts(
+            device,
+            &sky_bindings,
+            vk::ShaderStageFlags::FRAGMENT,
+            PUSH_BYTES_SKY,
+            "sky",
+        );
         let sky_lut_sampler = pass::linear_clamp_sampler(device, "sky cloud LUT");
 
         let push_2d = [vk::PushConstantRange::default()
@@ -344,42 +328,14 @@ impl Pipelines {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
-        let tonemap_set_layout = unsafe {
-            device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default()
-                        .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
-                        .bindings(&tonemap_binding),
-                    None,
-                )
-                .expect("Failed to create tonemap set layout")
-        };
-        let tonemap_sampler = unsafe {
-            device
-                .create_sampler(
-                    &vk::SamplerCreateInfo::default()
-                        .mag_filter(vk::Filter::LINEAR)
-                        .min_filter(vk::Filter::LINEAR)
-                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
-                    None,
-                )
-                .expect("Failed to create tonemap sampler")
-        };
-        let push_tonemap = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-            .offset(0)
-            .size(PUSH_BYTES_TONEMAP)];
-        let set_layouts_tonemap = [tonemap_set_layout];
-        let layout_tonemap_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts_tonemap)
-            .push_constant_ranges(&push_tonemap);
-        let layout_tonemap = unsafe {
-            device
-                .create_pipeline_layout(&layout_tonemap_info, None)
-                .expect("Failed to create tonemap pipeline layout")
-        };
+        let (tonemap_set_layout, layout_tonemap) = pass::push_descriptor_layouts(
+            device,
+            &tonemap_binding,
+            vk::ShaderStageFlags::FRAGMENT,
+            PUSH_BYTES_TONEMAP,
+            "tonemap",
+        );
+        let tonemap_sampler = pass::linear_clamp_sampler(device, "tonemap");
 
         // Fused TAA tonemap: HDR + spill + history + depth, larger push.
         let tonemap_taa_binding = [
@@ -404,30 +360,14 @@ impl Pipelines {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
-        let tonemap_taa_set_layout = unsafe {
-            device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default()
-                        .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
-                        .bindings(&tonemap_taa_binding),
-                    None,
-                )
-                .expect("Failed to create tonemap TAA set layout")
-        };
+        let (tonemap_taa_set_layout, layout_tonemap_taa) = pass::push_descriptor_layouts(
+            device,
+            &tonemap_taa_binding,
+            vk::ShaderStageFlags::FRAGMENT,
+            PUSH_BYTES_TONEMAP_TAA,
+            "tonemap TAA",
+        );
         let tonemap_depth_sampler = pass::nearest_clamp_sampler(device, "tonemap depth");
-        let push_tonemap_taa = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-            .offset(0)
-            .size(PUSH_BYTES_TONEMAP_TAA)];
-        let set_layouts_tonemap_taa = [tonemap_taa_set_layout];
-        let layout_tonemap_taa_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts_tonemap_taa)
-            .push_constant_ranges(&push_tonemap_taa);
-        let layout_tonemap_taa = unsafe {
-            device
-                .create_pipeline_layout(&layout_tonemap_taa_info, None)
-                .expect("Failed to create tonemap TAA pipeline layout")
-        };
 
         // Vertex layouts derived from struct fields (see vertex_input).
         // Locations, offsets, and formats are kept in sync automatically.
@@ -1135,24 +1075,13 @@ fn create_vrs_compute(device: &ash::Device, cache: vk::PipelineCache) -> VrsComp
     let (set_layout, layout) = pass::push_descriptor_layouts(
         device,
         &bindings,
+        vk::ShaderStageFlags::COMPUTE,
         size_of::<super::vrs::VrsPush>() as u32,
         "vrs",
     );
     let pipeline = pass::compute_pipeline(device, cache, layout, VRS_COMP, "vrs");
 
-    let depth_sampler = unsafe {
-        device
-            .create_sampler(
-                &vk::SamplerCreateInfo::default()
-                    .mag_filter(vk::Filter::NEAREST)
-                    .min_filter(vk::Filter::NEAREST)
-                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
-                None,
-            )
-            .expect("Failed to create VRS depth sampler")
-    };
+    let depth_sampler = pass::nearest_clamp_sampler(device, "VRS depth");
 
     VrsCompute {
         pipeline,

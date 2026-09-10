@@ -238,6 +238,7 @@ impl ExposureCompute {
         let (set_layout, layout) = pass::push_descriptor_layouts(
             device,
             &bindings,
+            vk::ShaderStageFlags::COMPUTE,
             size_of::<ExposurePush>() as u32,
             "exposure",
         );

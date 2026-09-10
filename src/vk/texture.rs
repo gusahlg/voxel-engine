@@ -6,6 +6,7 @@ use ash::{khr, vk};
 use super::image_upload::{
     ImageUpload, create_sampler_set_layout, push_combined_image_sampler, upload_image,
 };
+use super::pass;
 use super::transfer::TransferLane;
 use crate::font;
 
@@ -65,18 +66,7 @@ impl FontAtlas {
             },
         );
 
-        let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::NEAREST)
-            .min_filter(vk::Filter::NEAREST)
-            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
-        let sampler = unsafe {
-            device
-                .create_sampler(&sampler_info, None)
-                .expect("Failed to create font atlas sampler")
-        };
+        let sampler = pass::nearest_clamp_sampler(device, "font atlas");
 
         // Push-descriptor layout: binding 0 = combined image sampler, fragment.
         let set_layout = create_sampler_set_layout(device);

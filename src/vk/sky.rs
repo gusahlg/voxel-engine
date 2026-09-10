@@ -69,8 +69,13 @@ impl SkyCloudState {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
-        let (set_layout, layout) =
-            pass::push_descriptor_layouts(device, &bindings, 0, "sky cloud LUT");
+        let (set_layout, layout) = pass::push_descriptor_layouts(
+            device,
+            &bindings,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            "sky cloud LUT",
+        );
         let pipeline = pass::compute_pipeline(device, cache, layout, SKY_CLOUD_COMP, "sky cloud");
         SkyCloudState {
             pipeline,

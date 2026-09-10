@@ -215,31 +215,13 @@ impl CullState {
             storage(6),
             storage(7),
         ];
-        let set_layout = unsafe {
-            device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default()
-                        .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
-                        .bindings(&bindings),
-                    None,
-                )
-                .expect("create cull set layout")
-        };
-        let set_layouts = [set_layout];
-        let push = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(4)];
-        let layout = unsafe {
-            device
-                .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default()
-                        .set_layouts(&set_layouts)
-                        .push_constant_ranges(&push),
-                    None,
-                )
-                .expect("create cull pipeline layout")
-        };
+        let (set_layout, layout) = pass::push_descriptor_layouts(
+            device,
+            &bindings,
+            vk::ShaderStageFlags::COMPUTE,
+            4,
+            "cull",
+        );
         let bytes = if wave_atomics {
             CULL_COMP_WAVE
         } else {

@@ -152,6 +152,7 @@ impl BloomState {
         let (set_layout, layout) = pass::push_descriptor_layouts(
             device,
             &bindings,
+            vk::ShaderStageFlags::COMPUTE,
             size_of::<BloomPush>() as u32,
             "bloom",
         );
@@ -208,6 +209,7 @@ impl BloomState {
         let (spill_set_layout, spill_layout) = pass::push_descriptor_layouts(
             device,
             &spill_bindings,
+            vk::ShaderStageFlags::COMPUTE,
             size_of::<SpillPush>() as u32,
             "spill",
         );
