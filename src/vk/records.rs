@@ -7,9 +7,7 @@ use super::mesh_residency::MeshResidency;
 use crate::mesh::{Detail, Pass};
 use crate::rev::FRAMES_IN_FLIGHT;
 
-/// Persistent per-mesh record, indexed by slot.
-/// GPU twin: `shaders/mesh_record.slang` (std430, 80 bytes), included by
-/// mesh3d.vert, shadow_depth.vert, and cull.comp.
+/// Persistent per-mesh record, indexed by slot, mirrored in shaders.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MeshRecord {

@@ -64,13 +64,7 @@ pub const TAA_HISTORY_FORMAT: ash::vk::Format = ash::vk::Format::R16G16B16A16_SF
 
 /// Legacy compute-pass bindings, kept for the public `skeleton` re-export.
 /// The fused tonemap set is HDR=0, spill=1, history=2, depth=3.
-#[deprecated(
-    note = "TAA now resolves in the present-time tonemap fragment; these compute-pass bindings are unused"
-)]
 pub const TAA_RESOLVE_CURRENT_BINDING: u32 = 0;
-#[deprecated(
-    note = "TAA now resolves in the present-time tonemap fragment; these compute-pass bindings are unused"
-)]
 pub const TAA_RESOLVE_HISTORY_BINDING: u32 = 1;
 
 /// Fused tonemap descriptor bindings (`layout_tonemap_taa`).

@@ -1,6 +1,21 @@
 // Depth-only shadow map occluder pass; reuses mesh3d vertex format and record layout.
 #include "common.slang"
-#include "mesh_record.slang"
+
+// Per-mesh record: mirrors mesh3d's MeshRecord exactly (std430, 80 bytes).
+// Changing the struct stride breaks instance offset calculation.
+struct MeshRecord
+{
+    int3 block;       // world-space origin
+    uint detail_pass; // [0:4] detail+bias, [4:6] pass
+    float3 local_off; // mover offset; zero for terrain
+    uint pad0;
+    float3 aabb_min;
+    uint index_count;
+    float3 aabb_max;
+    int vertex_offset;
+    uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
+    uint flags; // bit 0 = packed face-runs valid (cull.comp)
+};
 
 [[vk::binding(0, 0)]]
 StructuredBuffer<MeshRecord> mesh_records;
@@ -32,12 +47,12 @@ ConstantBuffer<PushConstants> pc;
 [shader("vertex")]
 float4 vertexMain(VertexInput input) : SV_Position
 {
-    // The w1 micro-offset bits (SHIFT_MICRO_*) are deliberately ignored
+    // The w1 micro-offset bits (mesh.rs SHIFT_MICRO_*) are deliberately ignored
     // here: the occluder depth bias dwarfs the ±MICRO_STEP seam nudge.
     uint w0 = input.packed.x;
-    float x = float((w0 >> SHIFT_X) & MASK_COORD);
-    float y = float((w0 >> SHIFT_Y) & MASK_COORD);
-    float z = float((w0 >> SHIFT_Z) & MASK_COORD);
+    float x = float((w0 >> 0) & 0x1F);
+    float y = float((w0 >> 5) & 0x1F);
+    float z = float((w0 >> 10) & 0x1F);
 
     MeshRecord rec = mesh_records[input.instance];
     float scale = detail_scale(rec.detail_pass);
