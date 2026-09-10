@@ -32,6 +32,10 @@ use super::buffers::{
     DrawDyn, GpuResident, MeshHandles, MeshMeta, MeshRecord, PlacementState, build_mesh_resident,
     build_mesh_resident_staged,
 };
+use super::compute::{
+    ComputeDesc, ComputeDescOwned, ComputeKind, ComputeQueue, ComputeRuntime, ComputeStager,
+    EngineError,
+};
 use super::device::{Device, MemoryBudget};
 use super::image::{AllocError, render_target_oom_message};
 use super::instance::InstanceBundle;
@@ -114,6 +118,13 @@ pub(crate) enum RenderCmd {
     SetMsaa(u32),
     SetRenderScale(Scale),
     Frame(Box<DrawLists>),
+    RegisterCompute {
+        desc: ComputeDescOwned,
+        reply: Sender<Result<ComputeKind, EngineError>>,
+    },
+    ComputeFlush {
+        reply: Sender<()>,
+    },
     Shutdown,
 }
 
@@ -152,6 +163,8 @@ pub(crate) struct InitReply {
     pub mesh_stats: super::handles::MeshStatsShared,
     /// Shared with the render thread; workers clone [`MeshStager`] from it.
     pub mesh_staging: Arc<MeshStagingPool>,
+    /// Shared compute runtime (rings, job queue, poll).
+    pub compute: Arc<ComputeRuntime>,
 }
 
 /// Render-thread build parameters.
@@ -243,6 +256,7 @@ pub(crate) struct RenderClient {
     visible_dirty: std::collections::BTreeSet<u32>,
     mesh_alloc: GpuAllocator,
     mesh_staging: Arc<MeshStagingPool>,
+    compute: Arc<ComputeRuntime>,
     device: ash::Device,
     caps: DeviceCaps,
     size: PhysicalSize<u32>,
@@ -374,6 +388,7 @@ impl RenderClient {
             visible_dirty: std::collections::BTreeSet::new(),
             mesh_alloc,
             mesh_staging: reply.mesh_staging,
+            compute: reply.compute,
             device: reply.device,
             caps: reply.caps,
             size,
@@ -415,6 +430,47 @@ impl RenderClient {
     /// Cheap `Clone` handle workers use to acquire staging regions.
     pub(crate) fn mesh_stager(&self) -> MeshStager {
         self.mesh_staging.stager()
+    }
+
+    pub(crate) fn compute_stager(&self) -> ComputeStager {
+        self.compute.stager()
+    }
+
+    pub(crate) fn compute_queue(&self) -> ComputeQueue {
+        self.compute.queue_handle()
+    }
+
+    pub(crate) fn poll_compute(&self) -> Vec<(super::compute::JobId, Box<[u8]>)> {
+        self.compute.poll()
+    }
+
+    pub(crate) fn compute_pending(&self) -> usize {
+        self.compute.pending()
+    }
+
+    pub(crate) fn register_compute(
+        &self,
+        desc: &ComputeDesc<'_>,
+    ) -> Result<ComputeKind, EngineError> {
+        if !self.compute.enabled() {
+            return Err(EngineError::NoCompute);
+        }
+        let (tx, rx) = channel();
+        let _ = self.tx.send(RenderCmd::RegisterCompute {
+            desc: desc.owned(),
+            reply: tx,
+        });
+        rx.recv().unwrap_or(Err(EngineError::NoCompute))
+    }
+
+    pub(crate) fn compute_flush(&self) {
+        let (tx, rx) = channel();
+        let _ = self.tx.send(RenderCmd::ComputeFlush { reply: tx });
+        let _ = rx.recv();
+    }
+
+    pub(crate) fn take_compute_completed(&self, id: super::compute::JobId) -> Option<Box<[u8]>> {
+        self.compute.take_completed(id)
     }
 
     /// Legacy upload: placement is recovered from each draw's offset
@@ -991,6 +1047,13 @@ fn render_loop(
                 RenderCmd::SetRenderScale(s) => {
                     renderer.set_render_scale(s.get());
                 }
+                RenderCmd::RegisterCompute { desc, reply } => {
+                    let _ = reply.send(renderer.register_compute(desc));
+                }
+                RenderCmd::ComputeFlush { reply } => {
+                    renderer.flush_compute_blocking();
+                    let _ = reply.send(());
+                }
                 RenderCmd::Frame(_) | RenderCmd::Shutdown => unreachable!(),
             },
             |old| {
@@ -1001,11 +1064,14 @@ fn render_loop(
         ) {
             Drain::Shutdown => return renderer.teardown(),
             Drain::Frame(Some(frame)) => {
+                renderer.flush_compute_async();
                 renderer.draw_frame(&frame);
                 frames_rendered.fetch_add(1, Ordering::Relaxed);
                 let _ = ret.send(RenderReturn::Frame(frame));
             }
-            Drain::Frame(None) => {}
+            Drain::Frame(None) => {
+                renderer.flush_compute_async();
+            }
         }
     }
     // Sender dropped without a Shutdown (main gone): tear down anyway.

@@ -18,6 +18,9 @@ use crate::font;
 use crate::frame::{DrawLists, Frame};
 use crate::input::{InputState, Key, MouseButton};
 use crate::mesh::{MeshData, MeshHandle, MeshPlacement, Pass};
+use crate::vk::compute::{
+    ComputeDesc, ComputeJob, ComputeKind, ComputeQueue, ComputeStager, EngineError, JobId,
+};
 use crate::vk::mesh_staging::{MeshStager, MeshStaging};
 use crate::vk::render_client::{Capture, RenderClient};
 
@@ -581,6 +584,55 @@ impl Engine {
         self.client.set_mesh_placement(handle, placement);
     }
 
+    // ---- compute ----
+
+    /// Build a compute pipeline from `desc`. The game falls back to CPU on
+    /// [`EngineError::NoCompute`].
+    pub fn register_compute(&mut self, desc: &ComputeDesc<'_>) -> Result<ComputeKind, EngineError> {
+        self.client.register_compute(desc)
+    }
+
+    /// Cheap `Clone` handle workers use to acquire compute input regions.
+    /// Default 16 MiB (`VOXEL_COMPUTE_INPUT_MB`).
+    pub fn compute_stager(&self) -> ComputeStager {
+        self.client.compute_stager()
+    }
+
+    /// Cheap `Clone` handle: submit from any thread into a mutex queue the
+    /// render thread drains each frame.
+    pub fn compute_queue(&self) -> ComputeQueue {
+        self.client.compute_queue()
+    }
+
+    /// Copy out every job whose timeline value has completed (no waits).
+    /// Submission order. Inputs and readback regions are reclaimed.
+    pub fn poll_compute(&self) -> Vec<(JobId, Box<[u8]>)> {
+        self.client.poll_compute()
+    }
+
+    /// Jobs submitted but not yet returned by [`Self::poll_compute`].
+    pub fn compute_pending(&self) -> usize {
+        self.client.compute_pending()
+    }
+
+    /// Submit `job`, wait for it, and return its output.
+    ///
+    /// **Test-only.** May idle the device. The game's CPU/GPU parity test
+    /// uses this; production code should [`ComputeQueue::submit`] and
+    /// [`Self::poll_compute`].
+    pub fn run_compute_blocking(&mut self, job: ComputeJob<'_>) -> Result<Box<[u8]>, EngineError> {
+        let id = self.client.compute_queue().submit(job)?;
+        self.client.compute_flush();
+        self.client
+            .take_compute_completed(id)
+            .ok_or(EngineError::NoCompute)
+    }
+
+    /// Integer-hash example shader shipped with the engine.
+    pub fn example_compute_desc() -> ComputeDesc<'static> {
+        ComputeDesc::example()
+    }
+
     // ---- screenshots ----
 
     /// Captures the next presented frame (exactly what is shown) to a
@@ -757,10 +809,7 @@ pub fn run(config: Config, frame_callback: impl FnMut(&mut Engine) -> bool) {
     // The engine reports everything through `log`; give binaries that never
     // set up a logger a working RUST_LOG path (no-op if one exists).
     let _ = env_logger::try_init();
-    let event_loop = EventLoop::new().expect(
-        "Failed to create event loop: set DISPLAY or WAYLAND_DISPLAY, and a \
-         windowing library must be loadable",
-    );
+    let event_loop = create_event_loop();
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = EngineApp {
         config,
@@ -916,6 +965,28 @@ impl<F: FnMut(&mut Engine) -> bool> ApplicationHandler for EngineApp<F> {
             self.run_frame(event_loop);
         }
     }
+}
+
+fn create_event_loop() -> EventLoop<()> {
+    // Cargo's test harness runs tests on worker threads. Winit's default
+    // EventLoop::new panics off the process main thread; the compute
+    // roundtrip test sets VOXEL_EVENTLOOP_ANY_THREAD so the GPU path can
+    // run under `cargo test`.
+    let mut builder = EventLoop::builder();
+    if std::env::var_os("VOXEL_EVENTLOOP_ANY_THREAD").is_some() {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(
+                &mut builder,
+                true,
+            );
+            winit::platform::x11::EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
+        }
+    }
+    builder.build().expect(
+        "Failed to create event loop: set DISPLAY or WAYLAND_DISPLAY, and a \
+         windowing library must be loadable",
+    )
 }
 
 /// Pixel count above which VRS is recommended: `texel_area * 32768`.

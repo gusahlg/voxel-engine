@@ -134,6 +134,12 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             "computeMain",
             "spill.comp.spv",
         ),
+        job(
+            "shaders/compute_example.comp.slang",
+            Stage::Compute,
+            "computeMain",
+            "compute_example.comp.spv",
+        ),
     ];
     // Water depth-absorption path. Declares the depth input attachment
     // (set 0 binding 5) + Δd-driven body tint, compiled only into

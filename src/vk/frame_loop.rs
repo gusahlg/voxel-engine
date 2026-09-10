@@ -1132,6 +1132,10 @@ impl Renderer {
         // Begin render submission; this gets the timeline value to stamp mesh copies.
         let rs = self.timeline.begin_render(cmd);
         let done_at = rs.value();
+        let copies_pending;
+        let grew;
+        let quad_wait_some;
+        let tex_wait_some;
         unsafe {
             let device = &self.device.device;
             device
@@ -1155,7 +1159,7 @@ impl Renderer {
             // Last frame's separate-queue copies: this submission is the first
             // that can draw them (see `MeshResidency::flush_copies`). This
             // frame's copies are flushed next and deferred one frame.
-            let copies_pending = self.mesh_res.has_pending() || self.mesh_res.has_deferred();
+            copies_pending = self.mesh_res.has_pending() || self.mesh_res.has_deferred();
             let deferred = self.mesh_res.take_deferred_arrival(device, cmd);
             self.mesh_res.flush_copies(
                 device,
@@ -1197,7 +1201,7 @@ impl Renderer {
                 self.last_render_value,
                 done_at,
             );
-            let grew = tex.retire.is_some();
+            grew = tex.retire.is_some();
             if let Some((stamp, retired)) = tex.retire {
                 self.retired_textures.push(stamp, retired);
             }
@@ -1210,19 +1214,23 @@ impl Renderer {
                 tex.transfer_wait
                     .map(|v| (v, BLOCK_TEXTURE_CONSUMER_STAGES)),
             );
-            // Upload this slot's minimap texture (if its version is stale) on the
-            // live frame command buffer, before the render pass begins.
-            let minimap = self.minimap.sync(device, cmd, slot);
-            if profiling {
-                if copies_pending
-                    || quad_wait.is_some()
-                    || tex.transfer_wait.is_some()
-                    || grew
-                    || minimap
-                {
-                    self.gpu_timer.recorded(slot);
-                }
-                self.gpu_timer.mark(device, cmd, slot, GpuPass::Copies);
+            quad_wait_some = quad_wait.is_some();
+            tex_wait_some = tex.transfer_wait.is_some();
+        }
+
+        // Same-queue compute jobs: budgeted prefix before the scene.
+        // Dedicated/async tiers already flushed in the render loop.
+        // Empty queue → no commands (idle frames are untouched).
+        self.record_compute_fallback(cmd, done_at);
+
+        let minimap = unsafe { self.minimap.sync(&self.device.device, cmd, slot) };
+        if profiling {
+            if copies_pending || quad_wait_some || tex_wait_some || grew || minimap {
+                self.gpu_timer.recorded(slot);
+            }
+            unsafe {
+                self.gpu_timer
+                    .mark(&self.device.device, cmd, slot, GpuPass::Copies);
             }
         }
 

@@ -10,6 +10,7 @@ pub(crate) mod arena;
 pub(crate) mod block_textures;
 pub(crate) mod bloom;
 pub(crate) mod buffers;
+pub(crate) mod compute;
 pub(crate) mod cull;
 pub(crate) mod cull_math;
 pub(crate) mod device;
@@ -57,6 +58,7 @@ use crate::mesh::Pass;
 use crate::skeleton::{FrameSlot, PerSlot};
 use block_textures::BlockTextures;
 use buffers::{DrawIndexedIndirect, FRAMES_IN_FLIGHT, GpuResident, HostBuffer, MeshResidency};
+use compute::{ComputeLane, ComputeRuntime};
 use device::Device;
 use frame_loop::{DrawEntry, DrawRun, PendingSubmit};
 use gpu_timer::{GpuPipeStats, GpuTimer};
@@ -198,6 +200,10 @@ pub(crate) struct Renderer {
     timeline: Timeline,
     /// Transfer queue for staging copies.
     transfer_lane: TransferLane,
+    /// Compute job lane (dedicated / second queue / same-queue fallback).
+    compute_lane: ComputeLane,
+    /// Shared with main: staging rings, job queue, poll.
+    compute: Arc<ComputeRuntime>,
     /// Worker-writable mesh staging pool (also cloned to main via InitReply).
     mesh_staging: Arc<MeshStagingPool>,
     /// Transfer-lane value this graphics submission waits on: last frame's
@@ -468,6 +474,38 @@ impl Renderer {
             Box::from([])
         };
         let timeline = unsafe { Timeline::new(&device.device) };
+        let compute_lane = unsafe {
+            ComputeLane::new(
+                &device.device,
+                device.compute_family,
+                device.compute_queue,
+                device.compute_tier,
+            )
+        };
+        log::info!(
+            "compute lane: {:?} (family {})",
+            compute_lane.tier(),
+            compute_lane.family(),
+        );
+        let props = unsafe {
+            instance
+                .instance
+                .get_physical_device_properties(device.physical)
+        };
+        let compute = unsafe {
+            ComputeRuntime::new(
+                &instance.instance,
+                &device.device,
+                device.physical,
+                device.min_storage_buffer_offset_alignment.max(16),
+                timeline.semaphore(),
+                compute_lane.semaphore_opt(),
+                device.timestamps_supported,
+                device.timestamp_period_ns,
+                device.host_query_reset,
+                compute::compute_limits(&props),
+            )
+        };
         let mut cmds = cmds.into_iter();
         let slots = PerSlot::new(std::array::from_fn(|_| SlotState {
             cmd: cmds.next().expect("per-slot command buffer"),
@@ -559,6 +597,7 @@ impl Renderer {
             gpu_load: gpu_timer.load_shared(),
             mesh_stats: handles::MeshStatsShared::new(cull_math::cpu_cull_max()),
             mesh_staging: Arc::clone(&mesh_staging),
+            compute: Arc::clone(&compute),
         };
 
         let cull = cull::CullState::new(
@@ -619,6 +658,8 @@ impl Renderer {
             copy_cmd,
             timeline,
             transfer_lane,
+            compute_lane,
+            compute,
             mesh_staging,
             pending_transfer_wait: None,
             last_copy_value: TimelineValue::START,
@@ -909,6 +950,8 @@ impl Renderer {
             // here, then the pool buffer itself is destroyed.
             self.mesh_res.destroy_all(&mut |_a| {});
             self.mesh_staging.destroy(device);
+            self.compute.destroy(device);
+            self.compute_lane.destroy(device);
             for &sem in &self.present_semaphores {
                 sem.destroy(device);
             }
