@@ -1,6 +1,7 @@
 // Retired: TAA now resolves in the present-time tonemap fragment
-// (`shaders/tonemap.frag.slang`, `-DTAA_FUSED`). Kept as the original 5-tap
-// YCoCg / depth-aware reprojection reference; not compiled.
+// (`shaders/tonemap.frag.slang`, `-DTAA_FUSED`). Quarantined under
+// `shaders/retired/`; not in build.rs shipping jobs. Kept as the original
+// 5-tap YCoCg / depth-aware reprojection reference.
 //
 // taa_resolve.comp.slang — temporal anti-aliasing resolve.
 // 16×16 groupshared tile of the current HDR (1-pixel apron), 5-tap YCoCg

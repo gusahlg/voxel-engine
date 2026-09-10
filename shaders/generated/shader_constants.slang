@@ -90,6 +90,68 @@ static const float CANDLE_CLAMP = 4.0f;
 // inherits LOD's 2^k scale. Read by mesh3d.vert.
 static const float MICRO_STEP = 0.01f;
 
+// Packed vertex word 0: x-coordinate shift. 5-bit field, values 0..=16.
+static const int SHIFT_X = 0;
+
+// Packed vertex word 0: y-coordinate shift. 5-bit field, values 0..=16.
+static const int SHIFT_Y = 5;
+
+// Packed vertex word 0: z-coordinate shift. 5-bit field, values 0..=16.
+static const int SHIFT_Z = 10;
+
+// Packed vertex word 0: face-normal index shift. 3 bits: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z.
+static const int SHIFT_NORMAL = 15;
+
+// Packed vertex word 0: texture-array layer shift. 14 bits, word 0's remaining span.
+static const int SHIFT_LAYER = 18;
+
+// Packed vertex word 1: AO level shift. 2 bits, 0..=3; 3 = no occlusion.
+static const int SHIFT_AO = 0;
+
+// Packed vertex word 1: skylight shift. 4 bits, 0..=15.
+static const int SHIFT_SKY = 2;
+
+// Packed vertex word 1: blocklight shift. 4 bits, 0..=15.
+static const int SHIFT_BLOCK = 6;
+
+// Packed vertex word 1: water material bit. Set by the mesher for liquid faces.
+static const int SHIFT_WATER = 10;
+
+// Packed vertex word 1: x micro-offset shift. 2-bit two's-complement, -2..=1.
+static const int SHIFT_MICRO_X = 11;
+
+// Packed vertex word 1: y micro-offset shift. 2-bit two's-complement, -2..=1.
+static const int SHIFT_MICRO_Y = 13;
+
+// Packed vertex word 1: z micro-offset shift. 2-bit two's-complement, -2..=1.
+static const int SHIFT_MICRO_Z = 15;
+
+// Packed vertex coordinate mask (5 bits). Holds 0..=16; 17..=31 store without
+// corrupting a neighbour.
+static const uint MASK_COORD = 31;
+
+// Packed vertex face-normal index mask (3 bits).
+static const uint MASK_NORMAL = 7;
+
+// Packed vertex texture-array layer mask (14 bits, 16384 layers).
+static const uint MASK_LAYER = 16383;
+
+// Packed vertex AO-level mask (2 bits).
+static const uint MASK_AO = 3;
+
+// Packed vertex skylight / blocklight mask (4 bits).
+static const uint MASK_LIGHT = 15;
+
+// Packed vertex per-axis micro-offset mask (2 bits).
+static const uint MASK_MICRO = 3;
+
+// Baked AO level-0 diffuse multiplier. ao_factor = AO_MIN + ao_level * AO_STEP
+// (levels 0..=3 → 0.4..=1.0). Read by mesh3d.vert.
+static const float AO_MIN = 0.4f;
+
+// Baked AO per-level step. See AO_MIN.
+static const float AO_STEP = 0.2f;
+
 // Sun-disc solid core as a multiple of the sun angular radius.
 // Larger core keeps sun defined against brighter night sky. Complements SUN_DISC_RIM tightening.
 static const float SUN_DISC_CORE = 1.12f;

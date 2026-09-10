@@ -6,21 +6,7 @@
 // inside that slab are not emitted (every fragment would be discarded).
 
 #include "common.slang"
-
-// Mirrors vk::buffers::MeshRecord exactly (std430, 80 bytes).
-struct MeshRecord
-{
-    int3 block;
-    uint detail_pass; // [0:4] detail+bias, [4:6] pass
-    float3 local_off;
-    uint pad0;
-    float3 aabb_min;
-    uint index_count;
-    float3 aabb_max;
-    int vertex_offset;
-    uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
-    uint flags; // bit 0 = packed face-runs valid; clear → whole-mesh draw
-};
+#include "mesh_record.slang"
 
 // Mirrors vk::cull::PartitionGpu (std430).
 struct Partition
