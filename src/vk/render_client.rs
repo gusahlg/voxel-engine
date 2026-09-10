@@ -148,6 +148,7 @@ pub(crate) struct InitReply {
     pub exposure: super::exposure::ExposureShared,
     /// Last completed frame GPU busy / inter-submit gap.
     pub gpu_load: super::gpu_timer::GpuLoadShared,
+    pub mesh_stats: super::handles::MeshStatsShared,
     /// Shared with the render thread; workers clone [`MeshStager`] from it.
     pub mesh_staging: Arc<MeshStagingPool>,
 }
@@ -251,6 +252,7 @@ pub(crate) struct RenderClient {
     /// The render thread's published exposure cell, cloned into `Engine`.
     exposure: super::exposure::ExposureShared,
     gpu_load: super::gpu_timer::GpuLoadShared,
+    mesh_stats: super::handles::MeshStatsShared,
     /// `None` once joined (shutdown is idempotent).
     join: Option<JoinHandle<Option<DeviceLeftovers>>>,
     /// Render-thread completed `draw_frame` calls (monotonic).
@@ -358,13 +360,15 @@ impl RenderClient {
         if mesh_alloc.unified_memory() {
             log::info!("Unified memory detected: mesh uploads bypass staging");
         }
+        let mut mesh_ids = MeshHandles::new();
+        mesh_ids.attach_stats(reply.mesh_stats.clone());
         let client = RenderClient {
             tx: cmd_tx,
             ret_rx,
             frames: FramePool::with_boxes(FRAME_POOL_SIZE),
             spare: None,
             shrink_ticks: 0,
-            mesh_ids: MeshHandles::new(),
+            mesh_ids,
             visible: Vec::new(),
             visible_dirty: std::collections::BTreeSet::new(),
             mesh_alloc,
@@ -378,6 +382,7 @@ impl RenderClient {
             cull_faces: true,
             exposure: reply.exposure,
             gpu_load: reply.gpu_load,
+            mesh_stats: reply.mesh_stats.clone(),
             join: Some(join),
             frames_rendered,
             frames_coalesced,
@@ -392,6 +397,16 @@ impl RenderClient {
 
     pub(crate) fn gpu_load(&self) -> super::gpu_timer::GpuLoadShared {
         self.gpu_load.clone()
+    }
+
+    pub(crate) fn mesh_stats(&self) -> super::handles::MeshStatsShared {
+        self.mesh_stats.clone()
+    }
+
+    fn publish_arena_bytes(&self) {
+        let s = self.mesh_alloc.stats();
+        self.mesh_stats
+            .store_bytes(s.device_reserved, s.device_used);
     }
 
     // ---- meshes ----
@@ -466,6 +481,7 @@ impl RenderClient {
         );
         let quads = meta.bounds[6] / 6;
         let handle = self.mesh_ids.alloc_slot(meta);
+        self.publish_arena_bytes();
         self.set_visible(handle.slot, true);
         let _ = self.tx.send(RenderCmd::UploadMesh {
             slot: handle.slot,
@@ -715,6 +731,7 @@ impl RenderClient {
                     self.mesh_alloc.free(a);
                     self.mesh_alloc.shrink_staging(&self.device);
                 }
+                self.publish_arena_bytes();
                 self.shrink_ticks = DEVICE_SHRINK_SETTLE_TICKS;
             }
         }
@@ -727,6 +744,7 @@ impl RenderClient {
         unsafe {
             self.mesh_alloc.shrink_device(&self.device);
         }
+        self.publish_arena_bytes();
         self.shrink_ticks -= 1;
     }
 

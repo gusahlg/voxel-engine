@@ -435,6 +435,10 @@ static GAUGES: [AtomicU64; Gauge::COUNT] = [const { AtomicU64::new(0) }; Gauge::
 /// Full-res overdraw (`frag.full / pixels`), stored as f64 bits. Printed with
 /// two decimals on the `sets` line. Zero when pipe stats are unpublished.
 static OVERDRAW_FULL: AtomicU64 = AtomicU64::new(0);
+/// `slots N/M arenas A` on the sets line (`M` = cpu_cull_max).
+static MESH_SLOTS_LIVE: AtomicU64 = AtomicU64::new(0);
+static MESH_SLOTS_MAX: AtomicU64 = AtomicU64::new(0);
+static MESH_ARENAS: AtomicU64 = AtomicU64::new(0);
 
 /// Record the current value of a gauge. Cheap no-op when profiling is off.
 pub fn gauge(g: Gauge, value: u64) {
@@ -444,6 +448,15 @@ pub fn gauge(g: Gauge, value: u64) {
 }
 
 /// Record full-res overdraw (`frag.full / render-extent pixels`).
+/// Record mesh slot occupancy for the profiler's `sets` line.
+pub fn mesh_sets(live: u32, cpu_cull_max: u32, arenas: u32) {
+    if enabled() {
+        MESH_SLOTS_LIVE.store(u64::from(live), Ordering::Relaxed);
+        MESH_SLOTS_MAX.store(u64::from(cpu_cull_max), Ordering::Relaxed);
+        MESH_ARENAS.store(u64::from(arenas), Ordering::Relaxed);
+    }
+}
+
 pub fn overdraw_full(ratio: f64) {
     if enabled() && ratio.is_finite() {
         OVERDRAW_FULL.store(ratio.to_bits(), Ordering::Relaxed);
@@ -879,7 +892,12 @@ fn report(frames: u64) {
     // Set sizes: the iterated-set counts behind the CPU list cost. `list.world`
     // scales with these, so a jump here — not a per-item regression — is what
     // makes it spike. Last-sampled values, not windowed averages.
-    let mut sline = String::from("  sets   :");
+    let mut sline = format!(
+        "  sets   : slots {}/{} arenas {}",
+        MESH_SLOTS_LIVE.load(Ordering::Relaxed),
+        MESH_SLOTS_MAX.load(Ordering::Relaxed),
+        MESH_ARENAS.load(Ordering::Relaxed),
+    );
     for g in Gauge::ALL {
         sline.push_str(&format!(
             " {} {}",

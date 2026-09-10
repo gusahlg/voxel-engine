@@ -174,6 +174,9 @@ pub(crate) struct ArenaDirectory {
     /// visibility mask stop here rather than at the table's high-water mark
     /// when the tail has been freed.
     live_end: u32,
+    /// Directory rows with `refs > 0`.
+    occupied: u32,
+    stats: Option<super::handles::MeshStatsShared>,
 }
 
 impl ArenaDirectory {
@@ -190,6 +193,19 @@ impl ArenaDirectory {
             blend: Vec::new(),
             blend_pos: Vec::new(),
             live_end: 0,
+            occupied: 0,
+            stats: None,
+        }
+    }
+
+    pub fn attach_stats(&mut self, stats: super::handles::MeshStatsShared) {
+        self.stats = Some(stats);
+        self.publish();
+    }
+
+    fn publish(&self) {
+        if let Some(stats) = &self.stats {
+            stats.store_arenas(self.occupied);
         }
     }
 
@@ -240,6 +256,9 @@ impl ArenaDirectory {
             }
         };
         self.refs[arena as usize] += 1;
+        if self.refs[arena as usize] == 1 {
+            self.occupied += 1;
+        }
         let lane = group_lane(pass, lod);
         if let Some(lane) = lane {
             self.live[arena as usize][lane] += 1;
@@ -257,6 +276,7 @@ impl ArenaDirectory {
         }
         self.set_blend(slot, pass == Pass::Blend);
         self.live_end = self.live_end.max(slot + 1);
+        self.publish();
         arena
     }
 
@@ -360,6 +380,9 @@ impl ArenaDirectory {
             return;
         }
         self.refs[arena as usize] -= 1;
+        if self.refs[arena as usize] == 0 {
+            self.occupied = self.occupied.saturating_sub(1);
+        }
         if let Some(lane) = lane {
             self.live[arena as usize][lane] -= 1;
             self.set_member(arena as usize, slot, false);
@@ -378,6 +401,7 @@ impl ArenaDirectory {
                 .rposition(Option::is_some)
                 .map_or(0, |i| i as u32 + 1);
         }
+        self.publish();
     }
 
     pub fn arena_buffer(&self, arena: usize) -> vk::Buffer {
@@ -395,6 +419,11 @@ impl ArenaDirectory {
 
     pub fn arena_count(&self) -> usize {
         self.buffers.len()
+    }
+
+    #[cfg(test)]
+    pub fn occupied_arenas(&self) -> u32 {
+        self.occupied
     }
 
     /// Live camera-group records (Opaque + Cutout + OpaqueLod) across every
@@ -707,7 +736,11 @@ mod tests {
         let mut dir = ArenaDirectory::new();
         dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL, UNIT);
         dir.note_upload(1, G1, buf(1), Pass::Opaque, FULL, UNIT);
+        assert_eq!(dir.occupied_arenas(), 1);
+        assert_eq!(dir.live_end(), 2);
         dir.note_free(0, G1);
+        assert_eq!(dir.occupied_arenas(), 1);
+        assert_eq!(dir.live_end(), 2);
         let (parts, total) = dir.partitions();
         assert_eq!(parts[camera_part(0, 0, 0, 1)].capacity, 1);
         // K camera slots + 2 shadow slots, each sized off the remaining live count.
@@ -718,7 +751,10 @@ mod tests {
     fn note_free_on_last_reference_drains_the_arena_row_for_reuse() {
         let mut dir = ArenaDirectory::new();
         dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL, UNIT);
+        assert_eq!(dir.occupied_arenas(), 1);
         dir.note_free(0, G1);
+        assert_eq!(dir.occupied_arenas(), 0);
+        assert_eq!(dir.live_end(), 0);
         assert_eq!(dir.arena_count(), 1); // row kept, but refs == 0 now
         // A fresh upload reuses the drained row instead of growing the table.
         let arena = dir.note_upload(1, G1, buf(2), Pass::Cutout, FULL, UNIT);
@@ -748,8 +784,13 @@ mod tests {
         let mut dir = ArenaDirectory::new();
         dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL, UNIT);
         dir.note_free(0, genr(1)); // real free: drains the slot
+        assert_eq!(dir.occupied_arenas(), 0);
         dir.note_upload(0, genr(2), buf(2), Pass::Cutout, FULL, UNIT); // reused, new generation
+        assert_eq!(dir.occupied_arenas(), 1);
+        assert_eq!(dir.live_end(), 1);
         dir.note_free(0, genr(1)); // stale duplicate: must be ignored
+        assert_eq!(dir.occupied_arenas(), 1);
+        assert_eq!(dir.live_end(), 1);
         let (parts, total) = dir.partitions();
         assert_eq!(
             parts[camera_part(1, 0, 0, 1)].capacity,

@@ -22,6 +22,7 @@ use crate::vk::mesh_staging::{MeshStager, MeshStaging};
 use crate::vk::render_client::{Capture, RenderClient};
 
 pub use crate::vk::gpu_timer::GpuLoad;
+pub use crate::vk::handles::MeshStats;
 
 #[derive(Clone)]
 pub struct Config {
@@ -175,6 +176,7 @@ pub struct Engine {
     pub(crate) exposure_shared: crate::vk::exposure::ExposureShared,
     /// Last completed frame GPU busy / inter-submit gap (slot-delayed).
     pub(crate) gpu_load: crate::vk::gpu_timer::GpuLoadShared,
+    pub(crate) mesh_stats: crate::vk::handles::MeshStatsShared,
     /// The window lives on the main thread; only the `Renderer` moved to the
     /// render thread. Window-touching methods read this directly.
     pub(crate) window: winit::window::Window,
@@ -205,10 +207,12 @@ impl Engine {
         let lists = client.take_frame(!config.vsync && config.target_fps == 0);
         let exposure_shared = client.exposure();
         let gpu_load = client.gpu_load();
+        let mesh_stats = client.mesh_stats();
         Ok(Self {
             client,
             exposure_shared,
             gpu_load,
+            mesh_stats,
             window,
             input: InputState::new(),
             lists,
@@ -272,6 +276,12 @@ impl Engine {
     /// own stamps and `VOXEL_PROFILE` are unaffected.
     pub fn gpu_load(&self) -> Option<GpuLoad> {
         self.gpu_load.load()
+    }
+
+    /// Live mesh-slot and arena occupancy. Lock-free atomic loads; cheap
+    /// enough to call every frame from the main thread.
+    pub fn mesh_stats(&self) -> MeshStats {
+        self.mesh_stats.load()
     }
 
     /// Record the two extra per-frame timestamps that feed [`Self::gpu_load`].

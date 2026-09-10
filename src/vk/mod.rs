@@ -554,6 +554,7 @@ impl Renderer {
             render_scale,
             exposure: exposure.shared(),
             gpu_load: gpu_timer.load_shared(),
+            mesh_stats: handles::MeshStatsShared::new(cull_math::cpu_cull_max()),
             mesh_staging: Arc::clone(&mesh_staging),
         };
 
@@ -593,7 +594,11 @@ impl Renderer {
             record_buffers: None,
             shadow_cache: shadow::ShadowCache::new(),
             cull,
-            arena_dir: cull::ArenaDirectory::new(),
+            arena_dir: {
+                let mut dir = cull::ArenaDirectory::new();
+                dir.attach_stats(reply.mesh_stats.clone());
+                dir
+            },
             cull_frame: None,
             visible_mask: Vec::new(),
             quad_ibo: buffers::QuadIbo::new(),
