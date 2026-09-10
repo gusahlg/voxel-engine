@@ -20,10 +20,10 @@
 //!   RENDERED frame (the render thread may coalesce main-thread frames). The
 //!   tonemap present copy runs only on presented frames; its meter carries the
 //!   per-rendered-frame share, with the per-presented cost alongside.
-//!   `gap` is device time between the end of the previous render submit's last
-//!   stamp and this submit's first stamp: idle GPU plus submit/command-processor
-//!   overhead. It is not part of the gpu total; the header's `idle N%` is the
-//!   window average of `gap / (gap + gpu_frame)`.
+//!   `gap` is device time between the previous render submit's union-stage end
+//!   stamp and this submit's `TOP_OF_PIPE` start: idle GPU plus submit/command-
+//!   processor overhead. It is not part of the gpu total; the header's `idle N%`
+//!   is the window average of `gap / (gap + gpu_frame)`.
 //! - Workers run in parallel off the critical path; their ms/frame is *offered
 //!   load* — if it exceeds the frame wall-time, the backlog grows and far
 //!   terrain lags behind the player.
@@ -125,7 +125,9 @@ pub enum Meter {
     /// live in the bloom span's spill dispatch.
     GpuTonemap,
     /// Device-time gap before this render submit: idle GPU plus submit /
-    /// command-processor overhead (`start(N) - end(N-1)` on the device clock).
+    /// command-processor overhead (`TOP_OF_PIPE(N) - union-end(N-1)` on the
+    /// device clock). Pass ends are stamped at each pass's last real stage,
+    /// never `BOTTOM_OF_PIPE`.
     GpuGap,
     // Tier::Workers — off-thread chunk jobs; the tile stages are sub-timings
     WorkGenerate,

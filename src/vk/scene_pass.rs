@@ -78,14 +78,16 @@ impl<'a> RenderPass<'a> {
             // from UNDEFINED (cleared every frame; see SAMPLEABLE_DEPTH_REST_LAYOUT).
             let mut image_barriers = [vk::ImageMemoryBarrier2::default(); 5];
             let mut barrier_count = 0;
-            // Offscreen: src COLOR_ATTACHMENT_OUTPUT / NONE (discard).
+            // Offscreen: src NONE / NONE. `UNDEFINED` discards the image; a
+            // color-out src would serialize against the previous CB even though
+            // the slot timeline wait already proved this image idle.
             // Dst COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE.
             // Old UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
             // MSAA: this image is the AVERAGE resolve target; skip the barrier
             // when colour is not stored (no resolve this frame).
             if store_color || r.targets.msaa.is_none() {
                 image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
                     .src_access_mask(vk::AccessFlags2::NONE)
                     .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -96,13 +98,14 @@ impl<'a> RenderPass<'a> {
                 barrier_count += 1;
             }
             // Depth attachment (MS depth when multisampled, else the
-            // single-sample depth): src LATE_FRAGMENT_TESTS / NONE (discard),
-            // plus FRAGMENT_SHADER when a later frame sampled this slot's
-            // stored depth (WAR: that sample is a different command buffer
-            // still in flight). Dst EARLY|LATE_FRAGMENT_TESTS /
-            // DEPTH_STENCIL_ATTACHMENT_{READ,WRITE}. Old UNDEFINED →
-            // DEPTH_ATTACHMENT_OPTIMAL. Contents are cleared every frame.
-            let mut depth_src = vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
+            // single-sample depth): src NONE / NONE (`UNDEFINED` discard)
+            // when nothing sampled this image; plus FRAGMENT_SHADER when a
+            // later frame sampled this slot's stored depth (WAR: that sample
+            // is a different command buffer still in flight). Dst
+            // EARLY|LATE_FRAGMENT_TESTS / DEPTH_STENCIL_ATTACHMENT_{READ,WRITE}.
+            // Old UNDEFINED → DEPTH_ATTACHMENT_OPTIMAL. Contents are cleared
+            // every frame.
+            let mut depth_src = vk::PipelineStageFlags2::NONE;
             if depth_sampled {
                 depth_src |= vk::PipelineStageFlags2::FRAGMENT_SHADER;
             }
@@ -122,15 +125,16 @@ impl<'a> RenderPass<'a> {
                 .image(r.targets.depth[slot].image())
                 .subresource_range(depth_range());
             barrier_count += 1;
-            // MSAA SAMPLE_ZERO resolve target: src COLOR_ATTACHMENT_OUTPUT / NONE
-            // (Vulkan runs depth resolves at color-output). Dst COLOR_ATTACHMENT_OUTPUT
-            // / COLOR_ATTACHMENT_WRITE. Old UNDEFINED → DEPTH_ATTACHMENT_OPTIMAL.
+            // MSAA SAMPLE_ZERO resolve target: src NONE / NONE (`UNDEFINED`
+            // discard; Vulkan would otherwise run a color-out src on this
+            // depth resolve). Dst COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE.
+            // Old UNDEFINED → DEPTH_ATTACHMENT_OPTIMAL.
             // The MS `depth` attachment above is never sampled; only this image
             // rests in SAMPLEABLE_DEPTH_REST_LAYOUT after `end` when a later
             // pass samples it. Skip the resolve-target barrier when nothing does.
             if sample_depth && let Some(resolved) = &r.targets.resolved_depth[slot] {
                 image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
                     .src_access_mask(vk::AccessFlags2::NONE)
                     .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -141,11 +145,11 @@ impl<'a> RenderPass<'a> {
                 barrier_count += 1;
             }
             if let Some(msaa) = &r.targets.msaa {
-                // MSAA color: src COLOR_ATTACHMENT_OUTPUT / NONE (discard).
+                // MSAA color: src NONE / NONE (`UNDEFINED` discard).
                 // Dst COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE.
                 // Old UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
                 image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
                     .src_access_mask(vk::AccessFlags2::NONE)
                     .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -573,7 +577,7 @@ impl<'a> RenderPass<'a> {
 
     /// Draws every non-empty arena partition of one cull group with `pipeline`.
     /// [`GpuTimer::mark`] is a no-op when the group recorded nothing, so empty
-    /// groups account 0 instead of a BOTTOM_OF_PIPE stamp.
+    /// groups account 0 instead of a timestamp.
     unsafe fn record_group_indirect_count(&self, group: cull::Group, pipeline: vk::Pipeline) {
         self.pipe_begin_group(group);
         let mut calls = 0u32;
