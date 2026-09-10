@@ -972,6 +972,11 @@ fn build_table() -> Vec<Def> {
             doc: "Bias added to the signed detail level k before it is stored in the\n4-bit detail field of MeshRecord.detail_pass. Decode: 2^k = exp2(bits - bias).",
             val: Val::UInt(2),
         },
+        Def {
+            name: "GLOW_SCALE",
+            doc: "HDR emissive scale for MaterialDesc.glow: after lighting, add\n(glow/255) * GLOW_SCALE * albedo. Default 4.0. Read by mesh3d.frag via material.slang.",
+            val: Val::Scalar(4.0),
+        },
     ]
 }
 
