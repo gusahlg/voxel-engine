@@ -96,6 +96,42 @@ pub(crate) fn index_bounds_from_quad_counts(counts: [u32; 6]) -> [u32; 7] {
     bounds
 }
 
+/// Shared meta + residency tail after a device allocation and optional copy.
+/// Vertex bytes and AABB are the caller's: this only records them.
+fn finish_resident(
+    alloc: Allocation,
+    bounds: [u32; 7],
+    aabb: (Vec3, Vec3),
+    pass: Pass,
+    copy: Option<PendingCopy>,
+) -> (MeshMeta, GpuResident) {
+    debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
+    let vertex_offset = (alloc.offset / VERTEX_STRIDE) as i32;
+    let (aabb_min, aabb_max) = aabb;
+    let meta = MeshMeta {
+        aabb_min,
+        aabb_max,
+        bounds,
+        vertex_offset,
+        pass,
+        placement: PlacementState::Tracked(None),
+        dyn_lane: DrawDyn::resting(),
+    };
+    // No staged copy (unified memory: already written) is immediately
+    // drawable; a staged copy gates drawability until `flush_copies` submits
+    // it (see [`GpuResident::arrived_at`]).
+    let arrived_at = copy.is_none().then_some(TimelineValue::START);
+    (
+        meta,
+        GpuResident {
+            buffer: alloc.buffer,
+            arena: alloc,
+            copy,
+            arrived_at,
+        },
+    )
+}
+
 /// Allocates a device buffer for `data`, writes/stages its bytes, and returns
 /// the main-owned [`MeshMeta`] plus render-owned [`GpuResident`]. Main-thread
 /// only: touches the allocator + persistent mapping, never the timeline.
@@ -168,32 +204,12 @@ pub(crate) unsafe fn build_mesh_resident(
         scan_min == aabb_min && scan_max == aabb_max
     });
 
-    const _: () =
-        assert!(MESH_ALIGN.is_multiple_of(VERTEX_STRIDE) && MESH_ALIGN.is_multiple_of(256));
-    debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
-    let vertex_offset = (alloc.offset / VERTEX_STRIDE) as i32;
-
-    let meta = MeshMeta {
-        aabb_min,
-        aabb_max,
+    Some(finish_resident(
+        alloc,
         bounds,
-        vertex_offset,
-        pass: data.pass,
-        placement: PlacementState::Tracked(None),
-        dyn_lane: DrawDyn::resting(),
-    };
-    // No staged copy (unified memory: already written above) is immediately
-    // drawable; a staged copy gates drawability until `flush_copies` submits
-    // it (see [`GpuResident::arrived_at`]).
-    let arrived_at = copy.is_none().then_some(TimelineValue::START);
-    Some((
-        meta,
-        GpuResident {
-            buffer: alloc.buffer,
-            arena: alloc,
-            copy,
-            arrived_at,
-        },
+        (aabb_min, aabb_max),
+        data.pass,
+        copy,
     ))
 }
 
@@ -246,7 +262,6 @@ pub(crate) unsafe fn build_mesh_resident_staged(
             return None;
         }
     };
-    debug_assert_eq!(alloc.offset % VERTEX_STRIDE, 0);
 
     let copy = if let Some(mapped) = alloc.mapped {
         // Unified / ReBAR: both the ring region and the arena block are
@@ -273,24 +288,11 @@ pub(crate) unsafe fn build_mesh_resident_staged(
         })
     };
 
-    let arrived_at = copy.is_none().then_some(TimelineValue::START);
-    let vertex_offset = (alloc.offset / VERTEX_STRIDE) as i32;
-    let meta = MeshMeta {
-        aabb_min,
-        aabb_max,
+    Some(finish_resident(
+        alloc,
         bounds,
-        vertex_offset,
+        (aabb_min, aabb_max),
         pass,
-        placement: PlacementState::Tracked(None),
-        dyn_lane: DrawDyn::resting(),
-    };
-    Some((
-        meta,
-        GpuResident {
-            buffer: alloc.buffer,
-            arena: alloc,
-            copy,
-            arrived_at,
-        },
+        copy,
     ))
 }
