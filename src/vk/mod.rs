@@ -249,6 +249,8 @@ pub(crate) struct Renderer {
     pending_submits: Vec<PendingSubmit>,
     /// Runtime batch limit (`VOXEL_SUBMIT_BATCH`, default [`crate::rev::SUBMIT_BATCH_MAX`]).
     submit_batch_limit: usize,
+    /// Eager-flush the pending batch while slot waits are blocking (GPU-bound).
+    gpu_bound: frame_loop::GpuBoundState,
 }
 
 impl Renderer {
@@ -701,6 +703,7 @@ impl Renderer {
             empty_extra,
             pending_submits: Vec::with_capacity(crate::rev::SUBMIT_BATCH_MAX),
             submit_batch_limit: frame_loop::submit_batch_limit(),
+            gpu_bound: frame_loop::GpuBoundState::default(),
         };
         Ok((renderer, reply))
     }

@@ -128,6 +128,38 @@ fn pending_blocks_wait(pending_slots: impl IntoIterator<Item = usize>, wait_slot
     pending_slots.into_iter().any(|s| s == wait_slot)
 }
 
+/// Consecutive short slot waits that clear [`GpuBoundState`].
+const GPU_BOUND_CLEAR_AFTER: u8 = 8;
+/// Slot-wait duration that counts as GPU-bound (eager flush). Shorter waits
+/// (a few microseconds while the in-flight batch finishes inside the submit
+/// floor) stay batched. Overridden by `VOXEL_EAGER_FLUSH_US` (read once).
+const EAGER_FLUSH_WAIT_US: u64 = 15;
+
+/// Adaptive submit-batch flush: eager while the GPU is the bottleneck so the
+/// next batch is in-flight before the CPU records, batched otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct GpuBoundState {
+    gpu_bound: bool,
+    idle_waits: u8,
+}
+
+impl GpuBoundState {
+    /// Sets GPU-bound when the slot wait took at least [`eager_flush_wait`].
+    /// Shorter waits count as idle for the [`GPU_BOUND_CLEAR_AFTER`] streak.
+    fn note_wait(&mut self, waited: std::time::Duration) {
+        if waited >= eager_flush_wait() {
+            self.gpu_bound = true;
+            self.idle_waits = 0;
+        } else if self.gpu_bound {
+            self.idle_waits = self.idle_waits.saturating_add(1);
+            if self.idle_waits >= GPU_BOUND_CLEAR_AFTER {
+                self.gpu_bound = false;
+                self.idle_waits = 0;
+            }
+        }
+    }
+}
+
 /// `VOXEL_SUBMIT_BATCH` (integer ≥ 1): command buffers per `vkQueueSubmit2`
 /// for unpresented uncapped frames. Unset uses [`SUBMIT_BATCH_MAX`]. Clamped
 /// to `1..=FRAMES_IN_FLIGHT-1` so the ring always has a free slot. Read once
@@ -140,6 +172,19 @@ pub(super) fn submit_batch_limit() -> usize {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(SUBMIT_BATCH_MAX);
         parsed.clamp(1, FRAMES_IN_FLIGHT as usize - 1)
+    })
+}
+
+/// Slot-wait duration that enables eager flush. `VOXEL_EAGER_FLUSH_US` if
+/// set and parseable, otherwise [`EAGER_FLUSH_WAIT_US`]. Read once.
+fn eager_flush_wait() -> std::time::Duration {
+    static THRESHOLD: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        let us = std::env::var("VOXEL_EAGER_FLUSH_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(EAGER_FLUSH_WAIT_US);
+        std::time::Duration::from_micros(us)
     })
 }
 
@@ -547,6 +592,11 @@ impl Renderer {
     /// the wait must never target a timeline value that has not been submitted,
     /// and a deferred frame's host-visible slot (uniforms, cull buffers, query
     /// readback) must not be overwritten until its batch signals.
+    ///
+    /// When the GPU is the bottleneck ([`GpuBoundState`]: last slot wait
+    /// ≥ [`eager_flush_wait`]), flushes any deferred batch unconditionally so
+    /// the GPU stays fed while the CPU records. When CPU-bound, flush only if
+    /// the wait would block, preserving two-frames-per-submit.
     fn wait_slot_and_reclaim(&mut self, slot: usize) {
         let vsync = self.vsync.current();
         let wait_slot = reclaim_wait_slot(slot, vsync);
@@ -563,11 +613,19 @@ impl Renderer {
             !pending_blocks_wait(self.pending_submits.iter().map(|p| p.slot), wait_slot),
             "wait_slot_and_reclaim must not wait on an unsubmitted frame"
         );
+        let value = self.slots[FrameSlot::new(wait_slot)].render_value;
+        let completed = unsafe { self.timeline.counter(&self.device.device) };
+        let would_block = completed < value;
+        // GPU-bound: flush before waiting so the next batch is queued while
+        // this slot completes. CPU-bound: flush only if this wait would block.
+        if self.gpu_bound.gpu_bound || would_block {
+            self.flush_pending_submits();
+        }
         let device = &self.device.device;
         unsafe {
             {
                 let _p = crate::profile::scope(crate::profile::Meter::Fence);
-                let value = self.slots[FrameSlot::new(wait_slot)].render_value;
+                let wait_start = std::time::Instant::now();
                 if vsync {
                     self.timeline.wait(device, value);
                 } else {
@@ -575,6 +633,7 @@ impl Renderer {
                         std::time::Duration::from_micros(200);
                     self.timeline.wait_spin(device, value, FENCE_SPIN_BUDGET);
                 }
+                self.gpu_bound.note_wait(wait_start.elapsed());
             }
             self.publish_vrs_mix(slot);
             self.publish_cull_stats(slot);
@@ -1672,8 +1731,8 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        FRAMES_IN_FLIGHT, SUBMIT_BATCH_MAX, SubmitBatchAction, pending_blocks_wait,
-        reclaim_wait_slot, submit_batch_action,
+        FRAMES_IN_FLIGHT, GPU_BOUND_CLEAR_AFTER, GpuBoundState, SUBMIT_BATCH_MAX,
+        SubmitBatchAction, pending_blocks_wait, reclaim_wait_slot, submit_batch_action,
     };
 
     #[test]
@@ -1735,22 +1794,57 @@ mod tests {
         assert!(FRAMES_IN_FLIGHT as usize > SUBMIT_BATCH_MAX);
     }
 
-    /// Walk the slot ring under the production defer/flush rules. The next
-    /// slot to record must not still be in the pending list — otherwise
-    /// `wait_slot_and_reclaim` would wait on a value that has not been
-    /// submitted (or, worse, on the slot's previous already-signalled value
-    /// and reset an unsubmitted command buffer).
-    fn simulate_ring(uncapped: bool, limit: usize, present: impl Fn(usize) -> bool) {
+    /// Apply the wait-path flush rules: safety-net if `wait_slot` / `slot` is
+    /// still pending, then flush the rest of the batch when GPU-bound or when
+    /// the wait would block (`!slot_reached`).
+    fn apply_wait_path_flush(
+        pending: &mut Vec<usize>,
+        wait_slot: usize,
+        slot: usize,
+        slot_reached: bool,
+        gpu_bound: bool,
+    ) {
+        if pending_blocks_wait(pending.iter().copied(), wait_slot)
+            || pending_blocks_wait(pending.iter().copied(), slot)
+        {
+            pending.clear();
+        }
+        if gpu_bound || !slot_reached {
+            pending.clear();
+        }
+    }
+
+    /// Walk the slot ring under the production defer/flush rules.
+    ///
+    /// After the wait-path flush the slot being reused must be free —
+    /// otherwise the wait would target a value that has not been submitted
+    /// (or, worse, the slot's previous already-signalled value and reset an
+    /// unsubmitted command buffer).
+    fn simulate_ring(
+        uncapped: bool,
+        limit: usize,
+        present: impl Fn(usize) -> bool,
+        slot_reached: bool,
+        gpu_bound: bool,
+    ) {
         let fif = FRAMES_IN_FLIGHT as usize;
         let mut pending: Vec<usize> = Vec::new();
         let mut slot = 0usize;
         for i in 0..64 {
-            let will_present = present(i);
+            let wait_slot = reclaim_wait_slot(slot, !uncapped);
+            apply_wait_path_flush(&mut pending, wait_slot, slot, slot_reached, gpu_bound);
+            if gpu_bound || !slot_reached {
+                assert!(
+                    pending.is_empty(),
+                    "gpu-bound or blocking wait must flush pending (frame {i}, slot {slot})"
+                );
+            }
             assert!(
                 !pending_blocks_wait(pending.iter().copied(), slot),
                 "slot {slot} still pending at reuse (frame {i}, pending {pending:?}); \
                  FRAMES_IN_FLIGHT must be SUBMIT_BATCH_MAX + 1"
             );
+            let will_present = present(i);
             if will_present || !uncapped {
                 pending.clear();
             }
@@ -1766,11 +1860,21 @@ mod tests {
 
     #[test]
     fn slot_ring_stays_available_under_uncapped_batching() {
-        simulate_ring(true, SUBMIT_BATCH_MAX, |i| i % 5 == 0);
-        simulate_ring(true, SUBMIT_BATCH_MAX, |_| false);
-        simulate_ring(true, 1, |_| false);
-        simulate_ring(false, SUBMIT_BATCH_MAX, |_| false);
-        simulate_ring(true, SUBMIT_BATCH_MAX, |_| true);
+        for slot_reached in [true, false] {
+            for gpu_bound in [false, true] {
+                simulate_ring(
+                    true,
+                    SUBMIT_BATCH_MAX,
+                    |i| i % 5 == 0,
+                    slot_reached,
+                    gpu_bound,
+                );
+                simulate_ring(true, SUBMIT_BATCH_MAX, |_| false, slot_reached, gpu_bound);
+                simulate_ring(true, 1, |_| false, slot_reached, gpu_bound);
+                simulate_ring(false, SUBMIT_BATCH_MAX, |_| false, slot_reached, gpu_bound);
+                simulate_ring(true, SUBMIT_BATCH_MAX, |_| true, slot_reached, gpu_bound);
+            }
+        }
     }
 
     #[test]
@@ -1779,12 +1883,16 @@ mod tests {
         assert!(pending_blocks_wait([0], 0));
         assert!(!pending_blocks_wait([0], 1));
         assert!(pending_blocks_wait([0, 1], 1));
-        // The wait-path flush: once the blocking slot is submitted, reuse is
+        // Safety-net flush: once the blocking slot is submitted, reuse is
         // legal (the subsequent timeline wait covers the batch signal).
         let mut pending = vec![0, 1];
         assert!(pending_blocks_wait(pending.iter().copied(), 0));
-        pending.clear();
+        apply_wait_path_flush(&mut pending, 0, 0, true, false);
         assert!(!pending_blocks_wait(pending.iter().copied(), 0));
+        assert!(
+            pending.is_empty(),
+            "safety-net flush submits the slot before wait_spin"
+        );
     }
 
     #[test]
@@ -1804,5 +1912,64 @@ mod tests {
             !pending_blocks_wait(slack.iter().copied(), fif - 1),
             "a batch of FIF-1 leaves the next ring slot free"
         );
+    }
+
+    #[test]
+    fn wait_keeps_pending_when_the_slot_is_already_complete() {
+        let mut pending = vec![0];
+        apply_wait_path_flush(&mut pending, 1, 1, true, false);
+        assert_eq!(
+            pending,
+            vec![0],
+            "already-reached slot must not flush a deferred batch"
+        );
+    }
+
+    #[test]
+    fn wait_flushes_pending_when_the_slot_wait_would_block() {
+        let mut pending = vec![0];
+        apply_wait_path_flush(&mut pending, 1, 1, false, false);
+        assert!(
+            pending.is_empty(),
+            "blocking wait must flush the deferred batch first"
+        );
+    }
+
+    #[test]
+    fn wait_flushes_pending_while_gpu_bound_even_if_slot_is_complete() {
+        let mut pending = vec![0];
+        apply_wait_path_flush(&mut pending, 1, 1, true, true);
+        assert!(
+            pending.is_empty(),
+            "gpu-bound frames flush the deferred batch before wait"
+        );
+    }
+
+    #[test]
+    fn gpu_bound_sets_on_long_wait_and_clears_after_short_waits() {
+        let mut s = GpuBoundState::default();
+        assert!(!s.gpu_bound);
+        let short = std::time::Duration::from_micros(5);
+        let long = std::time::Duration::from_micros(30);
+        s.note_wait(short);
+        assert!(!s.gpu_bound, "a 5 us wait does not set gpu_bound");
+        s.note_wait(long);
+        assert!(s.gpu_bound, "a 30 us wait sets gpu_bound");
+        assert_eq!(s.idle_waits, 0);
+        s.note_wait(long);
+        assert!(s.gpu_bound);
+        assert_eq!(s.idle_waits, 0, "another long wait resets the idle streak");
+        for i in 1..GPU_BOUND_CLEAR_AFTER {
+            s.note_wait(short);
+            assert!(s.gpu_bound, "still bound after {i} short waits");
+        }
+        s.note_wait(short);
+        assert!(
+            !s.gpu_bound,
+            "clears after {GPU_BOUND_CLEAR_AFTER} short waits"
+        );
+        assert_eq!(s.idle_waits, 0);
+        s.note_wait(short);
+        assert!(!s.gpu_bound);
     }
 }
