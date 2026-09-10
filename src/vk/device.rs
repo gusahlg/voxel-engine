@@ -370,6 +370,20 @@ impl Device {
             .sum()
     }
 
+    /// Index and size of the largest `DEVICE_LOCAL` heap, if any.
+    pub fn largest_device_local_heap(
+        memory_props: &vk::PhysicalDeviceMemoryProperties,
+    ) -> Option<(usize, u64)> {
+        (0..memory_props.memory_heap_count as usize)
+            .filter(|&i| {
+                memory_props.memory_heaps[i]
+                    .flags
+                    .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+            })
+            .map(|i| (i, memory_props.memory_heaps[i].size))
+            .max_by_key(|&(_, size)| size)
+    }
+
     pub fn max_msaa(&self) -> u32 {
         for (flag, n) in [
             (vk::SampleCountFlags::TYPE_8, 8),

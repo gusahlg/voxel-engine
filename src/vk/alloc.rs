@@ -351,6 +351,24 @@ impl GpuAllocator {
         self.unified.0
     }
 
+    /// Live budget and usage (bytes) of the largest `DEVICE_LOCAL` heap.
+    /// One `vkGetPhysicalDeviceMemoryProperties2` when `VK_EXT_memory_budget`
+    /// is enabled; otherwise both `None`.
+    pub(crate) fn live_device_local_budget(&self) -> (Option<u64>, Option<u64>) {
+        let Some(heap) = super::device::Device::largest_device_local_heap(&self.memory_props)
+        else {
+            return (None, None);
+        };
+        let Some(token) = self.memory_budget else {
+            return (None, None);
+        };
+        let snap = unsafe { token.query(&self.instance, self.physical) };
+        (
+            Some(snap.heap_budget[heap.0]),
+            Some(snap.heap_usage[heap.0]),
+        )
+    }
+
     fn budget_query(&self) -> Option<BudgetQuery> {
         self.memory_budget.map(|token| BudgetQuery {
             instance: self.instance.clone(),
@@ -948,7 +966,43 @@ mod tests {
             heap_index: 1,
         };
         props.memory_heap_count = 2;
+        props.memory_heaps[0] = vk::MemoryHeap {
+            size: 8 << 30,
+            flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+        };
+        props.memory_heaps[1] = vk::MemoryHeap {
+            size: 16 << 30,
+            flags: vk::MemoryHeapFlags::empty(),
+        };
         props
+    }
+
+    #[test]
+    fn largest_device_local_heap_picks_biggest_device_local() {
+        use super::super::device::Device;
+
+        let two = two_heap_props();
+        assert_eq!(
+            Device::largest_device_local_heap(&two),
+            Some((0, 8 << 30)),
+            "ignores a larger non-DEVICE_LOCAL heap"
+        );
+
+        let mut dual = two_heap_props();
+        dual.memory_heap_count = 3;
+        dual.memory_heaps[2] = vk::MemoryHeap {
+            size: 12 << 30,
+            flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+        };
+        assert_eq!(
+            Device::largest_device_local_heap(&dual),
+            Some((2, 12 << 30)),
+            "picks the larger of two DEVICE_LOCAL heaps"
+        );
+
+        let mut none = two_heap_props();
+        none.memory_heaps[0].flags = vk::MemoryHeapFlags::empty();
+        assert_eq!(Device::largest_device_local_heap(&none), None);
     }
 
     #[test]
