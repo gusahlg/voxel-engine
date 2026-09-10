@@ -378,9 +378,9 @@ static const float WATER_DEEP[3] = {
 };
 
 // How far the lit block colour is mixed toward WATER_DEEP for the water body
-// (0 = keep block colour, 1 = full deep tint). Interim fallback mix used when
-// dynamic_rendering_local_read is unavailable / MSAA is on (no depth input read);
-// true depth-difference absorption (WATER_ABS) supersedes it when available.
+// (0 = keep block colour, 1 = full deep tint). Fallback mix used when previous-frame
+// depth is invalid, or MSAA is on (absorb pipeline not built); true depth-difference
+// absorption (WATER_ABS) supersedes it when the previous depth is sampled.
 static const float WATER_BODY_MIX = 0.6f;
 
 // Water absorption coefficient (1/metres²). Larger saturates in shallower water.

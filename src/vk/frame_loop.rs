@@ -485,26 +485,17 @@ impl Renderer {
     }
 
     /// The layout the scene-pass *attachment* (MS depth, or the single-sample
-    /// depth when not multisampled) lives in *during* the pass. With the
-    /// water-absorption path *this frame* (`absorb`) it is `RENDERING_LOCAL_READ`
-    /// — the one layout valid simultaneously as depth attachment and as the
-    /// blend pass's input attachment (mid-pass transitions are illegal, so a
-    /// single in-pass layout is the only coherent design). Frames that have
-    /// the absorb pipeline but no Blend draw use `DEPTH_ATTACHMENT_OPTIMAL`
-    /// and the plain depth barriers. Every in-pass depth barrier and
-    /// attachment info reads this ONE function, so the two configurations
-    /// cannot drift apart.
+    /// depth when not multisampled) lives in *during* the pass:
+    /// `DEPTH_ATTACHMENT_OPTIMAL`. Water absorption samples the *previous*
+    /// slot's stored depth, so this pass never self-depends on its own depth
+    /// attachment (that used to force `RENDERING_LOCAL_READ` and defeat Hi-Z).
     ///
     /// After `RenderPass::end`, if a later pass this frame samples it, the
     /// *sampleable* single-sample image leaves this layout and rests in
     /// [`SAMPLEABLE_DEPTH_REST_LAYOUT`]. The next scene pass of this slot
     /// begins from `UNDEFINED` either way.
-    pub(super) fn depth_pass_layout(absorb: bool) -> vk::ImageLayout {
-        if absorb {
-            vk::ImageLayout::RENDERING_LOCAL_READ_KHR
-        } else {
-            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
-        }
+    pub(super) fn depth_pass_layout() -> vk::ImageLayout {
+        vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
     }
 
     /// Layout and write scope of the single-sample depth image *during the
@@ -517,9 +508,8 @@ impl Renderer {
     /// the contract.
     pub(super) fn sampleable_depth_attachment_state(
         &self,
-        absorb: bool,
     ) -> (vk::ImageLayout, vk::PipelineStageFlags2, vk::AccessFlags2) {
-        sampleable_depth_attachment_state(self.targets.samples, Self::depth_pass_layout(absorb))
+        sampleable_depth_attachment_state(self.targets.samples, Self::depth_pass_layout())
     }
 
     /// Scene-pass → rest: sampleable depth becomes [`SAMPLEABLE_DEPTH_REST_LAYOUT`].
@@ -530,12 +520,8 @@ impl Renderer {
     /// without a further transition: VRS compute, the quarter-res spill compute
     /// (godrays), and the present-time tonemap fragment (fused TAA). The present
     /// copy is a later submit that waits on the render timeline.
-    pub(super) fn sampleable_depth_rest_barrier(
-        &self,
-        slot: usize,
-        absorb: bool,
-    ) -> vk::ImageMemoryBarrier2<'_> {
-        let (src_layout, src_stage, src_access) = self.sampleable_depth_attachment_state(absorb);
+    pub(super) fn sampleable_depth_rest_barrier(&self, slot: usize) -> vk::ImageMemoryBarrier2<'_> {
+        let (src_layout, src_stage, src_access) = self.sampleable_depth_attachment_state();
         vk::ImageMemoryBarrier2::default()
             .src_stage_mask(src_stage)
             .src_access_mask(src_access)
@@ -1335,20 +1321,33 @@ impl Renderer {
         // Depth consumers after the scene pass, computed once: VRS classify,
         // spill/godrays (presented + bloom or a live march), fused TAA.
         let spill_live = self.flags.bloom || godray.strength > 0.0;
-        let sample_depth =
-            sampleable_depth_consumed(will_present, self.flags.taa, spill_live, classify_vrs);
-        // Absorb (water depth-input) needs RENDERING_LOCAL_READ for the whole
-        // scene pass. Only frames that actually draw Blend pay that layout;
-        // otherwise depth stays DEPTH_ATTACHMENT_OPTIMAL. Known here because
-        // `prepare_blend_draws` already filled `draw_runs`.
+        // Absorb stores this frame's depth so the *next* frame can sample it.
+        // Known here because `prepare_blend_draws` already filled `draw_runs`.
         let absorb_this_frame = self.pipelines.mesh3d_transparent_absorb.is_some()
             && self.draw_runs.iter().any(|run| run.pass == Pass::Blend);
+        let sample_depth = sampleable_depth_consumed(
+            will_present,
+            self.flags.taa,
+            spill_live,
+            classify_vrs,
+            absorb_this_frame,
+        );
         // Lean opaque/LOD fragments: compile-time equivalent of every optional
         // lighting lane off and fog off. Chosen once per frame from flags.
         let mesh_lean = super::uniforms::mesh_lean(&self.flags);
         // HDR colour is only read by bloom/exposure/spill/tonemap, all of which
         // run on presented frames. Minimap is a separate texture; screenshots
         // copy the swapchain after tonemap; VRS classify reads depth not colour.
+
+        let prev_valid = self.prev_depth.valid(slot, self.render_extent);
+        let depth_sampled = self.prev_depth.begin_slot(slot);
+        if absorb_this_frame && !prev_valid {
+            self.ensure_prev_depth_dummy(cmd);
+        }
+        if absorb_this_frame && prev_valid {
+            self.prev_depth
+                .mark_sampled(super::PrevDepthTrack::prev_slot(slot));
+        }
 
         let device = &self.device.device;
         let stamp = |p| {
@@ -1369,6 +1368,7 @@ impl Renderer {
                     sample_depth,
                     will_present,
                     absorb_this_frame,
+                    depth_sampled,
                     mesh_lean,
                 )
             }
@@ -1498,6 +1498,8 @@ impl Renderer {
                 HdrReadable::new(slot)
             }
         };
+        self.prev_depth
+            .finish(slot, sample_depth, self.render_extent);
         // Bloom pyramid + quarter-res spill (bloom composite + godrays). The
         // tonemap present-copy takes one bilinear tap of the spill. Present-only
         // — a dropped mailbox frame never samples either image. Forced capture
@@ -1534,6 +1536,20 @@ impl Renderer {
                 .expect("end command buffer failed");
         }
         (rs, readable)
+    }
+
+    /// Prime the 1×1 dummy depth to `SHADER_READ_ONLY_OPTIMAL` so binding 5 is
+    /// a valid descriptor when previous-frame depth is missing. One transition
+    /// from UNDEFINED; subsequent calls are no-ops.
+    fn ensure_prev_depth_dummy(&mut self, cmd: vk::CommandBuffer) {
+        if self.prev_depth_dummy.layout() == SAMPLEABLE_DEPTH_REST_LAYOUT {
+            return;
+        }
+        self.prev_depth_dummy.transition(
+            &self.device.device,
+            cmd,
+            super::image::LayoutUse::FragmentSampled,
+        );
     }
 
     /// The image+view holding slot `slot`'s HDR offscreen. TAA no longer

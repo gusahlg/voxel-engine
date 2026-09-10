@@ -10,9 +10,7 @@
 
 pub use super::handles::DrawDyn;
 pub use super::host_buffer::HostBuffer;
-pub use super::mesh3d_desc::{
-    create_mesh3d_set_layout, push_depth_input_attachment, push_mesh3d_descriptors,
-};
+pub use super::mesh3d_desc::{create_mesh3d_set_layout, push_mesh3d_descriptors, push_prev_depth};
 pub use super::records::{DrawIndexedIndirect, MeshRecord};
 pub use super::retire::RetireQueue;
 pub use crate::rev::{FRAMES_IN_FLIGHT, SUBMIT_BATCH_MAX};

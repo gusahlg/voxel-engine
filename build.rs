@@ -141,7 +141,7 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             "compute_example.comp.spv",
         ),
     ];
-    // Water depth-absorption path. Declares the depth input attachment
+    // Water depth-absorption path. Samples the previous frame's depth
     // (set 0 binding 5) + Δd-driven body tint, compiled only into
     // `mesh3d_transparent_absorb`. The default variant stays the interim-tint
     // fallback.
@@ -931,10 +931,10 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "WATER_BODY_MIX",
-            doc: "How far the lit block colour is mixed toward WATER_DEEP for the water body\n(0 = keep block colour, 1 = full deep tint). Interim fallback mix used when\ndynamic_rendering_local_read is unavailable / MSAA is on (no depth input read);\ntrue depth-difference absorption (WATER_ABS) supersedes it when available.",
+            doc: "How far the lit block colour is mixed toward WATER_DEEP for the water body\n(0 = keep block colour, 1 = full deep tint). Fallback mix used when previous-frame\ndepth is invalid, or MSAA is on (absorb pipeline not built); true depth-difference\nabsorption (WATER_ABS) supersedes it when the previous depth is sampled.",
             val: Val::Scalar(0.6),
         },
-        // Water depth-difference absorption: driven by water column thickness from input attachment.
+        // Water depth-difference absorption: driven by water column thickness from previous-frame depth.
         Def {
             name: "WATER_ABS",
             doc: "Water absorption coefficient (1/metres²). Larger saturates in shallower water.",

@@ -1,8 +1,8 @@
 use ash::{khr, vk};
 
 /// Create mesh3d push-descriptor set layout.
-pub fn create_mesh3d_set_layout(device: &ash::Device, local_read: bool) -> vk::DescriptorSetLayout {
-    let mut bindings = vec![
+pub fn create_mesh3d_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout {
+    let bindings = [
         vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -29,20 +29,16 @@ pub fn create_mesh3d_set_layout(device: &ash::Device, local_read: bool) -> vk::D
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         vk::DescriptorSetLayoutBinding::default()
+            .binding(5)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
             .binding(6)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::VERTEX),
     ];
-    if local_read {
-        bindings.push(
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(5)
-                .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-        );
-    }
     let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
         .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
         .bindings(&bindings);
@@ -123,28 +119,25 @@ pub fn push_mesh3d_descriptors(
     }
 }
 
-/// Pushes only binding 5 (the scene depth as an input attachment) for the water
-/// depth-absorption blend variant. Layered on top of an already-pushed 0-4 set
-/// (same compatible layout, so the earlier writes stay live). The depth image is
-/// the current depth attachment, so its descriptor layout matches the
-/// attachment's `DEPTH_ATTACHMENT_OPTIMAL` (dynamic_rendering_local_read reads it
-/// in place — the blend pipeline never writes depth).
-pub fn push_depth_input_attachment(
+/// Pushes only binding 5 (previous slot's sampleable depth + nearest/clamp
+/// sampler) for the water-absorption blend variant. Layered on top of an
+/// already-pushed 0-4 set (same compatible layout, so the earlier writes stay
+/// live). The image rests in `SHADER_READ_ONLY_OPTIMAL` from the previous
+/// frame's rest barrier (or the 1×1 dummy, primed to the same layout).
+pub fn push_prev_depth(
     push: &khr::push_descriptor::Device,
     cmd: vk::CommandBuffer,
     layout: vk::PipelineLayout,
+    sampler: vk::Sampler,
     depth_view: vk::ImageView,
 ) {
     let image_infos = [vk::DescriptorImageInfo::default()
+        .sampler(sampler)
         .image_view(depth_view)
-        // The whole scene pass runs depth in RENDERING_LOCAL_READ when the
-        // absorb path is active (the only caller): the one layout valid as
-        // BOTH depth attachment and input attachment, and the only truthful
-        // value here (VUID-VkWriteDescriptorSet-descriptorType-04151).
-        .image_layout(vk::ImageLayout::RENDERING_LOCAL_READ_KHR)];
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
     let writes = [vk::WriteDescriptorSet::default()
         .dst_binding(5)
-        .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .image_info(&image_infos)];
     unsafe {
         push.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &writes);

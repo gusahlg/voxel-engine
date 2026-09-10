@@ -78,7 +78,7 @@ struct PushConstants
     // LOD slab extents (fragment pass only).
     float clip;
     float clip_v;
-    float2 pad;
+    float2 inv_render_extent; // fragment water absorb; unused here
     // f64 camera eye split: eye = cam_block + cam_frac, frac in [0,1).
     int3 cam_block;
     int pad0;

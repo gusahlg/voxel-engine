@@ -32,12 +32,14 @@ pub(super) struct RenderPass<'a> {
     scene_state: Option<(glam::Mat4, pipeline::EyeSplit)>,
     mesh_push_bound: std::cell::Cell<bool>,
     index_bound: std::cell::Cell<bool>,
-    /// A later pass this frame samples the sampleable depth (VRS / spill / TAA).
+    /// A later pass this frame samples the sampleable depth (VRS / spill / TAA
+    /// / next-frame water absorb).
     sample_depth: bool,
-    /// Water-absorption Blend draws this frame: depth lives in
-    /// `RENDERING_LOCAL_READ` and the absorb input-attachment mapping is live
-    /// for that pass. Water-free frames keep `DEPTH_ATTACHMENT_OPTIMAL`.
+    /// Water-absorption Blend draws this frame: binding 5 is the previous
+    /// slot's sampleable depth (or the dummy when that depth is invalid).
     absorb_this_frame: bool,
+    /// Previous slot stored sampleable depth at this render extent.
+    prev_depth_valid: bool,
     /// Lean opaque/LOD fragment pipelines this frame: every optional lighting
     /// lane is off and fog is off. Chosen once per frame from `RenderFlags`.
     mesh_lean: bool,
@@ -56,6 +58,7 @@ impl<'a> RenderPass<'a> {
         sample_depth: bool,
         store_color: bool,
         absorb_this_frame: bool,
+        depth_sampled: bool,
         mesh_lean: bool,
     ) -> RenderPass<'a> {
         let device = &r.device.device;
@@ -93,12 +96,18 @@ impl<'a> RenderPass<'a> {
                 barrier_count += 1;
             }
             // Depth attachment (MS depth when multisampled, else the
-            // single-sample depth): src LATE_FRAGMENT_TESTS / NONE (discard).
-            // Dst EARLY|LATE_FRAGMENT_TESTS / DEPTH_STENCIL_ATTACHMENT_{READ,WRITE}.
-            // Old UNDEFINED → depth_pass_layout. Unconditional: VRS no longer
-            // round-trips this image, and contents are cleared anyway.
+            // single-sample depth): src LATE_FRAGMENT_TESTS / NONE (discard),
+            // plus FRAGMENT_SHADER when a later frame sampled this slot's
+            // stored depth (WAR: that sample is a different command buffer
+            // still in flight). Dst EARLY|LATE_FRAGMENT_TESTS /
+            // DEPTH_STENCIL_ATTACHMENT_{READ,WRITE}. Old UNDEFINED →
+            // DEPTH_ATTACHMENT_OPTIMAL. Contents are cleared every frame.
+            let mut depth_src = vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
+            if depth_sampled {
+                depth_src |= vk::PipelineStageFlags2::FRAGMENT_SHADER;
+            }
             image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
+                .src_stage_mask(depth_src)
                 .src_access_mask(vk::AccessFlags2::NONE)
                 .dst_stage_mask(
                     vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
@@ -109,7 +118,7 @@ impl<'a> RenderPass<'a> {
                         | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
                 )
                 .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(super::Renderer::depth_pass_layout(absorb_this_frame))
+                .new_layout(super::Renderer::depth_pass_layout())
                 .image(r.targets.depth[slot].image())
                 .subresource_range(depth_range());
             barrier_count += 1;
@@ -226,7 +235,7 @@ impl<'a> RenderPass<'a> {
             };
             let mut depth_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(r.targets.depth[slot].view())
-                .image_layout(super::Renderer::depth_pass_layout(absorb_this_frame))
+                .image_layout(super::Renderer::depth_pass_layout())
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(depth_store)
                 .clear_value(vk::ClearValue {
@@ -316,6 +325,7 @@ impl<'a> RenderPass<'a> {
             index_bound: std::cell::Cell::new(false),
             sample_depth,
             absorb_this_frame,
+            prev_depth_valid: r.prev_depth.valid(slot, r.render_extent),
             mesh_lean,
         }
     }
@@ -395,11 +405,17 @@ impl<'a> RenderPass<'a> {
     unsafe fn push_mesh3d_constants(&self, clip: f32, clip_v: f32) {
         let r = self.r;
         let (view_proj, eye) = self.scene_state.expect("a mesh pass implies a 3D scene");
+        let extent = r.render_extent;
+        let inv_render_extent = if self.prev_depth_valid {
+            [1.0 / extent.width as f32, 1.0 / extent.height as f32]
+        } else {
+            [0.0, 0.0]
+        };
         let push = pipeline::Mesh3dPush {
             view_proj,
             clip,
             clip_v,
-            _pad: [0.0; 2],
+            inv_render_extent,
             eye,
         };
         let layout = r.pipelines.layout_3d;
@@ -446,47 +462,29 @@ impl<'a> RenderPass<'a> {
         // descriptors. Re-establish them at the head of every mesh pass so the
         // transparent pass (recorded after sky) draws with valid state.
         unsafe { self.bind_mesh3d_state() };
-        // The water-absorption blend variant reads the scene depth as an input
-        // attachment (set 0 binding 5). Layered on top of the 0-4 push above
-        // (same layout ⇒ those writes stay live); pushed only for Blend when the
-        // absorb pipeline is active, and consumed only inside the water branch.
-        let absorb_active = self.absorb_this_frame;
-        if pass == Pass::Blend && absorb_active {
+        // The water-absorption blend variant samples the previous slot's
+        // sampleable depth (set 0 binding 5). Layered on top of the 0-4 push
+        // above (same layout ⇒ those writes stay live); pushed only for Blend
+        // when the absorb pipeline is active, and consumed only inside the
+        // water branch. Dummy 1×1 when that depth is invalid (shader falls
+        // back to WATER_BODY_MIX).
+        if self.absorb_this_frame {
             let layout = self.r.pipelines.layout_3d;
-            buffers::push_depth_input_attachment(
+            let depth_view = if self.prev_depth_valid {
+                self.r
+                    .targets
+                    .sampleable_depth(super::PrevDepthTrack::prev_slot(self.slot))
+                    .view()
+            } else {
+                self.r.prev_depth_dummy.view()
+            };
+            buffers::push_prev_depth(
                 &self.r.device.push_descriptor,
                 self.cmd,
                 layout,
-                self.r.targets.depth[self.slot].view(),
+                self.r.pipelines.tonemap_depth_sampler,
+                depth_view,
             );
-            // Framebuffer-local (BY_REGION) dependency INSIDE the render pass
-            // — legal exactly because dynamic_rendering_local_read is enabled
-            // whenever this pipeline exists: the opaque passes' depth writes
-            // must be visible to the water branch's input-attachment reads.
-            // No layout change (illegal inside a pass; the frame-wide
-            // RENDERING_LOCAL_READ layout is what makes that unnecessary).
-            let dep = [vk::MemoryBarrier2::default()
-                .src_stage_mask(
-                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                )
-                .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(vk::AccessFlags2::INPUT_ATTACHMENT_READ)];
-            unsafe {
-                self.r.device.device.cmd_pipeline_barrier2(
-                    self.cmd,
-                    &vk::DependencyInfo::default()
-                        .dependency_flags(vk::DependencyFlags::BY_REGION)
-                        .memory_barriers(&dep),
-                );
-            }
-            // The instance's input-attachment mapping must MATCH the bound
-            // pipeline at every draw. Set the absorb pipeline's mapping (depth
-            // → input 0, color not-an-input) for exactly this pass's draws;
-            // restored to the implicit identity below so the later sky/debug
-            // pipelines (created without a mapping) stay valid.
-            unsafe { self.set_input_attachment_mapping(true) };
         }
         let device = &self.r.device.device;
         let cmd = self.cmd;
@@ -543,9 +541,6 @@ impl<'a> RenderPass<'a> {
                     blend_calls += u64::from(run.count);
                 }
             }
-        }
-        if pass == Pass::Blend && absorb_active {
-            unsafe { self.set_input_attachment_mapping(false) };
         }
         crate::profile::gauge(crate::profile::Gauge::CallsBlend, blend_calls);
     }
@@ -701,33 +696,6 @@ impl<'a> RenderPass<'a> {
                 Self::pipe_stat_pass(group),
             );
         }
-    }
-
-    /// Sets the render-pass instance's input-attachment mapping: the absorb
-    /// pipeline's custom one (`true`: depth → fragment input 0, the color
-    /// attachment not an input), or back to the IMPLICIT identity every
-    /// mapping-less pipeline was created with (`false`: color 0 → input 0,
-    /// no depth) — the state a pipeline and the instance must agree on at
-    /// every draw (VUID-vkCmdDraw*-None-09549/10927).
-    unsafe fn set_input_attachment_mapping(&self, absorb: bool) {
-        let lr = self
-            .r
-            .device
-            .local_read
-            .as_ref()
-            .expect("absorb pipeline exists only with local_read");
-        let depth_input_index = 0u32;
-        let custom_colors = [vk::ATTACHMENT_UNUSED];
-        let identity_colors = [0u32];
-        let mapping = if absorb {
-            vk::RenderingInputAttachmentIndexInfoKHR::default()
-                .color_attachment_input_indices(&custom_colors)
-                .depth_input_attachment_index(&depth_input_index)
-        } else {
-            vk::RenderingInputAttachmentIndexInfoKHR::default()
-                .color_attachment_input_indices(&identity_colors)
-        };
-        unsafe { lr.cmd_set_rendering_input_attachment_indices(self.cmd, &mapping) };
     }
 
     /// Pushes `view_proj` to `layout_debug` for the immediate debug geometry.
@@ -959,9 +927,7 @@ impl<'a> RenderPass<'a> {
             // Sampleable depth rest: see `sampleable_depth_rest_barrier`.
             // Skipped when nothing samples; the next begin is UNDEFINED.
             if self.sample_depth {
-                images[n] = self
-                    .r
-                    .sampleable_depth_rest_barrier(self.slot, self.absorb_this_frame);
+                images[n] = self.r.sampleable_depth_rest_barrier(self.slot);
                 n += 1;
             }
             if classify_vrs {
