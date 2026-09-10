@@ -577,9 +577,9 @@ impl<'a> RenderPass<'a> {
 
     /// Draws every non-empty arena partition of one cull group with `pipeline`.
     /// [`GpuTimer::mark`] is a no-op when the group recorded nothing, so empty
-    /// groups account 0 instead of a timestamp.
+    /// groups account 0 instead of a timestamp. Pipeline-statistics queries
+    /// are skipped for the same empty groups (no `vkCmdBeginQuery`/`EndQuery`).
     unsafe fn record_group_indirect_count(&self, group: cull::Group, pipeline: vk::Pipeline) {
-        self.pipe_begin_group(group);
         let mut calls = 0u32;
         if let Some(frame) = &self.r.cull_frame {
             let span = frame.arena_count * cull::BUCKETS;
@@ -588,6 +588,7 @@ impl<'a> RenderPass<'a> {
                 .iter()
                 .all(|p| p.capacity == 0)
             {
+                self.pipe_begin_group(group);
                 self.r.gpu_timer.recorded(self.slot);
                 unsafe { self.bind_mesh3d_state() };
                 let device = &self.r.device.device;
@@ -628,6 +629,7 @@ impl<'a> RenderPass<'a> {
                         }
                     }
                 }
+                self.pipe_end_group(group);
             }
         }
         if let Some(frame) = &self.r.cull_frame {
@@ -646,7 +648,6 @@ impl<'a> RenderPass<'a> {
             cull::Group::Cutout => {}
         }
         self.stamp_group(group);
-        self.pipe_end_group(group);
     }
 
     /// GPU timestamp closing `group`'s draws. No-op when profiling is off or
@@ -675,6 +676,8 @@ impl<'a> RenderPass<'a> {
         }
     }
 
+    /// Opens the group's pipeline-statistics query. Caller records this only
+    /// when the group has at least one non-zero-capacity partition.
     fn pipe_begin_group(&self, group: cull::Group) {
         if !crate::profile::is_enabled() {
             return;
