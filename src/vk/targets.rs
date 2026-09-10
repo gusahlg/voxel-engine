@@ -9,7 +9,7 @@ use super::SampleCount;
 use super::buffers::FRAMES_IN_FLIGHT;
 use super::image::{
     AllocError, ImageDesc, ImageResource, allocate_and_bind_image, create_image_array,
-    image_purpose,
+    image_purpose, render_target_oom_message,
 };
 
 /// Lowest render scale the allocation-failure ladder will try.
@@ -44,6 +44,31 @@ pub(crate) fn next_lower(msaa: SampleCount, scale: f32) -> Option<(SampleCount, 
             stepped
         },
     ))
+}
+
+/// Walk the MSAA/scale ladder from `(msaa, scale)` inclusive.
+///
+/// `try_alloc` is called at each rung. `Ok` accepts that configuration;
+/// `Err` logs the allocation failure and tries [`next_lower`]. Returns `None`
+/// when the floor is reached without a success.
+pub(crate) fn walk_ladder<T>(
+    mut msaa: SampleCount,
+    mut scale: f32,
+    mut try_alloc: impl FnMut(SampleCount, f32) -> Result<T, AllocError>,
+) -> Option<(T, SampleCount, f32)> {
+    loop {
+        match try_alloc(msaa, scale) {
+            Ok(t) => return Some((t, msaa, scale)),
+            Err(err) => log::warn!("{}", render_target_oom_message(&err)),
+        }
+        match next_lower(msaa, scale) {
+            Some((m, s)) => {
+                msaa = m;
+                scale = s;
+            }
+            None => return None,
+        }
+    }
 }
 
 const SLOTS: usize = FRAMES_IN_FLIGHT as usize;
@@ -1030,6 +1055,58 @@ mod tests {
     #[test]
     fn next_lower_from_1x_half_scale_is_none() {
         assert_eq!(next_lower(SampleCount::X1, 0.5), None);
+    }
+
+    #[test]
+    fn walk_ladder_starts_at_request_and_stops_on_success() {
+        let oom = AllocError::new(0, "test", vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+
+        // Inclusive start: the requested rung is tried before next_lower.
+        let mut tried = Vec::new();
+        let got = walk_ladder(SampleCount::X8, 2.0, |msaa, scale| {
+            tried.push((msaa, scale));
+            if msaa == SampleCount::X2 {
+                Ok("ok")
+            } else {
+                Err(oom.clone())
+            }
+        });
+        assert_eq!(got, Some(("ok", SampleCount::X2, 2.0)));
+        assert_eq!(
+            tried,
+            [
+                (SampleCount::X8, 2.0),
+                (SampleCount::X4, 2.0),
+                (SampleCount::X2, 2.0),
+            ]
+        );
+
+        // Floor failure yields None after trying the last rung once.
+        let mut floor_tried = 0u32;
+        assert!(
+            walk_ladder(SampleCount::X1, 0.5, |msaa, scale| {
+                floor_tried += 1;
+                assert_eq!((msaa, scale), (SampleCount::X1, 0.5));
+                Err::<&str, _>(oom.clone())
+            })
+            .is_none()
+        );
+        assert_eq!(floor_tried, 1);
+
+        // Retain: start at next_lower(request) and Ok-stop on the live rung
+        // without descending further.
+        let mut retain_tried = Vec::new();
+        let live = SampleCount::X2;
+        let got = walk_ladder(SampleCount::X4, 2.0, |msaa, _scale| {
+            retain_tried.push(msaa);
+            if msaa == live {
+                Ok(None::<&str>)
+            } else {
+                Err(oom.clone())
+            }
+        });
+        assert_eq!(got, Some((None, SampleCount::X2, 2.0)));
+        assert_eq!(retain_tried, [SampleCount::X4, SampleCount::X2]);
     }
 
     #[test]

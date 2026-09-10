@@ -66,7 +66,7 @@ use compute::{ComputeLane, ComputeRuntime};
 use device::Device;
 use frame_loop::{DrawEntry, DrawRun, PendingSubmit};
 use gpu_timer::{GpuPipeStats, GpuTimer};
-use image::{AllocError, ImageDesc, ImageResource, render_target_oom_message};
+use image::{AllocError, ImageDesc, ImageResource};
 use instance::InstanceBundle;
 use materials::MaterialTable;
 use mesh_staging::MeshStagingPool;
@@ -74,7 +74,7 @@ use minimap::MinimapTexture;
 use pipeline::Pipelines;
 use render_client::{Capture, DeviceCaps, DeviceLeftovers, InitReply, RenderConfig, RenderReturn};
 use swapchain::Swapchain;
-use targets::{RenderTargets, next_lower};
+use targets::{RenderTargets, walk_ladder};
 use texture::FontAtlas;
 use timeline::{BinarySemaphore, Timeline, TimelineValue};
 use transfer::TransferLane;
@@ -284,7 +284,7 @@ impl Renderer {
             present_interval,
             flags,
         } = cfg;
-        let mut render_scale = Scale::new(render_scale).as_f32();
+        let render_scale = Scale::new(render_scale).as_f32();
 
         let device = Device::new(
             &instance.entry,
@@ -323,72 +323,55 @@ impl Renderer {
 
         let requested_msaa = resolve_msaa(msaa, device.max_msaa(), "requested");
         let requested_scale = render_scale;
-        let mut msaa = requested_msaa;
-        let mut render_extent = scaled_extent(swapchain.extent, render_scale);
         let memory_props = unsafe {
             instance
                 .instance
                 .get_physical_device_memory_properties(device.physical)
         };
-        let targets = match RenderTargets::new(
-            &instance.instance,
-            &device.device,
-            device.physical,
-            render_extent,
-            msaa,
-            device.fragment_shading_rate.as_ref(),
-        ) {
-            Ok(targets) => targets,
-            Err(err) => {
-                log::warn!("{}", render_target_oom_message(&err));
-                let original = err;
-                let mut applied = None;
-                while let Some((next_msaa, next_scale)) = next_lower(msaa, render_scale) {
-                    msaa = next_msaa;
-                    render_scale = next_scale;
-                    render_extent = scaled_extent(swapchain.extent, render_scale);
-                    match RenderTargets::new(
-                        &instance.instance,
-                        &device.device,
-                        device.physical,
-                        render_extent,
-                        msaa,
-                        device.fragment_shading_rate.as_ref(),
-                    ) {
-                        Ok(targets) => {
-                            log::warn!(
-                                "renderer: render targets fell back to MSAA {} / render scale {} (requested {} / {})",
-                                msaa.as_u32(),
-                                render_scale,
-                                requested_msaa.as_u32(),
-                                requested_scale,
-                            );
-                            applied = Some(targets);
-                            break;
-                        }
-                        Err(err) => {
-                            log::warn!("{}", render_target_oom_message(&err));
-                        }
-                    }
+        let mut first_err = None;
+        let walked = walk_ladder(requested_msaa, requested_scale, |msaa, scale| {
+            RenderTargets::new(
+                &instance.instance,
+                &device.device,
+                device.physical,
+                scaled_extent(swapchain.extent, scale),
+                msaa,
+                device.fragment_shading_rate.as_ref(),
+            )
+            .inspect_err(|err| {
+                if first_err.is_none() {
+                    first_err = Some(err.clone());
                 }
-                match applied {
-                    Some(targets) => targets,
-                    None => {
-                        abort_build(
-                            instance,
-                            surface_loader,
-                            surface,
-                            device,
-                            transfer_lane,
-                            swapchain,
-                            None,
-                            None,
-                        );
-                        return Err(original);
-                    }
+            })
+        });
+        let (targets, msaa, render_scale) = match walked {
+            Some((targets, msaa, scale)) => {
+                if msaa != requested_msaa || (scale - requested_scale).abs() > f32::EPSILON {
+                    log::warn!(
+                        "renderer: render targets fell back to MSAA {} / render scale {} (requested {} / {})",
+                        msaa.as_u32(),
+                        scale,
+                        requested_msaa.as_u32(),
+                        requested_scale,
+                    );
                 }
+                (targets, msaa, scale)
+            }
+            None => {
+                abort_build(
+                    instance,
+                    surface_loader,
+                    surface,
+                    device,
+                    transfer_lane,
+                    swapchain,
+                    None,
+                    None,
+                );
+                return Err(first_err.expect("request rung was attempted"));
             }
         };
+        let render_extent = scaled_extent(swapchain.extent, render_scale);
         let taa = match taa::TaaState::new(&device.device, &memory_props, swapchain.extent) {
             Ok(taa) => taa,
             Err(err) => {

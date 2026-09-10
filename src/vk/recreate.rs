@@ -11,7 +11,7 @@ use super::image::render_target_oom_message;
 use super::pipeline::Pipelines;
 use super::render_client::RenderReturn;
 use super::swapchain::Swapchain;
-use super::targets::{RenderTargets, next_lower};
+use super::targets::{RenderTargets, next_lower, walk_ladder};
 use super::{Renderer, SampleCount, create_present_semaphores, scaled_extent};
 
 /// Whether to keep live render targets or free them after the requested rung
@@ -221,90 +221,74 @@ impl Renderer {
                         prev_msaa,
                         prev_scale,
                     );
-                    let mut found = None;
-                    match strategy {
-                        RecreateOomStrategy::FreeFirst => {
-                            log::info!(
-                                "renderer: freeing previous render targets before walking the ladder (requested MSAA {} / scale {}, previous {} / {})",
-                                requested_msaa.as_u32(),
-                                requested_scale,
-                                prev_msaa.as_u32(),
-                                prev_scale,
-                            );
-                            // Device is already idle from the wait at the start
-                            // of `apply_pending`.
-                            self.targets.destroy(&self.device.device);
-                            let mut msaa = requested_msaa;
-                            let mut scale = requested_scale;
-                            loop {
-                                let extent = scaled_extent(self.swapchain.extent, scale);
-                                match RenderTargets::new(
-                                    &self.instance.instance,
-                                    &self.device.device,
-                                    self.device.physical,
-                                    extent,
-                                    msaa,
-                                    self.device.fragment_shading_rate.as_ref(),
-                                ) {
-                                    Ok(new_targets) => {
-                                        found = Some((new_targets, msaa, scale, extent));
-                                        break;
-                                    }
-                                    Err(err) => {
-                                        log::warn!("{}", render_target_oom_message(&err));
-                                    }
-                                }
-                                match next_lower(msaa, scale) {
-                                    Some((next_msaa, next_scale)) => {
-                                        msaa = next_msaa;
-                                        scale = next_scale;
-                                    }
-                                    None => break,
-                                }
+                    let found = {
+                        let instance = &self.instance.instance;
+                        let vk_device = &self.device.device;
+                        let physical = self.device.physical;
+                        let fsr = self.device.fragment_shading_rate.as_ref();
+                        let swapchain_extent = self.swapchain.extent;
+                        let try_alloc = |msaa: SampleCount, scale: f32| {
+                            RenderTargets::new(
+                                instance,
+                                vk_device,
+                                physical,
+                                scaled_extent(swapchain_extent, scale),
+                                msaa,
+                                fsr,
+                            )
+                        };
+                        let pack = |targets, msaa, scale| {
+                            (targets, msaa, scale, scaled_extent(swapchain_extent, scale))
+                        };
+                        match strategy {
+                            RecreateOomStrategy::FreeFirst => {
+                                log::info!(
+                                    "renderer: freeing previous render targets before walking the ladder (requested MSAA {} / scale {}, previous {} / {})",
+                                    requested_msaa.as_u32(),
+                                    requested_scale,
+                                    prev_msaa.as_u32(),
+                                    prev_scale,
+                                );
+                                // Device is already idle from the wait at the start
+                                // of `apply_pending`.
+                                self.targets.destroy(vk_device);
+                                walk_ladder(requested_msaa, requested_scale, try_alloc)
+                                    .map(|(targets, msaa, scale)| pack(targets, msaa, scale))
+                            }
+                            RecreateOomStrategy::Retain => {
+                                log::info!(
+                                    "renderer: retaining previous render targets (MSAA {} / scale {}); requested MSAA {} / scale {} did not fit",
+                                    prev_msaa.as_u32(),
+                                    prev_scale,
+                                    requested_msaa.as_u32(),
+                                    requested_scale,
+                                );
+                                next_lower(requested_msaa, requested_scale).and_then(
+                                    |(msaa, scale)| {
+                                        walk_ladder(msaa, scale, |msaa, scale| {
+                                            let extent = scaled_extent(swapchain_extent, scale);
+                                            // Live images already match this rung: do not
+                                            // allocate a second copy, and do not walk below
+                                            // a working config.
+                                            if msaa == prev_msaa
+                                                && (scale - prev_scale).abs() <= f32::EPSILON
+                                                && prev_extent.width == extent.width
+                                                && prev_extent.height == extent.height
+                                            {
+                                                return Ok(None);
+                                            }
+                                            try_alloc(msaa, scale).map(Some)
+                                        })
+                                        .and_then(
+                                            |(targets, msaa, scale)| {
+                                                targets.map(|t| pack(t, msaa, scale))
+                                            },
+                                        )
+                                    },
+                                )
                             }
                         }
-                        RecreateOomStrategy::Retain => {
-                            log::info!(
-                                "renderer: retaining previous render targets (MSAA {} / scale {}); requested MSAA {} / scale {} did not fit",
-                                prev_msaa.as_u32(),
-                                prev_scale,
-                                requested_msaa.as_u32(),
-                                requested_scale,
-                            );
-                            let mut msaa = requested_msaa;
-                            let mut scale = requested_scale;
-                            while let Some((next_msaa, next_scale)) = next_lower(msaa, scale) {
-                                msaa = next_msaa;
-                                scale = next_scale;
-                                let extent = scaled_extent(self.swapchain.extent, scale);
-                                // Live images already match this rung: do not allocate a
-                                // second copy, and do not walk below a working config.
-                                let already_live = next_msaa == prev_msaa
-                                    && (next_scale - prev_scale).abs() <= f32::EPSILON
-                                    && prev_extent.width == extent.width
-                                    && prev_extent.height == extent.height;
-                                if already_live {
-                                    break;
-                                }
-                                match RenderTargets::new(
-                                    &self.instance.instance,
-                                    &self.device.device,
-                                    self.device.physical,
-                                    extent,
-                                    next_msaa,
-                                    self.device.fragment_shading_rate.as_ref(),
-                                ) {
-                                    Ok(new_targets) => {
-                                        found = Some((new_targets, next_msaa, next_scale, extent));
-                                        break;
-                                    }
-                                    Err(err) => {
-                                        log::warn!("{}", render_target_oom_message(&err));
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    };
                     if let Some((new_targets, msaa, scale, extent)) = found {
                         let fell_back = msaa != requested_msaa
                             || (scale - requested_scale).abs() > f32::EPSILON;
