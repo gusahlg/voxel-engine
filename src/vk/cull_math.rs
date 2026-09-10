@@ -1,5 +1,7 @@
 use super::arena::ArenaDirectory;
-use super::buffers::{DrawIndexedIndirect, MESH_FLAG_FACE_RUNS, MeshRecord};
+#[cfg(test)]
+use super::buffers::MESH_FLAG_FACE_RUNS;
+use super::buffers::{DrawIndexedIndirect, MeshRecord};
 use super::pipeline::EyeSplit;
 use crate::camera::Frustum;
 
@@ -71,18 +73,20 @@ fn lod_aabb_inside_slab(mn: [f32; 3], mx: [f32; 3], clip: f32, clip_v: f32) -> b
 }
 
 /// Camera-distance bucket of an AABB centre, matching `cull.comp.slang`.
+/// Splits are 16/64/256 (powers of two), so comparing `dist²` against `split²`
+/// is exact and skips the `sqrt`.
+#[cfg(test)]
+#[inline(always)]
 fn distance_bucket(dist: f32) -> u32 {
-    let mut b = 0u32;
-    if dist >= crate::genconst::CULL_BUCKET_SPLIT_0 {
-        b = 1;
-    }
-    if dist >= crate::genconst::CULL_BUCKET_SPLIT_1 {
-        b = 2;
-    }
-    if dist >= crate::genconst::CULL_BUCKET_SPLIT_2 {
-        b = 3;
-    }
-    b.min(crate::genconst::CULL_DISTANCE_BUCKETS - 1)
+    distance_bucket_sq(dist * dist)
+}
+
+#[inline(always)]
+fn distance_bucket_sq(d2: f32) -> u32 {
+    const S0: f32 = crate::genconst::CULL_BUCKET_SPLIT_0;
+    const S1: f32 = crate::genconst::CULL_BUCKET_SPLIT_1;
+    const S2: f32 = crate::genconst::CULL_BUCKET_SPLIT_2;
+    u32::from(d2 >= S0 * S0) + u32::from(d2 >= S1 * S1) + u32::from(d2 >= S2 * S2)
 }
 
 pub(crate) fn cpu_cull_max() -> u32 {
@@ -93,8 +97,30 @@ pub(crate) fn cpu_cull_max() -> u32 {
 }
 
 /// P-vertex test matching `outside_plane` in `cull.comp.slang` and
-/// [`Frustum::intersects_aabb`].
+/// [`Frustum::intersects_aabb`]. Branch-free: `max(n·mn, n·mx)` selects the
+/// p-vertex for each axis without a sign compare (valid when `mn <= mx`).
+#[inline(always)]
 fn outside_plane(plane: [f32; 4], mn: [f32; 3], mx: [f32; 3]) -> bool {
+    let d = f32::max(plane[0] * mn[0], plane[0] * mx[0])
+        + f32::max(plane[1] * mn[1], plane[1] * mx[1])
+        + f32::max(plane[2] * mn[2], plane[2] * mx[2])
+        + plane[3];
+    d < 0.0
+}
+
+#[inline(always)]
+fn aabb_in_planes(planes: &[[f32; 4]; 5], mn: [f32; 3], mx: [f32; 3]) -> bool {
+    u32::from(outside_plane(planes[0], mn, mx))
+        | u32::from(outside_plane(planes[1], mn, mx))
+        | u32::from(outside_plane(planes[2], mn, mx))
+        | u32::from(outside_plane(planes[3], mn, mx))
+        | u32::from(outside_plane(planes[4], mn, mx))
+        == 0
+}
+
+/// Legacy p-vertex used by [`cpu_cull_legacy`]: the shader's `?:` form.
+#[cfg(test)]
+fn outside_plane_select(plane: [f32; 4], mn: [f32; 3], mx: [f32; 3]) -> bool {
     let corner = [
         if plane[0] >= 0.0 { mx[0] } else { mn[0] },
         if plane[1] >= 0.0 { mx[1] } else { mn[1] },
@@ -103,8 +129,9 @@ fn outside_plane(plane: [f32; 4], mn: [f32; 3], mx: [f32; 3]) -> bool {
     plane[0] * corner[0] + plane[1] * corner[1] + plane[2] * corner[2] + plane[3] < 0.0
 }
 
-fn aabb_in_planes(planes: &[[f32; 4]], mn: [f32; 3], mx: [f32; 3]) -> bool {
-    planes.iter().all(|p| !outside_plane(*p, mn, mx))
+#[cfg(test)]
+fn aabb_in_planes_select(planes: &[[f32; 4]], mn: [f32; 3], mx: [f32; 3]) -> bool {
+    planes.iter().all(|p| !outside_plane_select(*p, mn, mx))
 }
 
 fn slot_visible(visible: &[u32], slot: u32) -> bool {
@@ -113,8 +140,35 @@ fn slot_visible(visible: &[u32], slot: u32) -> bool {
         .is_some_and(|w| w & (1 << (slot & 31)) != 0)
 }
 
+/// Persistent CPU-cull staging: per-partition command lists and counts stay in
+/// cache-resident host memory across frames (inner capacity retained).
+/// Host-visible (write-combined) buffers are filled with one contiguous copy
+/// per partition, never by scattered per-slot stores.
+#[derive(Default)]
+pub(crate) struct CpuCullScratch {
+    pub part_cmds: Vec<Vec<DrawIndexedIndirect>>,
+    pub counts: Vec<u32>,
+    live_vis: Vec<u32>,
+}
+
+#[cfg(test)]
+fn flatten_part_cmds(
+    part_cmds: &[Vec<DrawIndexedIndirect>],
+    partitions: &[PartitionGpu],
+) -> Vec<DrawIndexedIndirect> {
+    let total: usize = partitions.iter().map(|p| p.capacity as usize).sum();
+    let mut cmds = vec![bytemuck::Zeroable::zeroed(); total];
+    for (i, p) in partitions.iter().enumerate() {
+        let src = &part_cmds[i];
+        let start = p.offset as usize;
+        cmds[start..start + src.len()].copy_from_slice(src);
+    }
+    cmds
+}
+
 /// Camera-relative AABB and decoded scale, matching the shader's
 /// `offset / mn / mx / scale` reconstruction.
+#[cfg(test)]
 fn cam_relative_aabb(rec: &MeshRecord, eye: EyeSplit) -> ([f32; 3], [f32; 3], f32) {
     let scale = rec.detail_scale();
     let offset = [
@@ -202,6 +256,7 @@ fn merge_face_runs(vis: [bool; 6], bounds: [u32; 7], out: &mut [FaceRun; 3]) -> 
     n
 }
 
+#[cfg(test)]
 fn emit_cmd(
     part: usize,
     cmd: DrawIndexedIndirect,
@@ -216,9 +271,223 @@ fn emit_cmd(
     }
 }
 
+#[inline(always)]
+fn emit_part(
+    part: usize,
+    cmd: DrawIndexedIndirect,
+    partitions: &[PartitionGpu],
+    part_cmds: &mut [Vec<DrawIndexedIndirect>],
+    counts: &mut [u32],
+) {
+    let i = counts[part];
+    counts[part] = i + 1;
+    if i < partitions[part].capacity {
+        part_cmds[part].push(cmd);
+    }
+}
+
+#[inline(always)]
+fn cam_relative_soa(
+    aabb: [f32; 6],
+    block: [i32; 3],
+    eye_block: [i32; 3],
+    eye_frac: [f32; 3],
+) -> ([f32; 3], [f32; 3]) {
+    let dx = (block[0] - eye_block[0]) as f32 - eye_frac[0];
+    let dy = (block[1] - eye_block[1]) as f32 - eye_frac[1];
+    let dz = (block[2] - eye_block[2]) as f32 - eye_frac[2];
+    (
+        [aabb[0] + dx, aabb[1] + dy, aabb[2] + dz],
+        [aabb[3] + dx, aabb[4] + dy, aabb[5] + dz],
+    )
+}
+
+/// Precompute the per-frame live ∩ (visible ∨ shadows) bitset. Arrival is
+/// tested in the hot loop so a constant-true `is_arrived` can be DCE'd.
+fn build_live_vis(
+    live_bits: &[u32],
+    visible: &[u32],
+    slot_count: u32,
+    shadow: bool,
+    out: &mut Vec<u32>,
+) {
+    let words = slot_count.div_ceil(32) as usize;
+    out.clear();
+    out.resize(words, 0);
+    if words == 0 {
+        return;
+    }
+    if shadow {
+        let n = words.min(live_bits.len());
+        out[..n].copy_from_slice(&live_bits[..n]);
+    } else {
+        let n = words.min(live_bits.len()).min(visible.len());
+        for i in 0..n {
+            out[i] = live_bits[i] & visible[i];
+        }
+    }
+    let rem = slot_count % 32;
+    if rem != 0 {
+        out[words - 1] &= (1u32 << rem) - 1;
+    }
+}
+
+/// Host re-implementation of `computeMain` in `cull.comp.slang`. Writes
+/// `DrawCmd`s at partition offsets and per-partition counts into `scratch`
+/// (capacity retained across frames).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cpu_cull_into(
+    _records: &[MeshRecord],
+    dir: &ArenaDirectory,
+    is_arrived: impl Fn(u32) -> bool,
+    visible: &[u32],
+    partitions: &[PartitionGpu],
+    camera: &Frustum,
+    shadow: Option<&[Frustum; 2]>,
+    eye: EyeSplit,
+    slot_count: u32,
+    clip: f32,
+    clip_v: f32,
+    face_cull: bool,
+    scratch: &mut CpuCullScratch,
+) -> [u32; STATS_COUNT] {
+    let npart = partitions.len();
+    if scratch.part_cmds.len() < npart {
+        scratch.part_cmds.resize_with(npart, Vec::new);
+    }
+    for v in &mut scratch.part_cmds[..npart] {
+        v.clear();
+    }
+    scratch.counts.clear();
+    scratch.counts.resize(npart, 0);
+
+    let shadow_on = shadow.is_some();
+    build_live_vis(
+        dir.live_bits(),
+        visible,
+        slot_count,
+        shadow_on,
+        &mut scratch.live_vis,
+    );
+
+    let cam_planes = camera.planes().map(|p| p.to_array());
+    let shadow_planes = shadow.map(|frusta| {
+        [
+            frusta[0].planes().map(|p| p.to_array()),
+            frusta[1].planes().map(|p| p.to_array()),
+        ]
+    });
+
+    match (face_cull, shadow_on) {
+        (false, false) => cull_fast_solid(
+            dir,
+            is_arrived,
+            partitions,
+            &cam_planes,
+            clip,
+            clip_v,
+            slot_count,
+            &scratch.live_vis,
+            &mut scratch.part_cmds,
+            &mut scratch.counts,
+            eye.block,
+            eye.frac,
+        ),
+        (false, true) => cull_slots::<false, true>(
+            dir,
+            is_arrived,
+            partitions,
+            &cam_planes,
+            shadow_planes.as_ref(),
+            visible,
+            eye,
+            clip,
+            clip_v,
+            slot_count,
+            &scratch.live_vis,
+            &mut scratch.part_cmds,
+            &mut scratch.counts,
+        ),
+        (true, false) => cull_slots::<true, false>(
+            dir,
+            is_arrived,
+            partitions,
+            &cam_planes,
+            None,
+            visible,
+            eye,
+            clip,
+            clip_v,
+            slot_count,
+            &scratch.live_vis,
+            &mut scratch.part_cmds,
+            &mut scratch.counts,
+        ),
+        (true, true) => cull_slots::<true, true>(
+            dir,
+            is_arrived,
+            partitions,
+            &cam_planes,
+            shadow_planes.as_ref(),
+            visible,
+            eye,
+            clip,
+            clip_v,
+            slot_count,
+            &scratch.live_vis,
+            &mut scratch.part_cmds,
+            &mut scratch.counts,
+        ),
+    }
+}
+
 /// Host re-implementation of `computeMain` in `cull.comp.slang`. Writes
 /// `DrawCmd`s at partition offsets and per-partition counts.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cpu_cull(
+    records: &[MeshRecord],
+    dir: &ArenaDirectory,
+    is_arrived: impl Fn(u32) -> bool,
+    visible: &[u32],
+    partitions: &[PartitionGpu],
+    camera: &Frustum,
+    shadow: Option<&[Frustum; 2]>,
+    eye: EyeSplit,
+    slot_count: u32,
+    clip: f32,
+    clip_v: f32,
+    face_cull: bool,
+) -> (Vec<DrawIndexedIndirect>, Vec<u32>, [u32; STATS_COUNT]) {
+    let mut scratch = CpuCullScratch::default();
+    let stats = cpu_cull_into(
+        records,
+        dir,
+        is_arrived,
+        visible,
+        partitions,
+        camera,
+        shadow,
+        eye,
+        slot_count,
+        clip,
+        clip_v,
+        face_cull,
+        &mut scratch,
+    );
+    (
+        flatten_part_cmds(&scratch.part_cmds, partitions),
+        scratch.counts,
+        stats,
+    )
+}
+
+/// Pre-SoA CPU cull: walks `0..slot_count`, loads the 80-byte [`MeshRecord`],
+/// and uses the shader's `?:` p-vertex. Kept as the emission reference for
+/// the old-vs-new test.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn cpu_cull_legacy(
     records: &[MeshRecord],
     dir: &ArenaDirectory,
     is_arrived: impl Fn(u32) -> bool,
@@ -274,7 +543,7 @@ pub(crate) fn cpu_cull(
             first_instance: slot,
         };
 
-        if cam_visible && aabb_in_planes(&cam_planes, mn, mx) {
+        if cam_visible && aabb_in_planes_select(&cam_planes, mn, mx) {
             let group = if pass == 0 && scale > 1.0 { 2 } else { pass };
             if group != 2 || !lod_aabb_inside_slab(mn, mx, clip, clip_v) {
                 let cx = 0.5 * (mn[0] + mx[0]);
@@ -308,25 +577,229 @@ pub(crate) fn cpu_cull(
             }
         }
 
-        if pass == 0 && scale <= 1.0 {
-            if let Some(planes) = &shadow_planes {
-                let shadow_base =
-                    CAMERA_GROUPS as u32 * arena_count * crate::genconst::CULL_DISTANCE_BUCKETS;
-                for c in 0..2 {
-                    if aabb_in_planes(&planes[c], mn, mx) {
-                        emit_cmd(
-                            (shadow_base + c as u32 * arena_count + arena) as usize,
-                            cmd,
-                            partitions,
-                            &mut cmds,
-                            &mut counts,
-                        );
-                    }
+        if pass == 0
+            && scale <= 1.0
+            && let Some(planes) = &shadow_planes
+        {
+            let shadow_base =
+                CAMERA_GROUPS as u32 * arena_count * crate::genconst::CULL_DISTANCE_BUCKETS;
+            for (c, plane) in planes.iter().enumerate() {
+                if aabb_in_planes_select(plane, mn, mx) {
+                    emit_cmd(
+                        (shadow_base + c as u32 * arena_count + arena) as usize,
+                        cmd,
+                        partitions,
+                        &mut cmds,
+                        &mut counts,
+                    );
                 }
             }
         }
     }
     (cmds, counts, stats)
+}
+
+/// Solid (no face-runs, no shadows) hot path: no per-slot Option, no MeshRecord.
+#[allow(clippy::too_many_arguments)]
+fn cull_fast_solid(
+    dir: &ArenaDirectory,
+    is_arrived: impl Fn(u32) -> bool,
+    partitions: &[PartitionGpu],
+    cam_planes: &[[f32; 4]; 5],
+    clip: f32,
+    clip_v: f32,
+    slot_count: u32,
+    live_vis: &[u32],
+    part_cmds: &mut [Vec<DrawIndexedIndirect>],
+    counts: &mut [u32],
+    eye_block: [i32; 3],
+    eye_frac: [f32; 3],
+) -> [u32; STATS_COUNT] {
+    let mut stats = [0u32; STATS_COUNT];
+    let aabbs = dir.cull_aabbs();
+    let blocks = dir.cull_blocks();
+    let bits_soa = dir.cull_bits();
+    let index_counts = dir.cull_index_counts();
+    let vertex_offsets = dir.cull_vertex_offsets();
+    let arena_count = dir.arena_count() as u32;
+    let buckets = crate::genconst::CULL_DISTANCE_BUCKETS;
+
+    for slot in 0..slot_count {
+        let w = (slot >> 5) as usize;
+        if unsafe { *live_vis.get_unchecked(w) } & (1u32 << (slot & 31)) == 0 {
+            continue;
+        }
+        if !is_arrived(slot) {
+            continue;
+        }
+        let i = slot as usize;
+        let bits = unsafe { *bits_soa.get_unchecked(i) };
+        if bits == 0 {
+            continue;
+        }
+        let aabb = unsafe { *aabbs.get_unchecked(i) };
+        let block = unsafe { *blocks.get_unchecked(i) };
+        let (mn, mx) = cam_relative_soa(aabb, block, eye_block, eye_frac);
+        if !aabb_in_planes(cam_planes, mn, mx) {
+            continue;
+        }
+        let pass = super::arena::cull_bits_pass(bits);
+        let lod = super::arena::cull_bits_lod(bits);
+        let group = if pass == 0 && lod { 2 } else { pass };
+        if group == 2 && lod_aabb_inside_slab(mn, mx, clip, clip_v) {
+            continue;
+        }
+        let cx = 0.5 * (mn[0] + mx[0]);
+        let cy = 0.5 * (mn[1] + mx[1]);
+        let cz = 0.5 * (mn[2] + mx[2]);
+        let bucket = distance_bucket_sq(cx * cx + cy * cy + cz * cz);
+        let arena = super::arena::cull_bits_arena(bits) - 1;
+        let part = ((group * arena_count + arena) * buckets + bucket) as usize;
+        let cmd = DrawIndexedIndirect {
+            index_count: unsafe { *index_counts.get_unchecked(i) },
+            instance_count: 1,
+            first_index: 0,
+            vertex_offset: unsafe { *vertex_offsets.get_unchecked(i) },
+            first_instance: slot,
+        };
+        emit_part(part, cmd, partitions, part_cmds, counts);
+        stats[group as usize * 2] += 1;
+        stats[group as usize * 2 + 1] += cmd.index_count;
+    }
+    stats
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cull_slots<const FACE: bool, const SHADOW: bool>(
+    dir: &ArenaDirectory,
+    is_arrived: impl Fn(u32) -> bool,
+    partitions: &[PartitionGpu],
+    cam_planes: &[[f32; 4]; 5],
+    shadow_planes: Option<&[[[f32; 4]; 5]; 2]>,
+    visible: &[u32],
+    eye: EyeSplit,
+    clip: f32,
+    clip_v: f32,
+    slot_count: u32,
+    live_vis: &[u32],
+    part_cmds: &mut [Vec<DrawIndexedIndirect>],
+    counts: &mut [u32],
+) -> [u32; STATS_COUNT] {
+    let mut stats = [0u32; STATS_COUNT];
+    let aabbs = dir.cull_aabbs();
+    let blocks = dir.cull_blocks();
+    let bits_soa = dir.cull_bits();
+    let index_counts = dir.cull_index_counts();
+    let vertex_offsets = dir.cull_vertex_offsets();
+    let face_quads = dir.cull_face_quads();
+    let eye_block = eye.block;
+    let eye_frac = eye.frac;
+    let arena_count = dir.arena_count() as u32;
+    let buckets = crate::genconst::CULL_DISTANCE_BUCKETS;
+    let shadow_base = CAMERA_GROUPS as u32 * arena_count * buckets;
+
+    for slot in 0..slot_count {
+        let w = (slot >> 5) as usize;
+        let bit = 1u32 << (slot & 31);
+        if unsafe { live_vis.get_unchecked(w) } & bit == 0 {
+            continue;
+        }
+        if !is_arrived(slot) {
+            continue;
+        }
+        let i = slot as usize;
+        let bits = unsafe { *bits_soa.get_unchecked(i) };
+        if bits == 0 {
+            continue;
+        }
+        let aabb = unsafe { *aabbs.get_unchecked(i) };
+        let block = unsafe { *blocks.get_unchecked(i) };
+        let (mn, mx) = cam_relative_soa(aabb, block, eye_block, eye_frac);
+        let pass = super::arena::cull_bits_pass(bits);
+        let lod = super::arena::cull_bits_lod(bits);
+        let arena = super::arena::cull_bits_arena(bits) - 1;
+        let cam_visible = !SHADOW || slot_visible(visible, slot);
+
+        let mut cam_ok = false;
+        let mut group = 0u32;
+        let mut part = 0usize;
+        if cam_visible && aabb_in_planes(cam_planes, mn, mx) {
+            group = if pass == 0 && lod { 2 } else { pass };
+            if group != 2 || !lod_aabb_inside_slab(mn, mx, clip, clip_v) {
+                let cx = 0.5 * (mn[0] + mx[0]);
+                let cy = 0.5 * (mn[1] + mx[1]);
+                let cz = 0.5 * (mn[2] + mx[2]);
+                let bucket = distance_bucket_sq(cx * cx + cy * cy + cz * cz);
+                part = ((group * arena_count + arena) * buckets + bucket) as usize;
+                cam_ok = true;
+            }
+        }
+        let mut sh0 = false;
+        let mut sh1 = false;
+        if SHADOW
+            && pass == 0
+            && !lod
+            && let Some(planes) = shadow_planes
+        {
+            sh0 = aabb_in_planes(&planes[0], mn, mx);
+            sh1 = aabb_in_planes(&planes[1], mn, mx);
+        }
+        if !cam_ok && !sh0 && !sh1 {
+            continue;
+        }
+
+        let cmd = DrawIndexedIndirect {
+            index_count: unsafe { *index_counts.get_unchecked(i) },
+            instance_count: 1,
+            first_index: 0,
+            vertex_offset: unsafe { *vertex_offsets.get_unchecked(i) },
+            first_instance: slot,
+        };
+
+        if cam_ok {
+            if FACE && super::arena::cull_bits_face(bits) {
+                let vis = face_vis(mn, mx);
+                let bounds = packed_face_bounds(unsafe { *face_quads.get_unchecked(i) });
+                let mut runs = [FaceRun {
+                    first_index: 0,
+                    index_count: 0,
+                }; 3];
+                let n_runs = merge_face_runs(vis, bounds, &mut runs);
+                for run in runs.iter().take(n_runs) {
+                    let mut drawn = cmd;
+                    drawn.first_index = run.first_index;
+                    drawn.index_count = run.index_count;
+                    emit_part(part, drawn, partitions, part_cmds, counts);
+                    stats[group as usize * 2] += 1;
+                    stats[group as usize * 2 + 1] += drawn.index_count;
+                }
+            } else {
+                emit_part(part, cmd, partitions, part_cmds, counts);
+                stats[group as usize * 2] += 1;
+                stats[group as usize * 2 + 1] += cmd.index_count;
+            }
+        }
+
+        if sh0 {
+            emit_part(
+                (shadow_base + arena) as usize,
+                cmd,
+                partitions,
+                part_cmds,
+                counts,
+            );
+        }
+        if sh1 {
+            emit_part(
+                (shadow_base + arena_count + arena) as usize,
+                cmd,
+                partitions,
+                part_cmds,
+                counts,
+            );
+        }
+    }
+    stats
 }
 
 /// Partition index for a camera (pass, arena, bucket) triple.
@@ -541,6 +1014,9 @@ mod tests {
         [u32; STATS_COUNT],
     ) {
         let eye = origin_eye();
+        for (i, rec) in records.iter().enumerate() {
+            dir.note_cull_draw(i as u32, rec);
+        }
         let mut parts = Vec::new();
         let runs = if face_cull { MAX_FACE_RUNS } else { 1 };
         dir.partitions_into(&mut parts, runs, Some(eye));
@@ -820,6 +1296,305 @@ mod tests {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(CPU_CULL_MAX),
             cpu_cull_max()
+        );
+    }
+
+    #[test]
+    fn branch_free_pvertex_matches_select_for_valid_aabbs() {
+        let camera = look_neg_z();
+        let planes = camera.planes().map(|p| p.to_array());
+        let boxes = [
+            ([-1.0, -1.0, -11.0], [1.0, 1.0, -9.0]),
+            ([-1.0, -1.0, 9.0], [1.0, 1.0, 11.0]),
+            ([-1.0, -1.0, -5.0], [1.0, 1.0, 5.0]),
+            ([-10.0, -1.0, -15.0], [-5.0, 1.0, -10.0]),
+            ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
+            ([-100.0, -50.0, -200.0], [100.0, 50.0, -4.0]),
+        ];
+        for (mn, mx) in boxes {
+            assert_eq!(
+                aabb_in_planes(&planes, mn, mx),
+                aabb_in_planes_select(&planes, mn, mx),
+                "mn={mn:?} mx={mx:?}"
+            );
+        }
+    }
+
+    fn assert_same_emission(
+        parts: &[PartitionGpu],
+        a_cmds: &[DrawIndexedIndirect],
+        a_counts: &[u32],
+        a_stats: [u32; STATS_COUNT],
+        b_cmds: &[DrawIndexedIndirect],
+        b_counts: &[u32],
+        b_stats: [u32; STATS_COUNT],
+    ) {
+        assert_eq!(a_counts, b_counts, "per-partition counts");
+        assert_eq!(a_stats, b_stats, "stats histogram");
+        assert_eq!(a_counts.len(), parts.len());
+        for (i, p) in parts.iter().enumerate() {
+            let n = a_counts[i].min(p.capacity) as usize;
+            let start = p.offset as usize;
+            assert_eq!(
+                &a_cmds[start..start + n],
+                &b_cmds[start..start + n],
+                "partition {i} commands"
+            );
+        }
+    }
+
+    fn rec_pass(mn: [f32; 3], mx: [f32; 3], pass: Pass, lod: bool) -> MeshRecord {
+        let mut rec = opaque_rec(mn, mx);
+        let detail = if lod {
+            crate::mesh::Detail(1)
+        } else {
+            crate::mesh::Detail::FULL
+        };
+        rec.detail_pass = u32::from(detail.to_gpu_bits()) | ((pass as u32) << 4);
+        rec
+    }
+
+    /// Mixed synthetic slot table: holes, Blend, LOD, face-runs, Cutout,
+    /// two arenas, some hidden, some not-yet-arrived.
+    fn synthetic_slots() -> (ArenaDirectory, Vec<MeshRecord>, Vec<u32>, Vec<bool>) {
+        const N: usize = 64;
+        let mut dir = ArenaDirectory::new();
+        let mut records = vec![bytemuck::Zeroable::zeroed(); N];
+        let mut arrived = vec![true; N];
+        let mut vis_bits = vec![0u32; N.div_ceil(32)];
+        for slot in 0..N as u32 {
+            vis_bits[(slot >> 5) as usize] |= 1 << (slot & 31);
+        }
+        for slot in 0..N as u32 {
+            let i = slot as usize;
+            let z = -10.0 - (slot % 17) as f32 * 8.0;
+            let mn = [-1.0, -1.0, z - 1.0];
+            let mx = [1.0, 1.0, z + 1.0];
+            let rec = match slot % 7 {
+                0 => opaque_rec([mn[0], mn[1], 9.0], [mx[0], mx[1], 11.0]), // behind
+                1 => rec_pass(mn, mx, Pass::Cutout, false),
+                2 => rec_pass(mn, mx, Pass::Opaque, true),
+                3 => face_rec(mn, mx),
+                4 => rec_pass(mn, mx, Pass::Blend, false),
+                5 if slot % 5 == 0 => continue, // hole
+                _ => opaque_rec(mn, mx),
+            };
+            records[i] = rec;
+            let lod = rec.detail_scale() > 1.0;
+            let buf_id = 1 + u64::from(slot % 2);
+            dir.note_upload(
+                slot,
+                G1,
+                buf(buf_id),
+                rec.pass(),
+                lod,
+                MeshAabb::from_record(&rec),
+            );
+            if slot % 11 == 0 {
+                vis_bits[(slot >> 5) as usize] &= !(1 << (slot & 31));
+            }
+            if slot % 13 == 0 {
+                arrived[i] = false;
+            }
+        }
+        for (i, rec) in records.iter().enumerate() {
+            dir.note_cull_draw(i as u32, rec);
+        }
+        (dir, records, vis_bits, arrived)
+    }
+
+    #[test]
+    fn cpu_cull_new_matches_legacy_emission() {
+        let camera = look_neg_z();
+        let shadow_frusta = [look_neg_z(), look_neg_z()];
+        let (mut dir, records, visible, arrived) = synthetic_slots();
+        let is_arrived = |s: u32| arrived.get(s as usize).copied().unwrap_or(false);
+        let eye = origin_eye();
+        for face_cull in [false, true] {
+            for with_shadow in [false, true] {
+                for (clip, clip_v) in [(0.0, 0.0), (40.0, 40.0)] {
+                    let mut parts = Vec::new();
+                    let runs = if face_cull { MAX_FACE_RUNS } else { 1 };
+                    dir.partitions_into(&mut parts, runs, Some(eye));
+                    let shadow = with_shadow.then_some(&shadow_frusta);
+                    let (old_cmds, old_counts, old_stats) = cpu_cull_legacy(
+                        &records,
+                        &dir,
+                        is_arrived,
+                        &visible,
+                        &parts,
+                        &camera,
+                        shadow,
+                        eye,
+                        dir.live_end(),
+                        clip,
+                        clip_v,
+                        face_cull,
+                    );
+                    let (new_cmds, new_counts, new_stats) = cpu_cull(
+                        &records,
+                        &dir,
+                        is_arrived,
+                        &visible,
+                        &parts,
+                        &camera,
+                        shadow,
+                        eye,
+                        dir.live_end(),
+                        clip,
+                        clip_v,
+                        face_cull,
+                    );
+                    assert_same_emission(
+                        &parts,
+                        &old_cmds,
+                        &old_counts,
+                        old_stats,
+                        &new_cmds,
+                        &new_counts,
+                        new_stats,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn cpu_cull_timing_10k_slots() {
+        const N: usize = 10_000;
+        const WARMUP: u32 = 20;
+        const ITERS: u32 = 200;
+        let camera = look_neg_z();
+        let eye = origin_eye();
+        let mut dir = ArenaDirectory::new();
+        let mut records = Vec::with_capacity(N);
+        for slot in 0..N as u32 {
+            let rec = opaque_rec([-1.0, -1.0, -11.0], [1.0, 1.0, -9.0]);
+            dir.note_upload(
+                slot,
+                G1,
+                buf(1),
+                Pass::Opaque,
+                FULL,
+                MeshAabb::from_record(&rec),
+            );
+            records.push(rec);
+        }
+        for (i, rec) in records.iter().enumerate() {
+            dir.note_cull_draw(i as u32, rec);
+        }
+        let visible = vec![u32::MAX; N.div_ceil(32)];
+        let mut parts = Vec::new();
+        dir.partitions_into(&mut parts, 1, Some(eye));
+        let slot_count = dir.live_end();
+        let mut scratch = CpuCullScratch::default();
+
+        fn time_ns(iters: u32, mut body: impl FnMut()) -> f64 {
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                body();
+            }
+            start.elapsed().as_nanos() as f64 / f64::from(iters)
+        }
+
+        for _ in 0..WARMUP {
+            let _ = cpu_cull_legacy(
+                &records,
+                &dir,
+                |_| true,
+                &visible,
+                &parts,
+                &camera,
+                None,
+                eye,
+                slot_count,
+                0.0,
+                0.0,
+                false,
+            );
+            let _ = cpu_cull_into(
+                &records,
+                &dir,
+                |_| true,
+                &visible,
+                &parts,
+                &camera,
+                None,
+                eye,
+                slot_count,
+                0.0,
+                0.0,
+                false,
+                &mut scratch,
+            );
+        }
+
+        // Include the host-visible fill: old path memcpy'd the whole sparse
+        // command buffer (including unused capacity); new copies each live
+        // partition range only.
+        let total: usize = parts.iter().map(|p| p.capacity as usize).sum();
+        let mut wc_cmds = vec![0u8; total * CMD_STRIDE as usize];
+        let mut wc_counts = vec![0u8; parts.len() * 4];
+
+        let old_ns = time_ns(ITERS, || {
+            let (cmds, counts, stats) = cpu_cull_legacy(
+                &records,
+                &dir,
+                |_| true,
+                &visible,
+                &parts,
+                &camera,
+                None,
+                eye,
+                slot_count,
+                0.0,
+                0.0,
+                false,
+            );
+            let cmd_bytes: &[u8] = bytemuck::cast_slice(&cmds);
+            wc_cmds[..cmd_bytes.len()].copy_from_slice(cmd_bytes);
+            let count_bytes: &[u8] = bytemuck::cast_slice(&counts);
+            wc_counts[..count_bytes.len()].copy_from_slice(count_bytes);
+            std::hint::black_box((&wc_cmds, &wc_counts, stats));
+        });
+        let new_ns = time_ns(ITERS, || {
+            let stats = cpu_cull_into(
+                &records,
+                &dir,
+                |_| true,
+                &visible,
+                &parts,
+                &camera,
+                None,
+                eye,
+                slot_count,
+                0.0,
+                0.0,
+                false,
+                &mut scratch,
+            );
+            for (i, p) in parts.iter().enumerate() {
+                let src = &scratch.part_cmds[i];
+                if src.is_empty() {
+                    continue;
+                }
+                let bytes: &[u8] = bytemuck::cast_slice(src);
+                let start = p.offset as usize * CMD_STRIDE as usize;
+                wc_cmds[start..start + bytes.len()].copy_from_slice(bytes);
+            }
+            let count_bytes: &[u8] = bytemuck::cast_slice(&scratch.counts);
+            wc_counts[..count_bytes.len()].copy_from_slice(count_bytes);
+            std::hint::black_box((&wc_cmds, &wc_counts, stats));
+        });
+        let old_per = old_ns / N as f64;
+        let new_per = new_ns / N as f64;
+        println!(
+            "cpu_cull timing: legacy {old_per:.2} ns/slot, new {new_per:.2} ns/slot (10k slots, {ITERS} iters)"
+        );
+        assert!(
+            new_per < old_per,
+            "new path should be cheaper: {old_per:.2} -> {new_per:.2} ns/slot"
         );
     }
 }

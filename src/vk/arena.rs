@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 use ash::vk;
 use glam::Vec3;
 
-use super::buffers::MeshRecord;
+use super::buffers::{MESH_FLAG_FACE_RUNS, MeshRecord};
 use super::cull_math::{
     BUCKETS, CULL_BUCKET_SPLITS, Group, LANES, PartitionGpu, SHADOW_GROUPS, partition_count,
 };
@@ -146,6 +146,43 @@ fn bucket_intersects(bucket: usize, dmin: f32, dmax: f32) -> bool {
     }
 }
 
+/// Packed CPU-cull bits: arena word in [0, 20), pass in [20, 22), LOD in bit 22,
+/// face-runs flag in bit 23. Zero means the slot is dead to the CPU cull
+/// (freed or Blend).
+const CULL_ARENA_MASK: u32 = 0x000F_FFFF;
+const CULL_PASS_SHIFT: u32 = 20;
+const CULL_LOD_BIT: u32 = 1 << 22;
+const CULL_FACE_BIT: u32 = 1 << 23;
+
+#[inline]
+fn pack_cull_bits(arena_word: u32, pass: Pass, lod: bool) -> u32 {
+    debug_assert!(arena_word != 0 && arena_word <= CULL_ARENA_MASK);
+    let pass_u = pass as u32;
+    (arena_word & CULL_ARENA_MASK)
+        | ((pass_u & 3) << CULL_PASS_SHIFT)
+        | (u32::from(lod) * CULL_LOD_BIT)
+}
+
+#[inline]
+pub(crate) fn cull_bits_arena(bits: u32) -> u32 {
+    bits & CULL_ARENA_MASK
+}
+
+#[inline]
+pub(crate) fn cull_bits_pass(bits: u32) -> u32 {
+    (bits >> CULL_PASS_SHIFT) & 3
+}
+
+#[inline]
+pub(crate) fn cull_bits_lod(bits: u32) -> bool {
+    bits & CULL_LOD_BIT != 0
+}
+
+#[inline]
+pub(crate) fn cull_bits_face(bits: u32) -> bool {
+    bits & CULL_FACE_BIT != 0
+}
+
 /// Arena registry with live counts per (arena, lane).
 pub(crate) struct ArenaDirectory {
     buffers: Vec<vk::Buffer>,
@@ -157,6 +194,21 @@ pub(crate) struct ArenaDirectory {
     slots: Vec<Option<(u32, Option<usize>, NonZeroU32)>>,
     /// Per-slot world AABB, parallel to `slots` (only valid when the slot is live).
     aabbs: Vec<MeshAabb>,
+    /// CPU-cull SoA: block-relative AABB `[min.xyz, max.xyz]`, parallel to `slots`.
+    cull_aabb: Vec<[f32; 6]>,
+    /// CPU-cull SoA: integer block of each slot's AABB, parallel to `slots`.
+    cull_block: Vec<[i32; 3]>,
+    /// CPU-cull SoA: packed arena/pass/lod (0 = dead to cull). Parallel to `slots`.
+    cull_bits: Vec<u32>,
+    /// CPU-cull SoA: draw index count, parallel to `slots`.
+    cull_index_count: Vec<u32>,
+    /// CPU-cull SoA: vertex offset, parallel to `slots`.
+    cull_vertex_offset: Vec<i32>,
+    /// CPU-cull SoA: packed face-quad counts, parallel to `slots`.
+    cull_face_quads: Vec<[u32; 3]>,
+    /// Per-slot live-to-cull bitset (camera-group slots only). Rebuilt into the
+    /// per-frame live+visible mask; maintained on register/free.
+    live_bits: Vec<u32>,
     /// Conservative union of live camera-group AABBs per arena.
     unions: Vec<ArenaUnion>,
     /// Camera-group slots per arena (unordered). Union recompute walks these
@@ -187,6 +239,13 @@ impl ArenaDirectory {
             refs: Vec::new(),
             slots: Vec::new(),
             aabbs: Vec::new(),
+            cull_aabb: Vec::new(),
+            cull_block: Vec::new(),
+            cull_bits: Vec::new(),
+            cull_index_count: Vec::new(),
+            cull_vertex_offset: Vec::new(),
+            cull_face_quads: Vec::new(),
+            live_bits: Vec::new(),
             unions: Vec::new(),
             members: Vec::new(),
             member_pos: Vec::new(),
@@ -267,9 +326,17 @@ impl ArenaDirectory {
         if self.slots.len() < n {
             self.slots.resize(n, None);
             self.aabbs.resize(n, MeshAabb::ZERO);
+            self.cull_aabb.resize(n, [0.0; 6]);
+            self.cull_block.resize(n, [0; 3]);
+            self.cull_bits.resize(n, 0);
+            self.cull_index_count.resize(n, 0);
+            self.cull_vertex_offset.resize(n, 0);
+            self.cull_face_quads.resize(n, [0; 3]);
+            self.live_bits.resize(n.div_ceil(32), 0);
         }
         self.slots[slot as usize] = Some((arena, lane, generation));
         self.aabbs[slot as usize] = aabb;
+        self.write_cull_soa(slot, arena, lane, pass, lod, aabb);
         if lane.is_some() {
             self.set_member(arena as usize, slot, true);
             self.grow_union(arena as usize, aabb);
@@ -361,6 +428,7 @@ impl ArenaDirectory {
             }
         }
         self.aabbs[slot as usize] = aabb;
+        self.write_cull_soa(slot, arena, new_lane, pass, lod, aabb);
         if new_lane.is_some() {
             self.grow_union(arena as usize, aabb);
         }
@@ -393,6 +461,7 @@ impl ArenaDirectory {
             self.mark_union_dirty(arena as usize);
         }
         self.set_blend(slot, false);
+        self.clear_cull_soa(slot);
         if slot + 1 == self.live_end {
             // The tail died: retreat to the next registered slot. Amortised
             // O(1) — each dead slot is stepped over once per retreat.
@@ -415,6 +484,109 @@ impl ArenaDirectory {
             .copied()
             .flatten()
             .map_or(0, |(a, _, _)| a + 1)
+    }
+
+    /// Block-relative AABB `[min.xyz, max.xyz]` for the CPU cull hot loop.
+    pub(crate) fn cull_aabbs(&self) -> &[[f32; 6]] {
+        &self.cull_aabb
+    }
+
+    /// Integer block of each slot's AABB, parallel to [`Self::cull_aabbs`].
+    pub(crate) fn cull_blocks(&self) -> &[[i32; 3]] {
+        &self.cull_block
+    }
+
+    /// Packed arena/pass/lod bits, parallel to [`Self::cull_aabbs`].
+    pub(crate) fn cull_bits(&self) -> &[u32] {
+        &self.cull_bits
+    }
+
+    /// Draw index counts, parallel to [`Self::cull_aabbs`].
+    pub(crate) fn cull_index_counts(&self) -> &[u32] {
+        &self.cull_index_count
+    }
+
+    /// Vertex offsets, parallel to [`Self::cull_aabbs`].
+    pub(crate) fn cull_vertex_offsets(&self) -> &[i32] {
+        &self.cull_vertex_offset
+    }
+
+    /// Packed face-quad counts, parallel to [`Self::cull_aabbs`].
+    pub(crate) fn cull_face_quads(&self) -> &[[u32; 3]] {
+        &self.cull_face_quads
+    }
+
+    /// Camera-group live bitset, maintained on register/free.
+    pub(crate) fn live_bits(&self) -> &[u32] {
+        &self.live_bits
+    }
+
+    /// Copies draw-emission fields from a mesh record into the CPU-cull SoA.
+    /// Call after [`Self::note_upload`] / [`Self::note_record`].
+    pub(crate) fn note_cull_draw(&mut self, slot: u32, rec: &MeshRecord) {
+        let i = slot as usize;
+        if i >= self.cull_index_count.len() {
+            return;
+        }
+        self.cull_index_count[i] = rec.index_count;
+        self.cull_vertex_offset[i] = rec.vertex_offset;
+        self.cull_face_quads[i] = rec.face_quads;
+        if rec.flags & MESH_FLAG_FACE_RUNS != 0 {
+            self.cull_bits[i] |= CULL_FACE_BIT;
+        } else {
+            self.cull_bits[i] &= !CULL_FACE_BIT;
+        }
+    }
+
+    fn write_cull_soa(
+        &mut self,
+        slot: u32,
+        arena: u32,
+        lane: Option<usize>,
+        pass: Pass,
+        lod: bool,
+        aabb: MeshAabb,
+    ) {
+        let i = slot as usize;
+        self.cull_aabb[i] = [
+            aabb.min[0],
+            aabb.min[1],
+            aabb.min[2],
+            aabb.max[0],
+            aabb.max[1],
+            aabb.max[2],
+        ];
+        self.cull_block[i] = aabb.block;
+        // Blend (no lane) is dead to the CPU cull: the shader skips pass > 1.
+        // Preserve the face-runs bit; [`Self::note_cull_draw`] sets it.
+        let face = self.cull_bits[i] & CULL_FACE_BIT;
+        self.cull_bits[i] = if lane.is_some() {
+            pack_cull_bits(arena + 1, pass, lod) | face
+        } else {
+            0
+        };
+        self.set_live_bit(slot, lane.is_some());
+    }
+
+    fn clear_cull_soa(&mut self, slot: u32) {
+        let i = slot as usize;
+        if i < self.cull_bits.len() {
+            self.cull_bits[i] = 0;
+        }
+        self.set_live_bit(slot, false);
+    }
+
+    fn set_live_bit(&mut self, slot: u32, on: bool) {
+        let i = (slot >> 5) as usize;
+        let b = 1u32 << (slot & 31);
+        if self.live_bits.len() <= i {
+            self.live_bits.resize(i + 1, 0);
+        }
+        if on {
+            self.live_bits[i] |= b;
+        } else {
+            self.live_bits[i] &= !b;
+        }
     }
 
     pub fn arena_count(&self) -> usize {
