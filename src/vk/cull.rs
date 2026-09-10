@@ -16,7 +16,9 @@ use ash::vk;
 
 use super::alloc::{GpuCpuReadback, find_memory_type};
 use super::buffers::{FRAMES_IN_FLIGHT, HostBuffer, MeshRecord, RecordBuffers};
-use super::cull_math::{FLAG_STATS, STATS_BYTES, STATS_COUNT, WORKGROUP, cpu_cull, cpu_cull_max};
+use super::cull_math::{
+    CpuCullScratch, FLAG_STATS, STATS_BYTES, STATS_COUNT, WORKGROUP, cpu_cull_into, cpu_cull_max,
+};
 use super::pass;
 use crate::camera::Frustum;
 
@@ -166,6 +168,8 @@ pub(crate) struct CullState {
     /// Recycled partition table when [`Self::prepare`] returns `None`, so a
     /// frame with nothing to cull does not drop last frame's allocation.
     spare_parts: Vec<PartitionGpu>,
+    /// CPU-side command/count staging reused across frames (capacity retained).
+    cpu_scratch: CpuCullScratch,
     /// Per-direction face-run culling. On by default; follows
     /// [`crate::Engine::set_cull_faces`].
     face_cull: bool,
@@ -275,6 +279,7 @@ impl CullState {
             }),
             stats: std::array::from_fn(|_| StatsReadback::new(device, memory_props)),
             spare_parts: Vec::new(),
+            cpu_scratch: CpuCullScratch::default(),
             face_cull: true,
         }
     }
@@ -344,7 +349,7 @@ impl CullState {
             return None;
         }
         if dir.camera_live() <= cpu_cull_max() {
-            let (cmds, counts, stats_hist) = cpu_cull(
+            let stats_hist = cpu_cull_into(
                 host_records,
                 dir,
                 is_arrived,
@@ -357,14 +362,23 @@ impl CullState {
                 clip,
                 clip_v,
                 face_cull,
+                &mut self.cpu_scratch,
             );
             unsafe {
                 let cb = &mut self.cpu_cmds[slot];
                 cb.maintain(instance, device, physical, u64::from(total) * CMD_STRIDE);
-                cb.write(0, bytemuck::cast_slice(&cmds));
                 let nb = &mut self.cpu_counts[slot];
                 nb.maintain(instance, device, physical, (partitions.len() * 4) as u64);
-                nb.write(0, bytemuck::cast_slice(&counts));
+                // One contiguous copy per live partition into write-combined
+                // memory; never a scattered per-slot store.
+                for (i, p) in partitions.iter().enumerate() {
+                    let src = &self.cpu_scratch.part_cmds[i];
+                    if src.is_empty() {
+                        continue;
+                    }
+                    cb.write(u64::from(p.offset) * CMD_STRIDE, bytemuck::cast_slice(src));
+                }
+                nb.write(0, bytemuck::cast_slice(&self.cpu_scratch.counts));
                 std::ptr::copy_nonoverlapping(
                     stats_hist.as_ptr(),
                     self.stats[slot].mapped,

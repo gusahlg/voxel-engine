@@ -812,6 +812,7 @@ impl Renderer {
             record.detail_scale() > 1.0,
             cull::MeshAabb::from_record(&record),
         );
+        self.arena_dir.note_cull_draw(slot, &record);
         self.mesh_res.apply_upload(slot, generation, resident);
         self.records.install(slot, record);
     }
@@ -825,6 +826,7 @@ impl Renderer {
             record.detail_scale() > 1.0,
             cull::MeshAabb::from_record(&record),
         );
+        self.arena_dir.note_cull_draw(slot, &record);
         self.records.set_record(slot, record);
     }
 
