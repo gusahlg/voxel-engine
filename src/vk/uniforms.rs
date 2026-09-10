@@ -3,7 +3,7 @@
 //! mapped buffer per frame-in-flight, each the size of the GPU struct
 //! (public [`FrameUniformsGpu`] plus the engine-derived tail). Written once per
 //! frame before recording; bound by push descriptor alongside the offsets SSBO
-//! (binding 0) and block texture (binding 1).
+//! (binding 0), block texture (binding 1), and material table (binding 7).
 //!
 //! `HostBuffer` wraps each slot's buffer handle with its persistent mapping,
 //! which `write` requires for coherent copies (a bare `ash::vk::Buffer` has no

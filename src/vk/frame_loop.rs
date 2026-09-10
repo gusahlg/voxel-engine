@@ -13,6 +13,7 @@ use super::buffers::{
     DrawIndexedIndirect, FRAMES_IN_FLIGHT, MESH_CONSUMER_STAGES, SUBMIT_BATCH_MAX,
 };
 use super::gpu_timer::{GpuPass, PipeStatPass};
+use super::materials::MATERIAL_CONSUMER_STAGES;
 use super::pipeline;
 use super::present::{HdrReadable, OverlayPresent};
 use super::render_client::RenderReturn;
@@ -591,6 +592,7 @@ impl Renderer {
                 && self.retired_textures.is_empty()
                 && !self.quad_ibo.has_garbage()
                 && !self.block_textures.has_garbage()
+                && !self.materials.has_garbage()
             {
                 return;
             }
@@ -604,6 +606,7 @@ impl Renderer {
             self.retired_textures
                 .collect(current, |mut tex| tex.destroy(device));
             self.block_textures.collect(device, current);
+            self.materials.collect(device, current);
             // Superseded quad IBO buffers are render-owned raw buffers (not
             // allocator suballocations), so destroy them here rather than shipping
             // them back to main's freelist.
@@ -619,6 +622,7 @@ impl Renderer {
                 self.quad_ibo.collect_transfer(device, transfer_current);
                 self.block_textures
                     .collect_transfer(device, transfer_current);
+                self.materials.collect_transfer(device, transfer_current);
             }
         }
     }
@@ -1112,7 +1116,7 @@ impl Renderer {
         // Overwrite of already-sampled layers: pending frames that still
         // sample SHADER_READ must be on the graphics queue before a
         // dedicated-family release (or a same-family extra wait).
-        if self.block_textures.has_overwrite_pending() {
+        if self.block_textures.has_overwrite_pending() || self.materials.has_overwrite_pending() {
             self.flush_pending_submits();
         }
         // Begin render submission; this gets the timeline value to stamp mesh copies.
@@ -1122,6 +1126,7 @@ impl Renderer {
         let grew;
         let quad_wait_some;
         let tex_wait_some;
+        let mat_wait_some;
         unsafe {
             let device = &self.device.device;
             device
@@ -1191,17 +1196,33 @@ impl Renderer {
             if let Some((stamp, retired)) = tex.retire {
                 self.retired_textures.push(stamp, retired);
             }
+            let mat_wait = self.materials.flush(
+                &self.instance.instance,
+                device,
+                self.device.physical,
+                &mut self.transfer_lane,
+                cmd,
+                self.device.graphics_queue,
+                self.device.graphics_family,
+                &self.timeline,
+                self.last_render_value,
+                done_at,
+            );
             self.pending_transfer_wait = fold_transfer_wait(
-                match (deferred, quad_wait) {
-                    (Some(a), Some(b)) => Some((a.max(b), MESH_CONSUMER_STAGES)),
-                    (Some(v), None) | (None, Some(v)) => Some((v, MESH_CONSUMER_STAGES)),
-                    (None, None) => None,
-                },
-                tex.transfer_wait
-                    .map(|v| (v, BLOCK_TEXTURE_CONSUMER_STAGES)),
+                fold_transfer_wait(
+                    match (deferred, quad_wait) {
+                        (Some(a), Some(b)) => Some((a.max(b), MESH_CONSUMER_STAGES)),
+                        (Some(v), None) | (None, Some(v)) => Some((v, MESH_CONSUMER_STAGES)),
+                        (None, None) => None,
+                    },
+                    tex.transfer_wait
+                        .map(|v| (v, BLOCK_TEXTURE_CONSUMER_STAGES)),
+                ),
+                mat_wait.map(|v| (v, MATERIAL_CONSUMER_STAGES)),
             );
             quad_wait_some = quad_wait.is_some();
             tex_wait_some = tex.transfer_wait.is_some();
+            mat_wait_some = mat_wait.is_some();
         }
 
         // Same-queue compute jobs: budgeted prefix before the scene.
@@ -1211,7 +1232,13 @@ impl Renderer {
 
         let minimap = unsafe { self.minimap.sync(&self.device.device, cmd, slot) };
         if profiling {
-            if copies_pending || quad_wait_some || tex_wait_some || grew || minimap {
+            if copies_pending
+                || quad_wait_some
+                || tex_wait_some
+                || mat_wait_some
+                || grew
+                || minimap
+            {
                 self.gpu_timer.recorded(slot);
             }
             unsafe {
