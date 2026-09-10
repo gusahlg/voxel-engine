@@ -26,6 +26,7 @@ struct FragmentInput
 {
     [[vk::location(0)]]
     float2 uv;
+    float4 frag_pos : SV_Position;
 };
 
 #ifdef TAA_FUSED
@@ -241,6 +242,8 @@ TaaFragmentOutput fragmentMain(FragmentInput input)
     // the spill texel's outUv.
     float3 hdr = (resolved + spillTex.Sample(input.uv).rgb) * pc.exposure;
     float3 ldr = applyVignette(tonemapSigmoid(hdr), input.uv);
+    // Output-space dither after the OETF, swapchain only (not TAA history).
+    ldr += (hash12(input.frag_pos.xy * 0.937) - 0.5) / 255.0;
 
     TaaFragmentOutput o;
     o.ldr = float4(ldr, 1.0);
@@ -260,6 +263,8 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // sample at UNwarped output uv so this tap matches the spill texel's outUv.
     hdr += spillTex.Sample(input.uv).rgb * pc.exposure;
     float3 ldr = applyVignette(tonemapSigmoid(hdr), input.uv);
+    // Output-space dither after the OETF, immediately before the 8-bit write.
+    ldr += (hash12(input.frag_pos.xy * 0.937) - 0.5) / 255.0;
     return float4(ldr, 1.0);
 }
 

@@ -16,6 +16,14 @@ float3 srgb_to_linear(float3 c)
     return select(c <= 0.04045, lo, hi);
 }
 
+// Fast hash for procedural stars, cloud value-noise, and output-space dither.
+float hash12(float2 p)
+{
+    float3 p3 = frac(float3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
 
 // Per-frame uniform block. Generated from the lane_table in build.rs (the twin of
 // voxel_engine::skeleton::FrameUniformsGpu) so a lane can never drift CPU↔GPU.

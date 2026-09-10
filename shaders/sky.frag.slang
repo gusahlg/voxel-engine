@@ -92,6 +92,5 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     }
     col = col * (1.0 - cover) + cloud_lit;
 
-    col += (hash12(input.ndc * 937.0) - 0.5) / 255.0;
     return float4(col, 1.0);
 }
