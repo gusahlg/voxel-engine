@@ -2,7 +2,9 @@
 ///
 /// 8-byte vertex: two u32s packing position, normal, layer (w0) and baked light (w1).
 /// Shader derives UV from position+normal; per-face lighting from normal.
-/// See bit shifts below (SHIFT_*/MASK_*); mirrored by Slang unpack in mesh3d.vert.
+/// See bit shifts below (SHIFT_*/MASK_*); single-sourced in `build.rs`
+/// `build_table()` as `genconst` / `shader_constants.slang`, unpacked by
+/// `mesh3d.vert.slang`.
 ///
 /// Word 0: x[0:5] y[5:10] z[10:15] normal[15:18] layer[18:32]
 /// Word 1: ao[0:2] skylight[2:6] blocklight[6:10] water[10] micro[11:17]
@@ -12,35 +14,13 @@
 /// Immediate debug geometry uses the separate unpacked [`DebugVertex`].
 use crate::vk::vertex_input::vertex_struct;
 
-// Bit shifts, mirrored by the Slang unpack in mesh3d.vert.slang.
-pub const SHIFT_X: u32 = 0;
-pub const SHIFT_Y: u32 = 5;
-pub const SHIFT_Z: u32 = 10;
-pub const SHIFT_NORMAL: u32 = 15;
-pub const SHIFT_LAYER: u32 = 18;
-/// AO level in w1[0:2], 0..=3; 3=no occlusion (diffuse multiplier).
-pub const SHIFT_AO: u32 = 0;
-/// Skylight and blocklight in w1[2:6] and [6:10] respectively, 0..=15 each.
-pub const SHIFT_SKY: u32 = 2;
-pub const SHIFT_BLOCK: u32 = 6;
-/// Water material bit in `w1` (bit 10). Set by mesher for liquid blocks;
-/// read by mesh3d.frag to select animated water shading in transparent pass.
-pub const SHIFT_WATER: u32 = 10;
-/// Per-axis micro-offsets in `w1` (bits 11-17): -2..=1 values that nudge vertices
-/// on double-covered LOD borders to break z-fighting. Default zero (no offset).
-pub const SHIFT_MICRO_X: u32 = 11;
-pub const SHIFT_MICRO_Y: u32 = 13;
-pub const SHIFT_MICRO_Z: u32 = 15;
-/// Two-bit mask for one micro-offset axis.
-pub const MASK_MICRO: u32 = 0x3;
-
-// Field masks (applied on pack so a debug-only out-of-range value can never
-// corrupt an adjacent field; the typed API keeps values in range anyway).
-const MASK_COORD: u32 = 0x1F; // 5 bits, holds 0..=16
-const MASK_NORMAL: u32 = 0x7; // 3 bits
-const MASK_LAYER: u32 = 0x3FFF; // 14 bits — word 0's remaining span, 16384 layers
-const MASK_AO: u32 = 0x3; // 2 bits
-const MASK_LIGHT: u32 = 0xF; // 4 bits
+// Packed-vertex bit layout lives in `build.rs` `build_table()` so the Slang
+// unpack cannot drift. Re-exported here so pack/unpack keep `mesh::SHIFT_*`.
+use crate::genconst::{MASK_AO, MASK_COORD, MASK_LAYER, MASK_LIGHT, MASK_NORMAL};
+pub use crate::genconst::{
+    MASK_MICRO, SHIFT_AO, SHIFT_BLOCK, SHIFT_LAYER, SHIFT_MICRO_X, SHIFT_MICRO_Y, SHIFT_MICRO_Z,
+    SHIFT_NORMAL, SHIFT_SKY, SHIFT_WATER, SHIFT_X, SHIFT_Y, SHIFT_Z,
+};
 
 /// Face normal. The discriminant IS the 3-bit index stored in the vertex and
 /// decoded by the shader: `0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z`.
@@ -230,7 +210,8 @@ impl MeshVertex {
     }
 }
 
-/// The sole CPU-side mirror of the Slang unpack in `mesh3d.vert.slang`. Returns
+/// The sole CPU-side mirror of the Slang unpack in `mesh3d.vert.slang` (same
+/// generated SHIFT_*/MASK_* names). Returns
 /// raw field integers (`pos`, normal index, layer, ao, sky, block); typed
 /// callers map from there. Keeping one decoder means the shift/mask consts are
 /// applied in exactly one place per direction (pack/unpack). Word-1's water/micro

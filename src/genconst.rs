@@ -60,6 +60,31 @@ mod tests {
     }
 
     #[test]
+    fn packed_vertex_layout_and_ao_curve() {
+        assert_eq!(SHIFT_X, 0);
+        assert_eq!(SHIFT_Y, 5);
+        assert_eq!(SHIFT_Z, 10);
+        assert_eq!(SHIFT_NORMAL, 15);
+        assert_eq!(SHIFT_LAYER, 18);
+        assert_eq!(SHIFT_AO, 0);
+        assert_eq!(SHIFT_SKY, 2);
+        assert_eq!(SHIFT_BLOCK, 6);
+        assert_eq!(SHIFT_WATER, 10);
+        assert_eq!(SHIFT_MICRO_X, 11);
+        assert_eq!(SHIFT_MICRO_Y, 13);
+        assert_eq!(SHIFT_MICRO_Z, 15);
+        assert_eq!(MASK_COORD, 0x1F);
+        assert_eq!(MASK_NORMAL, 0x7);
+        assert_eq!(MASK_LAYER, 0x3FFF);
+        assert_eq!(MASK_AO, 0x3);
+        assert_eq!(MASK_LIGHT, 0xF);
+        assert_eq!(MASK_MICRO, 0x3);
+        assert_eq!(AO_MIN, 0.4);
+        assert_eq!(AO_STEP, 0.2);
+        assert_eq!(AO_MIN + 3.0 * AO_STEP, 1.0);
+    }
+
+    #[test]
     fn sky_cloud_lut_in_quality_band() {
         assert!(
             (256..=512).contains(&SKY_CLOUD_LUT_SIZE),
