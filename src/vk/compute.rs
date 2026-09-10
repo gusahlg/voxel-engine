@@ -1004,8 +1004,13 @@ impl ComputeRuntime {
         }
         validate_desc(desc, &self.limits, self.readback.ring.capacity())?;
         let bindings = descriptor_bindings(desc.inputs);
-        let (set_layout, layout) =
-            pass::push_descriptor_layouts(device, &bindings, desc.push_bytes, "compute-job");
+        let (set_layout, layout) = pass::push_descriptor_layouts(
+            device,
+            &bindings,
+            vk::ShaderStageFlags::COMPUTE,
+            desc.push_bytes,
+            "compute-job",
+        );
         let pipeline = try_compute_pipeline(
             device,
             cache,
