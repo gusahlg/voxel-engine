@@ -576,7 +576,7 @@ impl<'a> RenderPass<'a> {
 
     /// Draws every non-empty arena partition of one cull group with `pipeline`.
     /// [`GpuTimer::mark`] is a no-op when the group recorded nothing, so empty
-    /// groups account 0 instead of a BOTTOM_OF_PIPE stamp.
+    /// groups account 0 instead of a timestamp.
     unsafe fn record_group_indirect_count(&self, group: cull::Group, pipeline: vk::Pipeline) {
         self.pipe_begin_group(group);
         let mut calls = 0u32;

@@ -1521,9 +1521,9 @@ impl Renderer {
             }
             unsafe {
                 self.gpu_timer
-                    .mark(&self.device.device, cmd, slot, GpuPass::Bloom)
-            };
-            self.gpu_timer.finish(slot);
+                    .mark(&self.device.device, cmd, slot, GpuPass::Bloom);
+                self.gpu_timer.finish(&self.device.device, cmd, slot);
+            }
             if lists.scene.is_some() {
                 self.pipe_stats.finish(slot);
             }
