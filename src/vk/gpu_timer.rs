@@ -15,8 +15,8 @@ use super::buffers::FRAMES_IN_FLIGHT;
 /// late-Z, compute, or copy) — never `BOTTOM_OF_PIPE`, which would drain idle
 /// pipe stages between passes. Empty passes skip the stamp
 /// ([`GpuTimer::recorded`]) and read 0. A final union-stage stamp at command-
-/// buffer end times the idle gap (the present copy is timed apart, see
-/// [`GpuTimer::end_copy`]).
+/// buffer end times the idle gap (the present copy is timed apart at the same
+/// union-stage end, see [`GpuTimer::end_copy`]).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum GpuPass {
     /// Staged mesh copies (graphics-queue tiers) + the minimap upload.
@@ -151,8 +151,8 @@ const COPY_STAMP_BASE: u32 = (GPU_STAMPS * FRAMES_IN_FLIGHT as usize) as u32;
 /// stamps (`VOXEL_PROFILE`) use a separate range and are unaffected.
 const LOAD_STAMP_BASE: u32 = COPY_STAMP_BASE + 2;
 /// Completion of this command buffer's real work: color-out, late-Z, compute,
-/// and copy. Used for the profiler frame-end stamp and the gpu_load end stamp
-/// instead of `BOTTOM_OF_PIPE`.
+/// and copy. Used for the profiler frame-end stamp, the gpu_load end stamp,
+/// and the present-copy end stamp instead of `BOTTOM_OF_PIPE`.
 const FRAME_END_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
     vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT.as_raw()
         | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw()
@@ -596,17 +596,15 @@ impl GpuTimer {
 
     /// Writes the present-copy end stamp (after the last barrier, before the
     /// command buffer ends) and marks the pair readable by the next copy.
+    /// Same union-stage rule as [`Self::end_load`] / [`Self::finish`]: color-out
+    /// (tonemap/overlay), late-Z, compute, and copy (screenshot readback) —
+    /// never `BOTTOM_OF_PIPE`.
     pub(super) unsafe fn end_copy(&mut self, device: &ash::Device, cmd: vk::CommandBuffer) {
         if !self.enabled() {
             return;
         }
         unsafe {
-            device.cmd_write_timestamp2(
-                cmd,
-                vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
-                self.pool,
-                COPY_STAMP_BASE + 1,
-            );
+            device.cmd_write_timestamp2(cmd, FRAME_END_STAGES, self.pool, COPY_STAMP_BASE + 1);
         }
         self.copy_primed = true;
     }
@@ -880,6 +878,12 @@ mod tests {
         assert!(FRAME_END_STAGES.contains(vk::PipelineStageFlags2::COMPUTE_SHADER));
         assert!(FRAME_END_STAGES.contains(vk::PipelineStageFlags2::COPY));
         assert!(!FRAME_END_STAGES.contains(vk::PipelineStageFlags2::BOTTOM_OF_PIPE));
+        // gpu_load `end_load` and present-copy `end_copy` share this union.
+        assert_ne!(
+            FRAME_END_STAGES,
+            vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+            "frame/copy/load end must not drain the pipe"
+        );
     }
 
     #[test]
