@@ -122,10 +122,22 @@ pub struct RenderFlags {
 /// Device capabilities sampled at renderer init. Device selection needs a
 /// window surface, so there is no headless [`probe_gpu_caps`]; read these
 /// from [`Engine::gpu_caps`] after [`run`] constructs the engine.
+///
+/// [`Self::device_local_budget`] / [`Self::device_local_usage`] are live
+/// (`VK_EXT_memory_budget`) for the largest `DEVICE_LOCAL` heap. The budget
+/// already excludes other processes' usage.
 #[derive(Clone, Debug)]
 pub struct GpuCaps {
     pub device_name: String,
+    /// Sum of every `DEVICE_LOCAL` heap size (static).
     pub device_local_bytes: u64,
+    /// Size of the largest `DEVICE_LOCAL` heap (static).
+    pub device_local_heap_size: u64,
+    /// Live remaining budget for that heap (`VK_EXT_memory_budget`), if the
+    /// extension is enabled. Already excludes other processes' usage.
+    pub device_local_budget: Option<u64>,
+    /// Live usage of that heap (`VK_EXT_memory_budget`), if enabled.
+    pub device_local_usage: Option<u64>,
     pub max_texture_array_layers: u32,
     pub max_msaa: u32,
     pub supports_vrs: bool,
@@ -385,6 +397,10 @@ impl Engine {
 
     /// GPU limits and optional features discovered at device selection.
     /// Requires a live engine (instance/device pick needs a window surface).
+    ///
+    /// [`GpuCaps::device_local_budget`] and [`GpuCaps::device_local_usage`]
+    /// are queried at this call (`vkGetPhysicalDeviceMemoryProperties2`), not
+    /// cached at startup.
     pub fn gpu_caps(&self) -> GpuCaps {
         self.client.gpu_caps()
     }
@@ -392,6 +408,9 @@ impl Engine {
     /// Device-local bytes the renderer would allocate for this settings combo,
     /// using the engine's real formats and per-slot duplication. Lets the game
     /// size MSAA / scale / TAA / bloom / VRS without mirroring those formats.
+    ///
+    /// Compare against [`GpuCaps::device_local_budget`] (live remaining) or
+    /// [`GpuCaps::device_local_heap_size`] (static heap size).
     pub fn estimate_render_targets(&self, config: &RenderTargetConfig) -> u64 {
         crate::vk::targets::estimate_render_targets(config)
     }

@@ -529,6 +529,9 @@ impl Renderer {
                     .unwrap_or_else(|_| "<unknown>".into())
             },
             device_local_bytes: Device::device_local_bytes(&memory_props),
+            device_local_heap_size: Device::largest_device_local_heap(&memory_props)
+                .map(|(_, size)| size)
+                .unwrap_or(0),
             supports_vrs: device.fragment_shading_rate.is_some(),
             vrs_texel_size: device
                 .fragment_shading_rate

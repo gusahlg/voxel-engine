@@ -49,6 +49,7 @@ pub(crate) struct DeviceCaps {
     pub max_texture_layers: u32,
     pub device_name: String,
     pub device_local_bytes: u64,
+    pub device_local_heap_size: u64,
     pub supports_vrs: bool,
     /// Attachment shading-rate texel size when VRS is available.
     pub vrs_texel_size: Option<(u32, u32)>,
@@ -655,9 +656,13 @@ impl RenderClient {
     }
 
     pub(crate) fn gpu_caps(&self) -> crate::GpuCaps {
+        let (device_local_budget, device_local_usage) = self.mesh_alloc.live_device_local_budget();
         crate::GpuCaps {
             device_name: self.caps.device_name.clone(),
             device_local_bytes: self.caps.device_local_bytes,
+            device_local_heap_size: self.caps.device_local_heap_size,
+            device_local_budget,
+            device_local_usage,
             max_texture_array_layers: self.caps.max_texture_layers,
             max_msaa: self.caps.max_msaa,
             supports_vrs: self.caps.supports_vrs,
