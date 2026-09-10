@@ -15,8 +15,8 @@ use super::buffers::FRAMES_IN_FLIGHT;
 /// late-Z, compute, or copy) — never `BOTTOM_OF_PIPE`, which would drain idle
 /// pipe stages between passes. Empty passes skip the stamp
 /// ([`GpuTimer::recorded`]) and read 0. A final union-stage stamp at command-
-/// buffer end times the idle gap (the present copy is timed apart, see
-/// [`GpuTimer::end_copy`]).
+/// buffer end times the idle gap (the present copy is timed apart at the same
+/// union-stage end, see [`GpuTimer::end_copy`]).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum GpuPass {
     /// Staged mesh copies (graphics-queue tiers) + the minimap upload.
@@ -151,8 +151,8 @@ const COPY_STAMP_BASE: u32 = (GPU_STAMPS * FRAMES_IN_FLIGHT as usize) as u32;
 /// stamps (`VOXEL_PROFILE`) use a separate range and are unaffected.
 const LOAD_STAMP_BASE: u32 = COPY_STAMP_BASE + 2;
 /// Completion of this command buffer's real work: color-out, late-Z, compute,
-/// and copy. Used for the profiler frame-end stamp and the gpu_load end stamp
-/// instead of `BOTTOM_OF_PIPE`.
+/// and copy. Used for the profiler frame-end stamp, the gpu_load end stamp,
+/// and the present-copy end stamp instead of `BOTTOM_OF_PIPE`.
 const FRAME_END_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
     vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT.as_raw()
         | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw()
@@ -596,17 +596,15 @@ impl GpuTimer {
 
     /// Writes the present-copy end stamp (after the last barrier, before the
     /// command buffer ends) and marks the pair readable by the next copy.
+    /// Same union-stage rule as [`Self::end_load`] / [`Self::finish`]: color-out
+    /// (tonemap/overlay), late-Z, compute, and copy (screenshot readback) —
+    /// never `BOTTOM_OF_PIPE`.
     pub(super) unsafe fn end_copy(&mut self, device: &ash::Device, cmd: vk::CommandBuffer) {
         if !self.enabled() {
             return;
         }
         unsafe {
-            device.cmd_write_timestamp2(
-                cmd,
-                vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
-                self.pool,
-                COPY_STAMP_BASE + 1,
-            );
+            device.cmd_write_timestamp2(cmd, FRAME_END_STAGES, self.pool, COPY_STAMP_BASE + 1);
         }
         self.copy_primed = true;
     }
@@ -633,6 +631,7 @@ pub(super) enum PipeStatPass {
 impl PipeStatPass {
     pub(super) const COUNT: usize = 5;
 }
+const _: () = assert!(PipeStatPass::COUNT <= 8);
 
 /// One query writes counters in bit-order of the enabled flags: IA primitives
 /// (free extra), clipping primitives, then fragment shader invocations.
@@ -657,6 +656,11 @@ pub(super) fn pipe_stat_query(slot: usize, pass: PipeStatPass) -> u32 {
     slot as u32 * PipeStatPass::COUNT as u32 + pass as u32
 }
 
+/// `1 << pass` in [`GpuPipeStats`]'s per-slot recorded mask.
+fn pipe_stat_bit(pass: PipeStatPass) -> u8 {
+    1 << (pass as u8)
+}
+
 /// Full-res overdraw: fragment invocations per render-extent pixel.
 pub(super) fn overdraw_ratio(frag_full: u64, width: u32, height: u32) -> f64 {
     let pixels = u64::from(width) * u64::from(height);
@@ -671,10 +675,16 @@ pub(super) fn overdraw_ratio(frag_full: u64, width: u32, height: u32) -> f64 {
 /// clipping primitives). Same delayed-slot readback as [`GpuTimer`]: a slot is
 /// read after its fence wait, then reset (host reset when the device has it,
 /// otherwise `vkCmdResetQueryPool` outside the render pass).
+///
+/// Empty cull groups skip `begin_query`/`end_query`; [`Self::read_into`] treats
+/// those queries as 0 so a mixed recorded/unrecorded slot still reads back.
 pub(super) struct GpuPipeStats {
     pool: vk::QueryPool,
     host_reset: bool,
     primed: [bool; FRAMES_IN_FLIGHT as usize],
+    /// `1 << PipeStatPass` bits that [`Self::begin_pass`] opened for the last
+    /// recording of this slot. Unrecorded queries stay 0 at readback.
+    recorded: [std::cell::Cell<u8>; FRAMES_IN_FLIGHT as usize],
 }
 
 impl GpuPipeStats {
@@ -696,6 +706,7 @@ impl GpuPipeStats {
             pool,
             host_reset,
             primed: [false; FRAMES_IN_FLIGHT as usize],
+            recorded: std::array::from_fn(|_| std::cell::Cell::new(0)),
         }
     }
 
@@ -705,7 +716,8 @@ impl GpuPipeStats {
 
     /// Reads `slot`'s prior counters. Caller has waited the slot fence.
     /// Returns `(frag[5], prims_full)` or `None` if the slot was never recorded
-    /// or the read failed (unsupported / not ready).
+    /// or the read failed (unsupported / not ready). Passes that skipped
+    /// `begin_query` (empty cull groups) contribute 0.
     pub(super) unsafe fn read_into(
         &mut self,
         device: &ash::Device,
@@ -714,19 +726,30 @@ impl GpuPipeStats {
         if !self.enabled() || !self.primed[slot] {
             return None;
         }
-        let mut raw = [PipeStatRow::default(); PipeStatPass::COUNT];
-        let first = pipe_stat_query(slot, PipeStatPass::OpaqueFull);
-        let read = unsafe {
-            device.get_query_pool_results(self.pool, first, &mut raw, vk::QueryResultFlags::TYPE_64)
-        };
-        if read.is_err() {
-            return None;
-        }
+        let mask = self.recorded[slot].get();
         let mut frag = [0u64; PipeStatPass::COUNT];
-        for pass in 0..PipeStatPass::COUNT {
-            frag[pass] = raw[pass].frag_invocs;
+        let mut prims_full = 0u64;
+        for (i, frag_i) in frag.iter_mut().enumerate() {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            let mut row = [PipeStatRow::default()];
+            let read = unsafe {
+                device.get_query_pool_results(
+                    self.pool,
+                    slot as u32 * PipeStatPass::COUNT as u32 + i as u32,
+                    &mut row,
+                    vk::QueryResultFlags::TYPE_64,
+                )
+            };
+            if read.is_err() {
+                return None;
+            }
+            *frag_i = row[0].frag_invocs;
+            if i == PipeStatPass::OpaqueFull as usize {
+                prims_full = row[0].clip_prims;
+            }
         }
-        let prims_full = raw[PipeStatPass::OpaqueFull as usize].clip_prims;
         Some((frag, prims_full))
     }
 
@@ -736,6 +759,7 @@ impl GpuPipeStats {
         if !self.enabled() {
             return;
         }
+        self.recorded[slot].set(0);
         let first = pipe_stat_query(slot, PipeStatPass::OpaqueFull);
         let count = PipeStatPass::COUNT as u32;
         unsafe {
@@ -757,6 +781,7 @@ impl GpuPipeStats {
         if !self.enabled() {
             return;
         }
+        self.recorded[slot].set(self.recorded[slot].get() | pipe_stat_bit(pass));
         unsafe {
             device.cmd_begin_query(
                 cmd,
@@ -880,6 +905,12 @@ mod tests {
         assert!(FRAME_END_STAGES.contains(vk::PipelineStageFlags2::COMPUTE_SHADER));
         assert!(FRAME_END_STAGES.contains(vk::PipelineStageFlags2::COPY));
         assert!(!FRAME_END_STAGES.contains(vk::PipelineStageFlags2::BOTTOM_OF_PIPE));
+        // gpu_load `end_load` and present-copy `end_copy` share this union.
+        assert_ne!(
+            FRAME_END_STAGES,
+            vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+            "frame/copy/load end must not drain the pipe"
+        );
     }
 
     #[test]
@@ -937,6 +968,23 @@ mod tests {
         );
         // Counter layout inside one query: IA prims, clip prims, frag invocs.
         assert_eq!(std::mem::size_of::<PipeStatRow>(), 3 * 8);
+        // Recorded-query bitmask: one bit per pass, empty groups leave the bit
+        // clear and read back as 0 without `vkCmdBeginQuery`.
+        let mut mask = 0u8;
+        for pass in [
+            PipeStatPass::OpaqueFull,
+            PipeStatPass::OpaqueLod,
+            PipeStatPass::Cutout,
+            PipeStatPass::Sky,
+            PipeStatPass::Transparent,
+        ] {
+            let bit = pipe_stat_bit(pass);
+            assert_eq!(bit.count_ones(), 1);
+            assert_eq!(mask & bit, 0, "{pass:?} bit must be unique");
+            mask |= bit;
+        }
+        assert_eq!(mask, (1 << PipeStatPass::COUNT) - 1);
+        assert_eq!(pipe_stat_bit(PipeStatPass::Cutout), 1 << 2);
     }
 
     #[test]
