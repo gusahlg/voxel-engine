@@ -43,9 +43,9 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             "debug.frag.spv",
         ),
         job(
-            "shaders/sky.vert.slang",
+            "shaders/fullscreen.vert.slang",
             Stage::Vertex,
-            "vertexMain",
+            "vertexSky",
             "sky.vert.spv",
         ),
         job(
@@ -61,9 +61,9 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             "sky_cloud.comp.spv",
         ),
         job(
-            "shaders/tonemap.vert.slang",
+            "shaders/fullscreen.vert.slang",
             Stage::Vertex,
-            "vertexMain",
+            "vertexTonemap",
             "tonemap.vert.spv",
         ),
         job(
@@ -83,12 +83,6 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             Stage::Fragment,
             "fragmentMain",
             "tris2d.frag.spv",
-        ),
-        job(
-            "shaders/tris2d_tex.frag.slang",
-            Stage::Fragment,
-            "fragmentMain",
-            "tris2d_tex.frag.spv",
         ),
         job(
             "shaders/vrs.comp.slang",
@@ -206,6 +200,16 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             Stage::Fragment,
             "fragmentMain",
             "tonemap_taa.frag.spv",
+        )
+    });
+    // Minimap overlay: same tris2d.frag source, RGBA sample + vertex tint.
+    jobs.push(ShaderJob {
+        defines: &[("TRIS2D_TEX", None)],
+        ..job(
+            "shaders/tris2d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "tris2d_tex.frag.spv",
         )
     });
     jobs
