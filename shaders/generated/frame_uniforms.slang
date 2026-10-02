@@ -22,8 +22,10 @@ struct FrameUniforms
     float4 horizon;
     // rgb = blocklight (candle) color (linear), w = ambient floor luma.
     float4 candle;
-    // x = exposure, y = reserved zero (post-effect dither removed), zw = TAA jitter
-    // in pixels (informational; jitter is applied via the matrix — zero until enabled).
+    // x = exposure, y = star floor: the least night factor the starfield renders at
+    // (0 on the ground; the game raises it toward 1 above the atmosphere so stars show by
+    // day), zw = TAA jitter in pixels (informational; jitter is applied via the matrix —
+    // zero until enabled).
     float4 exposure_dither;
     // x = stars gain (1 = night starfield renders, 0 = skipped — the
     // `RenderFlags::stars` gate). y = glow_pow, z = glow_scale (0.5+turbidity):

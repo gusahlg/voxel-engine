@@ -1019,7 +1019,7 @@ fn lane_table() -> Vec<Lane> {
         },
         Lane {
             name: "exposure_dither",
-            doc: "x = exposure, y = reserved zero (post-effect dither removed), zw = TAA jitter\nin pixels (informational; jitter is applied via the matrix — zero until enabled).",
+            doc: "x = exposure, y = star floor: the least night factor the starfield renders at\n(0 on the ground; the game raises it toward 1 above the atmosphere so stars show by\nday), zw = TAA jitter in pixels (informational; jitter is applied via the matrix —\nzero until enabled).",
         },
         Lane {
             name: "extras",

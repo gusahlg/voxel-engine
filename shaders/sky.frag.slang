@@ -76,8 +76,11 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // Uniform branch (both factors are per-frame constants): skips the whole
     // hash-grid star evaluation by day and when `RenderFlags::stars` is off —
     // the multiplied-out zero was still being computed for every sky pixel.
-    if (night * frame.extras.x > 0.0)
-        col += stars(ray, moon_dir, night) * frame.extras.x;
+    // Above the atmosphere the star floor (exposure_dither.y) keeps the field
+    // up by day.
+    float star_night = max(night, frame.exposure_dither.y);
+    if (star_night * frame.extras.x > 0.0)
+        col += stars(ray, moon_dir, star_night) * frame.extras.x;
 
     // Slab clouds composite LAST so opaque cloud occludes the sun/moon/stars it
     // covers. Hemisphere octahedral is injective only for y >= 0; skip the tap
