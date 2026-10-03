@@ -401,6 +401,7 @@ impl<'a> RenderPass<'a> {
             r.targets.shadow.sampler,
             r.targets.shadow.sample_view,
             r.materials.buffer(),
+            bufs.cages,
         );
         self.mesh_desc_bound.set(true);
     }
@@ -497,7 +498,11 @@ impl<'a> RenderPass<'a> {
             // Rebind only when the pass's pipeline changes.
             let mut bound: Option<vk::Pipeline> = None;
             for run in self.r.draw_runs.iter().filter(|run| run.pass == pass) {
-                let pipeline = self.r.mesh_pipeline_for(pass);
+                let pipeline = if run.caged {
+                    self.r.pipelines.caged_blend()
+                } else {
+                    self.r.mesh_pipeline_for(pass)
+                };
                 if bound != Some(pipeline) {
                     device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                     bound = Some(pipeline);
@@ -556,40 +561,60 @@ impl<'a> RenderPass<'a> {
         match pass {
             Pass::Opaque => {
                 let (full, lod) = self.r.pipelines.opaque_pipelines(self.mesh_lean);
-                unsafe { self.record_group_indirect_count(cull::Group::Opaque, full) };
-                unsafe { self.record_group_indirect_count(cull::Group::OpaqueLod, lod) };
+                let (caged, caged_lod) = self.r.pipelines.caged_opaque(self.mesh_lean);
+                // Flat then caged, full-res before LOD. Each pair shares one
+                // timestamp: caged calls add into the flat group's gauge.
+                unsafe {
+                    self.record_groups(&[
+                        (cull::Group::Opaque, full),
+                        (cull::Group::Caged, caged),
+                    ]);
+                    self.record_groups(&[
+                        (cull::Group::OpaqueLod, lod),
+                        (cull::Group::CagedLod, caged_lod),
+                    ]);
+                }
             }
             Pass::Cutout => unsafe {
-                self.record_group_indirect_count(
-                    cull::Group::Cutout,
-                    self.r.mesh_pipeline_for(pass),
-                );
+                self.record_groups(&[(cull::Group::Cutout, self.r.mesh_pipeline_for(pass))]);
             },
             Pass::Blend => unreachable!("Blend stays on the CPU path"),
         }
     }
 
-    /// Draws every non-empty arena partition of one cull group with `pipeline`.
-    /// [`GpuTimer::mark`] is a no-op when the group recorded nothing, so empty
-    /// groups account 0 instead of a timestamp.
-    unsafe fn record_group_indirect_count(&self, group: cull::Group, pipeline: vk::Pipeline) {
-        self.pipe_begin_group(group);
+    /// Draws every non-empty arena partition of each `(group, pipeline)`.
+    /// One pipeline-stat query and one GPU timestamp, both named by the first
+    /// group, so a caged group does not open a second query. An empty group
+    /// binds nothing. [`GpuTimer::mark`] is a no-op when nothing was recorded.
+    unsafe fn record_groups(&self, groups: &[(cull::Group, vk::Pipeline)]) {
+        let first = groups[0].0;
+        self.pipe_begin_group(first);
         let mut calls = 0u32;
         if let Some(frame) = &self.r.cull_frame {
-            let span = frame.arena_count * cull::BUCKETS;
-            let base = group as usize * span;
-            if !frame.partitions[base..base + span]
-                .iter()
-                .all(|p| p.capacity == 0)
-            {
-                self.r.gpu_timer.recorded(self.slot);
-                unsafe { self.bind_mesh3d_state() };
+            let mut drew = false;
+            let mut expected = 0u32;
+            for &(group, pipeline) in groups {
+                expected +=
+                    cull::group_indirect_calls(&frame.partitions, group, frame.arena_count);
+                let span = frame.arena_count * cull::BUCKETS;
+                let base = group as usize * span;
+                if frame.partitions[base..base + span]
+                    .iter()
+                    .all(|p| p.capacity == 0)
+                {
+                    continue;
+                }
+                if !drew {
+                    self.r.gpu_timer.recorded(self.slot);
+                    unsafe { self.bind_mesh3d_state() };
+                    drew = true;
+                }
                 let device = &self.r.device.device;
                 unsafe {
                     device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                     for arena in 0..frame.arena_count {
-                        let first = cull::camera_part(group as usize, arena, 0, frame.arena_count);
-                        if frame.partitions[first..first + cull::BUCKETS]
+                        let part0 = cull::camera_part(group as usize, arena, 0, frame.arena_count);
+                        if frame.partitions[part0..part0 + cull::BUCKETS]
                             .iter()
                             .all(|p| p.capacity == 0)
                         {
@@ -602,7 +627,7 @@ impl<'a> RenderPass<'a> {
                             &[0],
                         );
                         for bucket in 0..cull::BUCKETS {
-                            let idx = first + bucket;
+                            let idx = part0 + bucket;
                             let part = frame.partitions[idx];
                             // Bucket trimming already zeros unreachable buckets
                             // (and empty live lanes); skip the empty call.
@@ -623,24 +648,19 @@ impl<'a> RenderPass<'a> {
                     }
                 }
             }
+            debug_assert_eq!(calls, expected);
         }
-        if let Some(frame) = &self.r.cull_frame {
-            debug_assert_eq!(
-                calls,
-                cull::group_indirect_calls(&frame.partitions, group, frame.arena_count)
-            );
-        }
-        match group {
-            cull::Group::Opaque => {
+        match first {
+            cull::Group::Opaque | cull::Group::Caged => {
                 crate::profile::gauge(crate::profile::Gauge::CallsFull, u64::from(calls));
             }
-            cull::Group::OpaqueLod => {
+            cull::Group::OpaqueLod | cull::Group::CagedLod => {
                 crate::profile::gauge(crate::profile::Gauge::CallsLod, u64::from(calls));
             }
             cull::Group::Cutout => {}
         }
-        self.stamp_group(group);
-        self.pipe_end_group(group);
+        self.stamp_group(first);
+        self.pipe_end_group(first);
     }
 
     /// GPU timestamp closing `group`'s draws. No-op when profiling is off or
@@ -650,9 +670,9 @@ impl<'a> RenderPass<'a> {
             return;
         }
         let pass = match group {
-            cull::Group::Opaque => GpuPass::OpaqueFull,
+            cull::Group::Opaque | cull::Group::Caged => GpuPass::OpaqueFull,
             cull::Group::Cutout => GpuPass::Cutout,
-            cull::Group::OpaqueLod => GpuPass::OpaqueLod,
+            cull::Group::OpaqueLod | cull::Group::CagedLod => GpuPass::OpaqueLod,
         };
         unsafe {
             self.r
@@ -663,8 +683,8 @@ impl<'a> RenderPass<'a> {
 
     fn pipe_stat_pass(group: cull::Group) -> PipeStatPass {
         match group {
-            cull::Group::Opaque => PipeStatPass::OpaqueFull,
-            cull::Group::OpaqueLod => PipeStatPass::OpaqueLod,
+            cull::Group::Opaque | cull::Group::Caged => PipeStatPass::OpaqueFull,
+            cull::Group::OpaqueLod | cull::Group::CagedLod => PipeStatPass::OpaqueLod,
             cull::Group::Cutout => PipeStatPass::Cutout,
         }
     }

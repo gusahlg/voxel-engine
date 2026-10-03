@@ -429,12 +429,14 @@ pub use crate::producer::Detail;
 /// placement record. `block` is an exact integer at any world coordinate (the
 /// shader subtracts the camera's integer block before any float narrowing, so
 /// far terrain never jitters); `local_off` covers non-integer placements
-/// (movers such as avatars) and stays zero for terrain.
+/// (movers such as avatars) and stays zero for terrain. `cage` bends the mesh
+/// through eight corners; `None` is the flat path.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct MeshPlacement {
     pub block: glam::IVec3,
     pub local_off: glam::Vec3,
     pub detail: Detail,
+    pub cage: Option<crate::CageHandle>,
 }
 
 impl MeshPlacement {
@@ -444,6 +446,19 @@ impl MeshPlacement {
             block,
             local_off: glam::Vec3::ZERO,
             detail,
+            cage: None,
+        }
+    }
+
+    /// A mesh bent through `cage`. The anchor lives on the cage, so `block`
+    /// and `local_off` stay zero. Freeing the cage while a mesh still names it
+    /// drops that mesh back to the origin.
+    pub fn caged(cage: crate::CageHandle, detail: Detail) -> Self {
+        Self {
+            block: glam::IVec3::ZERO,
+            local_off: glam::Vec3::ZERO,
+            detail,
+            cage: Some(cage),
         }
     }
 
@@ -453,6 +468,7 @@ impl MeshPlacement {
     pub(crate) fn supersedes(&self, prev: &Self) -> bool {
         self.block != prev.block
             || self.detail != prev.detail
+            || self.cage != prev.cage
             || (self.local_off - prev.local_off).abs().max_element() > 1e-4
     }
 }
@@ -661,5 +677,22 @@ mod tests {
         assert_eq!(data.quad_counts(), [0; 6]);
         assert_eq!(data.vertex_bytes(), 0);
         assert!(data.vertices.iter().map(Vec::capacity).sum::<usize>() >= cap);
+    }
+
+    #[test]
+    fn placement_supersedes_when_the_cage_changes() {
+        use crate::vk::handles::GpuHandle;
+        let detail = Detail::FULL;
+        let flat = MeshPlacement::terrain(glam::IVec3::ZERO, detail);
+        assert!(flat.cage.is_none());
+        assert!(!flat.supersedes(&flat));
+        let cage = crate::CageHandle::from_parts(0, std::num::NonZeroU32::new(1).unwrap());
+        let bent = MeshPlacement::caged(cage, detail);
+        assert_eq!(bent.block, glam::IVec3::ZERO);
+        assert_eq!(bent.local_off, glam::Vec3::ZERO);
+        assert!(bent.supersedes(&flat));
+        assert!(!bent.supersedes(&bent));
+        let other = crate::CageHandle::from_parts(1, std::num::NonZeroU32::new(1).unwrap());
+        assert!(MeshPlacement::caged(other, detail).supersedes(&bent));
     }
 }

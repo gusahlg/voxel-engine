@@ -198,6 +198,76 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             "mesh3d_lod_lean.frag.spv",
         )
     });
+    // Caged mesh: bent vertices and a per-vertex face normal. The uncaged
+    // modules above stay free of the cage binding and the extra varying.
+    jobs.push(ShaderJob {
+        defines: &[("CAGED", None)],
+        ..job(
+            "shaders/mesh3d.vert.slang",
+            Stage::Vertex,
+            "vertexMain",
+            "mesh3d_caged.vert.spv",
+        )
+    });
+    jobs.push(ShaderJob {
+        defines: &[("CAGED", None)],
+        ..job(
+            "shaders/mesh3d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "mesh3d_caged.frag.spv",
+        )
+    });
+    jobs.push(ShaderJob {
+        defines: &[("CAGED", None), ("WATER_DEPTH_ABSORPTION", None)],
+        ..job(
+            "shaders/mesh3d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "mesh3d_caged_water.frag.spv",
+        )
+    });
+    jobs.push(ShaderJob {
+        defines: &[("CAGED", None), ("MESH3D_OPAQUE", None)],
+        ..job(
+            "shaders/mesh3d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "mesh3d_caged_opaque.frag.spv",
+        )
+    });
+    jobs.push(ShaderJob {
+        defines: &[("CAGED", None), ("MESH3D_OPAQUE", None), ("MESH3D_LOD", None)],
+        ..job(
+            "shaders/mesh3d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "mesh3d_caged_lod.frag.spv",
+        )
+    });
+    jobs.push(ShaderJob {
+        defines: &[("CAGED", None), ("MESH3D_OPAQUE", None), ("MESH3D_LEAN", None)],
+        ..job(
+            "shaders/mesh3d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "mesh3d_caged_opaque_lean.frag.spv",
+        )
+    });
+    jobs.push(ShaderJob {
+        defines: &[
+            ("CAGED", None),
+            ("MESH3D_OPAQUE", None),
+            ("MESH3D_LOD", None),
+            ("MESH3D_LEAN", None),
+        ],
+        ..job(
+            "shaders/mesh3d.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "mesh3d_caged_lod_lean.frag.spv",
+        )
+    });
     // Present-time TAA tonemap fragment (`-DTAA_FUSED`).
     jobs.push(ShaderJob {
         defines: &[("TAA_FUSED", None)],
@@ -602,8 +672,18 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "CULL_CAMERA_GROUPS",
-            doc: "Camera cull groups: full-res Opaque, Cutout, coarse-LOD Opaque.\nMust match vk::cull::CAMERA_GROUPS; the shader uses this for partition indexing.",
+            doc: "Camera cull groups: full-res Opaque, Cutout, coarse-LOD Opaque,\ncaged, caged LOD. Must match vk::cull::CAMERA_GROUPS.",
+            val: Val::UInt(5),
+        },
+        Def {
+            name: "CULL_CAGED_GROUP",
+            doc: "Camera cull group for a full-res caged mesh. Must match vk::cull::Group::Caged.",
             val: Val::UInt(3),
+        },
+        Def {
+            name: "CULL_CAGED_LOD_GROUP",
+            doc: "Camera cull group for a coarse-LOD caged mesh. Must match vk::cull::Group::CagedLod.",
+            val: Val::UInt(4),
         },
         Def {
             name: "CULL_BUCKET_SPLIT_0",

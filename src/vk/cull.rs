@@ -5,12 +5,13 @@
 //! count skips the dispatch and writes the same commands on the host.
 //!
 //! Camera groups (bucketed): full-res Opaque, Cutout, coarse-LOD Opaque
-//! (`scale > 1`). The LOD split exists so full-res opaque draws bind a
-//! fragment module with no `discard` (early depth write) while only the LOD
-//! partition pays for the box clip. Coarse-LOD meshes whose camera-relative
-//! AABB lies entirely inside that box are not emitted (every fragment would
-//! be discarded). Shadow Near/Far stay unbucketed and reuse the full-res
-//! Opaque live count.
+//! (`scale > 1`), full-res caged, coarse-LOD caged. The LOD split exists so
+//! full-res opaque draws bind a fragment module with no `discard` (early depth
+//! write) while only the LOD partition pays for the box clip. Coarse-LOD
+//! meshes whose camera-relative AABB lies entirely inside that box are not
+//! emitted (every fragment would be discarded). Caged meshes use the corner
+//! AABB and their own groups. Shadow Near/Far stay unbucketed; capacity is
+//! full-res Opaque plus full-res caged.
 
 use ash::vk;
 
@@ -217,6 +218,7 @@ impl CullState {
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             storage(6),
             storage(7),
+            storage(8),
         ];
         let (set_layout, layout) = pass::push_descriptor_layouts(
             device,
@@ -490,8 +492,9 @@ impl CullState {
                         .expect("visibility was just written"),
                 ),
                 info(self.stats[slot].gpu),
+                info(records.cages),
             ];
-            let writes: [vk::WriteDescriptorSet; 8] = std::array::from_fn(|i| {
+            let writes: [vk::WriteDescriptorSet; 9] = std::array::from_fn(|i| {
                 vk::WriteDescriptorSet::default()
                     .dst_binding(i as u32)
                     .descriptor_type(if i == 5 {
@@ -609,8 +612,11 @@ mod tests {
 
     #[test]
     fn stats_histogram_is_two_u32s_per_camera_group() {
-        assert_eq!(STATS_COUNT, 6);
-        assert_eq!(STATS_BYTES, 24);
+        assert_eq!(
+            STATS_COUNT,
+            crate::genconst::CULL_CAMERA_GROUPS as usize * 2
+        );
+        assert_eq!(STATS_BYTES, (STATS_COUNT * size_of::<u32>()) as u64);
         assert_eq!(FLAG_STATS, 1);
     }
 

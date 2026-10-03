@@ -278,6 +278,7 @@ fn main() {
                             block,
                             local_off: Vec3::new(0.0, WATER_LEVEL, 0.0),
                             detail: Detail::FULL,
+                            cage: None,
                         };
                         eng.upload_mesh_placed(&water_data, wet)
                             .expect("water upload");

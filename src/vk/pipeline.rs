@@ -160,6 +160,19 @@ const MESH3D_LOD_LEAN_FRAG: &[u8] =
 /// Shader variant that samples the previous frame's depth for water absorption;
 /// built when MSAA is off (single-sample depth is directly sampleable).
 const MESH3D_WATER_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_water.frag.spv"));
+/// Caged mesh vertex: trilinear through the cage, bent face normal at location 4.
+const MESH3D_CAGED_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_caged.vert.spv"));
+const MESH3D_CAGED_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_caged.frag.spv"));
+const MESH3D_CAGED_OPAQUE_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_caged_opaque.frag.spv"));
+const MESH3D_CAGED_LOD_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_caged_lod.frag.spv"));
+const MESH3D_CAGED_OPAQUE_LEAN_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_caged_opaque_lean.frag.spv"));
+const MESH3D_CAGED_LOD_LEAN_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_caged_lod_lean.frag.spv"));
+const MESH3D_CAGED_WATER_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_caged_water.frag.spv"));
 
 pub(crate) const DEBUG_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.vert.spv"));
 const DEBUG_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug.frag.spv"));
@@ -205,6 +218,14 @@ pub struct Pipelines {
     /// Water-absorption variant when MSAA is off (samples previous-frame depth);
     /// fallback to mesh3d_transparent otherwise.
     pub mesh3d_transparent_absorb: Option<vk::Pipeline>,
+    /// Caged twins of the mesh pipelines. Own vertex module (bent position and
+    /// face normal); the flat pipelines do not declare the cage binding.
+    pub mesh3d_caged: vk::Pipeline,
+    pub mesh3d_caged_lod: vk::Pipeline,
+    pub mesh3d_caged_lean: vk::Pipeline,
+    pub mesh3d_caged_lod_lean: vk::Pipeline,
+    pub mesh3d_caged_transparent: vk::Pipeline,
+    pub mesh3d_caged_transparent_absorb: Option<vk::Pipeline>,
     pub debug_tris: vk::Pipeline,
     /// Same debug modules/layout as `debug_tris`, but alpha blends and reads
     /// (never writes) depth — for translucent ground decals (contact shadows).
@@ -511,6 +532,14 @@ impl Pipelines {
         let absorb_ok = samples == vk::SampleCountFlags::TYPE_1;
         let mesh3d_water_frag =
             absorb_ok.then(|| pass::shader_module(device, MESH3D_WATER_FRAG, "water fragment"));
+        let blend_config = || PipelineConfig {
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            depth: DepthMode::ReadOnly,
+            cull: vk::CullModeFlags::NONE,
+            blend: true,
+            vrs: true,
+            depth_bias: None,
+        };
         let mesh3d_transparent_absorb = mesh3d_water_frag.map(|water_frag| {
             builder.build(
                 mesh_vert,
@@ -518,14 +547,81 @@ impl Pipelines {
                 &bindings_3d,
                 attributes_3d,
                 layout_3d,
-                PipelineConfig {
-                    topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                    depth: DepthMode::ReadOnly,
-                    cull: vk::CullModeFlags::NONE,
-                    blend: true,
-                    vrs: true,
-                    depth_bias: None,
-                },
+                blend_config(),
+            )
+        });
+
+        let mesh_caged_vert = pass::shader_module(device, MESH3D_CAGED_VERT, "mesh3d caged vertex");
+        let mesh_caged_frag =
+            pass::shader_module(device, MESH3D_CAGED_FRAG, "mesh3d caged fragment");
+        let mesh_caged_opaque_frag = pass::shader_module(
+            device,
+            MESH3D_CAGED_OPAQUE_FRAG,
+            "mesh3d caged opaque fragment",
+        );
+        let mesh_caged_lod_frag =
+            pass::shader_module(device, MESH3D_CAGED_LOD_FRAG, "mesh3d caged lod fragment");
+        let mesh_caged_opaque_lean_frag = pass::shader_module(
+            device,
+            MESH3D_CAGED_OPAQUE_LEAN_FRAG,
+            "mesh3d caged opaque lean fragment",
+        );
+        let mesh_caged_lod_lean_frag = pass::shader_module(
+            device,
+            MESH3D_CAGED_LOD_LEAN_FRAG,
+            "mesh3d caged lod lean fragment",
+        );
+        let mesh3d_caged = builder.build(
+            mesh_caged_vert,
+            mesh_caged_opaque_frag,
+            &bindings_3d,
+            attributes_3d,
+            layout_3d,
+            opaque_config(),
+        );
+        let mesh3d_caged_lod = builder.build(
+            mesh_caged_vert,
+            mesh_caged_lod_frag,
+            &bindings_3d,
+            attributes_3d,
+            layout_3d,
+            opaque_config(),
+        );
+        let mesh3d_caged_lean = builder.build(
+            mesh_caged_vert,
+            mesh_caged_opaque_lean_frag,
+            &bindings_3d,
+            attributes_3d,
+            layout_3d,
+            opaque_config(),
+        );
+        let mesh3d_caged_lod_lean = builder.build(
+            mesh_caged_vert,
+            mesh_caged_lod_lean_frag,
+            &bindings_3d,
+            attributes_3d,
+            layout_3d,
+            opaque_config(),
+        );
+        let mesh3d_caged_transparent = builder.build(
+            mesh_caged_vert,
+            mesh_caged_frag,
+            &bindings_3d,
+            attributes_3d,
+            layout_3d,
+            blend_config(),
+        );
+        let mesh_caged_water_frag = absorb_ok.then(|| {
+            pass::shader_module(device, MESH3D_CAGED_WATER_FRAG, "caged water fragment")
+        });
+        let mesh3d_caged_transparent_absorb = mesh_caged_water_frag.map(|water_frag| {
+            builder.build(
+                mesh_caged_vert,
+                water_frag,
+                &bindings_3d,
+                attributes_3d,
+                layout_3d,
+                blend_config(),
             )
         });
 
@@ -753,6 +849,15 @@ impl Pipelines {
             if let Some(m) = mesh3d_water_frag {
                 device.destroy_shader_module(m, None);
             }
+            device.destroy_shader_module(mesh_caged_vert, None);
+            device.destroy_shader_module(mesh_caged_frag, None);
+            device.destroy_shader_module(mesh_caged_opaque_frag, None);
+            device.destroy_shader_module(mesh_caged_lod_frag, None);
+            device.destroy_shader_module(mesh_caged_opaque_lean_frag, None);
+            device.destroy_shader_module(mesh_caged_lod_lean_frag, None);
+            if let Some(m) = mesh_caged_water_frag {
+                device.destroy_shader_module(m, None);
+            }
             device.destroy_shader_module(debug_vert, None);
             device.destroy_shader_module(debug_frag, None);
             device.destroy_shader_module(tri2d_vert, None);
@@ -775,6 +880,12 @@ impl Pipelines {
             mesh3d_lod_lean,
             mesh3d_transparent,
             mesh3d_transparent_absorb,
+            mesh3d_caged,
+            mesh3d_caged_lod,
+            mesh3d_caged_lean,
+            mesh3d_caged_lod_lean,
+            mesh3d_caged_transparent,
+            mesh3d_caged_transparent_absorb,
             debug_tris,
             debug_tris_blend,
             debug_lines,
@@ -830,6 +941,23 @@ impl Pipelines {
             .unwrap_or(self.mesh3d_transparent)
     }
 
+    /// Full-res and coarse-LOD caged opaque pipelines. Same `lean` switch as
+    /// [`Self::opaque_pipelines`].
+    pub fn caged_opaque(&self, lean: bool) -> (vk::Pipeline, vk::Pipeline) {
+        if lean {
+            (self.mesh3d_caged_lean, self.mesh3d_caged_lod_lean)
+        } else {
+            (self.mesh3d_caged, self.mesh3d_caged_lod)
+        }
+    }
+
+    /// Caged Blend pipeline. Absorption when that module was built, matching
+    /// [`Self::blend_pipeline`] rather than the per-frame absorb flag.
+    pub fn caged_blend(&self) -> vk::Pipeline {
+        self.mesh3d_caged_transparent_absorb
+            .unwrap_or(self.mesh3d_caged_transparent)
+    }
+
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe {
             if let Some(v) = &self.vrs_compute {
@@ -844,6 +972,14 @@ impl Pipelines {
             device.destroy_pipeline(self.mesh3d_lod_lean, None);
             device.destroy_pipeline(self.mesh3d_transparent, None);
             if let Some(p) = self.mesh3d_transparent_absorb {
+                device.destroy_pipeline(p, None);
+            }
+            device.destroy_pipeline(self.mesh3d_caged, None);
+            device.destroy_pipeline(self.mesh3d_caged_lod, None);
+            device.destroy_pipeline(self.mesh3d_caged_lean, None);
+            device.destroy_pipeline(self.mesh3d_caged_lod_lean, None);
+            device.destroy_pipeline(self.mesh3d_caged_transparent, None);
+            if let Some(p) = self.mesh3d_caged_transparent_absorb {
                 device.destroy_pipeline(p, None);
             }
             device.destroy_pipeline(self.debug_tris, None);
@@ -1211,6 +1347,11 @@ mod tests {
         for (name, bytes) in [
             ("MESH3D_OPAQUE", super::MESH3D_OPAQUE_FRAG),
             ("MESH3D_OPAQUE_LEAN", super::MESH3D_OPAQUE_LEAN_FRAG),
+            ("MESH3D_CAGED_OPAQUE", super::MESH3D_CAGED_OPAQUE_FRAG),
+            (
+                "MESH3D_CAGED_OPAQUE_LEAN",
+                super::MESH3D_CAGED_OPAQUE_LEAN_FRAG,
+            ),
         ] {
             assert!(
                 !spirv_has_opcode(bytes, OP_KILL) && !spirv_has_opcode(bytes, OP_DEMOTE),
@@ -1236,6 +1377,21 @@ mod tests {
                 || spirv_has_opcode(super::MESH3D_FRAG, OP_DEMOTE),
             "Blend mesh3d.frag must keep the slab-clip discard"
         );
+        assert!(
+            spirv_has_opcode(super::MESH3D_CAGED_LOD_FRAG, OP_KILL)
+                || spirv_has_opcode(super::MESH3D_CAGED_LOD_FRAG, OP_DEMOTE),
+            "caged LOD must keep the slab-clip discard"
+        );
+        assert!(
+            spirv_has_opcode(super::MESH3D_CAGED_LOD_LEAN_FRAG, OP_KILL)
+                || spirv_has_opcode(super::MESH3D_CAGED_LOD_LEAN_FRAG, OP_DEMOTE),
+            "caged LOD lean must keep the slab-clip discard"
+        );
+        assert!(
+            spirv_has_opcode(super::MESH3D_CAGED_FRAG, OP_KILL)
+                || spirv_has_opcode(super::MESH3D_CAGED_FRAG, OP_DEMOTE),
+            "caged Blend must keep the slab-clip discard"
+        );
     }
 
     #[test]
@@ -1248,12 +1404,37 @@ mod tests {
             ("mesh3d_opaque_lean.frag", super::MESH3D_OPAQUE_LEAN_FRAG),
             ("mesh3d_lod_lean.frag", super::MESH3D_LOD_LEAN_FRAG),
             ("mesh3d_water.frag", super::MESH3D_WATER_FRAG),
+            ("mesh3d_caged.frag", super::MESH3D_CAGED_FRAG),
+            ("mesh3d_caged_opaque.frag", super::MESH3D_CAGED_OPAQUE_FRAG),
+            ("mesh3d_caged_lod.frag", super::MESH3D_CAGED_LOD_FRAG),
+            (
+                "mesh3d_caged_opaque_lean.frag",
+                super::MESH3D_CAGED_OPAQUE_LEAN_FRAG,
+            ),
+            (
+                "mesh3d_caged_lod_lean.frag",
+                super::MESH3D_CAGED_LOD_LEAN_FRAG,
+            ),
+            ("mesh3d_caged_water.frag", super::MESH3D_CAGED_WATER_FRAG),
         ] {
             assert!(
                 spirv_has_binding(bytes, binding),
                 "{name} must declare the material SSBO at binding {binding}"
             );
         }
+    }
+
+    #[test]
+    fn uncaged_mesh_vert_does_not_bind_the_cage_table() {
+        let binding = super::super::mesh3d_desc::MESH3D_BINDING_CAGES;
+        assert!(
+            !spirv_has_binding(super::MESH3D_VERT, binding),
+            "flat mesh3d.vert must not declare the cage SSBO"
+        );
+        assert!(
+            spirv_has_binding(super::MESH3D_CAGED_VERT, binding),
+            "caged mesh3d.vert must declare the cage SSBO at binding {binding}"
+        );
     }
 
     #[test]

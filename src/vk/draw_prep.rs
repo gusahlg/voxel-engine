@@ -36,6 +36,8 @@ pub(crate) struct DrawEntry {
     slot: u32,
     /// Squared distance to AABB center (monotonic; back-to-front sort key).
     dist2: f32,
+    /// Binds the caged blend pipeline. Runs split on this as well as buffer.
+    caged: bool,
 }
 /// Contiguous indirect commands sharing one buffer and pass.
 #[derive(Clone, Copy)]
@@ -44,6 +46,7 @@ pub(crate) struct DrawRun {
     pub(super) pass: Pass,
     pub(super) first: u32,
     pub(super) count: u32,
+    pub(super) caged: bool,
 }
 /// Shadow-map content key: sun/eye-snap/occluders plus hashed avatar casters.
 fn shadow_key(
@@ -176,17 +179,35 @@ impl Renderer {
             // draw. `detail_scale` decodes the BIASED detail field — never
             // decode `detail_pass` here by hand (it carries a to_gpu_bits offset).
             let scale = rec.detail_scale();
-            let offset = glam::Vec3::new(
-                rec.block[0].wrapping_sub(eye.block[0]) as f32 - eye.frac[0] + rec.local_off[0],
-                rec.block[1].wrapping_sub(eye.block[1]) as f32 - eye.frac[1] + rec.local_off[1],
-                rec.block[2].wrapping_sub(eye.block[2]) as f32 - eye.frac[2] + rec.local_off[2],
-            );
-            let amin = glam::Vec3::from(rec.aabb_min);
-            let amax = glam::Vec3::from(rec.aabb_max);
-            if !camera.intersects_aabb(amin * scale + offset, amax * scale + offset) {
+            let caged = rec.cage != 0;
+            let (mn, mx, center) = if caged {
+                let Some(entry) = self.cages.entry(rec.cage) else {
+                    continue;
+                };
+                let aabb = super::arena::MeshAabb::from_cage(&entry);
+                let dx = aabb.block[0].wrapping_sub(eye.block[0]) as f32 - eye.frac[0];
+                let dy = aabb.block[1].wrapping_sub(eye.block[1]) as f32 - eye.frac[1];
+                let dz = aabb.block[2].wrapping_sub(eye.block[2]) as f32 - eye.frac[2];
+                let mn = glam::Vec3::new(aabb.min[0] + dx, aabb.min[1] + dy, aabb.min[2] + dz);
+                let mx = glam::Vec3::new(aabb.max[0] + dx, aabb.max[1] + dy, aabb.max[2] + dz);
+                (mn, mx, (mn + mx) * 0.5)
+            } else {
+                let offset = glam::Vec3::new(
+                    rec.block[0].wrapping_sub(eye.block[0]) as f32 - eye.frac[0] + rec.local_off[0],
+                    rec.block[1].wrapping_sub(eye.block[1]) as f32 - eye.frac[1] + rec.local_off[1],
+                    rec.block[2].wrapping_sub(eye.block[2]) as f32 - eye.frac[2] + rec.local_off[2],
+                );
+                let amin = glam::Vec3::from(rec.aabb_min);
+                let amax = glam::Vec3::from(rec.aabb_max);
+                (
+                    amin * scale + offset,
+                    amax * scale + offset,
+                    offset + (amin + amax) * 0.5 * scale,
+                )
+            };
+            if !camera.intersects_aabb(mn, mx) {
                 continue;
             }
-            let center = offset + (amin + amax) * 0.5 * scale;
             let dist2 = (center - scene.cam_pos).length_squared();
             self.draw_scratch.push(DrawEntry {
                 buffer: self.arena_dir.arena_buffer((arena - 1) as usize),
@@ -196,6 +217,7 @@ impl Renderer {
                 vertex_offset: rec.vertex_offset,
                 slot: s,
                 dist2,
+                caged,
             });
         }
         // Blend far→near for correct back-to-front alpha compositing.
@@ -216,12 +238,19 @@ impl Renderer {
                 first_instance: entry.slot,
             });
             match self.draw_runs.last_mut() {
-                Some(run) if run.buffer == entry.buffer && run.pass == entry.pass => run.count += 1,
+                Some(run)
+                    if run.buffer == entry.buffer
+                        && run.pass == entry.pass
+                        && run.caged == entry.caged =>
+                {
+                    run.count += 1
+                }
                 _ => self.draw_runs.push(DrawRun {
                     buffer: entry.buffer,
                     pass: entry.pass,
                     first: command_index,
                     count: 1,
+                    caged: entry.caged,
                 }),
             }
         }
@@ -252,7 +281,19 @@ impl Renderer {
                 &self.device.device,
                 self.device.physical,
             )
-        };
+        }
+        .and_then(|mut bufs| {
+            let cages = unsafe {
+                self.cages.flush(
+                    slot,
+                    &self.instance.instance,
+                    &self.device.device,
+                    self.device.physical,
+                )
+            }?;
+            bufs.cages = cages;
+            Some(bufs)
+        });
 
         // Cull emits shadow casters only when the shared map will actually be
         // rewritten this frame. A cache hit skips cascade `fit()` and sets
@@ -340,5 +381,11 @@ impl Renderer {
             crate::profile::Gauge::DrawsPacked,
             self.draw_commands.len() as u64,
         );
+        // This frame's eye, for the next command drain's cage occluder test.
+        // SetCage already ran, so it does not change the bump decided above.
+        if let Some((_, eye)) = camera_eye {
+            self.cages
+                .note_eye(*eye, [cfg.sphere_radius(0), cfg.sphere_radius(1)]);
+        }
     }
 }

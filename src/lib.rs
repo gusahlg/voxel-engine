@@ -10,6 +10,7 @@
 //!
 //! Entry point: [`run`] with a per-frame callback over [`Engine`].
 
+mod cage;
 mod camera;
 mod capture;
 mod color;
@@ -28,6 +29,7 @@ mod screenshot;
 pub mod skeleton;
 mod vk;
 
+pub use cage::CageHandle;
 pub use camera::{
     Aspect, Camera3D, Frustum, Lens, WarpMap, WarpPush, WarpStrength, Z_NEAR, world_to_screen,
 };

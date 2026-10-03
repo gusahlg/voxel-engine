@@ -14,7 +14,8 @@ pub struct MeshRecord {
     pub block: [i32; 3],
     pub detail_pass: u32,
     pub local_off: [f32; 3],
-    pub _pad: u32,
+    /// Cage-table index. 0 = flat mesh (the only value existing meshes use).
+    pub cage: u32,
     pub aabb_min: [f32; 3],
     pub index_count: u32,
     pub aabb_max: [f32; 3],
@@ -32,6 +33,7 @@ pub(crate) const MESH_FLAG_FACE_RUNS: u32 = 1;
 
 // Stride must match the vertex shaders exactly; layout drift corrupts every draw.
 const _: () = assert!(std::mem::size_of::<MeshRecord>() == 80);
+const _: () = assert!(std::mem::offset_of!(MeshRecord, cage) == 28);
 const _: () = assert!(std::mem::offset_of!(MeshRecord, face_quads) == 64);
 const _: () = assert!(std::mem::offset_of!(MeshRecord, flags) == 76);
 
@@ -55,14 +57,19 @@ impl MeshRecord {
 
     /// Compose a GPU record from mesh metadata and placement.
     pub(crate) fn compose(meta: &MeshMeta, p: crate::mesh::MeshPlacement) -> Self {
-        let (face_quads, flags) = Self::pack_face_quads(&meta.bounds);
+        let (face_quads, mut flags) = Self::pack_face_quads(&meta.bounds);
+        // Face-run culling assumes axis-aligned faces. A bent mesh draws whole.
+        let cage = p.cage.map(|h| h.gpu_index()).unwrap_or(0);
+        if cage != 0 {
+            flags &= !MESH_FLAG_FACE_RUNS;
+        }
         Self {
             block: p.block.to_array(),
             // Detail in the low DETAIL_GPU_BITS, pass in the next two.
             detail_pass: u32::from(p.detail.to_gpu_bits())
                 | ((meta.pass as u32) << crate::genconst::DETAIL_GPU_BITS),
             local_off: p.local_off.to_array(),
-            _pad: 0,
+            cage,
             aabb_min: meta.aabb_min.to_array(),
             index_count: meta.bounds[6],
             aabb_max: meta.aabb_max.to_array(),
@@ -114,6 +121,8 @@ pub(crate) struct RecordBuffers {
     pub records: vk::Buffer,
     pub dyns: vk::Buffer,
     pub arenas: vk::Buffer,
+    /// Cage SSBO (binding 8). Always a real buffer once any mesh exists.
+    pub cages: vk::Buffer,
     /// Table length in slots.
     pub slots: u32,
 }
@@ -136,6 +145,25 @@ impl RecordTable {
     /// The current occluder-set revision, read by the shadow cache each frame.
     pub(crate) fn occluder_rev(&self) -> u64 {
         self.occluder_rev
+    }
+
+    /// Bump the shadow-cache key without rewriting a record. Cage edits call
+    /// this only when a corner box meets a cascade sphere.
+    pub(crate) fn bump_occluder(&mut self) {
+        self.occluder_rev += 1;
+    }
+
+    pub(crate) fn slot_count(&self) -> u32 {
+        self.records.len() as u32
+    }
+
+    /// Replace one record and mark it dirty. Does not touch `occluder_rev`.
+    pub(crate) fn write_slot(&mut self, slot: u32, record: MeshRecord) {
+        let Some(rec) = self.records.get_mut(slot as usize) else {
+            return;
+        };
+        *rec = record;
+        self.mark(slot);
     }
 
     fn mark(&mut self, slot: u32) {
@@ -264,6 +292,7 @@ impl RecordTable {
             records: copy.records.bound()?,
             dyns: copy.dyns.bound()?,
             arenas: copy.arenas.bound()?,
+            cages: vk::Buffer::null(),
             slots: self.records.len() as u32,
         })
     }
@@ -386,6 +415,37 @@ mod tests {
             "index range stays whole-mesh (bounds[0]..bounds[6])"
         );
         assert_eq!(rec.vertex_offset, 12);
+    }
+
+    #[test]
+    fn compose_caged_stores_the_gpu_index_and_clears_face_runs() {
+        use std::num::NonZeroU32;
+
+        use super::super::handles::{DrawDyn, MeshMeta, PlacementState};
+        use super::{MESH_FLAG_FACE_RUNS, MeshRecord};
+        use crate::mesh::{Detail, MeshPlacement};
+        let meta = MeshMeta {
+            aabb_min: glam::Vec3::ZERO,
+            aabb_max: glam::Vec3::ONE,
+            bounds: [0; 7],
+            vertex_offset: 0,
+            pass: crate::mesh::Pass::Opaque,
+            placement: PlacementState::Pinned,
+            dyn_lane: DrawDyn::resting(),
+        };
+        let handle = crate::CageHandle {
+            slot: 4,
+            generation: NonZeroU32::new(1).unwrap(),
+        };
+        let rec = MeshRecord::compose(&meta, MeshPlacement::caged(handle, Detail::FULL));
+        assert_eq!(rec.cage, 5, "gpu index is the allocator slot plus one");
+        assert_eq!(rec.block, [0; 3]);
+        assert_eq!(rec.local_off, [0.0; 3]);
+        assert_eq!(
+            rec.flags & MESH_FLAG_FACE_RUNS,
+            0,
+            "a bent mesh draws whole, even when the buckets fit in u16"
+        );
     }
 
     /// Old upload: vertices in insertion order, six index buckets of the

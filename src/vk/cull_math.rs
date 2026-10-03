@@ -14,10 +14,14 @@ pub(crate) enum Group {
     Cutout = 1,
     /// Coarse-LOD (scale > 1) Opaque: the box-clip `discard` module.
     OpaqueLod = 2,
+    /// Full-res caged mesh (any non-blend pass, scale <= 1).
+    Caged = 3,
+    /// Coarse-LOD caged mesh (scale > 1).
+    CagedLod = 4,
 }
-/// Camera groups (Opaque, Cutout, OpaqueLod). Bucketed.
-pub(crate) const CAMERA_GROUPS: usize = 3;
-/// Shadow Near/Far. Unbucketed; sized from the full-res Opaque live count.
+/// Camera groups (Opaque, Cutout, OpaqueLod, Caged, CagedLod). Bucketed.
+pub(crate) const CAMERA_GROUPS: usize = 5;
+/// Shadow Near/Far. Unbucketed; sized from full-res Opaque plus full-res caged.
 pub(crate) const SHADOW_GROUPS: usize = 2;
 /// Camera groups + shadow groups.
 pub(crate) const GROUPS: usize = CAMERA_GROUPS + SHADOW_GROUPS;
@@ -33,7 +37,7 @@ pub(crate) const CULL_BUCKET_SPLITS: [f32; 3] = [
 /// camera is in {+, −, both}; upload order +X,+Y,+Z,−X,−Y,−Z keeps same-sign
 /// faces adjacent, so an outside camera sees ≤3 maximal contiguous runs.
 pub(crate) const MAX_FACE_RUNS: u32 = 3;
-/// Live-count lanes: [full-res Opaque, Cutout, LOD Opaque].
+/// Live-count lanes, one per camera group.
 pub(crate) const LANES: usize = CAMERA_GROUPS;
 /// Size of VkDrawIndexedIndirectCommand.
 pub(crate) const CMD_STRIDE: u64 = 20;
@@ -52,8 +56,32 @@ const CPU_CULL_MAX: u32 = 1024;
 
 const _: () = assert!(crate::genconst::CULL_DISTANCE_BUCKETS == 4);
 const _: () = assert!(crate::genconst::CULL_CAMERA_GROUPS == CAMERA_GROUPS as u32);
+const _: () = assert!(Group::Caged as u32 == crate::genconst::CULL_CAGED_GROUP);
+const _: () = assert!(Group::CagedLod as u32 == crate::genconst::CULL_CAGED_LOD_GROUP);
 const _: () = assert!(GROUPS == CAMERA_GROUPS + SHADOW_GROUPS);
-const _: () = assert!(Group::OpaqueLod as usize + 1 == CAMERA_GROUPS);
+const _: () = assert!(Group::CagedLod as usize + 1 == CAMERA_GROUPS);
+
+/// Camera-group index. Caged draws take their own groups so the flat pipelines
+/// stay free of the bent varying.
+#[inline(always)]
+fn camera_group(pass: u32, lod: bool, caged: bool) -> u32 {
+    if caged {
+        if lod {
+            Group::CagedLod as u32
+        } else {
+            Group::Caged as u32
+        }
+    } else if pass == 0 && lod {
+        Group::OpaqueLod as u32
+    } else {
+        pass
+    }
+}
+
+#[inline(always)]
+fn is_lod_group(group: u32) -> bool {
+    group == Group::OpaqueLod as u32 || group == Group::CagedLod as u32
+}
 
 /// True when every fragment of a camera-relative AABB would be discarded by
 /// the coarse-LOD box clip (`mesh3d.frag.slang`). A non-positive half-extent
@@ -629,8 +657,8 @@ fn cull_fast_solid(
         }
         let pass = super::arena::cull_bits_pass(bits);
         let lod = super::arena::cull_bits_lod(bits);
-        let group = if pass == 0 && lod { 2 } else { pass };
-        if group == 2 && lod_aabb_inside_box(mn, mx, half) {
+        let group = camera_group(pass, lod, super::arena::cull_bits_caged(bits));
+        if is_lod_group(group) && lod_aabb_inside_box(mn, mx, half) {
             continue;
         }
         let cx = 0.5 * (mn[0] + mx[0]);
@@ -707,8 +735,8 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
         let mut group = 0u32;
         let mut part = 0usize;
         if cam_visible && aabb_in_planes(cam_planes, mn, mx) {
-            group = if pass == 0 && lod { 2 } else { pass };
-            if group != 2 || !lod_aabb_inside_box(mn, mx, half) {
+            group = camera_group(pass, lod, super::arena::cull_bits_caged(bits));
+            if !is_lod_group(group) || !lod_aabb_inside_box(mn, mx, half) {
                 let cx = 0.5 * (mn[0] + mx[0]);
                 let cy = 0.5 * (mn[1] + mx[1]);
                 let cz = 0.5 * (mn[2] + mx[2]);
@@ -840,7 +868,13 @@ const _: () = assert!(std::mem::offset_of!(PartitionGpu, capacity) == 4);
 
 impl Group {
     /// Camera-group partition-table order (shadows are unbucketed after this).
-    pub(crate) const ALL: [Group; CAMERA_GROUPS] = [Group::Opaque, Group::Cutout, Group::OpaqueLod];
+    pub(crate) const ALL: [Group; CAMERA_GROUPS] = [
+        Group::Opaque,
+        Group::Cutout,
+        Group::OpaqueLod,
+        Group::Caged,
+        Group::CagedLod,
+    ];
 }
 
 #[cfg(test)]
@@ -961,7 +995,7 @@ mod tests {
             block: [0; 3],
             detail_pass: u32::from(crate::mesh::Detail::FULL.to_gpu_bits()),
             local_off: [0.0; 3],
-            _pad: 0,
+            cage: 0,
             aabb_min: mn,
             index_count: 36,
             aabb_max: mx,
@@ -1568,5 +1602,88 @@ mod tests {
             new_per < old_per,
             "new path should be cheaper: {old_per:.2} -> {new_per:.2} ns/slot"
         );
+    }
+
+    #[test]
+    fn caged_slot_culls_by_its_corner_box_and_skips_face_runs() {
+        let camera = look_neg_z();
+        let front = MeshAabb {
+            block: [0; 3],
+            min: [-1.0, -1.0, -11.0],
+            max: [1.0, 1.0, -9.0],
+        };
+        let behind = MeshAabb {
+            block: [0; 3],
+            min: [-1.0, -1.0, 9.0],
+            max: [1.0, 1.0, 11.0],
+        };
+        // In the frustum, and strictly inside a 10-block clip box.
+        let inside = MeshAabb {
+            block: [0; 3],
+            min: [-1.0, -1.0, -6.0],
+            max: [1.0, 1.0, -4.0],
+        };
+        let mut dir = ArenaDirectory::new();
+        dir.note_upload(0, G1, buf(1), Pass::Opaque, false, front);
+        dir.note_upload_caged(1, G1, buf(1), Pass::Opaque, false, front);
+        dir.note_upload_caged(2, G1, buf(1), Pass::Opaque, false, behind);
+        dir.note_upload_caged(3, G1, buf(1), Pass::Opaque, true, inside);
+
+        let mut kept = opaque_rec(behind.min, behind.max);
+        kept.cage = 1;
+        kept.face_quads = [1 | (1 << 16), 1 | (1 << 16), 1 | (1 << 16)];
+        kept.flags = 0;
+        let mut hidden = opaque_rec(front.min, front.max);
+        hidden.cage = 2;
+        let mut lod = opaque_rec(inside.min, inside.max);
+        lod.cage = 3;
+        let records = [
+            opaque_rec(front.min, front.max),
+            kept,
+            hidden,
+            lod,
+        ];
+        let (parts, cmds, counts, stats) = run_cpu(
+            &mut dir,
+            &records,
+            &[0b1111],
+            &camera,
+            true,
+            [10.0, 10.0, 10.0],
+        );
+        let opaque = part_cmds(
+            &parts,
+            &cmds,
+            &counts,
+            camera_part(Group::Opaque as usize, 0, 0, 1),
+        );
+        assert_eq!(opaque.len(), 1);
+        assert_eq!(opaque[0].first_instance, 0);
+        let caged = part_cmds(
+            &parts,
+            &cmds,
+            &counts,
+            camera_part(Group::Caged as usize, 0, 0, 1),
+        );
+        assert_eq!(caged.len(), 1, "corner box in front is kept");
+        assert_eq!(caged[0].first_instance, 1);
+        assert_eq!(caged[0].first_index, 0, "face runs stay off");
+        assert_eq!(caged[0].index_count, 36);
+        assert!(
+            cmds.iter().all(|c| c.first_instance != 2),
+            "a corner box behind the camera is culled even when the local box is in front"
+        );
+        let lod_cmds = part_cmds(
+            &parts,
+            &cmds,
+            &counts,
+            camera_part(Group::CagedLod as usize, 0, 0, 1),
+        );
+        assert!(
+            lod_cmds.is_empty(),
+            "a caged LOD mesh inside the clip box is not drawn"
+        );
+        assert_eq!(stats[Group::Caged as usize * 2], 1);
+        assert_eq!(stats[Group::Caged as usize * 2 + 1], 36);
     }
 }

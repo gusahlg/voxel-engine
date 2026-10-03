@@ -10,6 +10,7 @@ pub(crate) mod arena;
 pub(crate) mod block_textures;
 pub(crate) mod bloom;
 pub(crate) mod buffers;
+pub(crate) mod cages;
 pub(crate) mod compute;
 pub(crate) mod cull;
 pub(crate) mod cull_math;
@@ -163,6 +164,8 @@ pub(crate) struct Renderer {
     present_semaphores: Vec<BinarySemaphore>,
     /// Persistent per-mesh record/dyn SSBOs (slot-indexed via `first_instance`).
     pub(crate) records: buffers::RecordTable,
+    /// Bent-mesh cages, indexed by `MeshRecord.cage` (0 = none).
+    cages: cages::CageTable,
     /// The record/dyn/arena buffers flushed for the recording slot this frame;
     /// the mesh passes' descriptor pushes read them. `None` while no mesh exists.
     record_buffers: Option<buffers::RecordBuffers>,
@@ -660,6 +663,7 @@ impl Renderer {
             slots,
             present_semaphores,
             records: buffers::RecordTable::new(),
+            cages: cages::CageTable::new(),
             record_buffers: None,
             shadow_cache: shadow::ShadowCache::new(),
             cull,
@@ -797,14 +801,27 @@ impl Renderer {
     ) {
         // Grow the shared quad IBO to index this mesh before its draws record.
         self.quad_ibo.require(quads);
-        self.arena_dir.note_upload(
-            slot,
-            generation,
-            resident.buffer(),
-            record.pass(),
-            record.detail_scale() > 1.0,
-            cull::MeshAabb::from_record(&record),
-        );
+        let (caged, aabb) = self.placement_aabb(&record);
+        let lod = record.detail_scale() > 1.0;
+        if caged {
+            self.arena_dir.note_upload_caged(
+                slot,
+                generation,
+                resident.buffer(),
+                record.pass(),
+                lod,
+                aabb,
+            );
+        } else {
+            self.arena_dir.note_upload(
+                slot,
+                generation,
+                resident.buffer(),
+                record.pass(),
+                lod,
+                aabb,
+            );
+        }
         self.arena_dir.note_cull_draw(slot, &record);
         self.mesh_res.apply_upload(slot, generation, resident);
         self.records.install(slot, record);
@@ -813,14 +830,91 @@ impl Renderer {
     /// Replaces a mover's recomposed record, keeping the cull lane counts in
     /// step should its detail (LOD lane) have changed.
     pub(crate) fn apply_set_record(&mut self, slot: u32, record: buffers::MeshRecord) {
-        self.arena_dir.note_record(
-            slot,
-            record.pass(),
-            record.detail_scale() > 1.0,
-            cull::MeshAabb::from_record(&record),
-        );
+        let (caged, aabb) = self.placement_aabb(&record);
+        let lod = record.detail_scale() > 1.0;
+        if caged {
+            self.arena_dir
+                .note_record_caged(slot, record.pass(), lod, aabb);
+        } else {
+            self.arena_dir
+                .note_record(slot, record.pass(), lod, aabb);
+        }
         self.arena_dir.note_cull_draw(slot, &record);
         self.records.set_record(slot, record);
+    }
+
+    /// Install or replace a cage, then retarget every live mesh that names it.
+    pub(crate) fn apply_set_cage(
+        &mut self,
+        index: u32,
+        generation: NonZeroU32,
+        entry: crate::cage::CageGpu,
+    ) {
+        let edit = self.cages.set(index, generation, entry);
+        self.finish_cage_edit(index, edit);
+    }
+
+    /// Drop a cage. Meshes that still name it fall back to a flat draw.
+    pub(crate) fn apply_free_cage(&mut self, index: u32, generation: NonZeroU32) {
+        let edit = self.cages.free(index, generation);
+        self.finish_cage_edit(index, edit);
+    }
+
+    fn finish_cage_edit(&mut self, index: u32, edit: cages::CageEdit) {
+        if !self.cages.bumps(&edit) {
+            if !matches!(edit, cages::CageEdit::Changed { .. }) {
+                return;
+            }
+        } else {
+            self.records.bump_occluder();
+        }
+        let cages::CageEdit::Changed { new, .. } = edit else {
+            return;
+        };
+        let n = self.records.slot_count();
+        for slot in 0..n {
+            if self.arena_dir.arena_word(slot as usize) == 0 {
+                continue;
+            }
+            let Some(rec) = self.records.record(slot).copied() else {
+                continue;
+            };
+            if rec.cage != index {
+                continue;
+            }
+            let lod = rec.detail_scale() > 1.0;
+            match new {
+                Some(entry) => {
+                    self.arena_dir.note_record_caged(
+                        slot,
+                        rec.pass(),
+                        lod,
+                        cull::MeshAabb::from_cage(&entry),
+                    );
+                }
+                None => {
+                    let mut rec = rec;
+                    rec.cage = 0;
+                    let aabb = cull::MeshAabb::from_record(&rec);
+                    self.records.write_slot(slot, rec);
+                    self.arena_dir.note_record(slot, rec.pass(), lod, aabb);
+                    self.arena_dir.note_cull_draw(slot, &rec);
+                }
+            }
+        }
+    }
+
+    /// `(caged, world AABB)`. A missing cage slot is the zero cage, which is
+    /// what the shader reads until the upload lands.
+    fn placement_aabb(&self, record: &buffers::MeshRecord) -> (bool, cull::MeshAabb) {
+        if record.cage == 0 {
+            return (false, cull::MeshAabb::from_record(record));
+        }
+        let entry = self
+            .cages
+            .entry(record.cage)
+            .unwrap_or(crate::cage::CageGpu::ZERO);
+        (true, cull::MeshAabb::from_cage(&entry))
     }
 
     /// Set one word of the visibility mask.
@@ -1001,6 +1095,7 @@ impl Renderer {
             self.pipe_stats.destroy(device);
             self.targets.destroy(device);
             self.records.destroy(device);
+            self.cages.destroy(device);
             self.cull.destroy(device);
             self.quad_ibo.destroy(device);
             // The residents' allocations belong to the main-owned allocator

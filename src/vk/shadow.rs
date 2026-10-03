@@ -144,6 +144,12 @@ impl ShadowCfg {
     fn texel_world_at(&self, radius: f32) -> f32 {
         2.0 * radius / self.resolution as f32
     }
+
+    /// Eye-centred sphere the cage occluder test uses: the cascade split plus
+    /// the same margin `fit` adds when it builds the cascade frustum.
+    pub(crate) fn sphere_radius(&self, cascade: usize) -> f32 {
+        self.splits[cascade] + BIAS_MARGIN
+    }
 }
 
 /// Inputs that determine shadow map content (world-anchored, whole-texel snapped).
@@ -646,20 +652,26 @@ impl Renderer {
             device.cmd_set_viewport(cmd, 0, &[viewport]);
             device.cmd_set_scissor(cmd, 0, &[scissor]);
 
-            let occluders = self
-                .flags
-                .shadows
-                .then(|| self.record_buffers.map(|b| b.records))
-                .flatten();
-            if let Some(records_buffer) = occluders {
+            let occluders = self.flags.shadows.then(|| self.record_buffers).flatten();
+            if let Some(bufs) = occluders {
                 let records_info = [vk::DescriptorBufferInfo::default()
-                    .buffer(records_buffer)
+                    .buffer(bufs.records)
                     .offset(0)
                     .range(vk::WHOLE_SIZE)];
-                let write = [vk::WriteDescriptorSet::default()
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&records_info)];
+                let cage_info = [vk::DescriptorBufferInfo::default()
+                    .buffer(bufs.cages)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)];
+                let write = [
+                    vk::WriteDescriptorSet::default()
+                        .dst_binding(super::mesh3d_desc::MESH3D_BINDING_RECORDS)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&records_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_binding(super::mesh3d_desc::MESH3D_BINDING_CAGES)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&cage_info),
+                ];
                 self.device.push_descriptor.cmd_push_descriptor_set(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,

@@ -113,6 +113,12 @@ impl SlotPass for u32 {
     }
 }
 
+impl SlotPass for () {
+    fn slot_pass(&self) -> Option<Pass> {
+        None
+    }
+}
+
 /// Bridge letting [`HandleAllocator`] mint handles generically.
 pub(crate) trait GpuHandle: Copy {
     fn from_parts(slot: u32, generation: NonZeroU32) -> Self;

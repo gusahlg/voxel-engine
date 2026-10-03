@@ -312,17 +312,36 @@ impl Renderer {
     }
 
     /// Last completed cull geometry stats for this slot (`FRAMES_IN_FLIGHT`-frame delayed).
-    /// `draws.full` / `tris.full` are camera group 0 (full-res opaque);
-    /// `draws.cutout` / `tris.cutout` are group 1; `draws.lod` / `tris.lod`
-    /// are group 2 (coarse LOD). Gauges no-op when profiling is off.
+    /// Full-res and coarse-LOD gauges include the caged groups. Gauges no-op
+    /// when profiling is off.
     pub(super) fn publish_cull_stats(&self, slot: usize) {
-        let [d0, i0, d1, i1, d2, i2] = self.cull.stats(slot);
-        crate::profile::gauge(crate::profile::Gauge::DrawsFull, d0 as u64);
-        crate::profile::gauge(crate::profile::Gauge::DrawsCutout, d1 as u64);
-        crate::profile::gauge(crate::profile::Gauge::DrawsLod, d2 as u64);
-        crate::profile::gauge(crate::profile::Gauge::TrisFull, u64::from(i0 / 3));
-        crate::profile::gauge(crate::profile::Gauge::TrisCutout, u64::from(i1 / 3));
-        crate::profile::gauge(crate::profile::Gauge::TrisLod, u64::from(i2 / 3));
+        let s = self.cull.stats(slot);
+        let draws = |g: super::cull::Group| u64::from(s[g as usize * 2]);
+        let tris = |g: super::cull::Group| u64::from(s[g as usize * 2 + 1] / 3);
+        crate::profile::gauge(
+            crate::profile::Gauge::DrawsFull,
+            draws(super::cull::Group::Opaque) + draws(super::cull::Group::Caged),
+        );
+        crate::profile::gauge(
+            crate::profile::Gauge::DrawsCutout,
+            draws(super::cull::Group::Cutout),
+        );
+        crate::profile::gauge(
+            crate::profile::Gauge::DrawsLod,
+            draws(super::cull::Group::OpaqueLod) + draws(super::cull::Group::CagedLod),
+        );
+        crate::profile::gauge(
+            crate::profile::Gauge::TrisFull,
+            tris(super::cull::Group::Opaque) + tris(super::cull::Group::Caged),
+        );
+        crate::profile::gauge(
+            crate::profile::Gauge::TrisCutout,
+            tris(super::cull::Group::Cutout),
+        );
+        crate::profile::gauge(
+            crate::profile::Gauge::TrisLod,
+            tris(super::cull::Group::OpaqueLod) + tris(super::cull::Group::CagedLod),
+        );
         crate::profile::gauge(
             crate::profile::Gauge::Arenas,
             self.arena_dir.arena_count() as u64,

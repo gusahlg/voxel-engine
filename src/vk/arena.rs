@@ -43,6 +43,17 @@ impl MeshAabb {
             ],
         }
     }
+
+    /// AABB of a cage's eight corners, relative to the cage anchor. Not scaled:
+    /// the corners are already in blocks.
+    pub(crate) fn from_cage(cage: &crate::cage::CageGpu) -> Self {
+        let (min, max) = crate::cage::corner_aabb(cage.corners3());
+        Self {
+            block: cage.anchor,
+            min,
+            max,
+        }
+    }
 }
 
 /// Conservative union of live camera-group AABBs for one arena, stored relative
@@ -147,20 +158,22 @@ fn bucket_intersects(bucket: usize, dmin: f32, dmax: f32) -> bool {
 }
 
 /// Packed CPU-cull bits: arena word in [0, 20), pass in [20, 22), LOD in bit 22,
-/// face-runs flag in bit 23. Zero means the slot is dead to the CPU cull
-/// (freed or Blend).
+/// face-runs flag in bit 23, cage in bit 24. Zero means the slot is dead to
+/// the CPU cull (freed or Blend).
 const CULL_ARENA_MASK: u32 = 0x000F_FFFF;
 const CULL_PASS_SHIFT: u32 = 20;
 const CULL_LOD_BIT: u32 = 1 << 22;
 const CULL_FACE_BIT: u32 = 1 << 23;
+const CULL_CAGE_BIT: u32 = 1 << 24;
 
 #[inline]
-fn pack_cull_bits(arena_word: u32, pass: Pass, lod: bool) -> u32 {
+fn pack_cull_bits(arena_word: u32, pass: Pass, lod: bool, caged: bool) -> u32 {
     debug_assert!(arena_word != 0 && arena_word <= CULL_ARENA_MASK);
     let pass_u = pass as u32;
     (arena_word & CULL_ARENA_MASK)
         | ((pass_u & 3) << CULL_PASS_SHIFT)
         | (u32::from(lod) * CULL_LOD_BIT)
+        | (u32::from(caged) * CULL_CAGE_BIT)
 }
 
 #[inline]
@@ -183,10 +196,16 @@ pub(crate) fn cull_bits_face(bits: u32) -> bool {
     bits & CULL_FACE_BIT != 0
 }
 
+#[inline]
+pub(crate) fn cull_bits_caged(bits: u32) -> bool {
+    bits & CULL_CAGE_BIT != 0
+}
+
 /// Arena registry with live counts per (arena, lane).
 pub(crate) struct ArenaDirectory {
     buffers: Vec<vk::Buffer>,
-    /// Live [Opaque, Cutout, OpaqueLod] counts per arena (shadow reuses Opaque).
+    /// Live camera-group counts per arena. Shadow capacity is full-res Opaque
+    /// plus full-res caged.
     live: Vec<[u32; LANES]>,
     /// Reference count per arena; zero = reusable.
     refs: Vec<u32>,
@@ -281,6 +300,32 @@ impl ArenaDirectory {
         lod: bool,
         aabb: MeshAabb,
     ) -> u32 {
+        self.note_upload_at(slot, generation, buffer, pass, lod, false, aabb)
+    }
+
+    /// [`Self::note_upload`] for a mesh whose record names a cage.
+    pub fn note_upload_caged(
+        &mut self,
+        slot: u32,
+        generation: NonZeroU32,
+        buffer: vk::Buffer,
+        pass: Pass,
+        lod: bool,
+        aabb: MeshAabb,
+    ) -> u32 {
+        self.note_upload_at(slot, generation, buffer, pass, lod, true, aabb)
+    }
+
+    fn note_upload_at(
+        &mut self,
+        slot: u32,
+        generation: NonZeroU32,
+        buffer: vk::Buffer,
+        pass: Pass,
+        lod: bool,
+        caged: bool,
+        aabb: MeshAabb,
+    ) -> u32 {
         if let Some(Some((old_arena, old_lane, _))) = self.slots.get(slot as usize).copied() {
             // Re-register without a free: drop the old box out of the union.
             if old_lane.is_some() {
@@ -318,7 +363,7 @@ impl ArenaDirectory {
         if self.refs[arena as usize] == 1 {
             self.occupied += 1;
         }
-        let lane = group_lane(pass, lod);
+        let lane = group_lane(pass, lod, caged);
         if let Some(lane) = lane {
             self.live[arena as usize][lane] += 1;
         }
@@ -336,7 +381,7 @@ impl ArenaDirectory {
         }
         self.slots[slot as usize] = Some((arena, lane, generation));
         self.aabbs[slot as usize] = aabb;
-        self.write_cull_soa(slot, arena, lane, pass, lod, aabb);
+        self.write_cull_soa(slot, arena, lane, pass, lod, caged, aabb);
         if lane.is_some() {
             self.set_member(arena as usize, slot, true);
             self.grow_union(arena as usize, aabb);
@@ -404,10 +449,19 @@ impl ArenaDirectory {
     /// partition capacities keep matching what the cull shader emits.
     /// Grows the arena union with the new AABB (stale-large until a free).
     pub fn note_record(&mut self, slot: u32, pass: Pass, lod: bool, aabb: MeshAabb) {
+        self.note_record_at(slot, pass, lod, false, aabb);
+    }
+
+    /// [`Self::note_record`] for a mesh whose record names a cage.
+    pub fn note_record_caged(&mut self, slot: u32, pass: Pass, lod: bool, aabb: MeshAabb) {
+        self.note_record_at(slot, pass, lod, true, aabb);
+    }
+
+    fn note_record_at(&mut self, slot: u32, pass: Pass, lod: bool, caged: bool, aabb: MeshAabb) {
         let Some(Some((arena, lane, _))) = self.slots.get(slot as usize).copied() else {
             return;
         };
-        let new_lane = group_lane(pass, lod);
+        let new_lane = group_lane(pass, lod, caged);
         if lane != new_lane {
             if let Some(old) = lane {
                 self.live[arena as usize][old] -= 1;
@@ -428,7 +482,7 @@ impl ArenaDirectory {
             }
         }
         self.aabbs[slot as usize] = aabb;
-        self.write_cull_soa(slot, arena, new_lane, pass, lod, aabb);
+        self.write_cull_soa(slot, arena, new_lane, pass, lod, caged, aabb);
         if new_lane.is_some() {
             self.grow_union(arena as usize, aabb);
         }
@@ -545,6 +599,7 @@ impl ArenaDirectory {
         lane: Option<usize>,
         pass: Pass,
         lod: bool,
+        caged: bool,
         aabb: MeshAabb,
     ) {
         let i = slot as usize;
@@ -561,7 +616,7 @@ impl ArenaDirectory {
         // Preserve the face-runs bit; [`Self::note_cull_draw`] sets it.
         let face = self.cull_bits[i] & CULL_FACE_BIT;
         self.cull_bits[i] = if lane.is_some() {
-            pack_cull_bits(arena + 1, pass, lod) | face
+            pack_cull_bits(arena + 1, pass, lod, caged) | face
         } else {
             0
         };
@@ -653,8 +708,9 @@ impl ArenaDirectory {
     /// in one bucket and emits that many face-runs) unless `eye` is set and the
     /// arena union AABB cannot reach that bucket — then capacity is 0 so the
     /// draw loop skips the call. Shadow groups (Near, Far) stay ×1 (whole-mesh
-    /// cmd) and reuse the full-res Opaque live count — a caster may land in
-    /// both cascades.
+    /// cmd) and reuse the full-res Opaque plus full-res caged live counts — a
+    /// caster may land in both cascades. Caged cutout shares the caged lane, so
+    /// that capacity is a slight over-estimate.
     pub(crate) fn partitions_into(
         &mut self,
         parts: &mut Vec<PartitionGpu>,
@@ -693,7 +749,8 @@ impl ArenaDirectory {
         }
         for _cascade in 0..SHADOW_GROUPS {
             for arena in 0..a {
-                let capacity = self.live[arena][0];
+                let capacity = self.live[arena][Group::Opaque as usize]
+                    + self.live[arena][Group::Caged as usize];
                 parts.push(PartitionGpu { offset, capacity });
                 offset += capacity;
             }
@@ -712,12 +769,20 @@ impl ArenaDirectory {
     }
 }
 
-/// Get live-count lane for a (pass, lod) record (Blend returns None).
-fn group_lane(pass: Pass, lod: bool) -> Option<usize> {
+/// Live-count lane for a (pass, lod, caged) record. Blend stays off the GPU
+/// cull. Caged cutout shares the caged lane (it uses the opaque pipeline).
+fn group_lane(pass: Pass, lod: bool, caged: bool) -> Option<usize> {
+    if caged {
+        return match pass {
+            Pass::Blend => None,
+            Pass::Opaque | Pass::Cutout if lod => Some(Group::CagedLod as usize),
+            Pass::Opaque | Pass::Cutout => Some(Group::Caged as usize),
+        };
+    }
     match pass {
-        Pass::Opaque if lod => Some(2),
-        Pass::Opaque => Some(0),
-        Pass::Cutout => Some(1),
+        Pass::Opaque if lod => Some(Group::OpaqueLod as usize),
+        Pass::Opaque => Some(Group::Opaque as usize),
+        Pass::Cutout => Some(Group::Cutout as usize),
         Pass::Blend => None,
     }
 }
@@ -772,7 +837,8 @@ mod tests {
         assert_eq!(arena, 0);
         assert_eq!(dir.arena_count(), 1);
         let (parts, total) = dir.partitions();
-        // 3 camera groups * K buckets + 2 shadow groups, one arena.
+        // 5 camera groups * K buckets + 2 shadow groups, one arena.
+        // Empty caged lanes add no commands, so the opaque offsets stay put.
         assert_eq!(parts.len(), partition_count(1));
         for bucket in 0..BUCKETS {
             assert_eq!(
@@ -1097,12 +1163,60 @@ mod tests {
 
     #[test]
     fn group_lane_maps_camera_passes_and_excludes_blend() {
-        assert_eq!(group_lane(Pass::Opaque, FULL), Some(0));
-        assert_eq!(group_lane(Pass::Opaque, LOD), Some(2));
-        assert_eq!(group_lane(Pass::Cutout, FULL), Some(1));
-        assert_eq!(group_lane(Pass::Cutout, LOD), Some(1));
-        assert_eq!(group_lane(Pass::Blend, FULL), None);
-        assert_eq!(group_lane(Pass::Blend, LOD), None);
+        assert_eq!(group_lane(Pass::Opaque, FULL, false), Some(0));
+        assert_eq!(group_lane(Pass::Opaque, LOD, false), Some(2));
+        assert_eq!(group_lane(Pass::Cutout, FULL, false), Some(1));
+        assert_eq!(group_lane(Pass::Cutout, LOD, false), Some(1));
+        assert_eq!(group_lane(Pass::Blend, FULL, false), None);
+        assert_eq!(group_lane(Pass::Blend, LOD, false), None);
+        assert_eq!(
+            group_lane(Pass::Opaque, FULL, true),
+            Some(Group::Caged as usize)
+        );
+        assert_eq!(
+            group_lane(Pass::Cutout, FULL, true),
+            Some(Group::Caged as usize)
+        );
+        assert_eq!(
+            group_lane(Pass::Opaque, LOD, true),
+            Some(Group::CagedLod as usize)
+        );
+        assert_eq!(group_lane(Pass::Blend, FULL, true), None);
+    }
+
+    #[test]
+    fn caged_full_res_adds_its_lane_and_shadow_capacity() {
+        let mut dir = ArenaDirectory::new();
+        dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL, UNIT);
+        dir.note_upload_caged(1, G1, buf(1), Pass::Opaque, FULL, UNIT);
+        dir.note_upload_caged(2, G1, buf(1), Pass::Cutout, FULL, UNIT);
+        dir.note_upload_caged(3, G1, buf(1), Pass::Opaque, LOD, UNIT);
+        let (parts, _) = dir.partitions();
+        assert_eq!(
+            parts[camera_part(Group::Opaque as usize, 0, 0, 1)].capacity,
+            1
+        );
+        // Cutout shares the caged lane, so shadow capacity counts it too.
+        assert_eq!(
+            parts[camera_part(Group::Caged as usize, 0, 0, 1)].capacity,
+            2
+        );
+        assert_eq!(
+            parts[camera_part(Group::CagedLod as usize, 0, 0, 1)].capacity,
+            1
+        );
+        assert_eq!(parts[shadow_part(0, 0, 1)].capacity, 3);
+        dir.note_record_caged(1, Pass::Opaque, LOD, UNIT);
+        let (parts, _) = dir.partitions();
+        assert_eq!(
+            parts[camera_part(Group::Caged as usize, 0, 0, 1)].capacity,
+            1
+        );
+        assert_eq!(
+            parts[camera_part(Group::CagedLod as usize, 0, 0, 1)].capacity,
+            2
+        );
+        assert_eq!(parts[shadow_part(0, 0, 1)].capacity, 2);
     }
 
     #[test]
@@ -1111,8 +1225,8 @@ mod tests {
         dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL, UNIT);
         let (parts, _) = dir.partitions();
         assert_eq!(
-            GROUPS, 5,
-            "Opaque, Cutout, OpaqueLod, ShadowNear, ShadowFar"
+            GROUPS, 7,
+            "Opaque, Cutout, OpaqueLod, Caged, CagedLod, ShadowNear, ShadowFar"
         );
         assert_eq!(parts.len(), CAMERA_GROUPS * BUCKETS + SHADOW_GROUPS);
         // Adjacent camera buckets of the same arena share capacity but not offset.

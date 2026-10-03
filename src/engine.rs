@@ -6,7 +6,7 @@
 /// winit 0.30's callback model.
 use std::time::{Duration, Instant};
 
-use glam::{Vec2, Vec3};
+use glam::{IVec3, Vec2, Vec3};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -18,6 +18,7 @@ use crate::font;
 use crate::frame::{DrawLists, Frame};
 use crate::input::{InputState, Key, MouseButton};
 use crate::mesh::{MeshData, MeshHandle, MeshPlacement, Pass};
+use crate::CageHandle;
 use crate::vk::compute::{
     ComputeDesc, ComputeJob, ComputeKind, ComputeQueue, ComputeStager, EngineError, JobId,
 };
@@ -582,6 +583,23 @@ impl Engine {
         placement: crate::mesh::MeshPlacement,
     ) {
         self.client.set_mesh_placement(handle, placement);
+    }
+
+    /// Allocate a cage. `None` only if the table index would wrap (slot
+    /// `u32::MAX`, whose gpu index is the reserved 0).
+    pub fn create_cage(&mut self, anchor: IVec3, corners: [Vec3; 8]) -> Option<CageHandle> {
+        self.client.create_cage(anchor, corners)
+    }
+
+    /// Replace a live cage's anchor and corners.
+    pub fn set_cage(&mut self, handle: CageHandle, anchor: IVec3, corners: [Vec3; 8]) {
+        self.client.set_cage(handle, anchor, corners);
+    }
+
+    /// Release a cage. A mesh that still names it is drawn uncaged at its
+    /// record placement (origin, for [`MeshPlacement::caged`]).
+    pub fn free_cage(&mut self, handle: CageHandle) {
+        self.client.free_cage(handle);
     }
 
     // ---- compute ----

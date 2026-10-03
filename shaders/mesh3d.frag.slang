@@ -42,6 +42,11 @@ struct FragmentInput
     // y: flat_rgba
     [[vk::location(3)]]
     nointerpolation uint2 ids;
+
+#ifdef CAGED
+    [[vk::location(4)]]
+    nointerpolation float3 face_n;
+#endif
 };
 
 // View-proj and LOD box. Same 112-byte layout as mesh3d.vert: half_z is the
@@ -270,7 +275,9 @@ float4 fragmentMain(FragmentInput input) : SV_Target
 
     uint packed = input.ids.x;
     uint layer = packed & 0x3FFFu;
+#ifndef CAGED
     uint face = (packed >> 16) & 7u;
+#endif
 
     // Base albedo: flat far material, per-layer procedural, or texture-sampled.
     // The default material table is ARRAY_LAYER + alpha 255 + glow 0: the
@@ -305,7 +312,11 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     float sky_amount = input.light_lv.x;
     float block_amount = input.light_lv.y;
     float ao = input.light_lv.z;
+#ifdef CAGED
+    float3 N = input.face_n;
+#else
     float3 N = FACE_NORMAL[face];
+#endif
 #ifndef MESH3D_LEAN
     float dist = length(input.world);
 #endif

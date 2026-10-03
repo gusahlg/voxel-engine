@@ -1,5 +1,6 @@
 // Depth-only shadow map occluder pass; reuses mesh3d vertex format and record layout.
 #include "common.slang"
+#include "cage.slang"
 
 // Per-mesh record: mirrors mesh3d's MeshRecord exactly (std430, 80 bytes).
 // Changing the struct stride breaks instance offset calculation.
@@ -8,7 +9,7 @@ struct MeshRecord
     int3 block;       // world-space origin
     uint detail_pass; // [0:5] detail+bias, [5:7] pass
     float3 local_off; // mover offset; zero for terrain
-    uint pad0;
+    uint cage;        // 0 = flat; else index into the cage table
     float3 aabb_min;
     uint index_count;
     float3 aabb_max;
@@ -56,8 +57,15 @@ float4 vertexMain(VertexInput input) : SV_Position
 
     MeshRecord rec = mesh_records[input.instance];
     float scale = detail_scale(rec.detail_pass);
-    float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
-    float3 world = float3(x, y, z) * scale + offset;
+    float3 q = float3(x, y, z) * scale;
+    float3 world;
+    if (rec.cage != 0u)
+        world = cage_world(cages[rec.cage], q, scale, pc.cam_block, pc.cam_frac);
+    else
+    {
+        float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
+        world = q + offset;
+    }
 
     return mul(pc.view_proj, float4(world, 1.0));
 }

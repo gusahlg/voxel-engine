@@ -136,9 +136,15 @@ static const uint CULL_WORKGROUP = 64;
 // Shadow groups stay unbucketed. CPU partition math and the cull shader must agree.
 static const uint CULL_DISTANCE_BUCKETS = 4;
 
-// Camera cull groups: full-res Opaque, Cutout, coarse-LOD Opaque.
-// Must match vk::cull::CAMERA_GROUPS; the shader uses this for partition indexing.
-static const uint CULL_CAMERA_GROUPS = 3;
+// Camera cull groups: full-res Opaque, Cutout, coarse-LOD Opaque,
+// caged, caged LOD. Must match vk::cull::CAMERA_GROUPS.
+static const uint CULL_CAMERA_GROUPS = 5;
+
+// Camera cull group for a full-res caged mesh. Must match vk::cull::Group::Caged.
+static const uint CULL_CAGED_GROUP = 3;
+
+// Camera cull group for a coarse-LOD caged mesh. Must match vk::cull::Group::CagedLod.
+static const uint CULL_CAGED_LOD_GROUP = 4;
 
 // Camera-distance edge (metres from AABB centre) between cull buckets 0 and 1.
 // Bucket 0 is nearest; record_mesh_indirect_count draws 0..K-1 near-to-far.

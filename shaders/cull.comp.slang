@@ -1,11 +1,13 @@
 // Emit indirect draw commands per frustum test: one thread per mesh slot.
 // Camera partitions are (group, arena, distance-bucket); shadows are
 // per-cascade and unbucketed. Camera groups (CULL_CAMERA_GROUPS): 0 full-res
-// Opaque, 1 Cutout, 2 coarse-LOD Opaque (scale > 1, the only camera draws
-// that pay for the box-clip `discard`). Group 2 meshes whose AABB is fully
-// inside that box are not emitted (every fragment would be discarded).
+// Opaque, 1 Cutout, 2 coarse-LOD Opaque (scale > 1), 3 full-res caged,
+// 4 coarse-LOD caged. Groups 2 and 4 whose AABB is fully inside the LOD box
+// are not emitted (every fragment would be discarded). A caged mesh is culled
+// by its eight corners; its face-run flag is clear, so it draws whole.
 
 #include "common.slang"
+#include "cage.slang"
 
 // Mirrors vk::buffers::MeshRecord exactly (std430, 80 bytes).
 struct MeshRecord
@@ -13,7 +15,7 @@ struct MeshRecord
     int3 block;
     uint detail_pass; // [0:5] detail+bias, [5:7] pass
     float3 local_off;
-    uint pad0;
+    uint cage; // 0 = flat; else index into the cage table
     float3 aabb_min;
     uint index_count;
     float3 aabb_max;
@@ -79,8 +81,8 @@ ConstantBuffer<CullParams> params;
 [[vk::binding(6, 0)]]
 StructuredBuffer<uint> visible;
 
-// Per camera group (0 full-res opaque, 1 cutout, 2 coarse LOD):
-// [draws0, index_count0, draws1, index_count1, draws2, index_count2].
+// Per camera group, two uints each: [draws, index_count].
+// 0 full-res opaque, 1 cutout, 2 coarse LOD, 3 caged, 4 caged LOD.
 // Written only when the stats push flag is set (profiling).
 [[vk::binding(7, 0)]]
 RWStructuredBuffer<uint> stats;
@@ -180,9 +182,24 @@ void computeMain(uint3 id: SV_DispatchThreadID)
         return; // Blend: CPU-sorted path
 
     float scale = detail_scale(rec.detail_pass);
-    float3 offset = float3(rec.block - params.cam_block) - params.cam_frac + rec.local_off;
-    float3 mn = rec.aabb_min * scale + offset;
-    float3 mx = rec.aabb_max * scale + offset;
+    float3 mn;
+    float3 mx;
+    // cage == 0 must not load the cage table (slot 0 is the zero cage).
+    bool caged = rec.cage != 0u;
+    if (caged)
+    {
+        Cage cg = cages[rec.cage];
+        cage_corners_aabb(cg, mn, mx);
+        float3 o = float3(cg.anchor - params.cam_block) - params.cam_frac;
+        mn += o;
+        mx += o;
+    }
+    else
+    {
+        float3 offset = float3(rec.block - params.cam_block) - params.cam_frac + rec.local_off;
+        mn = rec.aabb_min * scale + offset;
+        mx = rec.aabb_max * scale + offset;
+    }
 
     DrawCmd cmd;
     cmd.index_count = rec.index_count;
@@ -199,10 +216,14 @@ void computeMain(uint3 id: SV_DispatchThreadID)
             in_frustum = in_frustum && !outside_plane(params.cam_planes[p], mn, mx);
         if (in_frustum)
         {
-            // Camera group: the pass index, except coarse-LOD opaque → group 2.
-            uint group = (pass == 0u && scale > 1.0) ? 2u : pass;
-            // Group 2 fully inside the slab would discard every fragment.
-            if (group != 2u || !lod_aabb_inside_box(mn, mx, params.half_x, params.half_y, params.half_z))
+            // Flat: pass index, except coarse-LOD opaque → group 2.
+            // Caged: group 3, or group 4 when scale > 1 (cutout included).
+            uint group = caged
+                ? ((scale > 1.0) ? CULL_CAGED_LOD_GROUP : CULL_CAGED_GROUP)
+                : ((pass == 0u && scale > 1.0) ? 2u : pass);
+            // LOD groups fully inside the slab would discard every fragment.
+            bool lod_group = group == 2u || group == CULL_CAGED_LOD_GROUP;
+            if (!lod_group || !lod_aabb_inside_box(mn, mx, params.half_x, params.half_y, params.half_z))
             {
                 float dist = length(0.5 * (mn + mx));
                 uint bucket = distance_bucket(dist);

@@ -41,6 +41,7 @@ use super::image::{AllocError, render_target_oom_message};
 use super::instance::InstanceBundle;
 use super::mesh_staging::{MeshStager, MeshStaging, MeshStagingPool};
 use super::{Renderer, Scale, clamp_msaa, display_refresh_interval};
+use crate::cage::{CageGpu, CageHandle};
 use crate::engine::Config;
 use crate::frame::DrawLists;
 use crate::mesh::{Detail, MeshData, MeshHandle, MeshPlacement, Pass};
@@ -76,6 +77,17 @@ pub(crate) enum RenderCmd {
     SetRecord {
         slot: u32,
         record: MeshRecord,
+    },
+    /// Install or replace one cage. `slot` is the GPU index (allocator slot + 1).
+    SetCage {
+        slot: u32,
+        generation: NonZeroU32,
+        entry: CageGpu,
+    },
+    /// Drop one cage. `generation` is the handle's generation before the bump.
+    FreeCage {
+        slot: u32,
+        generation: NonZeroU32,
     },
     /// Patch the dynamic style lane (ordered like SetRecord).
     SetDrawDyn {
@@ -257,6 +269,8 @@ pub(crate) struct RenderClient {
     /// scanning every frame that did not free anything.
     shrink_ticks: u32,
     mesh_ids: MeshHandles,
+    /// Cage identity. No mesh stats: publishing those would clobber the mesh counts.
+    cage_ids: super::handles::HandleAllocator<CageHandle, ()>,
     /// Main's copy of the visibility mask and changed words (delta batching).
     visible: Vec<u32>,
     visible_dirty: std::collections::BTreeSet<u32>,
@@ -390,6 +404,7 @@ impl RenderClient {
             spare: None,
             shrink_ticks: 0,
             mesh_ids,
+            cage_ids: super::handles::HandleAllocator::new(),
             visible: Vec::new(),
             visible_dirty: std::collections::BTreeSet::new(),
             mesh_alloc,
@@ -607,6 +622,50 @@ impl RenderClient {
             let _ = self.tx.send(RenderCmd::SetVisible {
                 word,
                 bits: self.visible[word as usize],
+            });
+        }
+    }
+
+    pub(crate) fn create_cage(
+        &mut self,
+        anchor: glam::IVec3,
+        corners: [glam::Vec3; 8],
+    ) -> Option<CageHandle> {
+        let handle = self.cage_ids.alloc_slot(());
+        // gpu index 0 means "no cage"; a wrapped slot must not be handed out.
+        if handle.slot == u32::MAX {
+            self.cage_ids.free_slot(handle);
+            return None;
+        }
+        let _ = self.tx.send(RenderCmd::SetCage {
+            slot: handle.gpu_index(),
+            generation: handle.generation,
+            entry: CageGpu::from_corners(anchor, corners),
+        });
+        Some(handle)
+    }
+
+    pub(crate) fn set_cage(
+        &mut self,
+        handle: CageHandle,
+        anchor: glam::IVec3,
+        corners: [glam::Vec3; 8],
+    ) {
+        if self.cage_ids.meta_mut(handle).is_none() {
+            return;
+        }
+        let _ = self.tx.send(RenderCmd::SetCage {
+            slot: handle.gpu_index(),
+            generation: handle.generation,
+            entry: CageGpu::from_corners(anchor, corners),
+        });
+    }
+
+    pub(crate) fn free_cage(&mut self, handle: CageHandle) {
+        if self.cage_ids.free_slot(handle) {
+            let _ = self.tx.send(RenderCmd::FreeCage {
+                slot: handle.gpu_index(),
+                generation: handle.generation,
             });
         }
     }
@@ -1040,6 +1099,14 @@ fn render_loop(
                     renderer.apply_free_mesh(slot, generation)
                 }
                 RenderCmd::SetRecord { slot, record } => renderer.apply_set_record(slot, record),
+                RenderCmd::SetCage {
+                    slot,
+                    generation,
+                    entry,
+                } => renderer.apply_set_cage(slot, generation, entry),
+                RenderCmd::FreeCage { slot, generation } => {
+                    renderer.apply_free_cage(slot, generation)
+                }
                 RenderCmd::SetVisible { word, bits } => renderer.set_visible_word(word, bits),
                 RenderCmd::SetDrawDyn { slot, dyn_lane } => {
                     renderer.records.set_dyn(slot, dyn_lane)

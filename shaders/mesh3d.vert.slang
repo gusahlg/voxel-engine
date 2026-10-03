@@ -8,9 +8,14 @@
 // sky/block/AO levels interpolate as scalars; the fragment multiplies by
 // frame light/candle (uniform × interpolated scalar == interpolated product).
 // Face index is packed — no float3 normal varying; the fragment looks
-// `FACE_NORMAL` up.
+// `FACE_NORMAL` up. The CAGED variant (build.rs `-DCAGED`) writes the bent
+// face normal at location 4 instead, and is the only mesh3d vertex module
+// that reads the cage table.
 
 #include "common.slang"
+#ifdef CAGED
+#include "cage.slang"
+#endif
 
 // Per-mesh placement record (std430, mirrors vk::buffers::MeshRecord, 80 bytes).
 struct MeshRecord
@@ -18,7 +23,7 @@ struct MeshRecord
     int3 block;       // world-space origin
     uint detail_pass; // [0:5] detail+bias, [5:7] pass
     float3 local_off; // mover offset; zero for terrain
-    uint _pad;        // std430 padding
+    uint cage;        // 0 = flat; else index into the cage table
     float3 aabb_min;
     uint index_count;
     float3 aabb_max;
@@ -70,6 +75,12 @@ struct VertexOutput
     // y: flat_rgba
     [[vk::location(3)]]
     nointerpolation uint2 ids;
+
+#ifdef CAGED
+    // Bent face normal. Flat draws do not carry this varying.
+    [[vk::location(4)]]
+    nointerpolation float3 face_n;
+#endif
 };
 
 struct PushConstants
@@ -135,10 +146,19 @@ VertexOutput vertexMain(VertexInput input)
     DrawDyn style = draw_dyn[input.instance];
     uint detail = rec.detail_pass & ((1u << DETAIL_GPU_BITS) - 1u);
     float scale = detail_scale(detail);
+#ifdef CAGED
+    // `q` is the local cell position times the detail scale, in [0, 16·scale]³
+    // (micro can step slightly outside). UVs stay on the unbent cell.
+    float3 q = (float3(x, y, z) + micro) * scale;
+    Cage cg = cages[rec.cage];
+    float3 t = q / (16.0 * scale);
+    float3 world = cage_trilinear(cg, t) + float3(cg.anchor - pc.cam_block) - pc.cam_frac;
+#else
     // Camera-relative placement: block delta first, then fractional parts.
     // Integer subtraction wraps, matching the CPU `wrapping_sub`.
     float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
     float3 world = (float3(x, y, z) + micro) * scale + offset;
+#endif
 
     VertexOutput output;
     // Plain rectilinear projection; wide-FOV compression is a post-process.
@@ -154,6 +174,9 @@ VertexOutput vertexMain(VertexInput input)
     // Scale UV to maintain texel density across LOD levels.
     output.uv = uv * scale;
     output.world = world;
+#ifdef CAGED
+    output.face_n = cage_face_normal(cg, t, normal);
+#endif
     output.light_lv = float3(sky_amount, block_amount, ao_factor);
     output.ids = uint2(
         (layer & 0x3FFFu)

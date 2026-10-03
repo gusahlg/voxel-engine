@@ -2,6 +2,7 @@ use ash::{khr, vk};
 
 /// mesh3d push-descriptor bindings (set 0). Binding 5 is the previous frame's
 /// sampleable depth (water absorb); 7 is the material SSBO after dyns at 6.
+/// Binding 8 is the cage table (vertex only; flat mesh shaders do not read it).
 pub const MESH3D_BINDING_RECORDS: u32 = 0;
 pub const MESH3D_BINDING_BLOCK_TEX: u32 = 1;
 pub const MESH3D_BINDING_FRAME_UBO: u32 = 2;
@@ -10,6 +11,7 @@ pub const MESH3D_BINDING_SHADOW_MAP: u32 = 4;
 pub const MESH3D_BINDING_DEPTH_INPUT: u32 = 5;
 pub const MESH3D_BINDING_DYNS: u32 = 6;
 pub const MESH3D_BINDING_MATERIALS: u32 = 7;
+pub const MESH3D_BINDING_CAGES: u32 = 8;
 
 /// Create mesh3d push-descriptor set layout.
 pub fn create_mesh3d_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout {
@@ -54,6 +56,11 @@ pub fn create_mesh3d_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(MESH3D_BINDING_CAGES)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX),
     ];
     let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
         .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
@@ -80,6 +87,7 @@ pub fn push_mesh3d_descriptors(
     shadow_sampler: vk::Sampler,
     shadow_view: vk::ImageView,
     materials: vk::Buffer,
+    cages: vk::Buffer,
 ) {
     let buffer_infos = [vk::DescriptorBufferInfo::default()
         .buffer(records)
@@ -107,6 +115,10 @@ pub fn push_mesh3d_descriptors(
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
     let mat_infos = [vk::DescriptorBufferInfo::default()
         .buffer(materials)
+        .offset(0)
+        .range(vk::WHOLE_SIZE)];
+    let cage_infos = [vk::DescriptorBufferInfo::default()
+        .buffer(cages)
         .offset(0)
         .range(vk::WHOLE_SIZE)];
     let writes = [
@@ -138,6 +150,10 @@ pub fn push_mesh3d_descriptors(
             .dst_binding(MESH3D_BINDING_MATERIALS)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&mat_infos),
+        vk::WriteDescriptorSet::default()
+            .dst_binding(MESH3D_BINDING_CAGES)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&cage_infos),
     ];
     unsafe {
         push.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &writes);
@@ -185,6 +201,7 @@ mod tests {
         assert_eq!(MESH3D_BINDING_DEPTH_INPUT, 5);
         assert_eq!(MESH3D_BINDING_DYNS, 6);
         assert_eq!(MESH3D_BINDING_MATERIALS, 7);
+        assert_eq!(MESH3D_BINDING_CAGES, 8);
         let mut used = vec![
             MESH3D_BINDING_RECORDS,
             MESH3D_BINDING_BLOCK_TEX,
@@ -194,6 +211,7 @@ mod tests {
             MESH3D_BINDING_DEPTH_INPUT,
             MESH3D_BINDING_DYNS,
             MESH3D_BINDING_MATERIALS,
+            MESH3D_BINDING_CAGES,
         ];
         used.sort_unstable();
         let n = used.len();
@@ -203,6 +221,11 @@ mod tests {
             MESH3D_BINDING_MATERIALS,
             MESH3D_BINDING_DYNS + 1,
             "materials take the next free binding after dyns"
+        );
+        assert_eq!(
+            MESH3D_BINDING_CAGES,
+            MESH3D_BINDING_MATERIALS + 1,
+            "cages take the next free binding after materials"
         );
     }
 }
