@@ -38,7 +38,7 @@ const _: () = assert!(std::mem::offset_of!(MeshRecord, flags) == 76);
 impl MeshRecord {
     /// Decode pass bits from detail_pass.
     pub(crate) fn pass(&self) -> Pass {
-        match (self.detail_pass >> 4) & 3 {
+        match (self.detail_pass >> crate::genconst::DETAIL_GPU_BITS) & 3 {
             0 => Pass::Opaque,
             1 => Pass::Cutout,
             _ => Pass::Blend,
@@ -47,7 +47,10 @@ impl MeshRecord {
 
     /// Decode per-draw scale from biased detail field.
     pub(crate) fn detail_scale(&self) -> f32 {
-        Detail::from_gpu_bits((self.detail_pass & 0xF) as u8).scale()
+        Detail::from_gpu_bits(
+            (self.detail_pass & ((1u32 << crate::genconst::DETAIL_GPU_BITS) - 1)) as u8,
+        )
+        .scale()
     }
 
     /// Compose a GPU record from mesh metadata and placement.
@@ -55,8 +58,9 @@ impl MeshRecord {
         let (face_quads, flags) = Self::pack_face_quads(&meta.bounds);
         Self {
             block: p.block.to_array(),
-            // Detail in bits 0..4, pass in bits 4..6.
-            detail_pass: u32::from(p.detail.to_gpu_bits()) | ((meta.pass as u32) << 4),
+            // Detail in the low DETAIL_GPU_BITS, pass in the next two.
+            detail_pass: u32::from(p.detail.to_gpu_bits())
+                | ((meta.pass as u32) << crate::genconst::DETAIL_GPU_BITS),
             local_off: p.local_off.to_array(),
             _pad: 0,
             aabb_min: meta.aabb_min.to_array(),
@@ -321,7 +325,7 @@ mod tests {
         use super::super::handles::{DrawDyn, MeshMeta, PlacementState};
         use super::{MESH_FLAG_FACE_RUNS, MeshRecord};
         use crate::mesh::{Detail, MeshPlacement};
-        for k in -2..=13i8 {
+        for k in -2..=29i8 {
             let detail = Detail(k);
             let meta = MeshMeta {
                 aabb_min: glam::Vec3::ZERO,

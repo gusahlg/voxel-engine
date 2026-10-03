@@ -2,11 +2,11 @@
 // cascaded shadow attenuation. Fog == sky. Opaque and transparent pipelines.
 //
 // Variants (build.rs `-D`):
-//   (none)                       full module: water/absorb branch + LOD-slab
+//   (none)                       full module: water/absorb branch + LOD-box
 //                                `discard`; the Blend pipelines.
 //   MESH3D_OPAQUE                full-res opaque: no water code and NO `discard`
 //                                (no OpKill ⇒ early depth write stays enabled).
-//   MESH3D_OPAQUE + MESH3D_LOD   coarse-LOD opaque (scale > 1): keeps the slab
+//   MESH3D_OPAQUE + MESH3D_LOD   coarse-LOD opaque (scale > 1): keeps the box
 //                                clip `discard`, never samples the cascades.
 //   MESH3D_OPAQUE + MESH3D_LEAN  full-res opaque with every optional lane compiled
 //                                out (no cascade taps, no candle curve, no ambient
@@ -38,20 +38,24 @@ struct FragmentInput
     [[vk::location(2)]]
     float3 light_lv;
 
-    // x: layer[0:14] water[14] FLAT_COLOR[15] face[16:19] detail[20:24]
+    // x: layer[0:14] water[14] FLAT_COLOR[15] face[16:19] detail[20:25]
     // y: flat_rgba
     [[vk::location(3)]]
     nointerpolation uint2 ids;
 };
 
-// View-proj and LOD slab clip extents.
+// View-proj and LOD box. Same 112-byte layout as mesh3d.vert: half_z is the
+// eye-split tail pad, so the unused camera fields stay to hold that offset.
 struct PushConstants
 {
     float4x4 view_proj;
-    float clip;
-    float clip_v;
-    // Spare Mesh3dPush pad: 1/render_extent. xy = 0 when previous depth is invalid.
-    float2 inv_render_extent;
+    float half_x;
+    float half_y;
+    float2 inv_render_extent; // 1/render_extent; xy = 0 when previous depth is invalid
+    int3 cam_block;
+    int pad0;
+    float3 cam_frac;
+    float half_z;
 };
 
 [[vk::push_constant]]
@@ -237,19 +241,22 @@ float4 fragmentMain(FragmentInput input) : SV_Target
 {
 #if defined(MESH3D_LOD)
     // Coarse-LOD partition is scale > 1 by construction; skip the scale test.
-    if (pc.clip > 0.0) {
-        bool inside_h = length(input.world.xz) < pc.clip;
-        bool inside_v = pc.clip_v > 0.0 && abs(input.world.y) < pc.clip_v;
-        if (inside_h && inside_v)
+    // A non-positive half fails the strict compare, so the box stays closed.
+    {
+        bool inside = abs(input.world.x) < pc.half_x
+            && abs(input.world.y) < pc.half_y
+            && abs(input.world.z) < pc.half_z;
+        if (inside)
             discard;
     }
 #elif !defined(MESH3D_OPAQUE)
     // Blend module: mixed full-res / LOD draws share this path.
     float scale = detail_scale(input.ids.x >> 20);
-    if (scale > 1.0 && pc.clip > 0.0) {
-        bool inside_h = length(input.world.xz) < pc.clip;
-        bool inside_v = pc.clip_v > 0.0 && abs(input.world.y) < pc.clip_v;
-        if (inside_h && inside_v)
+    if (scale > 1.0) {
+        bool inside = abs(input.world.x) < pc.half_x
+            && abs(input.world.y) < pc.half_y
+            && abs(input.world.z) < pc.half_z;
+        if (inside)
             discard;
     }
 #endif

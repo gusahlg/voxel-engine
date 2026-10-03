@@ -341,16 +341,16 @@ impl<'a> RenderPass<'a> {
     /// incompatible layouts that disturb this state. Only sound when at least
     /// one mesh run exists (else the offsets SSBO can be a null buffer).
     ///
-    /// Push-constant bytes are identical for every mesh pass (`lists.lod_clip`,
-    /// `lod_clip_v`); the quad IBO binding survives pipeline/layout changes.
+    /// Push-constant bytes are identical for every mesh pass (`lists.lod_half`);
+    /// the quad IBO binding survives pipeline/layout changes.
     /// Both are bound once and skipped until a foreign pass invalidates them
     /// (push constants) — the IBO is never invalidated.
     unsafe fn bind_mesh3d_state(&self) {
         unsafe {
             self.push_mesh3d_descriptors();
             if !self.mesh_push_bound.get() {
-                // LOD slab extents: LOD tiles hard-discard inside the full-res volume.
-                self.push_mesh3d_constants(self.lists.lod_clip, self.lists.lod_clip_v);
+                // LOD box: LOD tiles hard-discard inside the full-res volume.
+                self.push_mesh3d_constants(self.lists.lod_half);
                 self.mesh_push_bound.set(true);
             }
             if !self.index_bound.get() {
@@ -405,9 +405,9 @@ impl<'a> RenderPass<'a> {
         self.mesh_desc_bound.set(true);
     }
 
-    /// Pushes view-proj + LOD slab extents. Identical for every mesh pass, so
+    /// Pushes view-proj + LOD box extents. Identical for every mesh pass, so
     /// skipped while `mesh_push_bound`. Jitter packaged once in `begin`.
-    unsafe fn push_mesh3d_constants(&self, clip: f32, clip_v: f32) {
+    unsafe fn push_mesh3d_constants(&self, half: glam::Vec3) {
         let r = self.r;
         let (view_proj, eye) = self.scene_state.expect("a mesh pass implies a 3D scene");
         let extent = r.render_extent;
@@ -416,13 +416,7 @@ impl<'a> RenderPass<'a> {
         } else {
             [0.0, 0.0]
         };
-        let push = pipeline::Mesh3dPush {
-            view_proj,
-            clip,
-            clip_v,
-            inv_render_extent,
-            eye,
-        };
+        let push = pipeline::Mesh3dPush::pack(view_proj, half, inv_render_extent, eye);
         let layout = r.pipelines.layout_3d;
         unsafe {
             r.device.device.cmd_push_constants(

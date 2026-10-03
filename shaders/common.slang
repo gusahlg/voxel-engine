@@ -70,8 +70,12 @@ static const float3 FACE_NORMAL[6] = {
     float3(0.0, 0.0, 1.0),  float3(0.0, 0.0, -1.0),
 };
 
-// 2^(bits-DETAIL_GPU_BIAS) from IEEE exponent bits: bits∈[0,15], bias 2 ⇒ exponent field 125..140, exact.
-float detail_scale(uint detail_pass) { return asfloat(((detail_pass & 0xFu) + (127u - DETAIL_GPU_BIAS)) << 23u); }
+// 2^(bits-DETAIL_GPU_BIAS) from IEEE exponent bits.
+// 5-bit field, bias 2 ⇒ bits∈[0,31], exponent field 125..156, k∈[-2,29], exact.
+float detail_scale(uint detail_pass)
+{
+    return asfloat(((detail_pass & ((1u << DETAIL_GPU_BITS) - 1u)) + (127u - DETAIL_GPU_BIAS)) << 23u);
+}
 
 #ifndef MESH3D_LEAN
 // Blocklight (torch/candle) response curve. `x` is a

@@ -127,7 +127,7 @@ impl ShadowCfg {
         splits: [64.0, 256.0],
     };
 
-    /// Fit the far cascade to full-res coverage (`DrawLists::lod_clip`).
+    /// Fit the far cascade to full-res coverage (the box's horizontal half-extent).
     /// `lod_clip <= 0` keeps [`Self::PROVISIONAL`]. Otherwise the far split is
     /// `lod_clip` clamped into `[SHADOW_FAR_MIN_RADIUS, PROVISIONAL.splits[1]]`
     /// (the min is itself min'd with the max so a clamp never panics).
@@ -695,13 +695,12 @@ impl Renderer {
                         vk::PipelineBindPoint::GRAPHICS,
                         self.shadow.pipeline,
                     );
-                    let push = crate::vk::pipeline::Mesh3dPush {
-                        view_proj: f.view_proj.0,
-                        clip: 0.0,
-                        clip_v: 0.0,
-                        inv_render_extent: [0.0; 2],
-                        eye: crate::vk::pipeline::EyeSplit::of(eye),
-                    };
+                    let push = crate::vk::pipeline::Mesh3dPush::pack(
+                        f.view_proj.0,
+                        glam::Vec3::ZERO,
+                        [0.0; 2],
+                        crate::vk::pipeline::EyeSplit::of(eye),
+                    );
                     device.cmd_push_constants(
                         cmd,
                         layout,

@@ -118,9 +118,10 @@ static const float SHADOW_BOUNCE_TINT = 0.75f;
 // double-darkens creases the cascade already shades); 0.5 is the new look.
 static const float AO_DIRECT = 0.5f;
 
-// Lower clamp of the far cascade split when fitted to DrawLists::lod_clip.
-// 96 >= 64·1.15 + 16 m fade band, so the blend band and SHADOW_LIMIT fade
-// never overlap the near split. Legacy 256 keeps the fixed far radius.
+// Lower clamp of the far cascade split when fitted to the coverage
+// box's horizontal half-extent. 96 >= 64·1.15 + 16 m fade band, so the blend
+// band and SHADOW_LIMIT fade never overlap the near split. Legacy 256 keeps
+// the fixed far radius.
 static const float SHADOW_FAR_MIN_RADIUS = 96.0f;
 
 // Cascade shadow map edge in texels. Mirror of vk/targets.rs (asserted equal
@@ -395,22 +396,16 @@ static const float WATER_ABS_BASE = 1.125f;
 // alias) — previously two independently hand-written 0.05s.
 static const float Z_NEAR = 0.05f;
 
-// Gameplay-tuned planet curvature: inverse of 2x the visual planet
-// radius (~300 km). Read by mesh3d.vert's horizon droop (CURVE_MAX_DROP-clamped,
-// presentation-only — does not affect gameplay).
-static const float CURVE_INV_2R = 1.6666667e-6f;
-
-// Planet-curvature horizon droop clamp, in metres (reached ~50 km out).
-// Bounds mesh3d.vert's CURVE_INV_2R droop so distant vertices can't overflow
-// or fold the horizon.
-static const float CURVE_MAX_DROP = 4096.0f;
-
 // Exposure metering luma floor: keeps log2(luma) finite on black tiles.
 // Read by exposure_reduce.comp.
 static const float LUMA_FLOOR = 0.0001f;
 
+// Width of the detail field in MeshRecord.detail_pass. The pass
+// occupies the next two bits. Range is -DETAIL_GPU_BIAS ..= 2^bits-1-bias.
+static const uint DETAIL_GPU_BITS = 5;
+
 // Bias added to the signed detail level k before it is stored in the
-// 4-bit detail field of MeshRecord.detail_pass. Decode: 2^k = exp2(bits - bias).
+// detail field of MeshRecord.detail_pass. Decode: 2^k = exp2(bits - bias).
 static const uint DETAIL_GPU_BIAS = 2;
 
 // HDR emissive scale for MaterialDesc.glow: after lighting, add

@@ -29,11 +29,12 @@ pub struct SkyDesc {
     pub sun_angular_radius: f32,
 }
 
-/// Full-res coverage slab. Use the same value for both streaming and LOD culling.
+/// Full-res coverage box, camera-relative. A fragment is covered when
+/// `abs(world)` is strictly inside `half` on every axis. A non-positive
+/// component covers nothing on that axis.
 #[derive(Clone, Copy, PartialEq)]
 pub struct CoverageVolume {
-    pub radius: f32,
-    pub half_height: f32,
+    pub half: Vec3,
 }
 
 /// Per-mesh style for [`Engine::set_mesh_style`](crate::Engine::set_mesh_style) — the
@@ -154,13 +155,10 @@ pub(crate) struct DrawLists {
     /// `begin_3d` call within the same frame, so it stays outside the
     /// atomically-replaced scene.
     pub sky: Option<SkyDesc>,
-    /// Chunk->LOD slab radius; full-res chunks own the near ground by default
-    /// (0.0 disables). LOD tiles hard-discard inside this radius. Set via
+    /// Chunk→LOD box half-extents. A non-positive component disables that
+    /// axis. LOD tiles hard-discard inside the box. Set via
     /// [`Frame3D::set_lod_clip`]; same post-`begin_3d` lifetime as `sky`.
-    pub lod_clip: f32,
-    /// Vertical half-height of the full-res slab; LOD above/below it is kept.
-    /// Same lifetime as `lod_clip`.
-    pub lod_clip_v: f32,
+    pub lod_half: Vec3,
     /// Debug-flat override (`DebugView::TerrainKey`): when set, every 3D mesh
     /// fragment outputs this flat key colour while still writing depth.
     /// `None` renders normally. Set via [`Frame3D::set_debug_flat`]; same
@@ -182,8 +180,7 @@ impl DrawLists {
             clear: LinearRgb([0.0, 0.0, 0.0]),
             scene: None,
             sky: None,
-            lod_clip: 0.0,
-            lod_clip_v: 0.0,
+            lod_half: Vec3::ZERO,
             debug_flat: None,
             cube_verts: Vec::new(),
             line_verts: Vec::new(),
@@ -196,8 +193,7 @@ impl DrawLists {
     pub fn reset(&mut self) {
         self.scene = None;
         self.sky = None;
-        self.lod_clip = 0.0;
-        self.lod_clip_v = 0.0;
+        self.lod_half = Vec3::ZERO;
         self.debug_flat = None;
         self.cube_verts.clear();
         self.line_verts.clear();
@@ -410,21 +406,46 @@ impl Drop for Frame<'_> {
     }
 }
 
+/// Contact-shadow quad. `+Y` is the historical ground corners, built with the
+/// same subtractions. Any other unit normal gets a quad in its plane, wound
+/// so the geometric normal equals `normal` (`u × v = -normal`).
+fn shadow_corners(center: Vec3, normal: Vec3, radius: f32) -> [[f32; 3]; 4] {
+    if normal == Vec3::Y {
+        let (cx, cy, cz, r) = (center.x, center.y, center.z, radius);
+        return [
+            [cx - r, cy, cz - r],
+            [cx - r, cy, cz + r],
+            [cx + r, cy, cz + r],
+            [cx + r, cy, cz - r],
+        ];
+    }
+    let helper = if normal.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+    let u = normal.cross(helper).normalize();
+    let v = u.cross(normal);
+    let corner = |a: f32, b: f32| {
+        let p = center + (u * a + v * b) * radius;
+        [p.x, p.y, p.z]
+    };
+    [
+        corner(-1.0, -1.0),
+        corner(-1.0, 1.0),
+        corner(1.0, 1.0),
+        corner(1.0, -1.0),
+    ]
+}
+
 pub struct Frame3D<'f, 'e> {
     frame: &'f mut Frame<'e>,
 }
 
 impl Frame3D<'_, '_> {
-    /// Sets chunk→LOD slab extents. Must equal the streamed full-res volume.
+    /// Sets the chunk→LOD coverage box. Must equal the streamed full-res volume.
     pub fn set_lod_clip(&mut self, v: CoverageVolume) {
-        let radius = v.radius.max(0.0);
-        let half_height = v.half_height.max(0.0);
-        if self.frame.eng.lists.lod_clip == radius && self.frame.eng.lists.lod_clip_v == half_height
-        {
+        let half = v.half.max(Vec3::ZERO);
+        if self.frame.eng.lists.lod_half == half {
             return;
         }
-        self.frame.eng.lists.lod_clip = radius;
-        self.frame.eng.lists.lod_clip_v = half_height;
+        self.frame.eng.lists.lod_half = half;
     }
 
     /// Sets the procedural sky drawn behind this frame's geometry. The
@@ -512,20 +533,15 @@ impl Frame3D<'_, '_> {
         }
     }
 
-    /// A flat, translucent ground decal centred at `center` (a contact shadow).
-    /// `radius` is the half-width of the square blob; `color`'s alpha controls
-    /// darkness. Drawn with the blended, depth-read-only debug pipeline, so it
-    /// blends over terrain without occluding geometry behind it. No sun offset:
-    /// a contact/AO blob sits directly under its owner.
-    pub fn draw_shadow(&mut self, center: Vec3, radius: f32, color: Color) {
+    /// A flat, translucent decal centred at `center` in the plane perpendicular
+    /// to `normal` (a contact shadow). `radius` is the half-width of the square;
+    /// `color`'s alpha controls darkness. `normal` must be a unit vector. `+Y`
+    /// is the historical ground quad. Drawn with the blended, depth-read-only
+    /// debug pipeline, so it blends over terrain without occluding geometry
+    /// behind it. No sun offset: a contact/AO blob sits on its owner.
+    pub fn draw_shadow(&mut self, center: Vec3, normal: Vec3, radius: f32, color: Color) {
         let c = [color.r, color.g, color.b, color.a];
-        // A single ground quad in the XZ plane at `center.y`, wound CCW from above.
-        let corners = [
-            [center.x - radius, center.y, center.z - radius],
-            [center.x - radius, center.y, center.z + radius],
-            [center.x + radius, center.y, center.z + radius],
-            [center.x + radius, center.y, center.z - radius],
-        ];
+        let corners = shadow_corners(center, normal, radius);
         let verts = &mut self.frame.eng.lists.shadow_verts;
         for idx in [0usize, 1, 2, 0, 2, 3] {
             verts.push(DebugVertex {
@@ -749,5 +765,48 @@ mod tests {
         let off = gate_uniforms(&flags, u);
         assert_eq!(off.extras[0], 0.0);
         assert!((off.extras[1] - crate::genconst::GLOW_POW_DAY).abs() < 1e-5);
+    }
+
+    #[test]
+    fn shadow_quad_on_plus_y_matches_the_ground_corners() {
+        let c = Vec3::new(1.0, 2.0, 3.0);
+        let r = 4.0;
+        assert_eq!(
+            shadow_corners(c, Vec3::Y, r),
+            [
+                [c.x - r, c.y, c.z - r],
+                [c.x - r, c.y, c.z + r],
+                [c.x + r, c.y, c.z + r],
+                [c.x + r, c.y, c.z - r],
+            ]
+        );
+    }
+
+    #[test]
+    fn shadow_quad_lies_in_the_plane_of_its_normal() {
+        let center = Vec3::new(3.0, -1.0, 2.0);
+        let radius = 1.5;
+        let normals = [
+            Vec3::X,
+            Vec3::NEG_X,
+            Vec3::NEG_Y,
+            Vec3::Z,
+            Vec3::NEG_Z,
+            Vec3::new(1.0, 1.0, 0.0).normalize(),
+            Vec3::new(0.2, -0.9, 0.3).normalize(),
+        ];
+        for normal in normals {
+            let corners = shadow_corners(center, normal, radius);
+            let p = |i: usize| Vec3::from_array(corners[i]);
+            let n = (p(1) - p(0)).cross(p(2) - p(0)).normalize();
+            assert!(
+                (n - normal).length() < 1e-5,
+                "normal {normal:?} wound to {n:?}"
+            );
+            for corner in corners {
+                let d = (Vec3::from_array(corner) - center).dot(normal);
+                assert!(d.abs() < 1e-5, "normal {normal:?} corner off plane by {d}");
+            }
+        }
     }
 }

@@ -7,7 +7,7 @@
 //! the matrices used for rendering, and `Frustum` extracts frustum planes for
 //! AABB culling.
 
-use glam::{Mat4, Vec2, Vec3, Vec4};
+use glam::{Mat4, Quat, Vec2, Vec3, Vec4};
 
 /// Near plane distance (single source with shader's WATER_Z_NEAR from genconst).
 pub use crate::genconst::Z_NEAR;
@@ -225,6 +225,18 @@ pub struct Camera3D {
 }
 
 impl Camera3D {
+    /// Camera at `position` whose axes are `rotation`. Forward is rotated −Z
+    /// (the direction [`Self::view`] looks), up is rotated +Y.
+    pub fn from_rotation(position: Vec3, rotation: Quat, fovy: f32, lens: Lens) -> Self {
+        Self {
+            position,
+            target: position + rotation * Vec3::new(0.0, 0.0, -1.0),
+            up: rotation * Vec3::Y,
+            fovy,
+            lens,
+        }
+    }
+
     /// Right-handed view matrix looking from `position` toward `target`.
     pub fn view(&self) -> Mat4 {
         Mat4::look_at_rh(self.position, self.target, self.up)
@@ -331,6 +343,19 @@ mod tests {
 
     fn aabb_around(center: Vec3, half: f32) -> (Vec3, Vec3) {
         (center - Vec3::splat(half), center + Vec3::splat(half))
+    }
+
+    #[test]
+    fn from_rotation_identity_matches_the_origin_camera() {
+        let cam =
+            Camera3D::from_rotation(Vec3::ZERO, super::Quat::IDENTITY, 60.0, Lens::Rectilinear);
+        let origin = origin_cam();
+        assert_eq!(cam.position, origin.position);
+        assert_eq!(cam.target, origin.target);
+        assert_eq!(cam.up, origin.up);
+        assert_eq!(cam.fovy, origin.fovy);
+        assert!(matches!(cam.lens, Lens::Rectilinear));
+        assert_eq!(cam.view(), origin.view());
     }
 
     #[test]

@@ -2,8 +2,8 @@
 // Camera partitions are (group, arena, distance-bucket); shadows are
 // per-cascade and unbucketed. Camera groups (CULL_CAMERA_GROUPS): 0 full-res
 // Opaque, 1 Cutout, 2 coarse-LOD Opaque (scale > 1, the only camera draws
-// that pay for the slab-clip `discard`). Group 2 meshes whose AABB is fully
-// inside that slab are not emitted (every fragment would be discarded).
+// that pay for the box-clip `discard`). Group 2 meshes whose AABB is fully
+// inside that box are not emitted (every fragment would be discarded).
 
 #include "common.slang"
 
@@ -11,7 +11,7 @@
 struct MeshRecord
 {
     int3 block;
-    uint detail_pass; // [0:4] detail+bias, [4:6] pass
+    uint detail_pass; // [0:5] detail+bias, [5:7] pass
     float3 local_off;
     uint pad0;
     float3 aabb_min;
@@ -50,8 +50,9 @@ struct CullParams
     uint arena_count;
     uint shadow_enabled;
     uint flags; // bit 0 = per-direction face-run culling
-    float clip;   // full-res slab radius; 0 = disabled (same as mesh3d push)
-    float clip_v; // full-res slab half-height; 0 = disabled
+    float half_x; // full-res box half-extents; a non-positive component covers nothing
+    float half_y;
+    float half_z;
 };
 
 [[vk::binding(0, 0)]]
@@ -114,19 +115,15 @@ uint distance_bucket(float dist)
 }
 
 // True when every fragment of a camera-relative AABB would be discarded by the
-// coarse-LOD slab clip (`mesh3d.frag.slang`). Both extents must be active:
-// `clip_v == 0` makes the fragment `inside_v` false, so nothing is discarded.
-// Horizontal test uses the farthest xz corner (max |x|, max |z|) so a skip is
-// exact for the per-fragment `length(world.xz) < clip` test. Host mirror:
-// `lod_aabb_inside_slab` in vk/cull.rs.
-bool lod_aabb_inside_slab(float3 mn, float3 mx, float clip, float clip_v)
+// coarse-LOD box clip (`mesh3d.frag.slang`). A non-positive half covers
+// nothing. The skip is exact: the farthest corner on each axis is strictly
+// inside. Host mirror: `lod_aabb_inside_box` in vk/cull_math.rs.
+bool lod_aabb_inside_box(float3 mn, float3 mx, float half_x, float half_y, float half_z)
 {
-    if (!(clip > 0.0 && clip_v > 0.0))
+    if (!(half_x > 0.0 && half_y > 0.0 && half_z > 0.0))
         return false;
-    float2 far_xz = max(abs(mn.xz), abs(mx.xz));
-    bool inside_h = length(far_xz) < clip;
-    bool inside_v = max(abs(mn.y), abs(mx.y)) < clip_v;
-    return inside_h && inside_v;
+    float3 far = max(abs(mn), abs(mx));
+    return far.x < half_x && far.y < half_y && far.z < half_z;
 }
 
 void emit(uint part, DrawCmd cmd)
@@ -178,7 +175,7 @@ void computeMain(uint3 id: SV_DispatchThreadID)
 
     uint arena = word - 1u;
     MeshRecord rec = records[slot];
-    uint pass = (rec.detail_pass >> 4) & 3u;
+    uint pass = (rec.detail_pass >> DETAIL_GPU_BITS) & 3u;
     if (pass > 1u)
         return; // Blend: CPU-sorted path
 
@@ -205,7 +202,7 @@ void computeMain(uint3 id: SV_DispatchThreadID)
             // Camera group: the pass index, except coarse-LOD opaque → group 2.
             uint group = (pass == 0u && scale > 1.0) ? 2u : pass;
             // Group 2 fully inside the slab would discard every fragment.
-            if (group != 2u || !lod_aabb_inside_slab(mn, mx, params.clip, params.clip_v))
+            if (group != 2u || !lod_aabb_inside_box(mn, mx, params.half_x, params.half_y, params.half_z))
             {
                 float dist = length(0.5 * (mn + mx));
                 uint bucket = distance_bucket(dist);
@@ -232,15 +229,10 @@ void computeMain(uint3 id: SV_DispatchThreadID)
                         b[i * 2u + 1u] = b[i * 2u] + 6u * (packed & 0xFFFFu);
                         b[i * 2u + 2u] = b[i * 2u + 1u] + 6u * (packed >> 16);
                     }
-                    // +axis vis iff mn[axis] < 0; −axis iff mx[axis] > 0. +Y uses the
-                    // drooped AABB because mesh3d.vert lowers far vertices by
-                    // min(|xz|²·CURVE_INV_2R, CURVE_MAX_DROP). −Y without droop is
-                    // already conservative.
+                    // +axis vis iff mn[axis] < 0; −axis iff mx[axis] > 0.
                     bool vis[6];
                     vis[0] = mn.x < 0.0;
-                    float2 far = max(abs(mn.xz), abs(mx.xz));
-                    float droop = min(dot(far, far) * CURVE_INV_2R, CURVE_MAX_DROP);
-                    vis[1] = (mn.y - droop) < 0.0;
+                    vis[1] = mn.y < 0.0;
                     vis[2] = mn.z < 0.0;
                     vis[3] = mx.x > 0.0;
                     vis[4] = mx.y > 0.0;

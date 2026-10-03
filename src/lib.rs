@@ -36,7 +36,7 @@ pub use engine::{
     Config, Engine, GpuCaps, GpuLoad, MeshStats, RenderFlags, RenderTargetConfig, run,
 };
 pub use frame::{CoverageVolume, FadeStyle, Frame, Frame3D, Lighting, SkyDesc};
-pub use glam::{DVec2, DVec3, IVec2, IVec3, Mat3, Mat4, Vec2, Vec3};
+pub use glam::{DMat3, DQuat, DVec2, DVec3, IVec2, IVec3, Mat3, Mat4, Quat, Vec2, Vec3};
 pub use input::{Key, MouseButton};
 pub use material::{
     MATERIAL_DESC_CAPACITY, MATERIAL_FLAG_EMISSIVE_ONLY_NIGHT, MATERIAL_FLAG_PROCEDURAL,

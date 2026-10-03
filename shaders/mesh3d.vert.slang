@@ -16,7 +16,7 @@
 struct MeshRecord
 {
     int3 block;       // world-space origin
-    uint detail_pass; // [0:4] detail+bias, [4:6] pass
+    uint detail_pass; // [0:5] detail+bias, [5:7] pass
     float3 local_off; // mover offset; zero for terrain
     uint _pad;        // std430 padding
     float3 aabb_min;
@@ -66,7 +66,7 @@ struct VertexOutput
     [[vk::location(2)]]
     float3 light_lv;
 
-    // x: layer[0:14] water[14] FLAT_COLOR[15] face[16:19] detail[20:24]
+    // x: layer[0:14] water[14] FLAT_COLOR[15] face[16:19] detail[20:25]
     // y: flat_rgba
     [[vk::location(3)]]
     nointerpolation uint2 ids;
@@ -75,23 +75,20 @@ struct VertexOutput
 struct PushConstants
 {
     float4x4 view_proj;
-    // LOD slab extents (fragment pass only).
-    float clip;
-    float clip_v;
+    // LOD box half-extents. half_z is the eye-split tail pad (byte 108).
+    float half_x;
+    float half_y;
     float2 inv_render_extent; // fragment water absorb; unused here
     // f64 camera eye split: eye = cam_block + cam_frac, frac in [0,1).
     int3 cam_block;
     int pad0;
     float3 cam_frac;
-    float pad1;
+    float half_z;
     // Lighting from per-frame UBO (binding 2).
 };
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc;
-
-// Planet curvature: droop is visual only (CLIP position only, not world).
-// Keeps culling conservative and shadows against flat silhouette.
 
 [shader("vertex")]
 VertexOutput vertexMain(VertexInput input)
@@ -136,21 +133,24 @@ VertexOutput vertexMain(VertexInput input)
     // Micro-offset is added in LOCAL space so it scales with the draw (2^k LOD).
     MeshRecord rec = mesh_records[input.instance];
     DrawDyn style = draw_dyn[input.instance];
-    uint detail = rec.detail_pass & 0xFu;
+    uint detail = rec.detail_pass & ((1u << DETAIL_GPU_BITS) - 1u);
     float scale = detail_scale(detail);
     // Camera-relative placement: block delta first, then fractional parts.
+    // Integer subtraction wraps, matching the CPU `wrapping_sub`.
     float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
     float3 world = (float3(x, y, z) + micro) * scale + offset;
 
     VertexOutput output;
-    // Round-world horizon: curve on-screen silhouette only, preserving world position for fog/shadows.
-    float3 curved = world;
-    curved.y -= min(dot(world.xz, world.xz) * CURVE_INV_2R, CURVE_MAX_DROP);
     // Plain rectilinear projection; wide-FOV compression is a post-process.
-    output.position = mul(pc.view_proj, float4(curved, 1.0));
-    // Resolve depth ties in coplanar LOD levels: push each farther proportionally to cell size.
+    output.position = mul(pc.view_proj, float4(world, 1.0));
+    // Coarser cells lose depth ties to finer ones. For k <= 9 the factor is
+    // exactly `1 - scale/4096`; beyond that it stays positive and decreasing.
     if (scale > 1.0)
-        output.position.z *= 1.0 - scale / 4096.0;
+    {
+        float k = float(int(detail) - int(DETAIL_GPU_BIAS));
+        float bias = 1.0 - min(scale, 512.0) / 4096.0 - max(k - 9.0, 0.0) * (1.0 / 512.0);
+        output.position.z *= bias;
+    }
     // Scale UV to maintain texel density across LOD levels.
     output.uv = uv * scale;
     output.world = world;

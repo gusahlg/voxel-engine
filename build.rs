@@ -582,7 +582,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "SHADOW_FAR_MIN_RADIUS",
-            doc: "Lower clamp of the far cascade split when fitted to DrawLists::lod_clip.\n96 >= 64·1.15 + 16 m fade band, so the blend band and SHADOW_LIMIT fade\nnever overlap the near split. Legacy 256 keeps the fixed far radius.",
+            doc: "Lower clamp of the far cascade split when fitted to the coverage\nbox's horizontal half-extent. 96 >= 64·1.15 + 16 m fade band, so the blend\nband and SHADOW_LIMIT fade never overlap the near split. Legacy 256 keeps\nthe fixed far radius.",
             val: Val::Scalar(if light_legacy { 256.0 } else { 96.0 }),
         },
         Def {
@@ -952,24 +952,19 @@ fn build_table() -> Vec<Def> {
             val: Val::Scalar(0.05),
         },
         Def {
-            name: "CURVE_INV_2R",
-            doc: "Gameplay-tuned planet curvature: inverse of 2x the visual planet\nradius (~300 km). Read by mesh3d.vert's horizon droop (CURVE_MAX_DROP-clamped,\npresentation-only — does not affect gameplay).",
-            val: Val::Scalar(1.0 / (2.0 * 300_000.0)),
-        },
-        Def {
-            name: "CURVE_MAX_DROP",
-            doc: "Planet-curvature horizon droop clamp, in metres (reached ~50 km out).\nBounds mesh3d.vert's CURVE_INV_2R droop so distant vertices can't overflow\nor fold the horizon.",
-            val: Val::Scalar(4096.0),
-        },
-        Def {
             name: "LUMA_FLOOR",
             doc: "Exposure metering luma floor: keeps log2(luma) finite on black tiles.\nRead by exposure_reduce.comp.",
             val: Val::Scalar(1e-4),
         },
         // Detail level bias for GPU encoding (shared with shaders).
         Def {
+            name: "DETAIL_GPU_BITS",
+            doc: "Width of the detail field in MeshRecord.detail_pass. The pass\noccupies the next two bits. Range is -DETAIL_GPU_BIAS ..= 2^bits-1-bias.",
+            val: Val::UInt(5),
+        },
+        Def {
             name: "DETAIL_GPU_BIAS",
-            doc: "Bias added to the signed detail level k before it is stored in the\n4-bit detail field of MeshRecord.detail_pass. Decode: 2^k = exp2(bits - bias).",
+            doc: "Bias added to the signed detail level k before it is stored in the\ndetail field of MeshRecord.detail_pass. Decode: 2^k = exp2(bits - bias).",
             val: Val::UInt(2),
         },
         Def {

@@ -82,9 +82,9 @@ impl ArenaUnion {
             return;
         }
         let d = [
-            (aabb.block[0] - self.origin[0]) as f32,
-            (aabb.block[1] - self.origin[1]) as f32,
-            (aabb.block[2] - self.origin[2]) as f32,
+            aabb.block[0].wrapping_sub(self.origin[0]) as f32,
+            aabb.block[1].wrapping_sub(self.origin[1]) as f32,
+            aabb.block[2].wrapping_sub(self.origin[2]) as f32,
         ];
         for i in 0..3 {
             self.min[i] = self.min[i].min(aabb.min[i] + d[i]);
@@ -97,9 +97,9 @@ impl ArenaUnion {
     /// placement so a single-mesh union agrees with `distance_bucket`.
     fn cam_dist_range(&self, eye: EyeSplit) -> (f32, f32) {
         let off = [
-            (self.origin[0] - eye.block[0]) as f32 - eye.frac[0],
-            (self.origin[1] - eye.block[1]) as f32 - eye.frac[1],
-            (self.origin[2] - eye.block[2]) as f32 - eye.frac[2],
+            self.origin[0].wrapping_sub(eye.block[0]) as f32 - eye.frac[0],
+            self.origin[1].wrapping_sub(eye.block[1]) as f32 - eye.frac[1],
+            self.origin[2].wrapping_sub(eye.block[2]) as f32 - eye.frac[2],
         ];
         aabb_center_dist_range(
             [

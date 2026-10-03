@@ -18,12 +18,14 @@ impl Detail {
     /// Full-resolution: one cell = one world unit (k=0, scale 1.0).
     pub const FULL: Detail = Detail(0);
 
-    /// Encodable range at the GPU boundary: `k ∈ −2..=13` biased into an
-    /// unsigned 4-bit field. The bias is single-sourced through genconst so the
-    /// shaders that decode `detail_pass` share the exact value.
+    /// Encodable range at the GPU boundary: `k ∈ −2..=29` biased into an
+    /// unsigned 5-bit field. The bias and the width are single-sourced through
+    /// genconst so the shaders that decode `detail_pass` share the exact value.
+    const GPU_BITS: u32 = crate::genconst::DETAIL_GPU_BITS;
+    const GPU_MASK: u32 = (1u32 << Self::GPU_BITS) - 1;
     const GPU_BIAS: i8 = crate::genconst::DETAIL_GPU_BIAS as i8;
     const GPU_MIN: i8 = -Self::GPU_BIAS;
-    const GPU_MAX: i8 = 15 - Self::GPU_BIAS;
+    const GPU_MAX: i8 = Self::GPU_MASK as i8 - Self::GPU_BIAS;
 
     /// A detail level from an unsigned LOD step (`k = level`, non-negative).
     /// Negative levels (half-block edits) are constructed via [`Detail`] directly.
@@ -41,7 +43,7 @@ impl Detail {
         2f32.powi(self.0 as i32)
     }
 
-    /// Bias `k` into the unsigned 4-bit field records/shaders store.
+    /// Bias `k` into the unsigned 5-bit field records/shaders store.
     pub fn to_gpu_bits(self) -> u8 {
         debug_assert!(
             (Self::GPU_MIN..=Self::GPU_MAX).contains(&self.0),
@@ -55,7 +57,11 @@ impl Detail {
 
     /// Inverse of [`Self::to_gpu_bits`].
     pub fn from_gpu_bits(bits: u8) -> Detail {
-        debug_assert!(bits <= 15, "GPU detail field {bits} does not fit 4 bits");
+        debug_assert!(
+            u32::from(bits) <= Self::GPU_MASK,
+            "GPU detail field {bits} does not fit {} bits",
+            Self::GPU_BITS
+        );
         Detail(bits as i8 - Self::GPU_BIAS)
     }
 }
@@ -260,11 +266,33 @@ mod tests {
 
     #[test]
     fn detail_gpu_bits_roundtrip_across_encodable_range() {
-        for k in -2..=13i8 {
+        for k in Detail::GPU_MIN..=Detail::GPU_MAX {
             let d = Detail(k);
             let bits = d.to_gpu_bits();
-            assert!(bits <= 15);
+            assert!(u32::from(bits) <= Detail::GPU_MASK);
             assert_eq!(Detail::from_gpu_bits(bits), d);
+        }
+    }
+
+    /// Depth-bias multiplier mirrored by `mesh3d.vert.slang`. For `k <= 9` it
+    /// equals `1 - 2^k/4096` bit for bit; past that it stays positive.
+    fn detail_depth_bias(k: i32) -> f32 {
+        let scale = 2f32.powi(k);
+        1.0 - scale.min(512.0) / 4096.0 - (k - 9).max(0) as f32 * (1.0 / 512.0)
+    }
+
+    #[test]
+    fn detail_depth_bias_is_positive_decreasing_and_matches_the_old_formula() {
+        let mut prev = f32::INFINITY;
+        for k in Detail::GPU_MIN as i32..=Detail::GPU_MAX as i32 {
+            let b = detail_depth_bias(k);
+            assert!(b > 0.0, "k={k} bias {b}");
+            assert!(b < prev, "k={k} bias {b} is not below {prev}");
+            prev = b;
+            if k <= 9 {
+                let old = 1.0 - 2f32.powi(k) / 4096.0;
+                assert_eq!(b.to_bits(), old.to_bits(), "k={k}");
+            }
         }
     }
 

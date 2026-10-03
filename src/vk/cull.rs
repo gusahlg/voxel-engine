@@ -7,8 +7,8 @@
 //! Camera groups (bucketed): full-res Opaque, Cutout, coarse-LOD Opaque
 //! (`scale > 1`). The LOD split exists so full-res opaque draws bind a
 //! fragment module with no `discard` (early depth write) while only the LOD
-//! partition pays for the slab clip. Coarse-LOD meshes whose camera-relative
-//! AABB lies entirely inside that slab are not emitted (every fragment would
+//! partition pays for the box clip. Coarse-LOD meshes whose camera-relative
+//! AABB lies entirely inside that box are not emitted (every fragment would
 //! be discarded). Shadow Near/Far stay unbucketed and reuse the full-res
 //! Opaque live count.
 
@@ -45,11 +45,13 @@ struct CullParamsGpu {
     arena_count: u32,
     shadow_enabled: u32,
     flags: u32,
-    clip: f32,
-    clip_v: f32,
+    half_x: f32,
+    half_y: f32,
+    half_z: f32,
+    // std140 rounds the block up to 16 bytes past half_z (292 → 304).
+    _pad: [f32; 3],
 }
-// std140: clip/clip_v occupy the former pad tail (same 288-byte size).
-const _: () = assert!(size_of::<CullParamsGpu>() == 288);
+const _: () = assert!(size_of::<CullParamsGpu>() == 304);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, cam_planes) == 0);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, shadow_planes) == 80);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, cam_block) == 240);
@@ -58,8 +60,9 @@ const _: () = assert!(std::mem::offset_of!(CullParamsGpu, cam_frac) == 256);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, arena_count) == 268);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, shadow_enabled) == 272);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, flags) == 276);
-const _: () = assert!(std::mem::offset_of!(CullParamsGpu, clip) == 280);
-const _: () = assert!(std::mem::offset_of!(CullParamsGpu, clip_v) == 284);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, half_x) == 280);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, half_y) == 284);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, half_z) == 288);
 
 /// Device-local grow-only buffer for GPU scratch.
 struct DeviceBuffer {
@@ -289,9 +292,9 @@ impl CullState {
     ///
     /// `slot_count` bounds the dispatch (the caller trims it to the directory's
     /// live end); `visible` must cover it. `partitions` is last frame's table
-    /// handed back for reuse (its contents are discarded). `clip` / `clip_v`
-    /// are the full-res slab extents (`DrawLists::lod_clip`, `lod_clip_v`);
-    /// 0 disables, matching the mesh3d push constants.
+    /// handed back for reuse (its contents are discarded). `half` is the
+    /// full-res coverage box (`DrawLists::lod_half`); a non-positive component
+    /// covers nothing, matching the mesh3d push constants.
     ///
     /// When the directory's camera-group live count is at most `CPU_CULL_MAX`
     /// (or `VOXEL_CPU_CULL_MAX`), commands and counts are written to host-visible
@@ -311,8 +314,7 @@ impl CullState {
         camera: &Frustum,
         shadow: Option<&[Frustum; 2]>,
         eye: super::pipeline::EyeSplit,
-        clip: f32,
-        clip_v: f32,
+        half: [f32; 3],
         visible: &[u32],
         mut partitions: Vec<PartitionGpu>,
     ) -> Option<CullFrame> {
@@ -341,8 +343,7 @@ impl CullState {
                 shadow,
                 eye,
                 slot_count,
-                clip,
-                clip_v,
+                half,
                 face_cull,
                 &mut self.cpu_scratch,
             );
@@ -385,8 +386,10 @@ impl CullState {
             arena_count: dir.arena_count() as u32,
             shadow_enabled: shadow.is_some() as u32,
             flags: u32::from(face_cull),
-            clip,
-            clip_v,
+            half_x: half[0],
+            half_y: half[1],
+            half_z: half[2],
+            _pad: [0.0; 3],
         };
         if let Some(frusta) = shadow {
             for (c, f) in frusta.iter().enumerate() {
@@ -612,10 +615,11 @@ mod tests {
     }
 
     #[test]
-    fn cull_params_std140_tail_is_slab_extents() {
-        assert_eq!(size_of::<CullParamsGpu>(), 288);
+    fn cull_params_std140_tail_is_box_extents() {
+        assert_eq!(size_of::<CullParamsGpu>(), 304);
         assert_eq!(std::mem::offset_of!(CullParamsGpu, flags), 276);
-        assert_eq!(std::mem::offset_of!(CullParamsGpu, clip), 280);
-        assert_eq!(std::mem::offset_of!(CullParamsGpu, clip_v), 284);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, half_x), 280);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, half_y), 284);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, half_z), 288);
     }
 }

@@ -177,9 +177,9 @@ impl Renderer {
             // decode `detail_pass` here by hand (it carries a to_gpu_bits offset).
             let scale = rec.detail_scale();
             let offset = glam::Vec3::new(
-                (rec.block[0] - eye.block[0]) as f32 - eye.frac[0] + rec.local_off[0],
-                (rec.block[1] - eye.block[1]) as f32 - eye.frac[1] + rec.local_off[1],
-                (rec.block[2] - eye.block[2]) as f32 - eye.frac[2] + rec.local_off[2],
+                rec.block[0].wrapping_sub(eye.block[0]) as f32 - eye.frac[0] + rec.local_off[0],
+                rec.block[1].wrapping_sub(eye.block[1]) as f32 - eye.frac[1] + rec.local_off[1],
+                rec.block[2].wrapping_sub(eye.block[2]) as f32 - eye.frac[2] + rec.local_off[2],
             );
             let amin = glam::Vec3::from(rec.aabb_min);
             let amax = glam::Vec3::from(rec.aabb_max);
@@ -257,9 +257,9 @@ impl Renderer {
         // Cull emits shadow casters only when the shared map will actually be
         // rewritten this frame. A cache hit skips cascade `fit()` and sets
         // `shadow_enabled = 0` so invisible slots bail before the AABB load.
-        // Far cascade radius follows full-res coverage (`lod_clip`); a render-
-        // distance change snaps `ShadowKey` from `cfg.splits` and rebuilds once.
-        let cfg = crate::skeleton::ShadowCfg::for_coverage(lists.lod_clip);
+        // Far cascade radius follows the coverage box's horizontal half-extent;
+        // a render-distance change snaps `ShadowKey` from `cfg.splits` and rebuilds once.
+        let cfg = crate::skeleton::ShadowCfg::for_coverage(lists.lod_half.x.max(lists.lod_half.z));
         let shadow_frusta = lists.scene.as_ref().and_then(|scene| {
             let rebuild = if self.flags.shadows {
                 let key = shadow_key(scene.eye, sun, self.records.occluder_rev(), lists, &cfg);
@@ -311,8 +311,7 @@ impl Renderer {
                         camera,
                         shadow_frusta.as_ref(),
                         *eye,
-                        lists.lod_clip,
-                        lists.lod_clip_v,
+                        lists.lod_half.to_array(),
                         &self.visible_mask[..need],
                         recycled,
                     )

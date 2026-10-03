@@ -37,10 +37,16 @@ pub struct EyeSplit {
 }
 
 impl EyeSplit {
+    /// Wrapping block: `(floor(eye) as i64) as i32`. The absolute coordinate is
+    /// unbounded; anything drawn must sit within 2^31 blocks of the camera.
     pub fn of(eye: glam::DVec3) -> Self {
         let block = eye.floor();
         Self {
-            block: block.as_ivec3().to_array(),
+            block: [
+                (block.x as i64) as i32,
+                (block.y as i64) as i32,
+                (block.z as i64) as i32,
+            ],
             _pad0: 0,
             frac: (eye - block).as_vec3().to_array(),
             _pad1: 0.0,
@@ -48,21 +54,43 @@ impl EyeSplit {
     }
 }
 
-/// 3D push constant data.
+/// 3D push constant data. 112 bytes: the LOD box reuses the old clip lanes
+/// (`half_x`, `half_y`) and [`EyeSplit`]'s tail pad (`_pad1` = `half_z`).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Mesh3dPush {
     pub view_proj: Mat4,
-    pub clip: f32,
-    /// Vertical half-height of the full-res slab.
-    pub clip_v: f32,
+    pub half_x: f32,
+    pub half_y: f32,
     /// 1/render_extent for previous-depth UV. Zero when that depth is invalid.
     pub inv_render_extent: [f32; 2],
     pub eye: EyeSplit,
 }
 
-// Struct must fit within 128-byte push budget.
-const _: () = assert!(size_of::<Mesh3dPush>() <= 128);
+impl Mesh3dPush {
+    pub(crate) fn pack(
+        view_proj: Mat4,
+        half: glam::Vec3,
+        inv_render_extent: [f32; 2],
+        mut eye: EyeSplit,
+    ) -> Self {
+        eye._pad1 = half.z;
+        Self {
+            view_proj,
+            half_x: half.x,
+            half_y: half.y,
+            inv_render_extent,
+            eye,
+        }
+    }
+}
+
+// Struct must fit within 128-byte push budget. half_z lives at byte 108.
+const _: () = assert!(size_of::<Mesh3dPush>() == 112);
+const _: () = assert!(std::mem::offset_of!(Mesh3dPush, half_x) == 64);
+const _: () = assert!(std::mem::offset_of!(Mesh3dPush, half_y) == 68);
+const _: () = assert!(std::mem::offset_of!(Mesh3dPush, eye) == 80);
+const _: () = assert!(std::mem::offset_of!(EyeSplit, _pad1) == 28);
 
 /// Debug push constant: view_proj only.
 #[repr(C)]
@@ -1220,5 +1248,24 @@ mod tests {
                 "{name} must declare the material SSBO at binding {binding}"
             );
         }
+    }
+
+    #[test]
+    fn eye_split_wraps_past_i32_and_keeps_a_nearby_record_offset() {
+        let near = super::EyeSplit::of(glam::DVec3::new(2_147_483_000.5, 0.0, 0.0));
+        assert_eq!(near.block[0], 2_147_483_000);
+        assert_eq!(near.frac[0], 0.5);
+        let record = (2_147_483_000i64 + 1000) as i32;
+        let delta = record.wrapping_sub(near.block[0]);
+        assert_eq!(delta, 1000);
+        assert_eq!(delta as f32 - near.frac[0], 999.5);
+
+        let far = super::EyeSplit::of(glam::DVec3::new(-2.5e9, 0.0, 0.0));
+        let wrapped = (-2_500_000_000i64) as i32;
+        assert_eq!(far.block[0], wrapped);
+        assert_ne!(far.block[0], i32::MIN);
+        assert_eq!(far.frac[0], 0.0);
+        let rec = (-2_500_000_000i64 + 1000) as i32;
+        assert_eq!(rec.wrapping_sub(far.block[0]), 1000);
     }
 }

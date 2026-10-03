@@ -12,7 +12,7 @@ pub(crate) enum Group {
     /// Full-res (scale <= 1) Opaque: no-`discard` fragment module.
     Opaque = 0,
     Cutout = 1,
-    /// Coarse-LOD (scale > 1) Opaque: the slab-clip `discard` module.
+    /// Coarse-LOD (scale > 1) Opaque: the box-clip `discard` module.
     OpaqueLod = 2,
 }
 /// Camera groups (Opaque, Cutout, OpaqueLod). Bucketed.
@@ -56,20 +56,17 @@ const _: () = assert!(GROUPS == CAMERA_GROUPS + SHADOW_GROUPS);
 const _: () = assert!(Group::OpaqueLod as usize + 1 == CAMERA_GROUPS);
 
 /// True when every fragment of a camera-relative AABB would be discarded by
-/// the coarse-LOD slab clip (`mesh3d.frag.slang`). Both extents must be
-/// active (`clip_v == 0` makes the fragment `inside_v` false). Horizontal
-/// test uses the farthest xz corner (max |x|, max |z|) so a skip is exact
-/// for the per-fragment `length(world.xz) < clip` test. Mirrored by
-/// `lod_aabb_inside_slab` in `cull.comp.slang`.
-fn lod_aabb_inside_slab(mn: [f32; 3], mx: [f32; 3], clip: f32, clip_v: f32) -> bool {
-    if !(clip > 0.0 && clip_v > 0.0) {
+/// the coarse-LOD box clip (`mesh3d.frag.slang`). A non-positive half-extent
+/// covers nothing. The skip is exact: the farthest corner on each axis must
+/// sit strictly inside `half`. Mirrored by `lod_aabb_inside_box` in
+/// `cull.comp.slang`.
+fn lod_aabb_inside_box(mn: [f32; 3], mx: [f32; 3], half: [f32; 3]) -> bool {
+    if half[0] <= 0.0 || half[1] <= 0.0 || half[2] <= 0.0 {
         return false;
     }
-    let far_x = mn[0].abs().max(mx[0].abs());
-    let far_z = mn[2].abs().max(mx[2].abs());
-    let inside_h = (far_x * far_x + far_z * far_z).sqrt() < clip;
-    let inside_v = mn[1].abs().max(mx[1].abs()) < clip_v;
-    inside_h && inside_v
+    mn[0].abs().max(mx[0].abs()) < half[0]
+        && mn[1].abs().max(mx[1].abs()) < half[1]
+        && mn[2].abs().max(mx[2].abs()) < half[2]
 }
 
 /// Camera-distance bucket of an AABB centre, matching `cull.comp.slang`.
@@ -172,9 +169,9 @@ fn flatten_part_cmds(
 fn cam_relative_aabb(rec: &MeshRecord, eye: EyeSplit) -> ([f32; 3], [f32; 3], f32) {
     let scale = rec.detail_scale();
     let offset = [
-        (rec.block[0] - eye.block[0]) as f32 - eye.frac[0] + rec.local_off[0],
-        (rec.block[1] - eye.block[1]) as f32 - eye.frac[1] + rec.local_off[1],
-        (rec.block[2] - eye.block[2]) as f32 - eye.frac[2] + rec.local_off[2],
+        rec.block[0].wrapping_sub(eye.block[0]) as f32 - eye.frac[0] + rec.local_off[0],
+        rec.block[1].wrapping_sub(eye.block[1]) as f32 - eye.frac[1] + rec.local_off[1],
+        rec.block[2].wrapping_sub(eye.block[2]) as f32 - eye.frac[2] + rec.local_off[2],
     ];
     (
         [
@@ -192,15 +189,11 @@ fn cam_relative_aabb(rec: &MeshRecord, eye: EyeSplit) -> ([f32; 3], [f32; 3], f3
 }
 
 /// Per-axis face visibility, matching `cull.comp.slang`: +axis iff `mn[axis] < 0`,
-/// −axis iff `mx[axis] > 0`. +Y subtracts the planet-curvature droop.
+/// −axis iff `mx[axis] > 0`.
 fn face_vis(mn: [f32; 3], mx: [f32; 3]) -> [bool; 6] {
-    let far_x = mn[0].abs().max(mx[0].abs());
-    let far_z = mn[2].abs().max(mx[2].abs());
-    let droop = ((far_x * far_x + far_z * far_z) * crate::genconst::CURVE_INV_2R)
-        .min(crate::genconst::CURVE_MAX_DROP);
     [
         mn[0] < 0.0,
-        (mn[1] - droop) < 0.0,
+        mn[1] < 0.0,
         mn[2] < 0.0,
         mx[0] > 0.0,
         mx[1] > 0.0,
@@ -293,9 +286,9 @@ fn cam_relative_soa(
     eye_block: [i32; 3],
     eye_frac: [f32; 3],
 ) -> ([f32; 3], [f32; 3]) {
-    let dx = (block[0] - eye_block[0]) as f32 - eye_frac[0];
-    let dy = (block[1] - eye_block[1]) as f32 - eye_frac[1];
-    let dz = (block[2] - eye_block[2]) as f32 - eye_frac[2];
+    let dx = block[0].wrapping_sub(eye_block[0]) as f32 - eye_frac[0];
+    let dy = block[1].wrapping_sub(eye_block[1]) as f32 - eye_frac[1];
+    let dz = block[2].wrapping_sub(eye_block[2]) as f32 - eye_frac[2];
     (
         [aabb[0] + dx, aabb[1] + dy, aabb[2] + dz],
         [aabb[3] + dx, aabb[4] + dy, aabb[5] + dz],
@@ -346,8 +339,7 @@ pub(crate) fn cpu_cull_into(
     shadow: Option<&[Frustum; 2]>,
     eye: EyeSplit,
     slot_count: u32,
-    clip: f32,
-    clip_v: f32,
+    half: [f32; 3],
     face_cull: bool,
     scratch: &mut CpuCullScratch,
 ) -> [u32; STATS_COUNT] {
@@ -384,8 +376,7 @@ pub(crate) fn cpu_cull_into(
             is_arrived,
             partitions,
             &cam_planes,
-            clip,
-            clip_v,
+            half,
             slot_count,
             &scratch.live_vis,
             &mut scratch.part_cmds,
@@ -401,8 +392,7 @@ pub(crate) fn cpu_cull_into(
             shadow_planes.as_ref(),
             visible,
             eye,
-            clip,
-            clip_v,
+            half,
             slot_count,
             &scratch.live_vis,
             &mut scratch.part_cmds,
@@ -416,8 +406,7 @@ pub(crate) fn cpu_cull_into(
             None,
             visible,
             eye,
-            clip,
-            clip_v,
+            half,
             slot_count,
             &scratch.live_vis,
             &mut scratch.part_cmds,
@@ -431,8 +420,7 @@ pub(crate) fn cpu_cull_into(
             shadow_planes.as_ref(),
             visible,
             eye,
-            clip,
-            clip_v,
+            half,
             slot_count,
             &scratch.live_vis,
             &mut scratch.part_cmds,
@@ -455,8 +443,7 @@ pub(crate) fn cpu_cull(
     shadow: Option<&[Frustum; 2]>,
     eye: EyeSplit,
     slot_count: u32,
-    clip: f32,
-    clip_v: f32,
+    half: [f32; 3],
     face_cull: bool,
 ) -> (Vec<DrawIndexedIndirect>, Vec<u32>, [u32; STATS_COUNT]) {
     let mut scratch = CpuCullScratch::default();
@@ -470,8 +457,7 @@ pub(crate) fn cpu_cull(
         shadow,
         eye,
         slot_count,
-        clip,
-        clip_v,
+        half,
         face_cull,
         &mut scratch,
     );
@@ -497,8 +483,7 @@ fn cpu_cull_legacy(
     shadow: Option<&[Frustum; 2]>,
     eye: EyeSplit,
     slot_count: u32,
-    clip: f32,
-    clip_v: f32,
+    half: [f32; 3],
     face_cull: bool,
 ) -> (Vec<DrawIndexedIndirect>, Vec<u32>, [u32; STATS_COUNT]) {
     let total: usize = partitions.iter().map(|p| p.capacity as usize).sum();
@@ -529,7 +514,7 @@ fn cpu_cull_legacy(
         let Some(rec) = records.get(slot as usize) else {
             continue;
         };
-        let pass = (rec.detail_pass >> 4) & 3;
+        let pass = (rec.detail_pass >> crate::genconst::DETAIL_GPU_BITS) & 3;
         if pass > 1 {
             continue;
         }
@@ -545,7 +530,7 @@ fn cpu_cull_legacy(
 
         if cam_visible && aabb_in_planes_select(&cam_planes, mn, mx) {
             let group = if pass == 0 && scale > 1.0 { 2 } else { pass };
-            if group != 2 || !lod_aabb_inside_slab(mn, mx, clip, clip_v) {
+            if group != 2 || !lod_aabb_inside_box(mn, mx, half) {
                 let cx = 0.5 * (mn[0] + mx[0]);
                 let cy = 0.5 * (mn[1] + mx[1]);
                 let cz = 0.5 * (mn[2] + mx[2]);
@@ -606,8 +591,7 @@ fn cull_fast_solid(
     is_arrived: impl Fn(u32) -> bool,
     partitions: &[PartitionGpu],
     cam_planes: &[[f32; 4]; 5],
-    clip: f32,
-    clip_v: f32,
+    half: [f32; 3],
     slot_count: u32,
     live_vis: &[u32],
     part_cmds: &mut [Vec<DrawIndexedIndirect>],
@@ -646,7 +630,7 @@ fn cull_fast_solid(
         let pass = super::arena::cull_bits_pass(bits);
         let lod = super::arena::cull_bits_lod(bits);
         let group = if pass == 0 && lod { 2 } else { pass };
-        if group == 2 && lod_aabb_inside_slab(mn, mx, clip, clip_v) {
+        if group == 2 && lod_aabb_inside_box(mn, mx, half) {
             continue;
         }
         let cx = 0.5 * (mn[0] + mx[0]);
@@ -678,8 +662,7 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
     shadow_planes: Option<&[[[f32; 4]; 5]; 2]>,
     visible: &[u32],
     eye: EyeSplit,
-    clip: f32,
-    clip_v: f32,
+    half: [f32; 3],
     slot_count: u32,
     live_vis: &[u32],
     part_cmds: &mut [Vec<DrawIndexedIndirect>],
@@ -725,7 +708,7 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
         let mut part = 0usize;
         if cam_visible && aabb_in_planes(cam_planes, mn, mx) {
             group = if pass == 0 && lod { 2 } else { pass };
-            if group != 2 || !lod_aabb_inside_slab(mn, mx, clip, clip_v) {
+            if group != 2 || !lod_aabb_inside_box(mn, mx, half) {
                 let cx = 0.5 * (mn[0] + mx[0]);
                 let cy = 0.5 * (mn[1] + mx[1]);
                 let cz = 0.5 * (mn[2] + mx[2]);
@@ -897,52 +880,48 @@ mod tests {
     }
 
     #[test]
-    fn lod_aabb_inside_slab_matches_fragment_discard() {
-        // Fully inside: farthest xz = (3, 4) length 5 < 10; |y| = 2 < 8.
-        assert!(lod_aabb_inside_slab(
+    fn lod_aabb_inside_box_matches_fragment_discard() {
+        let half = [10.0, 8.0, 10.0];
+        // Fully inside: farthest corner (3, 2, 4).
+        assert!(lod_aabb_inside_box(
             [-3.0, -2.0, -4.0],
             [1.0, 2.0, 2.0],
-            10.0,
-            8.0
+            half
         ));
-
-        // Straddling the circle: origin is inside, farthest (8, 8) length ~11.3 > 10.
-        assert!(!lod_aabb_inside_slab(
+        // A corner the old cylinder rejected (length ~11.3) is inside the box.
+        assert!(lod_aabb_inside_box(
             [-1.0, -1.0, -1.0],
             [8.0, 1.0, 8.0],
-            10.0,
-            8.0
+            half
         ));
-        // On the circle (6-8-10) is not strictly inside; skip only if farthest is inside.
-        assert!(!lod_aabb_inside_slab(
-            [0.0, -1.0, 0.0],
-            [6.0, 1.0, 8.0],
-            10.0,
-            8.0
-        ));
-
-        // Inside horizontally (length 5 < 10) but |y| = 9 is outside clip_v = 8.
-        assert!(!lod_aabb_inside_slab(
+        // |x| = 6 and |z| = 8 are both inside 10.
+        assert!(lod_aabb_inside_box([0.0, -1.0, 0.0], [6.0, 1.0, 8.0], half));
+        // |y| = 9 is outside half.y = 8.
+        assert!(!lod_aabb_inside_box(
             [-3.0, -9.0, -4.0],
             [3.0, 1.0, 4.0],
-            10.0,
-            8.0
+            half
         ));
-
-        // clip == 0 disables the fragment discard, so never skip.
-        assert!(!lod_aabb_inside_slab(
+        // Outside on X.
+        assert!(!lod_aabb_inside_box(
             [-1.0, -1.0, -1.0],
-            [1.0, 1.0, 1.0],
-            0.0,
-            8.0
+            [11.0, 1.0, 1.0],
+            half
         ));
-        // clip_v == 0 likewise (inside_v is then false in the fragment shader).
-        assert!(!lod_aabb_inside_slab(
-            [-1.0, -1.0, -1.0],
-            [1.0, 1.0, 1.0],
-            10.0,
-            0.0
+        // On the face (abs == half) is not strictly inside.
+        assert!(!lod_aabb_inside_box(
+            [0.0, 0.0, 0.0],
+            [10.0, 1.0, 1.0],
+            half
         ));
+        // A non-positive component covers nothing.
+        for closed in [[0.0, 8.0, 10.0], [10.0, 0.0, 10.0], [10.0, 8.0, 0.0]] {
+            assert!(!lod_aabb_inside_box(
+                [-1.0, -1.0, -1.0],
+                [1.0, 1.0, 1.0],
+                closed
+            ));
+        }
     }
 
     #[test]
@@ -1005,8 +984,7 @@ mod tests {
         visible: &[u32],
         camera: &Frustum,
         face_cull: bool,
-        clip: f32,
-        clip_v: f32,
+        half: [f32; 3],
     ) -> (
         Vec<PartitionGpu>,
         Vec<DrawIndexedIndirect>,
@@ -1030,8 +1008,7 @@ mod tests {
             None,
             eye,
             dir.live_end(),
-            clip,
-            clip_v,
+            half,
             face_cull,
         );
         (parts, cmds, counts, stats)
@@ -1072,7 +1049,7 @@ mod tests {
             MeshAabb::from_record(&front),
         );
         let (parts, cmds, counts, stats) =
-            run_cpu(&mut dir, &[front], &[1], &camera, false, 0.0, 0.0);
+            run_cpu(&mut dir, &[front], &[1], &camera, false, [0.0; 3]);
         let idx = camera_part(0, 0, 0, 1);
         assert_eq!(
             part_cmds(&parts, &cmds, &counts, idx),
@@ -1096,7 +1073,7 @@ mod tests {
             FULL,
             MeshAabb::from_record(&behind),
         );
-        let (_, _, counts, stats) = run_cpu(&mut dir, &[behind], &[1], &camera, false, 0.0, 0.0);
+        let (_, _, counts, stats) = run_cpu(&mut dir, &[behind], &[1], &camera, false, [0.0; 3]);
         assert!(counts.iter().all(|&c| c == 0));
         assert_eq!(stats, [0; STATS_COUNT]);
     }
@@ -1118,7 +1095,7 @@ mod tests {
             FULL,
             MeshAabb::from_record(&rec),
         );
-        let (parts, cmds, counts, _) = run_cpu(&mut dir, &[rec], &[1], &camera, false, 0.0, 0.0);
+        let (parts, cmds, counts, _) = run_cpu(&mut dir, &[rec], &[1], &camera, false, [0.0; 3]);
         let idx = camera_part(0, 0, 0, 1);
         assert_eq!(part_cmds(&parts, &cmds, &counts, idx).len(), 1);
     }
@@ -1136,7 +1113,7 @@ mod tests {
             FULL,
             MeshAabb::from_record(&rec),
         );
-        let (_, _, counts, _) = run_cpu(&mut dir, &[rec], &[0], &camera, false, 0.0, 0.0);
+        let (_, _, counts, _) = run_cpu(&mut dir, &[rec], &[0], &camera, false, [0.0; 3]);
         assert!(counts.iter().all(|&c| c == 0));
     }
 
@@ -1157,7 +1134,7 @@ mod tests {
             FULL,
             MeshAabb::from_record(&rec),
         );
-        let (parts, cmds, counts, stats) = run_cpu(&mut dir, &[rec], &[1], &camera, true, 0.0, 0.0);
+        let (parts, cmds, counts, stats) = run_cpu(&mut dir, &[rec], &[1], &camera, true, [0.0; 3]);
         let idx = camera_part(0, 0, 0, 1);
         let got = part_cmds(&parts, &cmds, &counts, idx);
         assert_eq!(
@@ -1196,7 +1173,7 @@ mod tests {
             FULL,
             MeshAabb::from_record(&rec),
         );
-        let (parts, cmds, counts, _) = run_cpu(&mut dir, &[rec], &[1], &camera, true, 0.0, 0.0);
+        let (parts, cmds, counts, _) = run_cpu(&mut dir, &[rec], &[1], &camera, true, [0.0; 3]);
         let idx = camera_part(0, 0, 0, 1);
         assert_eq!(
             part_cmds(&parts, &cmds, &counts, idx),
@@ -1266,13 +1243,13 @@ mod tests {
     }
 
     #[test]
-    fn cpu_cull_skips_lod_meshes_fully_inside_the_slab() {
+    fn cpu_cull_skips_lod_meshes_fully_inside_the_box() {
         let camera = look_neg_z();
         let mut rec = opaque_rec([-1.0, -1.0, -11.0], [1.0, 1.0, -9.0]);
         rec.detail_pass = u32::from(crate::mesh::Detail(1).to_gpu_bits());
         let (mn, mx, scale) = cam_relative_aabb(&rec, origin_eye());
         assert!(scale > 1.0);
-        assert!(lod_aabb_inside_slab(mn, mx, 100.0, 100.0));
+        assert!(lod_aabb_inside_box(mn, mx, [100.0; 3]));
         let mut dir = ArenaDirectory::new();
         dir.note_upload(
             0,
@@ -1282,7 +1259,7 @@ mod tests {
             LOD,
             MeshAabb::from_record(&rec),
         );
-        let (_, _, counts, stats) = run_cpu(&mut dir, &[rec], &[1], &camera, false, 100.0, 100.0);
+        let (_, _, counts, stats) = run_cpu(&mut dir, &[rec], &[1], &camera, false, [100.0; 3]);
         assert!(counts.iter().all(|&c| c == 0));
         assert_eq!(stats, [0; STATS_COUNT]);
     }
@@ -1350,7 +1327,8 @@ mod tests {
         } else {
             crate::mesh::Detail::FULL
         };
-        rec.detail_pass = u32::from(detail.to_gpu_bits()) | ((pass as u32) << 4);
+        rec.detail_pass = u32::from(detail.to_gpu_bits())
+            | ((pass as u32) << crate::genconst::DETAIL_GPU_BITS);
         rec
     }
 
@@ -1412,7 +1390,7 @@ mod tests {
         let eye = origin_eye();
         for face_cull in [false, true] {
             for with_shadow in [false, true] {
-                for (clip, clip_v) in [(0.0, 0.0), (40.0, 40.0)] {
+                for half in [[0.0, 0.0, 0.0], [40.0, 12.0, 25.0]] {
                     let mut parts = Vec::new();
                     let runs = if face_cull { MAX_FACE_RUNS } else { 1 };
                     dir.partitions_into(&mut parts, runs, Some(eye));
@@ -1427,8 +1405,7 @@ mod tests {
                         shadow,
                         eye,
                         dir.live_end(),
-                        clip,
-                        clip_v,
+                        half,
                         face_cull,
                     );
                     let (new_cmds, new_counts, new_stats) = cpu_cull(
@@ -1441,8 +1418,7 @@ mod tests {
                         shadow,
                         eye,
                         dir.live_end(),
-                        clip,
-                        clip_v,
+                        half,
                         face_cull,
                     );
                     assert_same_emission(
@@ -1509,8 +1485,7 @@ mod tests {
                 None,
                 eye,
                 slot_count,
-                0.0,
-                0.0,
+                [0.0; 3],
                 false,
             );
             let _ = cpu_cull_into(
@@ -1523,8 +1498,7 @@ mod tests {
                 None,
                 eye,
                 slot_count,
-                0.0,
-                0.0,
+                [0.0; 3],
                 false,
                 &mut scratch,
             );
@@ -1548,8 +1522,7 @@ mod tests {
                 None,
                 eye,
                 slot_count,
-                0.0,
-                0.0,
+                [0.0; 3],
                 false,
             );
             let cmd_bytes: &[u8] = bytemuck::cast_slice(&cmds);
@@ -1569,8 +1542,7 @@ mod tests {
                 None,
                 eye,
                 slot_count,
-                0.0,
-                0.0,
+                [0.0; 3],
                 false,
                 &mut scratch,
             );

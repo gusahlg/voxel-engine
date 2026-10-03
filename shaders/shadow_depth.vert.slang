@@ -6,7 +6,7 @@
 struct MeshRecord
 {
     int3 block;       // world-space origin
-    uint detail_pass; // [0:4] detail+bias, [4:6] pass
+    uint detail_pass; // [0:5] detail+bias, [5:7] pass
     float3 local_off; // mover offset; zero for terrain
     uint pad0;
     float3 aabb_min;
@@ -32,13 +32,13 @@ struct PushConstants
 {
     // Light-space view-proj per cascade (mirrors Mesh3dPush layout).
     float4x4 view_proj;
-    float clip;
-    float clip_v;
+    float half_x;
+    float half_y;
     float2 pad;
     int3 cam_block;
     int pad0;
     float3 cam_frac;
-    float pad1;
+    float half_z;
 };
 
 [[vk::push_constant]]
