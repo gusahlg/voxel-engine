@@ -31,6 +31,8 @@ Sampler2D cloudLut;
 [[vk::binding(1, 0)]]
 ConstantBuffer<FrameUniforms> frame;
 
+#include "far_body.slang"
+
 // Hash-grid stars on a world-space cube map: dominant axis picks the face
 // (ties X, then Y, then Z), then a 2D cell on that face. Fixed in the universe
 // when the viewer turns or crosses a cube edge. Same cell population and point
@@ -104,6 +106,12 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     float star_night = max(night, frame.exposure_dither.y);
     if (star_night * frame.extras.x > 0.0)
         col += stars(ray, moon_dir, star_night) * frame.extras.x;
+
+    // Far bodies occlude stars, the sun disc and the moon behind them.
+    // fwidth stays in this entry point, ahead of the body-count early-out,
+    // so a uniform count of zero cannot flatten the derivative.
+    float px = max(length(fwidth(ray)), 1e-6);
+    col = far_bodies(ray, col, px);
 
     // Slab clouds composite LAST so opaque cloud occludes the sun/moon/stars it
     // covers. The octahedral map is the local upper hemisphere; skip the tap

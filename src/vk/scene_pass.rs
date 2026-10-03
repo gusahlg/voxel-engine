@@ -807,11 +807,11 @@ impl<'a> RenderPass<'a> {
     }
 
     /// The procedural sky background pass (sky pipeline: fragment push constant,
-    /// FrameUniforms at set 0 binding 1, cloud LUT at binding 0, no vertex
-    /// buffer). A single fullscreen triangle at the reversed-Z far plane; the
-    /// read-only depth test rejects it wherever terrain wrote closer depth, so
-    /// it shades only background pixels. Skipped unless the frame set a sky
-    /// palette.
+    /// FrameUniforms at set 0 binding 1, cloud LUT at binding 0, far-body table
+    /// at binding 2, no vertex buffer). A single fullscreen triangle at the
+    /// reversed-Z far plane; the read-only depth test rejects it wherever
+    /// terrain wrote closer depth, so it shades only background pixels. Skipped
+    /// unless the frame set a sky palette.
     pub(super) unsafe fn record_sky(&self) {
         let Some(desc) = self.lists.sky else {
             return;
@@ -843,6 +843,11 @@ impl<'a> RenderPass<'a> {
                 .buffer(ubo)
                 .offset(0)
                 .range(vk::WHOLE_SIZE)];
+            let far = self.r.far_ring.buffer(FrameSlot::new(self.slot));
+            let far_infos = [vk::DescriptorBufferInfo::default()
+                .buffer(far)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_binding(0)
@@ -852,6 +857,10 @@ impl<'a> RenderPass<'a> {
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                     .buffer_info(&ubo_infos),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&far_infos),
             ];
             self.r.device.push_descriptor.cmd_push_descriptor_set(
                 cmd,

@@ -6,6 +6,7 @@ use glam::{DVec3, Mat3, Mat4, Vec2, Vec3};
 use crate::camera::{Aspect, Camera3D, WarpMap};
 use crate::color::{Color, LinearRgb};
 use crate::engine::Engine;
+use crate::far_body::{FarBody, MAX_FAR_BODIES};
 use crate::font;
 use crate::mesh::DebugVertex;
 use crate::vk::pipeline::Vertex2D;
@@ -158,6 +159,10 @@ pub(crate) struct DrawLists {
     /// Local sky frame for this scope. `None` is up `+Y` and altitude `0`.
     /// Set via [`Frame3D::set_local_frame`]; same post-`begin_3d` lifetime as `sky`.
     pub local: Option<LocalFrame>,
+    /// Far-body impostors for the sky pass. `far_count` is the live prefix;
+    /// the tail is stale and never read. Same post-`begin_3d` lifetime as `sky`.
+    pub far_bodies: [FarBody; MAX_FAR_BODIES],
+    pub far_count: u32,
     /// Chunk→LOD box half-extents. A non-positive component disables that
     /// axis. LOD tiles hard-discard inside the box. Set via
     /// [`Frame3D::set_lod_clip`]; same post-`begin_3d` lifetime as `sky`.
@@ -184,6 +189,8 @@ impl DrawLists {
             scene: None,
             sky: None,
             local: None,
+            far_bodies: [FarBody::default(); MAX_FAR_BODIES],
+            far_count: 0,
             lod_half: Vec3::ZERO,
             debug_flat: None,
             cube_verts: Vec::new(),
@@ -198,6 +205,7 @@ impl DrawLists {
         self.scene = None;
         self.sky = None;
         self.local = None;
+        self.far_count = 0;
         self.lod_half = Vec3::ZERO;
         self.debug_flat = None;
         self.cube_verts.clear();
@@ -211,6 +219,11 @@ impl DrawLists {
     /// `+Y` / altitude 0 when the app left it unset.
     pub(crate) fn local_frame(&self) -> LocalFrame {
         self.local.unwrap_or_default()
+    }
+
+    /// Live far bodies, far to near. The tail past `far_count` is stale.
+    pub(crate) fn far_slice(&self) -> &[FarBody] {
+        &self.far_bodies[..self.far_count as usize]
     }
 }
 
@@ -480,6 +493,14 @@ impl Frame3D<'_, '_> {
             return;
         }
         self.frame.eng.lists.local = Some(next);
+    }
+
+    /// Far bodies for this frame's sky pass (planets, moons, the home cube).
+    /// At most [`MAX_FAR_BODIES`] are kept; the engine sorts them far to near.
+    /// Same lifetime as [`set_sky`](Self::set_sky).
+    pub fn set_far_bodies(&mut self, bodies: &[FarBody]) {
+        let n = crate::far_body::store(bodies, &mut self.frame.eng.lists.far_bodies);
+        self.frame.eng.lists.far_count = n;
     }
 
     /// Debug-flat override (`DebugView::TerrainKey`): `Some(key)`

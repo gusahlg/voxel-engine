@@ -14,6 +14,7 @@ mod camera;
 mod capture;
 mod color;
 mod engine;
+mod far_body;
 mod font;
 mod frame;
 pub mod genconst;
@@ -35,6 +36,7 @@ pub use color::{Color, LinearRgb};
 pub use engine::{
     Config, Engine, GpuCaps, GpuLoad, MeshStats, RenderFlags, RenderTargetConfig, run,
 };
+pub use far_body::{FarBody, FarShape, MAX_FAR_BODIES};
 pub use frame::{CoverageVolume, FadeStyle, Frame, Frame3D, Lighting, SkyDesc};
 pub use glam::{DMat3, DQuat, DVec2, DVec3, IVec2, IVec3, Mat3, Mat4, Quat, Vec2, Vec3};
 pub use input::{Key, MouseButton};

@@ -17,6 +17,7 @@ pub(crate) mod depth;
 pub(crate) mod device;
 pub(crate) mod draw_prep;
 pub(crate) mod exposure;
+pub(crate) mod far_bodies;
 pub(crate) mod frame_loop;
 pub(crate) mod gpu_timer;
 pub(crate) mod handles;
@@ -181,6 +182,8 @@ pub(crate) struct Renderer {
     mesh3d_set_layout: vk::DescriptorSetLayout,
     /// Per-frame uniforms.
     ubo_ring: uniforms::UboRing,
+    /// Far-body table for the sky pass.
+    far_ring: far_bodies::FarBodyRing,
     /// Shadow pass.
     shadow: shadow::ShadowPass,
     /// Exposure metering.
@@ -524,6 +527,8 @@ impl Renderer {
 
         let present_semaphores = create_present_semaphores(&device.device, swapchain.images.len());
         let ubo_ring = uniforms::UboRing::new(&instance.instance, &device.device, device.physical);
+        let far_ring =
+            far_bodies::FarBodyRing::new(&instance.instance, &device.device, device.physical);
 
         let shadow = shadow::ShadowPass::new(
             &instance.instance,
@@ -668,6 +673,7 @@ impl Renderer {
             quad_ibo: buffers::QuadIbo::new(),
             mesh3d_set_layout,
             ubo_ring,
+            far_ring,
             shadow,
             exposure,
             bloom,
@@ -980,6 +986,7 @@ impl Renderer {
             self.minimap.destroy(device);
             device.destroy_descriptor_set_layout(self.mesh3d_set_layout, None);
             self.ubo_ring.destroy(device);
+            self.far_ring.destroy(device);
             self.shadow.destroy(device);
             self.exposure.destroy(device);
             self.bloom.destroy(device);

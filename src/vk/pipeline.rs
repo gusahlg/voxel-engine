@@ -219,9 +219,9 @@ pub struct Pipelines {
     pub tris2d_present: vk::Pipeline,
     pub tris2d_tex_present: vk::Pipeline,
     /// Vertex-less fullscreen background pass: geometry push constant + set 0
-    /// binding 0 (cloud LUT) and binding 1 (the shared per-frame `FrameUniforms`).
-    /// Depth-tests (read-only) at the reversed-Z far plane so it shades only
-    /// pixels the terrain left uncovered.
+    /// binding 0 (cloud LUT), binding 1 (the shared per-frame `FrameUniforms`),
+    /// and binding 2 (far-body storage buffer). Depth-tests (read-only) at the
+    /// reversed-Z far plane so it shades only pixels the terrain left uncovered.
     pub sky: vk::Pipeline,
     pub layout_sky: vk::PipelineLayout,
     pub sky_set_layout: vk::DescriptorSetLayout,
@@ -303,9 +303,10 @@ impl Pipelines {
         };
 
         // Sky layout: fragment push constant (inv VP + disc cosines) plus set 0
-        // binding 0 = cloud LUT, binding 1 = FrameUniforms. Dedicated rather than
-        // sharing mesh3d_set_layout: the LUT is a sampled image the mesh pass
-        // never touches.
+        // binding 0 = cloud LUT, binding 1 = FrameUniforms, binding 2 = far-body
+        // table. Dedicated rather than sharing mesh3d_set_layout: the LUT is a
+        // sampled image the mesh pass never touches. Push constants are full,
+        // so the bodies ride a storage buffer.
         let sky_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -315,6 +316,11 @@ impl Pipelines {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];

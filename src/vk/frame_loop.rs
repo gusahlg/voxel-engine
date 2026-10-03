@@ -204,6 +204,12 @@ impl Renderer {
             self.ubo_ring
                 .write_from_gpu(FrameSlot::new(slot), u, self.flags, lists.local_frame());
         }
+        // Far-body table (sky set 0 binding 2). Same slot fence as the UBO.
+        // A sky with no bodies still uploads a zero count so the binding is live.
+        if self.flags.sky && lists.sky.is_some() {
+            self.far_ring
+                .write(FrameSlot::new(slot), lists.far_slice());
+        }
         let warp_map = lists
             .scene
             .as_ref()
