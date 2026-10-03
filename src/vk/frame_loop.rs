@@ -46,7 +46,7 @@ pub(super) fn jittered_clip(
 fn project_godray(r: &Renderer, lists: &DrawLists) -> crate::camera::Godray {
     match lists.scene.as_ref() {
         Some(scene) => {
-            let u = scene.frame_uniforms;
+            let u = lists.lit_uniforms();
             crate::camera::Godray::project(
                 r.flags.godrays,
                 glam::Vec3::new(u.sun_dir_elev[0], u.sun_dir_elev[1], u.sun_dir_elev[2]),
@@ -66,19 +66,16 @@ fn project_godray(r: &Renderer, lists: &DrawLists) -> crate::camera::Godray {
 
 /// Get frame's sun direction, defaulting to up if absent.
 fn sun_dir(lists: &DrawLists) -> glam::DVec3 {
-    lists
-        .scene
-        .as_ref()
-        .map(|s| s.frame_uniforms)
-        .map(|u| {
-            glam::DVec3::new(
-                u.sun_dir_elev[0] as f64,
-                u.sun_dir_elev[1] as f64,
-                u.sun_dir_elev[2] as f64,
-            )
-        })
-        .filter(|d| d.length_squared() > 1e-6)
-        .unwrap_or(glam::DVec3::Y)
+    if lists.scene.is_none() {
+        return glam::DVec3::Y;
+    }
+    let u = lists.lit_uniforms();
+    let d = glam::DVec3::new(
+        u.sun_dir_elev[0] as f64,
+        u.sun_dir_elev[1] as f64,
+        u.sun_dir_elev[2] as f64,
+    );
+    if d.length_squared() > 1e-6 { d } else { glam::DVec3::Y }
 }
 
 impl Renderer {
@@ -180,11 +177,11 @@ impl Renderer {
         // sample the block; the full-bright filler just keeps the binding live
         // and validated.
         {
-            let mut u = lists
-                .scene
-                .as_ref()
-                .map(|s| s.frame_uniforms)
-                .unwrap_or_else(crate::skeleton::FrameUniformsGpu::full_bright);
+            let mut u = if lists.scene.is_some() {
+                lists.lit_uniforms()
+            } else {
+                crate::skeleton::FrameUniformsGpu::full_bright()
+            };
             // `prepare_derived` already ran in `Frame::begin_3d` (`gate_uniforms`)
             // or `full_bright`; do not redo it here.
             // Debug-flat: claim the `extras` lane as [r, g, b, enabled] —
@@ -726,14 +723,12 @@ impl Renderer {
 
         // Cloud LUT: march (or zero) before the scene pass so the sky fragment
         // has a sampled image. Skipped when there is no sky.
-        if self.flags.sky
-            && lists.sky.is_some()
-            && let Some(scene) = &lists.scene
-        {
+        if self.flags.sky && lists.sky.is_some() && lists.scene.is_some() {
+            let u = lists.lit_uniforms();
             self.record_sky_cloud_lut(
                 cmd,
                 slot,
-                &scene.frame_uniforms,
+                &u,
                 lists.local_frame().up,
                 self.pending_capture.is_some(),
             );

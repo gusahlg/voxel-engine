@@ -1,6 +1,7 @@
 //! Scale-normalised far-body impostors. The ray tests here are the CPU mirror of
-//! `shaders/far_body.slang`: the body sits at distance 1 along `dir`, with radius
-//! `radius/distance`, so a hit does not depend on the world-unit distance.
+//! `shaders/far_body.slang`. Outside shapes sit at distance 1 along `dir`, with
+//! radius `radius/distance`. An inner sphere is that same space with the viewer
+//! inside (`distance < radius`); the hit is the far root.
 
 use glam::{Quat, Vec3};
 
@@ -9,19 +10,22 @@ use crate::color::LinearRgb;
 /// Bodies kept from one [`crate::Frame3D::set_far_bodies`] call. Extra entries are dropped.
 pub const MAX_FAR_BODIES: usize = 32;
 
-/// Sphere, or a cube whose `radius` is the half-size.
+/// Sphere, a cube whose `radius` is the half-size, or the inside of a sphere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FarShape {
     Cube,
     #[default]
     Sphere,
+    /// The viewer is inside the sphere. Every view ray hits the far wall.
+    InnerSphere,
 }
 
 /// One body drawn in the sky pass.
 ///
 /// `dir` points from the camera to the body centre. `distance` and `radius` share
-/// a unit; `distance` must be greater than `radius` or the viewer is inside and
-/// the body is not drawn. `albedo` is the six cube faces (+X, −X, +Y, −Y, +Z, −Z);
+/// a unit. A cube or sphere is drawn only when `distance > radius` (the viewer is
+/// outside). [`FarShape::InnerSphere`] is the opposite: `distance < radius`, and
+/// the far wall is the sky. `albedo` is the six cube faces (+X, −X, +Y, −Y, +Z, −Z);
 /// a sphere uses `[0]` for land and `[1]` for the second tone. A black
 /// `atmosphere` draws no rim. `rotation` takes body space into world space
 /// (identity for an axis-aligned cube).
@@ -143,6 +147,35 @@ pub(crate) fn ray_sphere(ray: Vec3, dir: Vec3, rho: f32) -> Option<FarHit> {
     })
 }
 
+/// Ray from the origin against the far wall of a sphere the viewer is inside.
+/// `dir` is unit, toward the centre. `distance` and `radius` are world units with
+/// `distance < radius`. `t` is in the space where the centre sits at distance 1
+/// (`t = b + sqrt(disc)`). The normal points toward the centre.
+#[cfg(test)]
+pub(crate) fn ray_inner_sphere(ray: Vec3, dir: Vec3, distance: f32, radius: f32) -> Option<FarHit> {
+    if !(distance > 0.0 && radius > distance) || !ray.is_finite() || !dir.is_finite() {
+        return None;
+    }
+    let rho = radius / distance;
+    if !rho.is_finite() || !(rho > 1.0) {
+        return None;
+    }
+    let b = ray.dot(dir);
+    let disc = b * b - (1.0 - rho * rho);
+    if disc < 0.0 {
+        return None;
+    }
+    let t = b + disc.sqrt();
+    if t <= 0.0 {
+        return None;
+    }
+    Some(FarHit {
+        t,
+        normal: (dir - ray * t) / rho,
+        face: 0,
+    })
+}
+
 /// Ray from the origin against a cube of half-extent `rho` centred on unit `dir`.
 /// `rotation` is body→world and is not re-normalised.
 #[cfg(test)]
@@ -183,11 +216,18 @@ fn finite_rgb(c: LinearRgb) -> bool {
 }
 
 fn keep(body: &FarBody) -> Option<FarBody> {
-    if !body.distance.is_finite()
-        || !body.radius.is_finite()
-        || !(body.radius > 0.0)
-        || !(body.distance > body.radius)
-    {
+    let inside = matches!(body.shape, FarShape::InnerSphere);
+    // Outside shapes reject a viewer inside the solid. The inner sphere is the
+    // one shape that requires it, and it keeps distance and radius (not the
+    // outside `radius/distance < 1` form) so that case stays explicit.
+    let span_ok = if inside {
+        body.distance > 0.0
+            && body.distance < body.radius
+            && (body.radius / body.distance).is_finite()
+    } else {
+        body.distance > body.radius
+    };
+    if !body.distance.is_finite() || !body.radius.is_finite() || !(body.radius > 0.0) || !span_ok {
         return None;
     }
     if !body.dir.is_finite() || body.dir.length_squared() == 0.0 {
@@ -213,7 +253,9 @@ fn keep(body: &FarBody) -> Option<FarBody> {
 }
 
 /// Keep the first [`MAX_FAR_BODIES`] entries that can be drawn, then sort far to near.
-/// Equal distances draw the smaller radius first so a shell wins over a core it contains.
+/// An inner sphere draws first: it is the sky, and the bodies inside it composite
+/// over the wall. Equal distances then draw the smaller radius first so a shell
+/// wins over a core it contains.
 pub(crate) fn store(bodies: &[FarBody], out: &mut [FarBody; MAX_FAR_BODIES]) -> u32 {
     let mut n = 0usize;
     for body in bodies.iter().take(MAX_FAR_BODIES) {
@@ -223,10 +265,14 @@ pub(crate) fn store(bodies: &[FarBody], out: &mut [FarBody; MAX_FAR_BODIES]) -> 
         }
     }
     out[..n].sort_unstable_by(|a, b| {
-        b.distance
-            .total_cmp(&a.distance)
-            .then(a.radius.total_cmp(&b.radius))
-            .then(a.seed.cmp(&b.seed))
+        // `false` sorts before `true`, so the wall is the first draw.
+        let back = |body: &FarBody| !matches!(body.shape, FarShape::InnerSphere);
+        back(a).cmp(&back(b)).then(
+            b.distance
+                .total_cmp(&a.distance)
+                .then(a.radius.total_cmp(&b.radius))
+                .then(a.seed.cmp(&b.seed)),
+        )
     });
     n as u32
 }
@@ -372,8 +418,77 @@ mod tests {
         assert_eq!(store(&[inside], &mut out), 0);
         let buried = sphere_at(Vec3::Z, 1.0, 2.0, 5);
         assert_eq!(store(&[buried], &mut out), 0);
+        let mut wall = sphere_at(Vec3::Z, 2.0, 5.0, 7);
+        wall.shape = FarShape::InnerSphere;
+        assert_eq!(store(&[wall], &mut out), 1);
+        assert_eq!(out[0].shape, FarShape::InnerSphere);
+        assert!(out[0].distance < out[0].radius);
+        // Outside the inner sphere is not this shape.
+        wall.distance = 8.0;
+        assert_eq!(store(&[wall], &mut out), 0);
         let mut zero_dir = sphere_at(Vec3::ZERO, 10.0, 1.0, 6);
         zero_dir.dir = Vec3::ZERO;
         assert_eq!(store(&[zero_dir], &mut out), 0);
+    }
+
+    #[test]
+    fn inner_sphere_hits_every_ray_and_faces_the_centre() {
+        let dir = Vec3::Y;
+        let distance = 2.0;
+        let radius = 5.0;
+        let rho: f32 = radius / distance;
+        assert_eq!(rho.to_bits(), 2.5f32.to_bits());
+        let rays = [
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::X,
+            Vec3::NEG_X,
+            Vec3::Z,
+            Vec3::NEG_Z,
+            Vec3::new(1.0, 0.3, -0.4).normalize(),
+            Vec3::new(-0.2, -1.0, 0.5).normalize(),
+        ];
+        for ray in rays {
+            let hit = ray_inner_sphere(ray, dir, distance, radius).expect("inside hits");
+            let point = ray * hit.t;
+            let err = (point - dir).length() - rho;
+            assert!(err.abs() < 1e-4, "{ray:?} off the wall by {err}");
+            let toward = (dir - point).normalize();
+            assert!(
+                hit.normal.dot(toward) > 0.999,
+                "{ray:?} normal {:?} should point at the centre",
+                hit.normal
+            );
+            assert!((hit.normal.length() - 1.0).abs() < 1e-4);
+        }
+        // Looking at the centre: t = b + sqrt(disc) = 1 + rho, normal back along dir.
+        let b = 1.0f32;
+        let disc = b * b - (1.0 - rho * rho);
+        let t = b + disc.sqrt();
+        let hit = ray_inner_sphere(Vec3::Y, dir, distance, radius).unwrap();
+        assert_eq!(hit.t.to_bits(), t.to_bits());
+        assert_eq!(hit.t.to_bits(), 3.5f32.to_bits());
+        assert_eq!(hit.normal.y.to_bits(), (-1.0f32).to_bits());
+        assert_eq!(hit.normal.x.to_bits(), 0.0f32.to_bits());
+        assert_eq!(hit.face, 0);
+        // The near root is behind the camera. This shape takes the far one.
+        let near = b - disc.sqrt();
+        assert!(near < 0.0);
+        assert!(ray_inner_sphere(Vec3::Y, dir, 5.0, 2.0).is_none());
+        assert!(ray_inner_sphere(Vec3::Y, dir, 2.0, 2.0).is_none());
+        assert!(ray_inner_sphere(Vec3::Y, dir, 0.0, 2.0).is_none());
+    }
+
+    #[test]
+    fn inner_sphere_draws_behind_the_bodies_inside_it() {
+        let mut wall = sphere_at(Vec3::Z, 10.0, 40.0, 7);
+        wall.shape = FarShape::InnerSphere;
+        let core = sphere_at(Vec3::Z, 10.0, 1.0, 8);
+        let far = sphere_at(Vec3::X, 100.0, 1.0, 9);
+        let mut out = [FarBody::default(); MAX_FAR_BODIES];
+        assert_eq!(store(&[core, far, wall], &mut out), 3);
+        assert_eq!(out[0].shape, FarShape::InnerSphere);
+        assert_eq!(out[1].distance, 100.0);
+        assert_eq!(out[2].seed, 8);
     }
 }

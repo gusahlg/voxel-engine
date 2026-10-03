@@ -39,7 +39,7 @@ pub use engine::{
     Config, Engine, GpuCaps, GpuLoad, MeshStats, RenderFlags, RenderTargetConfig, run,
 };
 pub use far_body::{FarBody, FarShape, MAX_FAR_BODIES};
-pub use frame::{CoverageVolume, FadeStyle, Frame, Frame3D, Lighting, SkyDesc};
+pub use frame::{CoverageVolume, FadeStyle, Frame, Frame3D, Lighting, SkyDesc, SunOverride};
 pub use glam::{DMat3, DQuat, DVec2, DVec3, IVec2, IVec3, Mat3, Mat4, Quat, Vec2, Vec3};
 pub use input::{Key, MouseButton};
 pub use material::{

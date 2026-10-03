@@ -833,7 +833,7 @@ impl<'a> RenderPass<'a> {
     /// terrain wrote closer depth, so it shades only background pixels. Skipped
     /// unless the frame set a sky palette.
     pub(super) unsafe fn record_sky(&self) {
-        let Some(desc) = self.lists.sky else {
+        let Some(desc) = self.lists.sky_for_pass() else {
             return;
         };
         self.r.gpu_timer.recorded(self.slot);

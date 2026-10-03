@@ -1,11 +1,13 @@
-// Far-body impostors for the sky pass. Ray tests match src/far_body.rs:
-// the body is at distance 1 along dir, radius is radius/distance.
+// Far-body impostors for the sky pass. Ray tests match src/far_body.rs.
+// Outside, the body is at distance 1 along dir and radius is radius/distance.
+// An inner sphere uses that space with radius/distance > 1 (the viewer is
+// inside); the hit is the far root and the normal points at the centre.
 // Included from sky.frag after the frame uniform is declared.
 
 #ifndef VOXEL_FAR_BODY_SLANG
 #define VOXEL_FAR_BODY_SLANG
 
-// Ten float4 lanes, 160 bytes. atmosphere.a is the shape: 0 cube, 1 sphere.
+// Ten float4 lanes, 160 bytes. atmosphere.a is the shape: 0 cube, 1 sphere, 2 inner sphere.
 struct FarGpu
 {
     float4 dir_rho;
@@ -130,6 +132,22 @@ bool far_ray_sphere(float3 ray, float3 center, float rho, float facing, out floa
     return true;
 }
 
+// Viewer inside (rho = radius/distance > 1). Centre at distance 1. The forward
+// hit is the far root; the normal points back at the centre.
+bool far_ray_inner(float3 ray, float3 center, float rho, float facing, out float t, out float3 nrm)
+{
+    t = 0.0;
+    nrm = float3(0.0, 0.0, 0.0);
+    float disc = facing * facing - (1.0 - rho * rho);
+    if (disc < 0.0)
+        return false;
+    t = facing + sqrt(disc);
+    if (t <= 0.0)
+        return false;
+    nrm = (center - ray * t) / rho;
+    return true;
+}
+
 bool far_ray_cube(float3 ray, float3 center, float rho, float4 rot, out float t, out float3 nrm, out uint face)
 {
     t = 0.0;
@@ -181,16 +199,18 @@ float3 far_albedo(FarGpu b, float3 bodyP, uint face, bool sphere, float rho)
     return alb;
 }
 
-float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air, float rho)
+float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air, float rho, bool core)
 {
     // Same night flip as the terrain: light.w is 1 by day and 0 by night,
     // so the lit hemisphere follows the moon once the sun is down.
+    // `core` is the inner wall: the light is at the centre and the normal points
+    // there, so the whole wall faces it. No outdoor sky-dome fill.
     float flip = frame.light.w * 2.0 - 1.0;
-    float ndl = saturate(dot(nrm, frame.sun_dir_elev.xyz) * flip);
+    float ndl = core ? 1.0 : saturate(dot(nrm, frame.sun_dir_elev.xyz) * flip);
     // Standing on a body (it fills half the sky) its disc continues the terrain at the horizon, so
     // it takes the terrain's sky light (an omnidirectional share of the sun plus the bounce floor);
     // from afar it is a lit sphere with a dark night side.
-    float near = smoothstep(0.95, 0.9995, rho);
+    float near = core ? 0.0 : smoothstep(0.95, 0.9995, rho);
     float diffuse = lerp(ndl, 0.45 + 0.55 * ndl, near);
     float3 lit = alb * (frame.light.rgb * diffuse + frame.ambient_glow.rgb + frame.shadow_bounce.rgb * near);
     float fres = 1.0 - saturate(dot(nrm, -ray));
@@ -212,15 +232,36 @@ float3 far_bodies(float3 ray, float3 col, float px)
     {
         FarGpu b = farTable[0].body[i];
         float rho = b.dir_rho.w;
-        if (!(rho > 0.0 && rho < 1.0))
+        float shape = b.atmosphere.w;
+        bool inner = shape > 1.5;
+        if (inner)
+        {
+            if (!(rho > 1.0))
+                continue;
+        }
+        else if (!(rho > 0.0 && rho < 1.0))
             continue;
         float3 center = b.dir_rho.xyz;
         float facing = dot(ray, center);
-        if (facing <= 0.0)
+        // Inside the sphere every direction hits the far wall, including away from the centre.
+        if (!inner && facing <= 0.0)
             continue;
 
         float3 air = b.atmosphere.rgb;
         bool hasAir = dot(air, air) > 0.0;
+        if (inner)
+        {
+            float t = 0.0;
+            float3 nrm = float3(0.0, 0.0, 0.0);
+            if (far_ray_inner(ray, center, rho, facing, t, nrm) && t < bestT)
+            {
+                bestT = t;
+                float3 bodyP = far_inv_rotate(b.rot, ray * t - center);
+                float3 alb = far_albedo(b, bodyP, 0u, true, rho);
+                col = far_lit(alb, nrm, ray, air, rho, true);
+            }
+            continue;
+        }
         bool sphere = b.atmosphere.w > 0.5;
         // Angular diameter in pixels. Under ~0.7 px the disc is a soft point.
         float ang = (rho * 2.0) / px;
@@ -255,7 +296,7 @@ float3 far_bodies(float3 ray, float3 col, float px)
                     float3 bodyP = far_inv_rotate(b.rot, ray * t - center);
                     float3 alb = far_albedo(b, bodyP, 0u, true, rho);
                     float cov = saturate(0.5 + (rho - s) / px);
-                    col = lerp(col, far_lit(alb, nrm, ray, air, rho), cov);
+                    col = lerp(col, far_lit(alb, nrm, ray, air, rho, false), cov);
                 }
             }
             else if (hasAir)
@@ -277,7 +318,7 @@ float3 far_bodies(float3 ray, float3 col, float px)
                 bestT = t;
                 float3 bodyP = far_inv_rotate(b.rot, ray * t - center);
                 float3 alb = far_albedo(b, bodyP, face, false, rho);
-                col = lerp(col, far_lit(alb, nrm, ray, air, rho), 1.0);
+                col = lerp(col, far_lit(alb, nrm, ray, air, rho, false), 1.0);
             }
             else if (!hit && hasAir)
             {

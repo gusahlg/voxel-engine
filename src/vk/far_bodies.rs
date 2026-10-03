@@ -21,7 +21,7 @@ pub(crate) struct FarBodyGpu {
     pub albedo3: [f32; 4],
     pub albedo4: [f32; 4],
     pub albedo5: [f32; 4],
-    /// rgb rim tint, a = shape (0 cube, 1 sphere).
+    /// rgb rim tint, a = shape (0 cube, 1 sphere, 2 inner sphere).
     pub atmosphere: [f32; 4],
     pub seed: [u32; 4],
 }
@@ -48,6 +48,7 @@ fn pack_one(body: &FarBody) -> FarBodyGpu {
     let shape = match body.shape {
         FarShape::Cube => 0.0,
         FarShape::Sphere => 1.0,
+        FarShape::InnerSphere => 2.0,
     };
     FarBodyGpu {
         dir_rho: [dir.x, dir.y, dir.z, body.radius / body.distance],
@@ -166,5 +167,15 @@ mod tests {
         let packed = pack_one(&cube);
         assert_eq!(packed.atmosphere[3].to_bits(), 0.0f32.to_bits());
         assert_eq!(packed.dir_rho[3].to_bits(), 0.25f32.to_bits());
+
+        let mut wall = body;
+        wall.shape = FarShape::InnerSphere;
+        wall.dir = Vec3::Z;
+        wall.distance = 2.0;
+        wall.radius = 5.0;
+        let packed = pack_one(&wall);
+        assert_eq!(packed.atmosphere[3].to_bits(), 2.0f32.to_bits());
+        assert_eq!(packed.dir_rho[3].to_bits(), 2.5f32.to_bits());
+        assert_eq!(packed.dir_rho[2].to_bits(), 1.0f32.to_bits());
     }
 }

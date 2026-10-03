@@ -30,6 +30,75 @@ pub struct SkyDesc {
     pub sun_angular_radius: f32,
 }
 
+/// A point light standing in for the sun. When set on a frame, terrain,
+/// impostors and the sky halo use `dir` and `color`. The real sun disc stays
+/// hidden unless `show_disc`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SunOverride {
+    /// World-space direction from the viewer toward the light. Not required to be unit.
+    pub dir: Vec3,
+    /// Linear light colour, unclamped.
+    pub color: LinearRgb,
+    /// Draw the analytic sun disc along `dir` in `color`. Off hides the real disc.
+    pub show_disc: bool,
+}
+
+fn finite_unit(v: Vec3) -> Option<Vec3> {
+    if !v.is_finite() {
+        return None;
+    }
+    let l2 = v.length_squared();
+    if !(l2 > 1e-12) {
+        return None;
+    }
+    Some(v * l2.sqrt().recip())
+}
+
+fn color_finite(c: LinearRgb) -> bool {
+    c.0.iter().all(|ch| ch.is_finite())
+}
+
+/// Replace the sun direction and colour. `light.w` stays 1 so the night flip
+/// does not reverse `dir`. A non-finite override leaves `u` untouched.
+fn apply_sun_override(mut u: FrameUniformsGpu, over: SunOverride, up: Vec3) -> FrameUniformsGpu {
+    if !color_finite(over.color) {
+        return u;
+    }
+    let Some(dir) = finite_unit(over.dir) else {
+        return u;
+    };
+    let up = finite_unit(up).unwrap_or(Vec3::Y);
+    u.sun_dir_elev = [dir.x, dir.y, dir.z, dir.dot(up)];
+    u.light[0] = over.color.0[0];
+    u.light[1] = over.color.0[1];
+    u.light[2] = over.color.0[2];
+    u.light[3] = 1.0;
+    u.prepare_derived();
+    u
+}
+
+/// Sky descriptor after the override. `None` returns `desc` unchanged.
+pub(crate) fn sky_with_override(desc: SkyDesc, over: Option<SunOverride>) -> SkyDesc {
+    let Some(over) = over else {
+        return desc;
+    };
+    if !color_finite(over.color) {
+        return desc;
+    }
+    let Some(dir) = finite_unit(over.dir) else {
+        return desc;
+    };
+    SkyDesc {
+        sun_dir: dir,
+        sun_tint: if over.show_disc {
+            over.color
+        } else {
+            LinearRgb([0.0, 0.0, 0.0])
+        },
+        sun_angular_radius: desc.sun_angular_radius,
+    }
+}
+
 /// Full-res coverage box, camera-relative. A fragment is covered when
 /// `abs(world)` is strictly inside `half` on every axis. A non-positive
 /// component covers nothing on that axis.
@@ -163,6 +232,9 @@ pub(crate) struct DrawLists {
     /// the tail is stale and never read. Same post-`begin_3d` lifetime as `sky`.
     pub far_bodies: [FarBody; MAX_FAR_BODIES],
     pub far_count: u32,
+    /// Point light standing in for the sun. `None` leaves the composed sun alone.
+    /// Set via [`Frame3D::set_sun_override`]; same post-`begin_3d` lifetime as `sky`.
+    pub sun_override: Option<SunOverride>,
     /// Chunk→LOD box half-extents. A non-positive component disables that
     /// axis. LOD tiles hard-discard inside the box. Set via
     /// [`Frame3D::set_lod_clip`]; same post-`begin_3d` lifetime as `sky`.
@@ -191,6 +263,7 @@ impl DrawLists {
             local: None,
             far_bodies: [FarBody::default(); MAX_FAR_BODIES],
             far_count: 0,
+            sun_override: None,
             lod_half: Vec3::ZERO,
             debug_flat: None,
             cube_verts: Vec::new(),
@@ -206,6 +279,7 @@ impl DrawLists {
         self.sky = None;
         self.local = None;
         self.far_count = 0;
+        self.sun_override = None;
         self.lod_half = Vec3::ZERO;
         self.debug_flat = None;
         self.cube_verts.clear();
@@ -224,6 +298,24 @@ impl DrawLists {
     /// Live far bodies, far to near. The tail past `far_count` is stale.
     pub(crate) fn far_slice(&self) -> &[FarBody] {
         &self.far_bodies[..self.far_count as usize]
+    }
+
+    /// Sun direction and colour for this frame. With no override this is the
+    /// `begin_3d` packet, bit for bit. With no 3D scene, full-bright.
+    pub(crate) fn lit_uniforms(&self) -> FrameUniformsGpu {
+        let Some(scene) = &self.scene else {
+            return FrameUniformsGpu::full_bright();
+        };
+        match self.sun_override {
+            None => scene.frame_uniforms,
+            Some(over) => apply_sun_override(scene.frame_uniforms, over, self.local_frame().up),
+        }
+    }
+
+    /// Sky descriptor for the pass, with the real disc hidden unless the
+    /// override asks for it. `None` when the frame set no sky.
+    pub(crate) fn sky_for_pass(&self) -> Option<SkyDesc> {
+        self.sky.map(|desc| sky_with_override(desc, self.sun_override))
     }
 }
 
@@ -503,6 +595,12 @@ impl Frame3D<'_, '_> {
         self.frame.eng.lists.far_count = n;
     }
 
+    /// Light this frame from `over` instead of the composed sun. `None` restores
+    /// the sun `begin_3d` was given. Call inside the `begin_3d` scope.
+    pub fn set_sun_override(&mut self, over: Option<SunOverride>) {
+        self.frame.eng.lists.sun_override = over;
+    }
+
     /// Debug-flat override (`DebugView::TerrainKey`): `Some(key)`
     /// makes every 3D mesh fragment output `key` while still writing depth, so
     /// occlusion/silhouette stay exact and the sky-hole detector distinguishes
@@ -533,14 +631,16 @@ impl Frame3D<'_, '_> {
     /// sky key light (the same source terrain uses, see [`KeyLight`]) baked into
     /// the vertex colour, so limbs read as 3D and track the time of day.
     pub fn draw_box(&mut self, center: Vec3, half: Vec3, rot: Mat3, color: Color) {
-        let key = self
-            .frame
-            .eng
-            .lists
-            .scene
-            .as_ref()
-            .expect("draw_box is inside a begin_3d scope")
-            .key_light;
+        let lists = &self.frame.eng.lists;
+        let key = if lists.sun_override.is_none() {
+            lists
+                .scene
+                .as_ref()
+                .expect("draw_box is inside a begin_3d scope")
+                .key_light
+        } else {
+            KeyLight::from_uniforms(lists.lit_uniforms())
+        };
         debug_assert!(
             (key.dir.length_squared() - 1.0).abs() < 1e-4,
             "KeyLight::dir is unit length (normalized once in begin_3d)"
@@ -852,5 +952,118 @@ mod tests {
                 assert!(d.abs() < 1e-5, "normal {normal:?} corner off plane by {d}");
             }
         }
+    }
+
+    #[test]
+    fn sun_override_replaces_direction_and_colour_and_hides_the_disc() {
+        fn same_gpu(a: FrameUniformsGpu, b: FrameUniformsGpu) {
+            assert_eq!(bytemuck::bytes_of(&a), bytemuck::bytes_of(&b));
+        }
+        fn same_sky(a: SkyDesc, b: SkyDesc) {
+            assert_eq!(a.sun_dir, b.sun_dir);
+            assert_eq!(a.sun_tint, b.sun_tint);
+            assert_eq!(a.sun_angular_radius.to_bits(), b.sun_angular_radius.to_bits());
+        }
+
+        let mut base = FrameUniformsGpu::full_bright();
+        // Night, so an override that forgot `light.w = 1` would flip the direction.
+        base.sun_dir_elev = [0.0, -1.0, 0.0, -1.0];
+        base.light = [0.05, 0.06, 0.1, 0.0];
+        base.zenith = [0.2, 0.3, 0.5, 0.1];
+        base.horizon = [0.4, 0.45, 0.5, 0.02];
+        base.candle = [1.0, 0.8, 0.4, 0.25];
+        base.exposure_dither = [1.2, 0.0, 0.1, -0.2];
+        base.extras = [0.7, 0.0, 0.0, 0.0];
+        base.anim = [3.0, 4.0, 5.0, 6.0];
+        base.prepare_derived();
+
+        let over = SunOverride {
+            dir: Vec3::new(0.0, 2.0, 0.0),
+            color: LinearRgb([1.15, 0.40, 0.07]),
+            show_disc: false,
+        };
+        let lit = apply_sun_override(base, over, Vec3::Y);
+        assert_eq!(lit.sun_dir_elev[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!(lit.sun_dir_elev[1].to_bits(), 1.0f32.to_bits());
+        assert_eq!(lit.sun_dir_elev[2].to_bits(), 0.0f32.to_bits());
+        assert_eq!(lit.sun_dir_elev[3].to_bits(), 1.0f32.to_bits());
+        assert_eq!(lit.light[0].to_bits(), 1.15f32.to_bits());
+        assert_eq!(lit.light[1].to_bits(), 0.40f32.to_bits());
+        assert_eq!(lit.light[2].to_bits(), 0.07f32.to_bits());
+        assert_eq!(lit.light[3].to_bits(), 1.0f32.to_bits());
+        assert_eq!(lit.zenith, base.zenith);
+        assert_eq!(lit.horizon, base.horizon);
+        assert_eq!(lit.candle, base.candle);
+        assert_eq!(lit.exposure_dither, base.exposure_dither);
+        assert_eq!(lit.anim, base.anim);
+        assert_eq!(lit.extras[0].to_bits(), base.extras[0].to_bits());
+        assert_eq!(lit.extras[2].to_bits(), base.extras[2].to_bits());
+        assert_eq!(lit.extras[3].to_bits(), base.extras[3].to_bits());
+        assert_eq!(lit.extras[1].to_bits(), crate::genconst::GLOW_POW_DAY.to_bits());
+
+        let nan_dir = SunOverride {
+            dir: Vec3::new(f32::NAN, 0.0, 0.0),
+            ..over
+        };
+        same_gpu(apply_sun_override(base, nan_dir, Vec3::Y), base);
+        same_gpu(
+            apply_sun_override(base, SunOverride { dir: Vec3::ZERO, ..over }, Vec3::Y),
+            base,
+        );
+        let nan_color = SunOverride {
+            color: LinearRgb([f32::NAN, 0.0, 0.0]),
+            ..over
+        };
+        same_gpu(apply_sun_override(base, nan_color, Vec3::Y), base);
+
+        let side = apply_sun_override(
+            base,
+            SunOverride {
+                dir: Vec3::new(4.0, 0.0, 0.0),
+                ..over
+            },
+            Vec3::Y,
+        );
+        assert_eq!(side.sun_dir_elev[0].to_bits(), 1.0f32.to_bits());
+        assert_eq!(side.sun_dir_elev[1].to_bits(), 0.0f32.to_bits());
+        assert_eq!(side.sun_dir_elev[2].to_bits(), 0.0f32.to_bits());
+        assert_eq!(side.sun_dir_elev[3].to_bits(), 0.0f32.to_bits());
+
+        let desc = SkyDesc {
+            sun_dir: Vec3::new(0.0, 2.0, 0.0),
+            sun_tint: LinearRgb([0.9, 0.8, 0.7]),
+            sun_angular_radius: 0.03,
+        };
+        same_sky(sky_with_override(desc, None), desc);
+        let hidden = sky_with_override(desc, Some(over));
+        assert_eq!(hidden.sun_dir, Vec3::Y);
+        assert_eq!(hidden.sun_tint, LinearRgb([0.0, 0.0, 0.0]));
+        assert_eq!(
+            hidden.sun_angular_radius.to_bits(),
+            desc.sun_angular_radius.to_bits()
+        );
+        let shown = sky_with_override(
+            desc,
+            Some(SunOverride {
+                show_disc: true,
+                ..over
+            }),
+        );
+        assert_eq!(shown.sun_dir, Vec3::Y);
+        assert_eq!(shown.sun_tint, over.color);
+        assert_eq!(
+            shown.sun_angular_radius.to_bits(),
+            desc.sun_angular_radius.to_bits()
+        );
+        same_sky(sky_with_override(desc, Some(nan_dir)), desc);
+
+        let mut lists = DrawLists::new();
+        assert!(lists.sun_override.is_none());
+        lists.sun_override = Some(over);
+        lists.reset();
+        assert!(lists.sun_override.is_none());
+        // No scene: the override is not consulted, and the filler stays full-bright.
+        lists.sun_override = Some(over);
+        same_gpu(lists.lit_uniforms(), FrameUniformsGpu::full_bright());
     }
 }
