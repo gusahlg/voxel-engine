@@ -89,15 +89,25 @@ float3 candle_curve(float3 x)
 }
 #endif
 
+// World direction → local sky frame (tangent, up, bitangent). Identity when up is +Y,
+// so the `.y` gradient below matches the old world-Y sky.
+float3 sky_local(float3 ray, FrameUniforms frame)
+{
+    return float3(
+        dot(ray, frame.sky_tangent.xyz),
+        dot(ray, frame.sky_up.xyz),
+        dot(ray, frame.sky_bitangent.xyz));
+}
+
 // Analytic sky radiance along `ray` — THE sky formula, single source of truth
 // for the sky background, the distance fog (fog == sky evaluated at the
 // fragment), and water reflection: an elevation gradient between the horizon
-// and zenith anchors, plus a turbidity-scaled sun halo. `ray.y` below the
-// horizon clamps to the horizon colour. Halo exponent and tint×scale are
-// hoisted to `ambient_glow.w` / `glow_day.rgb` (CPU, once per frame).
+// and zenith anchors, plus a turbidity-scaled sun halo. Local up below the
+// horizon clamps to the horizon colour. The sun halo stays in world space.
+// Halo exponent and tint×scale are hoisted to `ambient_glow.w` / `glow_day.rgb`.
 float3 sky_radiance(float3 ray, FrameUniforms frame)
 {
-    float up = clamp(ray.y, 0.0, 1.0);
+    float up = clamp(sky_local(ray, frame).y, 0.0, 1.0);
     float3 base = lerp(frame.horizon.rgb, frame.zenith.rgb, sqrt(up));
     float c = max(dot(ray, frame.sun_dir_elev.xyz), 0.0);
     float3 glow = frame.glow_day.rgb * pow(c, frame.ambient_glow.w);

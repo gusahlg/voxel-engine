@@ -31,13 +31,34 @@ Sampler2D cloudLut;
 [[vk::binding(1, 0)]]
 ConstantBuffer<FrameUniforms> frame;
 
-// Hash-grid stars; static in world directions (deterministic). Fades by night/moon.
+// Hash-grid stars on a world-space cube map: dominant axis picks the face
+// (ties X, then Y, then Z), then a 2D cell on that face. Fixed in the universe
+// when the viewer turns or crosses a cube edge. Same cell population and point
+// shape as the old stereographic grid. Horizon fade follows local up and opens
+// to the whole sphere as the star floor (space) rises.
 float3 stars(float3 ray, float3 moon_dir, float night)
 {
-    // Project the ray to a 2D field; denom stays positive for any sky ray.
-    float2 sc = ray.xz / (ray.y + length(ray.xz));
-    float2 g = sc * STAR_DENSITY;
-    float2 cell = floor(g);
+    float3 a = abs(ray);
+    float2 uv;
+    float face;
+    if (a.x >= a.y && a.x >= a.z)
+    {
+        uv = ray.yz / a.x;
+        face = ray.x >= 0.0 ? 0.0 : 1.0;
+    }
+    else if (a.y >= a.z)
+    {
+        uv = ray.xz / a.y;
+        face = ray.y >= 0.0 ? 2.0 : 3.0;
+    }
+    else
+    {
+        uv = ray.xy / a.z;
+        face = ray.z >= 0.0 ? 4.0 : 5.0;
+    }
+    // uv is [-1, 1]. STAR_DENSITY matches the old zenith cells-per-radian.
+    float2 g = uv * STAR_DENSITY;
+    float2 cell = floor(g) + float2(face * 17.0, face * 41.0);
 
     if (hash12(cell) < STAR_THRESHOLD)
         return float3(0.0);
@@ -47,8 +68,10 @@ float3 stars(float3 ray, float3 moon_dir, float night)
     float2 d = frac(g) - 0.5 - jit * 0.8;
     float point = exp(-STAR_SHARP * dot(d, d));
 
-    // Invisible by day, out of the horizon band, and clear of the moon disc.
-    float horizon = saturate(ray.y * STAR_HORIZON_FADE);
+    // Invisible by day, out of the local horizon band, and clear of the moon disc.
+    // In space the star floor mixes the horizon gate toward 1, so stars fill the sphere.
+    float horizon = saturate(dot(ray, frame.sky_up.xyz) * STAR_HORIZON_FADE);
+    horizon = lerp(horizon, 1.0, frame.exposure_dither.y);
     float moon = 1.0 - smoothstep(STAR_MOON_FADE, 1.0, dot(ray, moon_dir));
     float3 star_col = float3(STAR_COLOR[0], STAR_COLOR[1], STAR_COLOR[2]);
     return star_col * (point * night * horizon * moon);
@@ -83,13 +106,13 @@ float4 fragmentMain(FragmentInput input) : SV_Target
         col += stars(ray, moon_dir, star_night) * frame.extras.x;
 
     // Slab clouds composite LAST so opaque cloud occludes the sun/moon/stars it
-    // covers. Hemisphere octahedral is injective only for y >= 0; skip the tap
-    // below the cloud horizon so downward rays don't alias zenith texels.
+    // covers. The octahedral map is the local upper hemisphere; skip the tap
+    // below the local cloud horizon so downward rays don't alias zenith texels.
     float cover = 0.0;
     float3 cloud_lit = float3(0.0);
-    if (ray.y > CLOUD_HORIZON_OFFSET)
+    if (sky_local(ray, frame).y > CLOUD_HORIZON_OFFSET)
     {
-        float4 t = cloudLut.SampleLevel(sky_oct_encode(ray), 0);
+        float4 t = cloudLut.SampleLevel(sky_oct_encode(ray, frame), 0);
         cloud_lit = t.rgb;
         cover = t.a;
     }

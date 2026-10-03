@@ -7,10 +7,12 @@
 
 #include "common.slang"
 
-// Upper-hemisphere octahedral: injective for y >= 0. y < 0 aliases xz of -n
-// and must not be sampled (sky.frag skips the LUT tap below CLOUD_HORIZON_OFFSET).
-float2 sky_oct_encode(float3 d)
+// Local upper hemisphere (world ray rotated into the sky basis first): injective
+// for local y >= 0. Local y < 0 aliases xz of -n and must not be sampled
+// (sky.frag skips the LUT tap below CLOUD_HORIZON_OFFSET).
+float2 sky_oct_encode(float3 d, FrameUniforms frame)
 {
+    d = sky_local(d, frame);
     float3 n = d / (abs(d.x) + abs(d.y) + abs(d.z));
     return n.xz * 0.5 + 0.5;
 }
@@ -46,19 +48,23 @@ float cloud_density(float2 world_xz, float time)
     return n > CLOUD_COVERAGE ? (n - CLOUD_COVERAGE) / (1.0 - CLOUD_COVERAGE) : 0.0;
 }
 
-// 2-plane slab clouds, marched camera-relative. Returns premultiplied radiance;
+// 2-plane slab clouds, marched camera-relative in the local frame. `ray` is a
+// world direction; the slab and the density plane use local up / the tangent
+// plane, and the sun glint stays in world space. Returns premultiplied radiance;
 // `cover` is background occlusion (opacity × horizon fade) for one-step composite.
-// Direction-only for a given frame: camera xz/y and time come from `frame.anim`.
+// Direction-only for a given frame: tangent-plane UV, altitude and time come from `frame.anim`.
 float3 clouds(float3 ray, FrameUniforms frame, out float cover)
 {
     cover = 0.0;
+    float3 world = ray;
+    ray = sky_local(ray, frame);
     // hide == 0 for ray.y <= CLOUD_HORIZON_OFFSET (> 0), so this also guards the
     // ray.y division below against a near-horizon blow-up.
     float hide = saturate((ray.y - CLOUD_HORIZON_OFFSET) * CLOUD_HORIZON_FADE);
     if (hide <= 0.0)
         return float3(0.0);
 
-    // Slab planes in camera-relative space: world altitude minus camera world-y.
+    // Slab planes in camera-relative space: slab altitude minus altitude above the local datum.
     float cam_y = frame.anim.w;
     float t0 = (CLOUD_BOTTOM - cam_y) / ray.y;
     float t1 = (CLOUD_BOTTOM + CLOUD_THICKNESS - cam_y) / ray.y;
@@ -68,9 +74,9 @@ float3 clouds(float3 ray, FrameUniforms frame, out float cover)
         return float3(0.0); // camera at/above the slab — nothing ahead
 
     float time = frame.anim.x;
-    float2 cam_xz = frame.anim.yz * ANIM_PERIOD; // wrapped camera world xz (metres)
-    float3 sun = frame.sun_dir_elev.xyz; // unit, prepared CPU-side
-    float bright = pow(max(dot(ray, sun), 0.0), 3.0);
+    float2 cam_xz = frame.anim.yz * ANIM_PERIOD; // wrapped tangent-plane camera metres
+    float3 sun = frame.sun_dir_elev.xyz; // unit, world space, prepared CPU-side
+    float bright = pow(max(dot(world, sun), 0.0), 3.0);
     float3 lit_col = frame.light.rgb * CLOUD_LIGHT + frame.zenith.rgb * CLOUD_AMBIENT;
 
     int steps = int(CLOUD_STEPS);

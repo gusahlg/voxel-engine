@@ -1,6 +1,7 @@
 //! Per-frame octahedral cloud LUT: compute march → bilinear tap in sky.frag.
 
 use ash::vk;
+use glam::Vec3;
 
 use super::buffers::FRAMES_IN_FLIGHT;
 use super::image::LayoutUse;
@@ -25,11 +26,17 @@ struct LutKey {
     sun: [i32; 3],
     light: [i32; 3],
     zenith: [i32; 3],
+    /// Quantised tangent and bitangent. The basis can jump when the least-aligned
+    /// axis changes, which a quantised `up` alone would miss.
+    tangent: [i32; 3],
+    bitangent: [i32; 3],
 }
 
 impl LutKey {
-    fn of(u: &FrameUniformsGpu) -> Self {
+    fn of(u: &FrameUniformsGpu, up: Vec3) -> Self {
         let r = |v: f32| (v * 1024.0).round() as i32;
+        let q = |v: Vec3| [r(v.x), r(v.y), r(v.z)];
+        let (tangent, _, bitangent) = super::uniforms::local_sky_basis(up);
         Self {
             t: (u.anim[0] * LUT_TIME_HZ).floor() as i32,
             xz: [
@@ -44,6 +51,8 @@ impl LutKey {
             ],
             light: [r(u.light[0]), r(u.light[1]), r(u.light[2])],
             zenith: [r(u.zenith[0]), r(u.zenith[1]), r(u.zenith[2])],
+            tangent: q(tangent),
+            bitangent: q(bitangent),
         }
     }
 }
@@ -115,9 +124,10 @@ impl super::Renderer {
         cmd: vk::CommandBuffer,
         slot: usize,
         u: &FrameUniformsGpu,
+        up: Vec3,
         force: bool,
     ) {
-        let key = LutKey::of(u);
+        let key = LutKey::of(u, up);
         if !force && self.sky_cloud.last_key[slot] == Some(key) {
             return;
         }
@@ -190,6 +200,7 @@ mod tests {
     use super::{LutKey, clouds_hidden};
     use crate::genconst;
     use crate::skeleton::FrameUniformsGpu;
+    use glam::Vec3;
 
     #[test]
     fn clouds_hidden_at_or_above_slab_top() {
@@ -216,21 +227,23 @@ mod tests {
     #[test]
     fn lut_key_quantizes_time_position_and_sun() {
         let u = FrameUniformsGpu::full_bright();
-        let a = LutKey::of(&u);
-        assert_eq!(a, LutKey::of(&u));
+        let a = LutKey::of(&u, Vec3::Y);
+        assert_eq!(a, LutKey::of(&u, Vec3::Y));
 
         let mut t = u;
         t.anim[0] += 1.0 / 60.0;
-        assert_ne!(a, LutKey::of(&t));
+        assert_ne!(a, LutKey::of(&t, Vec3::Y));
 
         let mut s = u;
         s.sun_dir_elev[0] += 1e-5;
-        assert_eq!(a, LutKey::of(&s));
+        assert_eq!(a, LutKey::of(&s, Vec3::Y));
 
         let mut y = u;
         y.anim[3] = f32::MAX;
-        assert_ne!(a, LutKey::of(&y));
-        assert_ne!(LutKey::of(&y).y, LutKey::of(&u).y);
+        assert_ne!(a, LutKey::of(&y, Vec3::Y));
+        assert_ne!(LutKey::of(&y, Vec3::Y).y, LutKey::of(&u, Vec3::Y).y);
+
+        assert_ne!(a, LutKey::of(&u, Vec3::X), "a new up rebuilds the cloud LUT");
     }
 
     #[test]

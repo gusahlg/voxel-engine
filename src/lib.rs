@@ -47,6 +47,7 @@ pub use mesh::{
 };
 pub use rev::Rev;
 pub use vk::RENDER_SCALE_RANGE;
+pub use vk::uniforms::local_sky_basis;
 pub use vk::compute::{
     ComputeDesc, ComputeInput, ComputeJob, ComputeKind, ComputeQueue, ComputeStager,
     EXAMPLE_COMPUTE_SPIRV, EngineError, JobId,

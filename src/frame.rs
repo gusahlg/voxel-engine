@@ -10,7 +10,7 @@ use crate::font;
 use crate::mesh::DebugVertex;
 use crate::vk::pipeline::Vertex2D;
 use crate::vk::taa::JitterOffset;
-use crate::vk::uniforms::FrameUniformsGpu;
+use crate::vk::uniforms::{FrameUniformsGpu, LocalFrame};
 
 /// Sky-pass-private state, set by the app inside a `begin_3d` scope: sun
 /// geometry plus the disc tint. The sky COLOURS (zenith/horizon gradient, fog
@@ -155,6 +155,9 @@ pub(crate) struct DrawLists {
     /// `begin_3d` call within the same frame, so it stays outside the
     /// atomically-replaced scene.
     pub sky: Option<SkyDesc>,
+    /// Local sky frame for this scope. `None` is up `+Y` and altitude `0`.
+    /// Set via [`Frame3D::set_local_frame`]; same post-`begin_3d` lifetime as `sky`.
+    pub local: Option<LocalFrame>,
     /// Chunk→LOD box half-extents. A non-positive component disables that
     /// axis. LOD tiles hard-discard inside the box. Set via
     /// [`Frame3D::set_lod_clip`]; same post-`begin_3d` lifetime as `sky`.
@@ -180,6 +183,7 @@ impl DrawLists {
             clear: LinearRgb([0.0, 0.0, 0.0]),
             scene: None,
             sky: None,
+            local: None,
             lod_half: Vec3::ZERO,
             debug_flat: None,
             cube_verts: Vec::new(),
@@ -193,6 +197,7 @@ impl DrawLists {
     pub fn reset(&mut self) {
         self.scene = None;
         self.sky = None;
+        self.local = None;
         self.lod_half = Vec3::ZERO;
         self.debug_flat = None;
         self.cube_verts.clear();
@@ -200,6 +205,12 @@ impl DrawLists {
         self.shadow_verts.clear();
         self.verts_2d.clear();
         self.tex_verts_2d.clear();
+    }
+
+    /// Resolved local frame: the value from [`Frame3D::set_local_frame`], or
+    /// `+Y` / altitude 0 when the app left it unset.
+    pub(crate) fn local_frame(&self) -> LocalFrame {
+        self.local.unwrap_or_default()
     }
 }
 
@@ -457,6 +468,18 @@ impl Frame3D<'_, '_> {
             return;
         }
         self.frame.eng.lists.sky = Some(desc);
+    }
+
+    /// Local up and altitude above the local surface datum for sky, fog, and
+    /// clouds. The engine derives the tangent basis into the frame-uniform tail.
+    /// Call inside the `begin_3d` scope; leaving it unset keeps `up = +Y` and
+    /// altitude `0` (the `+Y` sky matches the old world-Y gradient).
+    pub fn set_local_frame(&mut self, up: Vec3, altitude: f32) {
+        let next = LocalFrame { up, altitude };
+        if self.frame.eng.lists.local == Some(next) {
+            return;
+        }
+        self.frame.eng.lists.local = Some(next);
     }
 
     /// Debug-flat override (`DebugView::TerrainKey`): `Some(key)`

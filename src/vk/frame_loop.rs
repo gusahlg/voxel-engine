@@ -202,7 +202,7 @@ impl Renderer {
                 ];
             }
             self.ubo_ring
-                .write_from_gpu(FrameSlot::new(slot), u, self.flags);
+                .write_from_gpu(FrameSlot::new(slot), u, self.flags, lists.local_frame());
         }
         let warp_map = lists
             .scene
@@ -709,6 +709,7 @@ impl Renderer {
                 cmd,
                 slot,
                 &scene.frame_uniforms,
+                lists.local_frame().up,
                 self.pending_capture.is_some(),
             );
         }

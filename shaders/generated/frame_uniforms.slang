@@ -12,7 +12,7 @@
 struct FrameUniforms
 {
     // xyz = sun direction (unit, engine-normalized in prepare_derived),
-    // w = sun elevation (game: sun_dir.y in [-1,1]; drives the glow_pow lerp).
+    // w = sun elevation (game: dot(sun_dir, local up) in [-1,1]; drives the glow_pow lerp).
     float4 sun_dir_elev;
     // rgb = direct light color (linear), w = day_night_mix.
     float4 light;
@@ -32,9 +32,9 @@ struct FrameUniforms
     // engine-derived sky_radiance terms, filled by FrameUniformsGpu::prepare_derived.
     // w reserved (debug-flat may overwrite the whole lane).
     float4 extras;
-    // x = anim_time = world-time seconds mod ANIM_PERIOD; yz = fract(camera_world.xz
-    // / ANIM_PERIOD); w = camera world-y (metres, bounded ⇒ no wrap) for the cloud
-    // slab in sky.frag.
+    // x = anim_time = world-time seconds mod ANIM_PERIOD; yz = fract(tangent-plane
+    // camera metres / ANIM_PERIOD) — world xz when up is +Y; w = altitude above the
+    // local datum (metres) for the cloud slab. f32::MAX hides the slab.
     float4 anim;
     // --- engine-derived tail (not in FrameUniformsGpu) ---
     // Engine-derived (not in FrameUniformsGpu). rgb = ambient_floor_color
@@ -48,4 +48,15 @@ struct FrameUniforms
     // luma709(light)/luma709(zenith), SHADOW_BOUNCE_TINT); light.rgb when zenith
     // luma is 0. w = asfloat lane-enable bits (shadows=1, blocklight=2, ambient=4).
     float4 shadow_bounce;
+    // Engine-derived local sky basis (not in FrameUniformsGpu). xyz = tangent:
+    // the world axis least aligned with up, rejected into the plane (ties X, then Y,
+    // then Z). +Y up yields +X. w unused.
+    float4 sky_tangent;
+    // Engine-derived. xyz = unit local up (default +Y). w = altitude above the
+    // local datum from set_local_frame. The cloud slab reads anim.w (the game writes
+    // the same altitude, or f32::MAX when clouds are off).
+    float4 sky_up;
+    // Engine-derived. xyz = bitangent = tangent × up, right-handed (+Y up yields +Z).
+    // w unused.
+    float4 sky_bitangent;
 };

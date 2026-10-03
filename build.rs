@@ -785,7 +785,7 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "STAR_DENSITY",
-            doc: "Star hash-grid resolution: cells across the hemispheric ray projection.\nHigher ⇒ more, smaller cells (denser field). Slightly more presence without sparse\nfeel; correlates with STAR_THRESHOLD for ~5.5% population. Range [250–400].",
+            doc: "Star hash-grid resolution: cells across one cube-face axis in [-1, 1].\nNear a face centre this is the same cells-per-radian as the old zenith grid.\nHigher ⇒ more, smaller cells. Correlates with STAR_THRESHOLD for ~5.5% population.",
             val: Val::Scalar(328.0),
         },
         Def {
@@ -811,7 +811,7 @@ fn build_table() -> Vec<Def> {
         // Slab clouds: 2-plane volumetric slab in sky.frag, world-anchored so pinned day is deterministic.
         Def {
             name: "CLOUD_BOTTOM",
-            doc: "World-y (metres) of the lower slab plane. Clouds render only when the\ncamera (anim.w) is below the slab and the view ray rises into it.",
+            doc: "Altitude (metres above the local datum) of the lower slab plane. Clouds\nrender only when the camera (anim.w) is below the slab and the local up-component\nof the view ray rises into it.",
             val: Val::Scalar(180.0),
         },
         Def {
@@ -994,7 +994,7 @@ fn lane_table() -> Vec<Lane> {
     vec![
         Lane {
             name: "sun_dir_elev",
-            doc: "xyz = sun direction (unit, engine-normalized in prepare_derived),\nw = sun elevation (game: sun_dir.y in [-1,1]; drives the glow_pow lerp).",
+            doc: "xyz = sun direction (unit, engine-normalized in prepare_derived),\nw = sun elevation (game: dot(sun_dir, local up) in [-1,1]; drives the glow_pow lerp).",
         },
         Lane {
             name: "light",
@@ -1022,7 +1022,7 @@ fn lane_table() -> Vec<Lane> {
         },
         Lane {
             name: "anim",
-            doc: "x = anim_time = world-time seconds mod ANIM_PERIOD; yz = fract(camera_world.xz\n/ ANIM_PERIOD); w = camera world-y (metres, bounded ⇒ no wrap) for the cloud\nslab in sky.frag.",
+            doc: "x = anim_time = world-time seconds mod ANIM_PERIOD; yz = fract(tangent-plane\ncamera metres / ANIM_PERIOD) — world xz when up is +Y; w = altitude above the\nlocal datum (metres) for the cloud slab. f32::MAX hides the slab.",
         },
     ]
 }
@@ -1043,6 +1043,18 @@ fn derived_lane_table() -> Vec<Lane> {
         Lane {
             name: "shadow_bounce",
             doc: "Engine-derived. rgb = SHADOW_SKY_AMBIENT * lerp(light.rgb, zenith.rgb *\nluma709(light)/luma709(zenith), SHADOW_BOUNCE_TINT); light.rgb when zenith\nluma is 0. w = asfloat lane-enable bits (shadows=1, blocklight=2, ambient=4).",
+        },
+        Lane {
+            name: "sky_tangent",
+            doc: "Engine-derived local sky basis (not in FrameUniformsGpu). xyz = tangent:\nthe world axis least aligned with up, rejected into the plane (ties X, then Y,\nthen Z). +Y up yields +X. w unused.",
+        },
+        Lane {
+            name: "sky_up",
+            doc: "Engine-derived. xyz = unit local up (default +Y). w = altitude above the\nlocal datum from set_local_frame. The cloud slab reads anim.w (the game writes\nthe same altitude, or f32::MAX when clouds are off).",
+        },
+        Lane {
+            name: "sky_bitangent",
+            doc: "Engine-derived. xyz = bitangent = tangent × up, right-handed (+Y up yields +Z).\nw unused.",
         },
     ]
 }

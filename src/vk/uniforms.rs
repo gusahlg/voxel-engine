@@ -101,13 +101,54 @@ fn luma709(c: Vec3) -> f32 {
     c.dot(Vec3::new(0.2126, 0.7152, 0.0722))
 }
 
+/// Per-frame local sky frame. `None` on [`crate::frame::DrawLists`] means
+/// [`LocalFrame::default`]: up `+Y`, altitude `0`.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct LocalFrame {
+    pub up: Vec3,
+    pub altitude: f32,
+}
+
+impl Default for LocalFrame {
+    fn default() -> Self {
+        Self { up: Vec3::Y, altitude: 0.0 }
+    }
+}
+
+/// Orthonormal sky basis `(tangent, up, bitangent)`.
+///
+/// `tangent` is the world axis least aligned with `up` (ties break toward X,
+/// then Y, then Z), rejected into the plane. `bitangent = tangent × up`.
+/// Exact `+Y` yields the identity basis, so the old world-Y sky math is unchanged.
+pub fn local_sky_basis(up: Vec3) -> (Vec3, Vec3, Vec3) {
+    let len2 = up.length_squared();
+    if len2 <= 1e-12 {
+        return (Vec3::X, Vec3::Y, Vec3::Z);
+    }
+    let up = up * len2.sqrt().recip();
+    let (ax, ay, az) = (up.x.abs(), up.y.abs(), up.z.abs());
+    let axis = if ax <= ay && ax <= az {
+        Vec3::X
+    } else if ay <= az {
+        Vec3::Y
+    } else {
+        Vec3::Z
+    };
+    let tangent = axis - up * axis.dot(up);
+    let tlen2 = tangent.length_squared();
+    debug_assert!(tlen2 > 1e-12, "least-aligned axis is never parallel to up");
+    let tangent = tangent * tlen2.sqrt().recip();
+    let bitangent = tangent.cross(up);
+    (tangent, up, bitangent)
+}
+
 impl FrameUniformsExt {
     /// Hoist per-frame uniform-only math the shaders used to recompute every
     /// fragment: ambient floor colour, sky-halo exponent, halo tint×scale,
     /// the shadow-fallback day factor, the sky-dome shadow fill, and the
-    /// shadows/blocklight/ambient lane-enable bits in `shadow_bounce.w`.
-    /// Mirrors `common.slang`.
-    pub(crate) fn derive(u: FrameUniformsGpu, flags: RenderFlags) -> Self {
+    /// shadows/blocklight/ambient lane-enable bits in `shadow_bounce.w`,
+    /// and the local sky basis. Mirrors `common.slang`.
+    pub(crate) fn derive(u: FrameUniformsGpu, flags: RenderFlags, local: LocalFrame) -> Self {
         let zenith = Vec3::new(u.zenith[0], u.zenith[1], u.zenith[2]);
         let light = Vec3::new(u.light[0], u.light[1], u.light[2]);
         let floor = u.candle[3];
@@ -127,25 +168,29 @@ impl FrameUniformsExt {
             light
         };
         let bounce = bounce_src * SHADOW_SKY_AMBIENT;
+        let (tangent, up, bitangent) = local_sky_basis(local.up);
         Self {
             base: u,
             ambient_glow: [ambient.x, ambient.y, ambient.z, glow_pow],
             glow_day: [glow_rgb.x, glow_rgb.y, glow_rgb.z, day],
             shadow_bounce: [bounce.x, bounce.y, bounce.z, lane_enable_bits(&flags)],
+            sky_tangent: [tangent.x, tangent.y, tangent.z, 0.0],
+            sky_up: [up.x, up.y, up.z, local.altitude],
+            sky_bitangent: [bitangent.x, bitangent.y, bitangent.z, 0.0],
         }
     }
 }
 
-// Bumped when the GPU `FrameUniforms` layout changes (public prefix extras.yz
-// sky lanes, or the engine-derived tail).
-pub const FRAME_UNIFORMS_VERSION: u32 = 6;
+// Bumped when the GPU `FrameUniforms` layout changes (public prefix or the
+// engine-derived tail). 7 adds the local sky basis.
+pub const FRAME_UNIFORMS_VERSION: u32 = 7;
 
 /// The per-frame UBO ring. Indexed only by [`FrameSlot`],
 /// so raw-usize slot confusion is inexpressible here.
 pub(crate) struct UboRing {
     bufs: PerSlot<HostBuffer>,
     last: PerSlot<Option<FrameUniformsExt>>,
-    last_gpu: PerSlot<Option<(FrameUniformsGpu, RenderFlags)>>,
+    last_gpu: PerSlot<Option<(FrameUniformsGpu, RenderFlags, LocalFrame)>>,
 }
 
 impl UboRing {
@@ -173,12 +218,12 @@ impl UboRing {
         }
     }
 
-    /// Copy this frame's already-derived uniforms (176-byte `FrameUniformsExt`)
-    /// into `slot`'s mapped buffer. Coherent memory: the write is visible to
-    /// the GPU with no explicit flush. `prepare_derived` runs once on the
-    /// producer (begin_3d / full_bright); `FrameUniformsExt::derive` runs once
-    /// on the render thread before this write. Identical bytes for this slot
-    /// skip the map write.
+    /// Copy this frame's already-derived uniforms (`FrameUniformsExt`, public
+    /// wire plus the basis tail) into `slot`'s mapped buffer. Coherent memory:
+    /// the write is visible to the GPU with no explicit flush. `prepare_derived`
+    /// runs once on the producer (begin_3d / full_bright); `FrameUniformsExt::derive`
+    /// runs once on the render thread before this write. Identical bytes for
+    /// this slot skip the map write.
     pub(crate) fn write(&mut self, slot: FrameSlot, ext: &FrameUniformsExt) {
         if self.last[slot].as_ref() == Some(ext) {
             return;
@@ -194,12 +239,13 @@ impl UboRing {
         slot: FrameSlot,
         u: FrameUniformsGpu,
         flags: RenderFlags,
+        local: LocalFrame,
     ) {
-        if self.last_gpu[slot] == Some((u, flags)) {
+        if self.last_gpu[slot] == Some((u, flags, local)) {
             return;
         }
-        self.write(slot, &FrameUniformsExt::derive(u, flags));
-        self.last_gpu[slot] = Some((u, flags));
+        self.write(slot, &FrameUniformsExt::derive(u, flags, local));
+        self.last_gpu[slot] = Some((u, flags, local));
     }
 
     /// The buffer bound at set 0, binding 2 for `slot`. The per-frame UBO is
@@ -224,7 +270,7 @@ mod tests {
     use crate::engine::RenderFlags;
 
     fn derive_default(u: FrameUniformsGpu) -> FrameUniformsExt {
-        FrameUniformsExt::derive(u, RenderFlags::default())
+        FrameUniformsExt::derive(u, RenderFlags::default(), LocalFrame::default())
     }
 
     #[test]
@@ -259,10 +305,70 @@ mod tests {
     #[test]
     fn public_wire_stays_eight_lanes() {
         assert_eq!(size_of::<FrameUniformsGpu>(), 128);
-        assert_eq!(size_of::<FrameUniformsExt>(), 176);
+        assert_eq!(size_of::<FrameUniformsExt>(), 224);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, ambient_glow), 128);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, glow_day), 144);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, shadow_bounce), 160);
+        assert_eq!(std::mem::offset_of!(FrameUniformsExt, sky_tangent), 176);
+        assert_eq!(std::mem::offset_of!(FrameUniformsExt, sky_up), 192);
+        assert_eq!(std::mem::offset_of!(FrameUniformsExt, sky_bitangent), 208);
+    }
+
+    #[test]
+    fn plus_y_basis_is_the_identity() {
+        let (t, u, b) = local_sky_basis(Vec3::Y);
+        assert_eq!(t, Vec3::X);
+        assert_eq!(u, Vec3::Y);
+        assert_eq!(b, Vec3::Z);
+        let ray = Vec3::new(0.2, 0.9, -0.3);
+        let local = Vec3::new(ray.dot(t), ray.dot(u), ray.dot(b));
+        assert_eq!(local, ray);
+    }
+
+    #[test]
+    fn basis_is_right_handed_on_every_axis_and_a_diagonal() {
+        for up in [
+            Vec3::X,
+            -Vec3::X,
+            -Vec3::Y,
+            Vec3::Z,
+            -Vec3::Z,
+            Vec3::ONE.normalize(),
+            Vec3::new(0.2, 0.9, -0.1),
+        ] {
+            let (t, u, b) = local_sky_basis(up);
+            assert!((u - up.normalize()).length() < 1e-5, "up {up:?}");
+            assert!((t.length() - 1.0).abs() < 1e-5 && (b.length() - 1.0).abs() < 1e-5);
+            assert!(t.dot(u).abs() < 1e-5 && b.dot(u).abs() < 1e-5 && t.dot(b).abs() < 1e-5);
+            assert!((t.cross(u) - b).length() < 1e-5, "right-handed {up:?}");
+        }
+        let (t, u, b) = local_sky_basis(Vec3::X);
+        assert_eq!(u, Vec3::X);
+        assert_eq!(t, Vec3::Y);
+        assert_eq!(b, -Vec3::Z);
+        // A ray straight up the +X face is local +Y, so the old `.y` sky math stands.
+        assert!((Vec3::X.dot(u) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zero_up_falls_back_to_plus_y() {
+        assert_eq!(local_sky_basis(Vec3::ZERO), local_sky_basis(Vec3::Y));
+        assert_eq!(local_sky_basis(Vec3::Y * 4.0), local_sky_basis(Vec3::Y));
+    }
+
+    #[test]
+    fn derive_writes_the_basis_and_leaves_anim_w_alone() {
+        let mut u = FrameUniformsGpu::full_bright();
+        u.anim[3] = 42.0;
+        let ext = FrameUniformsExt::derive(
+            u,
+            RenderFlags::default(),
+            LocalFrame { up: Vec3::Y, altitude: 7.0 },
+        );
+        assert_eq!(ext.sky_tangent, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(ext.sky_up, [0.0, 1.0, 0.0, 7.0]);
+        assert_eq!(ext.sky_bitangent, [0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(ext.base.anim[3], 42.0);
     }
 
     #[test]
@@ -359,7 +465,7 @@ mod tests {
             lane_enable_bits(&f).to_bits(),
             LANE_BIT_SHADOWS | LANE_BIT_BLOCKLIGHT | LANE_BIT_AMBIENT
         );
-        let ext = FrameUniformsExt::derive(FrameUniformsGpu::full_bright(), f);
+        let ext = FrameUniformsExt::derive(FrameUniformsGpu::full_bright(), f, LocalFrame::default());
         assert_eq!(
             ext.shadow_bounce[3].to_bits(),
             lane_enable_bits(&f).to_bits()

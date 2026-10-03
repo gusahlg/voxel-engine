@@ -19,7 +19,12 @@ void computeMain(uint3 gid: SV_DispatchThreadID)
     if (gid.x >= n || gid.y >= n)
         return;
     float2 uv = (float2(gid.xy) + 0.5) / float(n);
-    float3 ray = sky_oct_decode(uv);
+    // Decode is in the local frame. Rebuild the world ray so `clouds` rotates
+    // it back; +Y (identity basis) is an exact copy.
+    float3 local = sky_oct_decode(uv);
+    float3 ray = local.x * frame.sky_tangent.xyz
+        + local.y * frame.sky_up.xyz
+        + local.z * frame.sky_bitangent.xyz;
     float cover;
     float3 lit = clouds(ray, frame, cover);
     lut[gid.xy] = float4(lit, cover);

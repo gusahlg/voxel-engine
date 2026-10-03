@@ -269,9 +269,9 @@ static const float STAR_COLOR[3] = {
     4.2f, 4.5f, 5.2f, 
 };
 
-// Star hash-grid resolution: cells across the hemispheric ray projection.
-// Higher ⇒ more, smaller cells (denser field). Slightly more presence without sparse
-// feel; correlates with STAR_THRESHOLD for ~5.5% population. Range [250–400].
+// Star hash-grid resolution: cells across one cube-face axis in [-1, 1].
+// Near a face centre this is the same cells-per-radian as the old zenith grid.
+// Higher ⇒ more, smaller cells. Correlates with STAR_THRESHOLD for ~5.5% population.
 static const float STAR_DENSITY = 328.0f;
 
 // Per-cell hash cutoff for a star to exist; fraction of lit cells is
@@ -289,8 +289,9 @@ static const float STAR_MOON_FADE = 0.9995f;
 // Star fade toward horizon (hides stars in fog band).
 static const float STAR_HORIZON_FADE = 8.0f;
 
-// World-y (metres) of the lower slab plane. Clouds render only when the
-// camera (anim.w) is below the slab and the view ray rises into it.
+// Altitude (metres above the local datum) of the lower slab plane. Clouds
+// render only when the camera (anim.w) is below the slab and the local up-component
+// of the view ray rises into it.
 static const float CLOUD_BOTTOM = 180.0f;
 
 // Vertical slab thickness (metres); the upper plane is CLOUD_BOTTOM + this.
