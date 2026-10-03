@@ -181,13 +181,18 @@ float3 far_albedo(FarGpu b, float3 bodyP, uint face, bool sphere, float rho)
     return alb;
 }
 
-float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air)
+float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air, float rho)
 {
     // Same night flip as the terrain: light.w is 1 by day and 0 by night,
     // so the lit hemisphere follows the moon once the sun is down.
     float flip = frame.light.w * 2.0 - 1.0;
     float ndl = saturate(dot(nrm, frame.sun_dir_elev.xyz) * flip);
-    float3 lit = alb * (frame.light.rgb * ndl + frame.ambient_glow.rgb);
+    // Standing on a body (it fills half the sky) its disc continues the terrain at the horizon, so
+    // it takes the terrain's sky light (an omnidirectional share of the sun plus the bounce floor);
+    // from afar it is a lit sphere with a dark night side.
+    float near = smoothstep(0.95, 0.9995, rho);
+    float diffuse = lerp(ndl, 0.45 + 0.55 * ndl, near);
+    float3 lit = alb * (frame.light.rgb * diffuse + frame.ambient_glow.rgb + frame.shadow_bounce.rgb * near);
     float fres = 1.0 - saturate(dot(nrm, -ray));
     fres = fres * fres * fres;
     return lit + air * fres;
@@ -250,7 +255,7 @@ float3 far_bodies(float3 ray, float3 col, float px)
                     float3 bodyP = far_inv_rotate(b.rot, ray * t - center);
                     float3 alb = far_albedo(b, bodyP, 0u, true, rho);
                     float cov = saturate(0.5 + (rho - s) / px);
-                    col = lerp(col, far_lit(alb, nrm, ray, air), cov);
+                    col = lerp(col, far_lit(alb, nrm, ray, air, rho), cov);
                 }
             }
             else if (hasAir)
@@ -272,7 +277,7 @@ float3 far_bodies(float3 ray, float3 col, float px)
                 bestT = t;
                 float3 bodyP = far_inv_rotate(b.rot, ray * t - center);
                 float3 alb = far_albedo(b, bodyP, face, false, rho);
-                col = lerp(col, far_lit(alb, nrm, ray, air), 1.0);
+                col = lerp(col, far_lit(alb, nrm, ray, air, rho), 1.0);
             }
             else if (!hit && hasAir)
             {
