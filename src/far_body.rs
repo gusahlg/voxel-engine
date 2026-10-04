@@ -10,25 +10,33 @@ use crate::color::LinearRgb;
 /// Bodies kept from one [`crate::Frame3D::set_far_bodies`] call. Extra entries are dropped.
 pub const MAX_FAR_BODIES: usize = 32;
 
-/// Sphere, a cube whose `radius` is the half-size, or the inside of a sphere.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// Sphere, a cube whose `radius` is the half-size, the inside of a sphere, or a
+/// rounded cube.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum FarShape {
     Cube,
     #[default]
     Sphere,
     /// The viewer is inside the sphere. Every view ray hits the far wall.
     InnerSphere,
+    /// `|x|^p + |y|^p + |z|^p = radius^p` in body space. `exponent` is p ≥ 2
+    /// (2 is the sphere; large p approaches the cube). Face centres sit at
+    /// `radius`; a unit direction `d` meets the surface at `radius / ‖d‖_p`.
+    Rounded { exponent: f32 },
 }
 
 /// One body drawn in the sky pass.
 ///
 /// `dir` points from the camera to the body centre. `distance` and `radius` share
-/// a unit. A cube or sphere is drawn only when `distance > radius` (the viewer is
-/// outside). [`FarShape::InnerSphere`] is the opposite: `distance < radius`, and
-/// the far wall is the sky. `albedo` is the six cube faces (+X, −X, +Y, −Y, +Z, −Z);
-/// a sphere uses `[0]` for land and `[1]` for the second tone. A black
-/// `atmosphere` draws no rim. `rotation` takes body space into world space
-/// (identity for an axis-aligned cube).
+/// a unit. A cube, sphere or rounded body is drawn only when `distance > radius`
+/// (the viewer is outside the face sphere; a rounded body may still bulge past
+/// the camera and the ray test drops those hits). [`FarShape::InnerSphere`] is
+/// the opposite: `distance < radius`, and the far wall is the sky. `albedo` is
+/// the six cube faces (+X, −X, +Y, −Y, +Z, −Z); a sphere uses `[0]` for land and
+/// `[1]` for the second tone. A rounded body shades the face of its body-space
+/// normal and uses the sphere's rim. A black `atmosphere` draws no rim.
+/// `rotation` takes body space into world space (identity for an axis-aligned
+/// cube or rounded body).
 #[derive(Clone, Copy, Debug)]
 pub struct FarBody {
     pub dir: Vec3,
@@ -57,7 +65,8 @@ impl Default for FarBody {
 }
 
 /// A hit in normalised space. `t` is along the unit view ray. `normal` is world
-/// space. `face` is the cube face (0 = +X … 5 = −Z) and 0 for a sphere.
+/// space. `face` is the cube face (0 = +X … 5 = −Z), the dominant axis of a
+/// rounded body's normal, and 0 for a sphere.
 /// Test-only: the sky shader is the copy that runs.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
@@ -211,11 +220,208 @@ pub(crate) fn ray_cube(ray: Vec3, dir: Vec3, rho: f32, rotation: Quat) -> Option
     })
 }
 
+/// Newton / secant steps on the rounded implicit. A radial hit lands in one step;
+/// a graze spends the rest of the budget shrinking the bracket.
+#[cfg(test)]
+const ROUNDED_STEPS: u32 = 6;
+
+/// Dominant axis of a body-space normal. Ties break toward X, then Y, then Z.
+#[cfg(test)]
+fn dom_face(n: Vec3) -> u32 {
+    let a = n.abs();
+    if a.x >= a.y && a.x >= a.z {
+        if n.x >= 0.0 { 0 } else { 1 }
+    } else if a.y >= a.z {
+        if n.y >= 0.0 { 2 } else { 3 }
+    } else if n.z >= 0.0 {
+        4
+    } else {
+        5
+    }
+}
+
+/// `s = ‖q‖_p` and its gradient. Zero at the origin.
+#[cfg(test)]
+fn lp_grad(q: Vec3, p: f32) -> (f32, Vec3) {
+    let ax = q.x.abs();
+    let ay = q.y.abs();
+    let az = q.z.abs();
+    let m = ax.max(ay).max(az);
+    if m == 0.0 {
+        return (0.0, Vec3::ZERO);
+    }
+    let inv = 1.0 / m;
+    let px = (ax * inv).powf(p);
+    let py = (ay * inv).powf(p);
+    let pz = (az * inv).powf(p);
+    let sum = px + py + pz;
+    if !(sum > 0.0) {
+        return (0.0, Vec3::ZERO);
+    }
+    let s = m * sum.powf(1.0 / p);
+    let mut g = Vec3::ZERO;
+    if ax > 0.0 {
+        g.x = px / sum * s / ax * q.x.signum();
+    }
+    if ay > 0.0 {
+        g.y = py / sum * s / ay * q.y.signum();
+    }
+    if az > 0.0 {
+        g.z = pz / sum * s / az * q.z.signum();
+    }
+    (s, g)
+}
+
+/// Hit at `t_hit` when that sample is outside the solid. Normal from the gradient.
+#[cfg(test)]
+fn rounded_at(ray_o: Vec3, ray_d: Vec3, rotation: Quat, t_hit: f32, p: f32, rho: f32) -> Option<FarHit> {
+    if !(t_hit > 0.0) {
+        return None;
+    }
+    let (s, g) = lp_grad(ray_o + ray_d * t_hit, p);
+    if !(s >= rho) || !s.is_finite() {
+        return None;
+    }
+    let glen = g.length();
+    if !(glen > 1e-8) || !glen.is_finite() {
+        return None;
+    }
+    let body_n = g / glen;
+    Some(FarHit {
+        t: t_hit,
+        normal: rotate(rotation, body_n),
+        face: dom_face(body_n),
+    })
+}
+
+/// Ray from the origin against the superellipsoid of face radius `rho` centred
+/// on unit `dir`. `exponent` is p ≥ 2. The enclosing sphere is
+/// `rho · 3^(1/2 − 1/p)`, padded a hair so its entry stays outside the solid.
+/// A miss that merely grazes that sphere, where the sphere lies on the body,
+/// reports the sphere point rather than a hole.
+#[cfg(test)]
+pub(crate) fn ray_rounded(ray: Vec3, dir: Vec3, rho: f32, rotation: Quat, exponent: f32) -> Option<FarHit> {
+    if !(rho > 0.0 && rho < 1.0)
+        || !(exponent >= 2.0)
+        || !exponent.is_finite()
+        || !ray.is_finite()
+        || !dir.is_finite()
+    {
+        return None;
+    }
+    let p = exponent.clamp(2.0, 32.0);
+    // Exact bound, then a hair so `pow` cannot place the entry inside a corner.
+    let rho_b = rho * 3.0f32.powf(0.5 - 1.0 / p) * (1.0 + 2.0e-4);
+    let facing = ray.dot(dir);
+    let disc = facing * facing - (1.0 - rho_b * rho_b);
+    if !(disc >= 0.0) || !disc.is_finite() {
+        return None;
+    }
+    let sd = disc.sqrt();
+    let t_near = facing - sd;
+    let t_far = facing + sd;
+    if !(t_far > 0.0) {
+        return None;
+    }
+    let inv = conjugate(rotation);
+    let o = rotate(inv, -dir);
+    let d = rotate(inv, ray);
+    let t0 = t_near.max(0.0);
+    let (s0, _) = lp_grad(o, p);
+    if t0 == 0.0 && s0 <= rho {
+        return None;
+    }
+    let t_c = facing.clamp(t0, t_far);
+    let (s_c, _) = lp_grad(o + d * t_c, p);
+    if s_c > rho {
+        if s_c <= rho * 1.001 && t_c > 0.0 {
+            if let Some(hit) = rounded_at(o, d, rotation, t_c, p, rho) {
+                return Some(hit);
+            }
+        }
+        // Grazing the enclosing sphere where that sphere meets the body.
+        if t_near > 0.0 && sd <= rho_b * 0.02 {
+            let (s_b, _) = lp_grad(o + d * t_near, p);
+            if s_b >= rho && s_b <= rho * 1.01 {
+                let n = (ray * t_near - dir) / rho_b;
+                return Some(FarHit {
+                    t: t_near,
+                    normal: n,
+                    face: dom_face(rotate(inv, n)),
+                });
+            }
+        }
+        return None;
+    }
+    let mut lo = t0;
+    let mut hi = t_c;
+    for _ in 0..ROUNDED_STEPS {
+        let (s_l, g_l) = lp_grad(o + d * lo, p);
+        if s_l >= rho && s_l <= rho * (1.0 + 2.0e-5) {
+            break;
+        }
+        if hi - lo < 1e-6 {
+            break;
+        }
+        let slope = g_l.dot(d);
+        let mut moved = false;
+        if slope < -1e-8 {
+            let t_n = lo - (s_l - rho) / slope;
+            if t_n > lo && t_n < hi {
+                let (s_n, _) = lp_grad(o + d * t_n, p);
+                if s_n >= rho {
+                    lo = t_n;
+                    moved = true;
+                } else {
+                    hi = t_n;
+                }
+            }
+        }
+        if !moved {
+            let (s_h, _) = lp_grad(o + d * hi, p);
+            let mut t_f = 0.5 * (lo + hi);
+            let span = s_l - s_h;
+            if span.abs() > 1e-12 {
+                let guess = lo + (hi - lo) * (s_l - rho) / span;
+                if guess > lo && guess < hi {
+                    t_f = guess;
+                }
+            }
+            let (s_f, _) = lp_grad(o + d * t_f, p);
+            if s_f >= rho {
+                lo = t_f;
+            } else {
+                hi = t_f;
+            }
+        }
+    }
+    if let Some(hit) = rounded_at(o, d, rotation, lo, p, rho) {
+        return Some(hit);
+    }
+    if t_near > 0.0 {
+        let (s_b, _) = lp_grad(o + d * t_near, p);
+        if s_b >= rho {
+            let n = (ray * t_near - dir) / rho_b;
+            return Some(FarHit {
+                t: t_near,
+                normal: n,
+                face: dom_face(rotate(inv, n)),
+            });
+        }
+    }
+    None
+}
+
 fn finite_rgb(c: LinearRgb) -> bool {
     c.0[0].is_finite() && c.0[1].is_finite() && c.0[2].is_finite()
 }
 
 fn keep(body: &FarBody) -> Option<FarBody> {
+    if let FarShape::Rounded { exponent } = body.shape {
+        if !(exponent >= 2.0) || !exponent.is_finite() {
+            return None;
+        }
+    }
     let inside = matches!(body.shape, FarShape::InnerSphere);
     // Outside shapes reject a viewer inside the solid. The inner sphere is the
     // one shape that requires it, and it keeps distance and radius (not the
@@ -490,5 +696,155 @@ mod tests {
         assert_eq!(out[0].shape, FarShape::InnerSphere);
         assert_eq!(out[1].distance, 100.0);
         assert_eq!(out[2].seed, 8);
+    }
+
+    fn axis_face(u: Vec3) -> Option<u32> {
+        let a = u.abs();
+        if a.x > 0.9 && a.y < 1e-4 && a.z < 1e-4 {
+            Some(if u.x > 0.0 { 0 } else { 1 })
+        } else if a.y > 0.9 && a.x < 1e-4 && a.z < 1e-4 {
+            Some(if u.y > 0.0 { 2 } else { 3 })
+        } else if a.z > 0.9 && a.x < 1e-4 && a.y < 1e-4 {
+            Some(if u.z > 0.0 { 4 } else { 5 })
+        } else {
+            None
+        }
+    }
+
+    /// Face centres, the three edge axes and the space diagonals.
+    fn rounded_dirs() -> [Vec3; 16] {
+        [
+            Vec3::X,
+            Vec3::NEG_X,
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::Z,
+            Vec3::NEG_Z,
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(1.0, 0.0, 1.0),
+            Vec3::new(0.0, 1.0, -1.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, -1.0, -1.0),
+        ]
+    }
+
+    fn outside(q: Vec3, rho: f32, p: f32) -> bool {
+        let (s, _) = lp_grad(q, p);
+        s + rho * 1.0e-4 >= rho
+    }
+
+    #[test]
+    fn rounded_hits_analytic_face_edge_and_corner() {
+        let rho = 0.3f32;
+        let tilt = Quat::from_xyzw(0.2, -0.4, 0.1, 0.8).normalize();
+        for p in [2.0f32, 2.17, 10.0] {
+            let corner = Vec3::ONE.normalize();
+            let radial = rho / lp_grad(corner, p).0;
+            let bound = rho * 3.0f32.powf(0.5 - 1.0 / p);
+            assert!(
+                (radial - bound).abs() < 1e-4,
+                "p {p}: corner radius {radial} bound {bound}"
+            );
+            for rotation in [Quat::IDENTITY, tilt] {
+                for dir in rounded_dirs() {
+                    let u = dir.normalize();
+                    let outward = rotate(rotation, u);
+                    // Look straight down this body direction so the sample is the near hit.
+                    let centre = -outward;
+                    let reach = rho / lp_grad(u, p).0;
+                    let point = centre + outward * reach;
+                    let ray = -outward;
+                    let hit = ray_rounded(ray, centre, rho, rotation, p)
+                        .unwrap_or_else(|| panic!("p {p} dir {u:?} missed"));
+                    let got = ray * hit.t;
+                    let err = (got - point).length();
+                    assert!(err < 2e-4, "p {p} dir {u:?} off by {err} (got {got}, want {point})");
+                    assert!(
+                        hit.normal.dot(outward) > 0.999,
+                        "p {p} normal {:?} not along {outward:?}",
+                        hit.normal
+                    );
+                    assert!((hit.normal.length() - 1.0).abs() < 1e-4);
+                    let q = rotate(conjugate(rotation), got - centre);
+                    assert!(outside(q, rho, p), "p {p} analytic hit inside");
+                    if let Some(face) = axis_face(u) {
+                        assert_eq!(hit.face, face, "p {p} face of {u:?}");
+                    }
+                }
+            }
+            // p = 2 is the sphere the closed form already tests.
+            if p == 2.0 {
+                let centre = Vec3::Z;
+                let ray = Vec3::new(0.12, -0.05, 1.0).normalize();
+                let sphere = ray_sphere(ray, centre, 0.4).unwrap();
+                let rounded = ray_rounded(ray, centre, 0.4, Quat::IDENTITY, p).unwrap();
+                assert!((sphere.t - rounded.t).abs() < 2e-4, "{} vs {}", sphere.t, rounded.t);
+                assert!(sphere.normal.dot(rounded.normal) > 0.999);
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_grazing_never_hits_inside() {
+        let perps = [
+            Vec3::X,
+            Vec3::Y,
+            Vec3::new(1.0, 1.0, 0.0).normalize(),
+            Vec3::new(-1.0, 2.0, 0.0).normalize(),
+            Vec3::new(2.0, -0.5, 0.0).normalize(),
+        ];
+        for p in [2.0f32, 2.17, 10.0] {
+            for rho in [0.35f32, 0.97] {
+                let bound = rho * 3.0f32.powf(0.5 - 1.0 / p);
+                let centre = Vec3::Z;
+                for perp in perps {
+                    for k in 0..18 {
+                        let s = bound * (k as f32) / 16.0;
+                        if s >= 1.0 {
+                            continue;
+                        }
+                        let z = (1.0 - s * s).sqrt();
+                        let ray = Vec3::new(perp.x * s, perp.y * s, z);
+                        if let Some(hit) = ray_rounded(ray, centre, rho, Quat::IDENTITY, p) {
+                            let q = rotate(conjugate(Quat::IDENTITY), ray * hit.t - centre);
+                            assert!(
+                                outside(q, rho, p),
+                                "p {p} rho {rho} s {s} hit inside at {:?}",
+                                ray * hit.t
+                            );
+                        }
+                    }
+                }
+                // Past the enclosing sphere there is nothing to hit.
+                if bound * 1.02 < 1.0 {
+                    let s = bound * 1.02;
+                    let ray = Vec3::new(s, 0.0, (1.0 - s * s).sqrt());
+                    assert!(
+                        ray_rounded(ray, centre, rho, Quat::IDENTITY, p).is_none(),
+                        "p {p} rho {rho} ray outside the bound hit"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_exponent_is_kept_only_when_real() {
+        let mut body = sphere_at(Vec3::Z, 4.0, 1.0, 3);
+        body.shape = FarShape::Rounded { exponent: 2.17 };
+        let mut out = [FarBody::default(); MAX_FAR_BODIES];
+        assert_eq!(store(std::slice::from_ref(&body), &mut out), 1);
+        assert_eq!(out[0].shape, FarShape::Rounded { exponent: 2.17 });
+        body.shape = FarShape::Rounded { exponent: 1.5 };
+        assert_eq!(store(std::slice::from_ref(&body), &mut out), 0);
+        body.shape = FarShape::Rounded { exponent: f32::NAN };
+        assert_eq!(store(std::slice::from_ref(&body), &mut out), 0);
+        body.shape = FarShape::Rounded { exponent: f32::INFINITY };
+        assert_eq!(store(std::slice::from_ref(&body), &mut out), 0);
     }
 }

@@ -21,8 +21,9 @@ pub(crate) struct FarBodyGpu {
     pub albedo3: [f32; 4],
     pub albedo4: [f32; 4],
     pub albedo5: [f32; 4],
-    /// rgb rim tint, a = shape (0 cube, 1 sphere, 2 inner sphere).
+    /// rgb rim tint, a = shape (0 cube, 1 sphere, 2 inner sphere, 3 rounded).
     pub atmosphere: [f32; 4],
+    /// x = noise seed. y = rounded exponent as f32 bits (0 for other shapes).
     pub seed: [u32; 4],
 }
 
@@ -45,10 +46,11 @@ fn rgb4(c: crate::color::LinearRgb) -> [f32; 4] {
 fn pack_one(body: &FarBody) -> FarBodyGpu {
     let dir = body.dir;
     let q = body.rotation;
-    let shape = match body.shape {
-        FarShape::Cube => 0.0,
-        FarShape::Sphere => 1.0,
-        FarShape::InnerSphere => 2.0,
+    let (shape, exponent) = match body.shape {
+        FarShape::Cube => (0.0, 0.0),
+        FarShape::Sphere => (1.0, 0.0),
+        FarShape::InnerSphere => (2.0, 0.0),
+        FarShape::Rounded { exponent } => (3.0, exponent),
     };
     FarBodyGpu {
         dir_rho: [dir.x, dir.y, dir.z, body.radius / body.distance],
@@ -65,7 +67,7 @@ fn pack_one(body: &FarBody) -> FarBodyGpu {
             body.atmosphere.0[2],
             shape,
         ],
-        seed: [body.seed, 0, 0, 0],
+        seed: [body.seed, exponent.to_bits(), 0, 0],
     }
 }
 
@@ -177,5 +179,36 @@ mod tests {
         assert_eq!(packed.atmosphere[3].to_bits(), 2.0f32.to_bits());
         assert_eq!(packed.dir_rho[3].to_bits(), 2.5f32.to_bits());
         assert_eq!(packed.dir_rho[2].to_bits(), 1.0f32.to_bits());
+        assert_eq!(packed.seed[1], 0);
+    }
+
+    #[test]
+    fn packs_rounded_exponent_round_trip() {
+        let body = FarBody {
+            dir: Vec3::new(0.0, 0.0, 8.0),
+            distance: 8.0,
+            radius: 2.0,
+            shape: FarShape::Rounded { exponent: 2.17 },
+            rotation: Quat::from_xyzw(0.0, 1.0, 0.0, 0.0),
+            albedo: [LinearRgb([0.4, 0.5, 0.6]); 6],
+            atmosphere: LinearRgb([0.1, 0.2, 0.3]),
+            seed: 0xB0D1,
+        };
+        let mut slot = [FarBody::default(); MAX_FAR_BODIES];
+        let n = store(std::slice::from_ref(&body), &mut slot);
+        assert_eq!(n, 1);
+        assert_eq!(slot[0].shape, FarShape::Rounded { exponent: 2.17 });
+        let table = pack_table(&slot[..n as usize]);
+        let gpu = &table.body[0];
+        assert_eq!(gpu.atmosphere[3].to_bits(), 3.0f32.to_bits());
+        assert_eq!(f32::from_bits(gpu.seed[1]).to_bits(), 2.17f32.to_bits());
+        assert_eq!(gpu.seed[0], 0xB0D1);
+        assert_eq!(gpu.seed[2], 0);
+        assert_eq!(gpu.dir_rho[3].to_bits(), 0.25f32.to_bits());
+        assert_eq!(gpu.rot, [0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(std::mem::size_of::<FarBodyGpu>(), 160);
+
+        let again = f32::from_bits(pack_one(&slot[0]).seed[1]);
+        assert_eq!(again.to_bits(), 2.17f32.to_bits());
     }
 }

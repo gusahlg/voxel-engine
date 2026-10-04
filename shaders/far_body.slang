@@ -7,7 +7,8 @@
 #ifndef VOXEL_FAR_BODY_SLANG
 #define VOXEL_FAR_BODY_SLANG
 
-// Ten float4 lanes, 160 bytes. atmosphere.a is the shape: 0 cube, 1 sphere, 2 inner sphere.
+// Ten float4 lanes, 160 bytes. atmosphere.a is the shape: 0 cube, 1 sphere,
+// 2 inner sphere, 3 rounded. seed.y is the rounded exponent as float bits.
 struct FarGpu
 {
     float4 dir_rho;
@@ -170,6 +171,184 @@ bool far_ray_cube(float3 ray, float3 center, float rho, float4 rot, out float t,
     return true;
 }
 
+// Dominant axis of a body-space normal. Ties break toward X, then Y, then Z.
+uint far_dom_face(float3 n)
+{
+    float3 a = abs(n);
+    if (a.x >= a.y && a.x >= a.z)
+        return n.x >= 0.0 ? 0u : 1u;
+    if (a.y >= a.z)
+        return n.y >= 0.0 ? 2u : 3u;
+    return n.z >= 0.0 ? 4u : 5u;
+}
+
+// s = ‖q‖_p and grad s. The origin reports zero.
+void far_lp(float3 q, float p, out float s, out float3 g)
+{
+    float3 a = abs(q);
+    float m = max(a.x, max(a.y, a.z));
+    s = 0.0;
+    g = float3(0.0, 0.0, 0.0);
+    if (m == 0.0)
+        return;
+    float inv = 1.0 / m;
+    float px = pow(a.x * inv, p);
+    float py = pow(a.y * inv, p);
+    float pz = pow(a.z * inv, p);
+    float sum = px + py + pz;
+    if (!(sum > 0.0))
+        return;
+    s = m * pow(sum, 1.0 / p);
+    if (a.x > 0.0) g.x = px / sum * s / a.x * sign(q.x);
+    if (a.y > 0.0) g.y = py / sum * s / a.y * sign(q.y);
+    if (a.z > 0.0) g.z = pz / sum * s / a.z * sign(q.z);
+}
+
+// Sample at tHit when it is outside the solid. Normal from the gradient.
+bool far_round_at(float4 rot, float3 o, float3 d, float tHit, float p, float rho, out float t, out float3 nrm, out uint face)
+{
+    t = 0.0;
+    nrm = float3(0.0, 0.0, 0.0);
+    face = 0u;
+    if (!(tHit > 0.0))
+        return false;
+    float s;
+    float3 g;
+    far_lp(o + d * tHit, p, s, g);
+    if (!(s >= rho))
+        return false;
+    float glen = length(g);
+    if (!(glen > 1e-8))
+        return false;
+    t = tHit;
+    nrm = far_rotate(rot, g / glen);
+    face = far_dom_face(g);
+    return true;
+}
+
+// Superellipsoid of face radius rho. Bound is rho * 3^(1/2 - 1/p), padded a hair
+// so the entry stays outside the solid. A graze of that sphere, where it meets
+// the body, falls back to the sphere point rather than opening a hole.
+bool far_ray_rounded(float3 ray, float3 center, float rho, float4 rot, float exponent, float facing, out float t, out float3 nrm, out uint face)
+{
+    t = 0.0;
+    nrm = float3(0.0, 0.0, 0.0);
+    face = 0u;
+    float p = clamp(exponent, 2.0, 32.0);
+    float rhoB = rho * pow(3.0, 0.5 - 1.0 / p) * (1.0 + 2.0e-4);
+    float disc = facing * facing - (1.0 - rhoB * rhoB);
+    if (disc < 0.0)
+        return false;
+    float sd = sqrt(disc);
+    float tNear = facing - sd;
+    float tFar = facing + sd;
+    if (!(tFar > 0.0))
+        return false;
+
+    float3 o = far_inv_rotate(rot, -center);
+    float3 d = far_inv_rotate(rot, ray);
+    float t0 = max(tNear, 0.0);
+    float s0;
+    float3 g0;
+    far_lp(o, p, s0, g0);
+    if (t0 == 0.0 && s0 <= rho)
+        return false;
+
+    float tC = clamp(facing, t0, tFar);
+    float sC;
+    float3 gC;
+    far_lp(o + d * tC, p, sC, gC);
+    if (sC > rho)
+    {
+        if (sC <= rho * 1.001 && tC > 0.0 && far_round_at(rot, o, d, tC, p, rho, t, nrm, face))
+            return true;
+        if (tNear > 0.0 && sd <= rhoB * 0.02)
+        {
+            float sB;
+            float3 gB;
+            far_lp(o + d * tNear, p, sB, gB);
+            if (sB >= rho && sB <= rho * 1.01)
+            {
+                t = tNear;
+                nrm = (ray * tNear - center) / rhoB;
+                face = far_dom_face(far_inv_rotate(rot, nrm));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    float lo = t0;
+    float hi = tC;
+    [loop]
+    for (uint step = 0u; step < 6u; step++)
+    {
+        float sL;
+        float3 gL;
+        far_lp(o + d * lo, p, sL, gL);
+        if (sL >= rho && sL <= rho * (1.0 + 2.0e-5))
+            break;
+        if (hi - lo < 1e-6)
+            break;
+        float slope = dot(gL, d);
+        bool moved = false;
+        if (slope < -1e-8)
+        {
+            float tN = lo - (sL - rho) / slope;
+            if (tN > lo && tN < hi)
+            {
+                float sN;
+                float3 gN;
+                far_lp(o + d * tN, p, sN, gN);
+                if (sN >= rho)
+                {
+                    lo = tN;
+                    moved = true;
+                }
+                else
+                    hi = tN;
+            }
+        }
+        if (!moved)
+        {
+            float sH;
+            float3 gH;
+            far_lp(o + d * hi, p, sH, gH);
+            float tF = 0.5 * (lo + hi);
+            float span = sL - sH;
+            if (abs(span) > 1e-12)
+            {
+                float guess = lo + (hi - lo) * (sL - rho) / span;
+                if (guess > lo && guess < hi)
+                    tF = guess;
+            }
+            float sF;
+            float3 gF;
+            far_lp(o + d * tF, p, sF, gF);
+            if (sF >= rho)
+                lo = tF;
+            else
+                hi = tF;
+        }
+    }
+    if (far_round_at(rot, o, d, lo, p, rho, t, nrm, face))
+        return true;
+    if (tNear > 0.0)
+    {
+        float sB;
+        float3 gB;
+        far_lp(o + d * tNear, p, sB, gB);
+        if (sB >= rho)
+        {
+            t = tNear;
+            nrm = (ray * tNear - center) / rhoB;
+            face = far_dom_face(far_inv_rotate(rot, nrm));
+            return true;
+        }
+    }
+    return false;
+}
+
 float3 far_face(FarGpu b, uint face)
 {
     if (face == 0u) return b.albedo0.rgb;
@@ -249,7 +428,8 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
         FarGpu b = farTable[0].body[i];
         float rho = b.dir_rho.w;
         float shape = b.atmosphere.w;
-        bool inner = shape > 1.5;
+        bool inner = shape > 1.5 && shape < 2.5;
+        bool rounded = shape > 2.5 && shape < 3.5;
         if (inner)
         {
             if (!(rho > 1.0))
@@ -260,7 +440,9 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
         float3 center = b.dir_rho.xyz;
         float facing = dot(ray, center);
         // Inside the sphere every direction hits the far wall, including away from the centre.
-        if (!inner && facing <= 0.0)
+        // A rounded body can contain the camera in its enclosing sphere while the camera is
+        // still outside the solid, so a ray away from the centre may meet the bulge.
+        if (!inner && !rounded && facing <= 0.0)
             continue;
 
         float3 air = b.atmosphere.rgb;
@@ -278,10 +460,10 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
             }
             continue;
         }
-        bool sphere = b.atmosphere.w > 0.5;
+        bool sphere = shape > 0.5 && shape < 1.5;
         // Angular diameter in pixels. Under ~0.7 px the disc is a soft point.
         float ang = (rho * 2.0) / px;
-        if (ang < 0.7)
+        if (ang < 0.7 && facing > 0.0)
         {
             float tPoint = 1.0 - rho;
             if (tPoint < bestT)
@@ -321,6 +503,31 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
                 if (s < rho + width && facing < bestT)
                 {
                     float u = saturate((s - rho) / width);
+                    float rim = 1.0 - u;
+                    col += air * (rim * rim);
+                }
+            }
+        }
+        else if (rounded)
+        {
+            float pExp = asfloat(b.seed.y);
+            hit = far_ray_rounded(ray, center, rho, b.rot, pExp, facing, t, nrm, face);
+            if (hit && t < bestT)
+            {
+                bestT = t;
+                float3 bodyP = far_inv_rotate(b.rot, ray * t - center);
+                float3 alb = far_albedo(b, bodyP, face, false, rho);
+                col = far_through_air(far_lit(alb, nrm, ray, air, rho, false), inscatter, rho);
+            }
+            else if (!hit && hasAir)
+            {
+                float pRim = max(pExp, 2.0);
+                float rhoB = rho * pow(3.0, 0.5 - 1.0 / pRim);
+                float s = length(cross(ray, center));
+                float width = max(rhoB * 0.05, px * 1.25);
+                if (s > rhoB && s < rhoB + width && facing < bestT)
+                {
+                    float u = saturate((s - rhoB) / width);
                     float rim = 1.0 - u;
                     col += air * (rim * rim);
                 }
