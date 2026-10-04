@@ -199,6 +199,21 @@ float3 far_albedo(FarGpu b, float3 bodyP, uint face, bool sphere, float rho)
     return alb;
 }
 
+// How much a disc of angular radius `rho` (sine of it) is the ground under the viewer: standing
+// on a body it fills half the sky and continues the terrain at the horizon.
+float far_near(float rho)
+{
+    return smoothstep(0.95, 0.9995, rho);
+}
+
+// A body beyond the viewer's air is seen through it: the air's in-scatter in front plus the body's
+// light, so its night side is the sky colour by day (not a black hole in it). The body underfoot is
+// the ground at the horizon and keeps its own colour.
+float3 far_through_air(float3 lit, float3 inscatter, float rho)
+{
+    return lit + inscatter * (1.0 - far_near(rho));
+}
+
 float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air, float rho, bool core)
 {
     // Same night flip as the terrain: light.w is 1 by day and 0 by night,
@@ -210,7 +225,7 @@ float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air, float rho, bool c
     // Standing on a body (it fills half the sky) its disc continues the terrain at the horizon, so
     // it takes the terrain's sky light (an omnidirectional share of the sun plus the bounce floor);
     // from afar it is a lit sphere with a dark night side.
-    float near = core ? 0.0 : smoothstep(0.95, 0.9995, rho);
+    float near = core ? 0.0 : far_near(rho);
     float diffuse = lerp(ndl, 0.45 + 0.55 * ndl, near);
     float3 lit = alb * (frame.light.rgb * diffuse + frame.ambient_glow.rgb + frame.shadow_bounce.rgb * near);
     float fres = 1.0 - saturate(dot(nrm, -ray));
@@ -219,7 +234,8 @@ float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air, float rho, bool c
 }
 
 // `px` is the pixel angle, from fwidth in the entry point (uniform flow).
-float3 far_bodies(float3 ray, float3 col, float px)
+// `inscatter` is the viewer's sky radiance along `ray` (no sun disc, moon or stars).
+float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
 {
     uint n = min(farTable[0].header.x, 32u);
     if (n == 0u)
@@ -296,7 +312,7 @@ float3 far_bodies(float3 ray, float3 col, float px)
                     float3 bodyP = far_inv_rotate(b.rot, ray * t - center);
                     float3 alb = far_albedo(b, bodyP, 0u, true, rho);
                     float cov = saturate(0.5 + (rho - s) / px);
-                    col = lerp(col, far_lit(alb, nrm, ray, air, rho, false), cov);
+                    col = lerp(col, far_through_air(far_lit(alb, nrm, ray, air, rho, false), inscatter, rho), cov);
                 }
             }
             else if (hasAir)
@@ -318,7 +334,7 @@ float3 far_bodies(float3 ray, float3 col, float px)
                 bestT = t;
                 float3 bodyP = far_inv_rotate(b.rot, ray * t - center);
                 float3 alb = far_albedo(b, bodyP, face, false, rho);
-                col = lerp(col, far_lit(alb, nrm, ray, air, rho, false), 1.0);
+                col = far_through_air(far_lit(alb, nrm, ray, air, rho, false), inscatter, rho);
             }
             else if (!hit && hasAir)
             {

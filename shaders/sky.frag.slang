@@ -90,7 +90,8 @@ float4 fragmentMain(FragmentInput input) : SV_Target
 
     // Fog IS the sky: the same analytic radiance the terrain fades toward, plus
     // the additive HDR sun disc. glow_pow / sun dir / disc cosines are hoisted.
-    float3 col = sky_radiance(ray, frame)
+    float3 inscatter = sky_radiance(ray, frame);
+    float3 col = inscatter
                + sun_disc_cos(ray, pc.sun.xyz, pc.sun_tint.rgb, pc.sun.w, pc.sun_tint.w);
 
     // Moon opposite sun, stars and moon gated by night (1 - light.w).
@@ -107,11 +108,12 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     if (star_night * frame.extras.x > 0.0)
         col += stars(ray, moon_dir, star_night) * frame.extras.x;
 
-    // Far bodies occlude stars, the sun disc and the moon behind them.
+    // Far bodies occlude stars, the sun disc and the moon behind them, and are
+    // seen through the viewer's own air (`inscatter`, ~0 in space).
     // fwidth stays in this entry point, ahead of the body-count early-out,
     // so a uniform count of zero cannot flatten the derivative.
     float px = max(length(fwidth(ray)), 1e-6);
-    col = far_bodies(ray, col, px);
+    col = far_bodies(ray, col, inscatter, px);
 
     // Slab clouds composite LAST so opaque cloud occludes the sun/moon/stars it
     // covers. The octahedral map is the local upper hemisphere; skip the tap
