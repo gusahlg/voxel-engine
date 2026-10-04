@@ -850,8 +850,8 @@ pub fn run(config: Config, frame_callback: impl FnMut(&mut Engine) -> bool) {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = EngineApp {
         config,
-        engine: None,
         callback: frame_callback,
+        engine: None,
         finished: false,
         ran_this_cycle: false,
         init_failed: false,
@@ -878,8 +878,11 @@ pub fn run(config: Config, frame_callback: impl FnMut(&mut Engine) -> bool) {
 
 struct EngineApp<F> {
     config: Config,
-    engine: Option<Engine>,
+    /// Declared before `engine` so it drops first: the game's worker threads still hold mesh
+    /// staging writers into the engine's mapped buffers, and must be joined before the renderer
+    /// frees them (dropping the engine first crashed on exit with a write into unmapped memory).
     callback: F,
+    engine: Option<Engine>,
     /// Set once the callback returns false; queued events after `exit()` must
     /// not run another frame (or the last frame's output would repeat).
     finished: bool,
