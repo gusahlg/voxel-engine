@@ -414,6 +414,18 @@ impl FarMaps {
         out
     }
 
+    /// Minimum datum offset of each map, for the lo-sphere disc. An empty
+    /// slot reports 0, the same flat datum the shader samples.
+    pub(crate) fn min_offsets(&self) -> [f32; MAX_FAR_MAPS] {
+        let mut out = [0.0; MAX_FAR_MAPS];
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot.g >= 2 {
+                out[i] = slot.min_off;
+            }
+        }
+        out
+    }
+
     pub(crate) fn has_garbage(&self) -> bool {
         !self.image_retire.is_empty()
             || !self.staging_retire.is_empty()

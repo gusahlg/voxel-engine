@@ -9,6 +9,8 @@
 //! cube, rounded or mapped body. When a coarse-shading query is passed, the
 //! base run is stably split into tiles the sun and moon discs miss, then the
 //! rest, and the heavy run is split into mapped-interior tiles, then the rest.
+//! A mapped-interior tile lies inside the horizon disc or, with the eye
+//! outside the lo sphere, inside that sphere's disc.
 //! `list_header.x` stays the whole base count; the shader still indexes by
 //! instance id.
 
@@ -708,6 +710,62 @@ fn mapped_interior_half(horizon: f32, air: f32, distance: f32, px_max: f32) -> O
     }
 }
 
+/// Half-angle of the lo-sphere disc, shrunk by `px_margin` radians, as `(sin, cos)`.
+///
+/// The surface is everywhere at least the lo sphere, so with the eye outside
+/// that sphere (`0 < rho_lo < 1`) every ray inside the disc of half-angle
+/// `asin(rho_lo)` around the body centre hits the surface. `px_margin` is the
+/// extra inset past the tile cone (2 px when it is [`FarView::px_max`]).
+/// `None` when the eye is not strictly outside the lo sphere or the margin
+/// eats the disc.
+fn lo_disc_interior(rho_lo: f32, px_margin: f32) -> Option<(f32, f32)> {
+    if !(rho_lo > 0.0 && rho_lo < 1.0) || !rho_lo.is_finite() {
+        return None;
+    }
+    if !px_margin.is_finite() || px_margin < 0.0 {
+        return None;
+    }
+    let sin_a = rho_lo;
+    let cos_a = (1.0 - sin_a * sin_a).max(0.0).sqrt();
+    let sin_d = px_margin.sin();
+    let cos_d = px_margin.cos();
+    // A margin of 90° or more leaves no disc a tile can sit inside.
+    if !(sin_d >= 0.0 && cos_d > 0.0) || !sin_d.is_finite() || !cos_d.is_finite() {
+        return None;
+    }
+    let sin_b = sin_a * cos_d - cos_a * sin_d;
+    let cos_b = cos_a * cos_d + sin_a * sin_d;
+    if !(sin_b > 0.0) || !sin_b.is_finite() || !cos_b.is_finite() {
+        None
+    } else {
+        Some((sin_b, cos_b))
+    }
+}
+
+/// `radius/distance + min_offset/distance` for a mapped body. `None` when the
+/// record is not mapped or the distance is unusable.
+fn mapped_rho_lo(gpu: &FarBodyGpu, map_min: &[f32; MAX_FAR_MAPS]) -> Option<f32> {
+    let shape = gpu.atmosphere[3];
+    if !(3.5..4.5).contains(&shape) {
+        return None;
+    }
+    let map_plus = gpu.seed[2];
+    if map_plus == 0 || map_plus as usize > MAX_FAR_MAPS {
+        return None;
+    }
+    let distance = gpu.albedo2[3];
+    let rho = gpu.dir_rho[3];
+    if !(distance > 0.0) || !distance.is_finite() || !rho.is_finite() {
+        return None;
+    }
+    let min_off = map_min[(map_plus as usize) - 1];
+    if !min_off.is_finite() {
+        return None;
+    }
+    let rho_lo = rho + min_off / distance;
+    rho_lo.is_finite().then_some(rho_lo)
+}
+
 /// Maximum of `dot(unit ray, dir)` on the view's direction cone.
 ///
 /// `dir` is unit. The maximum on a convex spherical polygon is 1 when `dir`
@@ -1266,14 +1324,22 @@ fn split_coarse_base(
 
 /// Stably partition the heavy run into mapped-interior tiles, then the rest.
 /// Returns the coarse count. A tile qualifies when its mask is exactly one
-/// mapped body with `horizon < 1`, its cone lies strictly inside that body's
-/// disc inset by the air limb and 3 px, and neither disc meets it. Stars, a
-/// missing frame, or an unusable disc leave the run unchanged and return 0.
+/// mapped body (no other body, and so no nearer body, can cover it), neither
+/// disc meets it, and its cone lies strictly inside one of:
+///
+/// * the horizon disc inset by the air limb and 3 px, when `horizon < 1`;
+/// * the lo-sphere disc inset by 2 px, when the eye is outside that sphere.
+///   The tile cone already carries the tile's angular radius, so the inset
+///   is the rest of the margin.
+///
+/// Stars, a missing frame, or an unusable disc leave the run unchanged and
+/// return 0. `map_min[i]` is map `i`'s minimum datum offset.
 fn split_coarse_far(
     table: &mut FarTableGpu,
     frames: &TileFrames,
     view: &FarView,
     query: &SkyCoarseQuery,
+    map_min: &[f32; MAX_FAR_MAPS],
 ) -> u32 {
     if query.stars {
         return 0;
@@ -1301,19 +1367,15 @@ fn split_coarse_far(
         return 0;
     };
     let kept = (table.header[0] as usize).min(MAX_FAR_BODIES);
+    // Horizon-disc cone, then lo-sphere disc. Either one admits the tile.
     let mut interior: [Option<(glam::Vec3, f32, f32)>; MAX_FAR_BODIES] = [None; MAX_FAR_BODIES];
+    let mut lo_interior: [Option<(glam::Vec3, f32, f32)>; MAX_FAR_BODIES] = [None; MAX_FAR_BODIES];
     for k in 0..kept {
         let gpu = &table.body[k];
         let shape = gpu.atmosphere[3];
-        let horizon = gpu.albedo0[3];
-        if !(3.5..4.5).contains(&shape) || !(horizon < 1.0) {
+        if !(3.5..4.5).contains(&shape) {
             continue;
         }
-        let Some((sin_b, cos_b)) =
-            mapped_interior_half(horizon, gpu.albedo1[3], gpu.albedo2[3], view.px_max)
-        else {
-            continue;
-        };
         let dir = glam::Vec3::new(table.cone[k][0], table.cone[k][1], table.cone[k][2]);
         let Some(dir) = unit_dir(dir) else {
             continue;
@@ -1321,7 +1383,19 @@ fn split_coarse_far(
         let Some(dir_view) = unit_dir(basis.to_view(dir)) else {
             continue;
         };
-        interior[k] = Some((dir_view, sin_b, cos_b));
+        let horizon = gpu.albedo0[3];
+        if horizon < 1.0
+            && let Some((sin_b, cos_b)) =
+                mapped_interior_half(horizon, gpu.albedo1[3], gpu.albedo2[3], view.px_max)
+        {
+            interior[k] = Some((dir_view, sin_b, cos_b));
+        }
+        // `px_max` is already two pixel-angles, the 2 px inset.
+        if let Some(rho_lo) = mapped_rho_lo(gpu, map_min)
+            && let Some((sin_b, cos_b)) = lo_disc_interior(rho_lo, view.px_max)
+        {
+            lo_interior[k] = Some((dir_view, sin_b, cos_b));
+        }
     }
     let start = (n_base + n_sphere) as usize;
     let end = start + n_heavy as usize;
@@ -1338,14 +1412,21 @@ fn split_coarse_far(
         let mask = table.tile_mask[index as usize];
         let inside = mask.count_ones() == 1 && {
             let k = mask.trailing_zeros() as usize;
-            match interior[k] {
+            let in_horizon = match interior[k] {
                 Some((dir_view, sin_b, cos_b)) => {
                     tile_strictly_inside(tile, dir_view, sin_b, cos_b)
-                        && !tile_within(tile, sun_view, sun_sin, sun_cos)
-                        && !tile_within(tile, moon_view, moon_sin, moon_cos)
                 }
                 None => false,
-            }
+            };
+            let in_lo = match lo_interior[k] {
+                Some((dir_view, sin_b, cos_b)) => {
+                    tile_strictly_inside(tile, dir_view, sin_b, cos_b)
+                }
+                None => false,
+            };
+            (in_horizon || in_lo)
+                && !tile_within(tile, sun_view, sun_sin, sun_cos)
+                && !tile_within(tile, moon_view, moon_sin, moon_cos)
         };
         take.push(inside);
     }
@@ -1632,6 +1713,7 @@ impl FarBodyRing {
         bodies: &[FarBody],
         view: Option<FarView>,
         map_max: &[f32; MAX_FAR_MAPS],
+        map_min: &[f32; MAX_FAR_MAPS],
         coarse: Option<SkyCoarseQuery>,
         sky_up: glam::Vec3,
     ) -> f32 {
@@ -1656,7 +1738,8 @@ impl FarBodyRing {
             if let (Some(query), Some(view)) = (coarse.as_ref(), view.as_ref()) {
                 if self.tiles.matches(view) {
                     draw.n_coarse = split_coarse_base(&mut table, &self.tiles, view, query);
-                    draw.n_coarse_far = split_coarse_far(&mut table, &self.tiles, view, query);
+                    draw.n_coarse_far =
+                        split_coarse_far(&mut table, &self.tiles, view, query, map_min);
                 }
             }
         }
@@ -3609,7 +3692,14 @@ mod tests {
         let header = table.list_header;
         // Sun behind the camera. The moon sits on the view axis, on the horizon,
         // so it only knocks out tiles near the limb.
-        let n = split_coarse_far(&mut table, &frames, &view, &coarse_query(Vec3::Z, false));
+        let map_min = [0.0f32; MAX_FAR_MAPS];
+        let n = split_coarse_far(
+            &mut table,
+            &frames,
+            &view,
+            &coarse_query(Vec3::Z, false),
+            &map_min,
+        );
         assert!(n > 0 && n < n_heavy, "coarse {n} of {n_heavy}");
         assert_eq!(table.list_header, header);
         let coarse = &table.tile_index[start..start + n as usize];
@@ -3642,34 +3732,81 @@ mod tests {
         }
         assert!(boundary > 0, "every heavy tile was interior");
 
-        // Stars, and a horizon that disables the cone, leave the heavy run put.
+        // Stars leave the heavy run put. A horizon of 1 does not: the lo sphere
+        // still classifies tiles, covered below.
         let mut starred = super::pack_table(std::slice::from_ref(&body), Some(view), &map_max);
         let star_before = starred.tile_index[start..end].to_vec();
         assert_eq!(
-            split_coarse_far(&mut starred, &frames, &view, &coarse_query(Vec3::Z, true)),
+            split_coarse_far(
+                &mut starred,
+                &frames,
+                &view,
+                &coarse_query(Vec3::Z, true),
+                &map_min,
+            ),
             0
         );
         assert_eq!(&starred.tile_index[start..end], star_before.as_slice());
 
-        // rho 0.75 reaches the bottom of this view; horizon >= 1 stays on the
-        // per-pixel disc and must not join the coarse prefix.
+        // horizon >= 1 disables the horizon disc. The lo sphere still admits
+        // tiles: min offset 0 makes rho_lo = rho = 0.75, and a downward view
+        // puts the centre inside that disc while the corners stay out.
         let disabled = mapped_down(4.0, 3.0, 1.0, 0.0);
-        let mut off = super::pack_table(std::slice::from_ref(&disabled), Some(view), &map_max);
+        let down = view_pitched(-50.0, 70.0, 640, 360);
+        let down_frames = TileFrames::build(&down).expect("down frames");
+        let mut off = super::pack_table(std::slice::from_ref(&disabled), Some(down), &map_max);
         let (off_start, off_end) = heavy_run(&off);
         assert!(off_end > off_start, "horizon >= 1 painted no heavy tile");
         let off_before = off.tile_index[off_start..off_end].to_vec();
-        assert_eq!(
-            split_coarse_far(&mut off, &frames, &view, &coarse_query(Vec3::Z, false)),
-            0
+        let n_lo = split_coarse_far(
+            &mut off,
+            &down_frames,
+            &down,
+            &coarse_query(Vec3::Y, false),
+            &map_min,
         );
-        assert_eq!(&off.tile_index[off_start..off_end], off_before.as_slice());
+        assert!(n_lo > 0 && (n_lo as usize) < off_end - off_start);
+        let (sin_lo, cos_lo) = lo_disc_interior(0.75, down.px_max).expect("lo disc");
+        let down_basis = ViewBasis::from_view_proj(down.view_proj).expect("down basis");
+        let down_dir = down_basis.to_view(-Vec3::Y).normalize();
+        let Some(sun) = unit_dir(Vec3::Y) else {
+            panic!("sun");
+        };
+        let sun_view = down_basis.to_view(sun).normalize();
+        let moon_view = down_basis.to_view(-sun).normalize();
+        let (sun_sin, sun_cos) =
+            widened_disc(coarse_query(Vec3::Y, false).sun_cos_rim, down.px_max).expect("sun disc");
+        let (moon_sin, moon_cos) =
+            widened_disc(coarse_query(Vec3::Y, false).moon_cos_rim, down.px_max).expect("moon");
+        let lo_coarse = &off.tile_index[off_start..off_start + n_lo as usize];
+        let lo_fine = &off.tile_index[off_start + n_lo as usize..off_end];
+        for &index in &off_before {
+            let tile = &down_frames.samples[index as usize];
+            let inside = tile_strictly_inside(tile, down_dir, sin_lo, cos_lo)
+                && !tile_within(tile, sun_view, sun_sin, sun_cos)
+                && !tile_within(tile, moon_view, moon_sin, moon_cos);
+            if inside {
+                assert!(
+                    lo_coarse.contains(&index),
+                    "lo-disc tile {index} stayed 1x1"
+                );
+            } else {
+                assert!(lo_fine.contains(&index), "outside tile {index} went coarse");
+            }
+        }
 
         // A second body on the same tiles drops those tiles out of the prefix.
         // Bottom-centre of this view, inside the mapped hemisphere and on screen.
         let companion = placed(Vec3::new(0.0, -1.0, -1.0), 0.15, FarShape::Sphere, 2);
         let mut both = super::pack_table(&[body, companion], Some(view), &map_max);
         assert_eq!(both.header[0], 2);
-        let n_both = split_coarse_far(&mut both, &frames, &view, &coarse_query(Vec3::Z, false));
+        let n_both = split_coarse_far(
+            &mut both,
+            &frames,
+            &view,
+            &coarse_query(Vec3::Z, false),
+            &map_min,
+        );
         assert!(n_both > 0, "the companion erased every interior tile");
         let (both_start, both_end) = heavy_run(&both);
         let both_coarse = &both.tile_index[both_start..both_start + n_both as usize];
@@ -3693,6 +3830,166 @@ mod tests {
         let mut covered = super::pack_table(std::slice::from_ref(&body), Some(view), &map_max);
         let mut query = coarse_query(-Vec3::Y, false);
         query.sun_cos_rim = 0.0;
-        assert_eq!(split_coarse_far(&mut covered, &frames, &view, &query), 0);
+        assert_eq!(
+            split_coarse_far(&mut covered, &frames, &view, &query, &map_min),
+            0
+        );
+    }
+
+    /// Every pixel of a lo-sphere interior tile meets the datum. Altitudes run
+    /// from 10 m to 1e6 m above the lo sphere; the horizon lane stays at 1 so
+    /// only the lo disc can admit a tile. The sun and moon sit on ±X, ninety
+    /// degrees off a view in the YZ plane, so a disc does not knock a tile out.
+    #[test]
+    fn lo_interior_pixels_hit_the_mapped_surface() {
+        let radius = 31_017_520.0f32;
+        let g = 9u32;
+        let gg = g as usize;
+        let mut datum = vec![0.0f32; 6 * gg * gg];
+        for face in 0..6usize {
+            let (tu, n, tv) = crate::far_body::far_map_basis(face);
+            for j in 0..g {
+                for i in 0..g {
+                    let edge = (g - 1) as f32;
+                    let xi = 2.0 * i as f32 / edge - 1.0;
+                    let eta = 2.0 * j as f32 / edge - 1.0;
+                    let quarter = std::f32::consts::FRAC_PI_4;
+                    let d =
+                        (n + tu * (xi * quarter).tan() + tv * (eta * quarter).tan()).normalize();
+                    let bump = radius
+                        * (0.004 * (d.x * 3.0).sin() * (d.y * 2.0 + 0.4).cos()
+                            + 0.002 * (d.z * 5.0).sin());
+                    datum[face * gg * gg + j as usize * gg + i as usize] = bump;
+                }
+            }
+        }
+        let min_off = datum.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_off = datum.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            min_off < 0.0 && max_off > 0.0,
+            "relief {min_off}..{max_off}"
+        );
+        // Point the deepest sample at the eye. The eye is then `altitude`
+        // above the surface as well as above the lo sphere, so it is outside
+        // the star body and a lo-disc ray has a forward hit.
+        let mut valley = Vec3::Y;
+        let mut valley_off = f32::INFINITY;
+        for face in 0..6usize {
+            let (tu, n, tv) = crate::far_body::far_map_basis(face);
+            for j in 0..g {
+                for i in 0..g {
+                    let edge = (g - 1) as f32;
+                    let xi = 2.0 * i as f32 / edge - 1.0;
+                    let eta = 2.0 * j as f32 / edge - 1.0;
+                    let quarter = std::f32::consts::FRAC_PI_4;
+                    let d =
+                        (n + tu * (xi * quarter).tan() + tv * (eta * quarter).tan()).normalize();
+                    let off = datum[face * gg * gg + j as usize * gg + i as usize];
+                    if off < valley_off {
+                        valley_off = off;
+                        valley = d;
+                    }
+                }
+            }
+        }
+        let valley_rot = Quat::from_rotation_arc(valley, Vec3::Y);
+        let mut map_min = [0.0f32; MAX_FAR_MAPS];
+        let mut map_max = [0.0f32; MAX_FAR_MAPS];
+        map_min[0] = min_off;
+        map_max[0] = max_off;
+
+        let mut state = 0xA11C_E5EDu32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let unit = |rng: &mut dyn FnMut() -> u32| rng() as f32 / u32::MAX as f32;
+        // 10 m through 1e6 m, plus a couple of draws inside that range.
+        let mut altitudes = vec![10.0f32, 1_000_000.0];
+        for _ in 0..6 {
+            let t = unit(&mut next);
+            // Log span so both the near ground and the far approach show up.
+            let log_h = 10.0f32.ln() + t * ((1.0e6f32).ln() - 10.0f32.ln());
+            altitudes.push(log_h.exp());
+        }
+        let width = 192u32;
+        let height = 108u32;
+        let mut checked = 0u32;
+        let mut interiors = 0u32;
+        for (trial, &altitude) in altitudes.iter().enumerate() {
+            let pitch = -75.0 + unit(&mut next) * 50.0;
+            let yaw = unit(&mut next) * std::f32::consts::TAU;
+            let distance = radius + min_off + altitude;
+            assert!(distance > 0.0);
+            let mut body = mapped_down(distance, radius, 1.0, 0.0);
+            // Yaw around the valley so the relief turns under a fixed eye.
+            body.rotation = Quat::from_rotation_y(yaw) * valley_rot;
+            let rho_lo = (radius + min_off) / distance;
+            assert!(
+                rho_lo > 0.0 && rho_lo < 1.0,
+                "alt {altitude} rho_lo {rho_lo}"
+            );
+            let view = view_pitched(pitch, 70.0, width, height);
+            let Some(frames) = TileFrames::build(&view) else {
+                continue;
+            };
+            let mut table = super::pack_table(std::slice::from_ref(&body), Some(view), &map_max);
+            if table.header[0] == 0 {
+                continue;
+            }
+            let (start, end) = heavy_run(&table);
+            if end <= start {
+                continue;
+            }
+            let n = split_coarse_far(
+                &mut table,
+                &frames,
+                &view,
+                &coarse_query(Vec3::X, false),
+                &map_min,
+            );
+            if n == 0 {
+                continue;
+            }
+            interiors += n;
+            let inv = view.view_proj.inverse();
+            let tile_px = table.header[1];
+            let tiles_x = table.header[2];
+            let rho = radius / distance;
+            for &index in &table.tile_index[start..start + n as usize] {
+                let [x0, y0, x1, y1] = tile_rect(index, tile_px, tiles_x, width, height);
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let ray = ray_at(&inv, width, height, x as f32 + 0.5, y as f32 + 0.5);
+                        if !ray.is_finite() {
+                            continue;
+                        }
+                        let hit = ray_mapped(
+                            ray,
+                            body.dir,
+                            rho,
+                            distance,
+                            body.rotation,
+                            1.0,
+                            g,
+                            &datum,
+                            min_off,
+                            max_off,
+                        );
+                        let facing = ray.dot(body.dir);
+                        let lo_disc = facing * facing - (1.0 - rho_lo * rho_lo);
+                        assert!(
+                            hit.is_some(),
+                            "trial {trial} alt {altitude} pitch {pitch:.1} pixel {x},{y} tile {index} missed; facing {facing} rho {rho} rho_lo {rho_lo} lo_disc {lo_disc} ray {ray:?}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(interiors > 0, "no lo-sphere interior tile in the sweep");
+        assert!(checked > 1000, "checked only {checked} interior pixels");
     }
 }

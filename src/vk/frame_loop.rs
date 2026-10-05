@@ -214,6 +214,7 @@ impl Renderer {
                 lists.far_slice(),
                 view,
                 &self.far_maps.max_offsets(),
+                &self.far_maps.min_offsets(),
                 coarse,
                 lists.local_frame().up,
             )
