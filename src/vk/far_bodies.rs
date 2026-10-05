@@ -1,6 +1,8 @@
 //! Host ring of far-body records for the sky pass (set 0, binding 2).
 //! One coherent buffer per frame-in-flight, written before the sky draw.
 //! The record matches `FarGpu` in `shaders/far_body.slang` (160 bytes, std430).
+//! A 16-byte cone sits in front of each record so a pixel can reject the body
+//! before loading it.
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
@@ -8,6 +10,13 @@ use bytemuck::{Pod, Zeroable};
 use crate::far_body::{FarBody, FarShape, MAX_FAR_BODIES};
 use crate::rev::{FrameSlot, PerSlot};
 use crate::vk::buffers::HostBuffer;
+
+/// `VOXEL_FAR_CULL=0` disables far-body culling. Any other value, including
+/// unset, leaves it on. Read once.
+fn far_cull_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !std::env::var("VOXEL_FAR_CULL").is_ok_and(|v| v == "0"))
+}
 
 /// One body on the GPU. Ten 16-byte lanes, 160 bytes.
 #[repr(C, align(16))]
@@ -27,17 +36,50 @@ pub(crate) struct FarBodyGpu {
     pub seed: [u32; 4],
 }
 
-/// Header plus the fixed table. `header[0]` is the live count.
+/// Header, then one cone per slot, then the body records.
+/// `header[0]` is the live count. `cone[i] = (dir.xyz, sine bound)` and a
+/// bound of `-1` means the pixel test must not reject that body.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 pub(crate) struct FarTableGpu {
     pub header: [u32; 4],
+    pub cone: [[f32; 4]; MAX_FAR_BODIES],
     pub body: [FarBodyGpu; MAX_FAR_BODIES],
 }
 
 const _: () = assert!(std::mem::size_of::<FarBodyGpu>() == 160);
-const _: () = assert!(std::mem::size_of::<FarTableGpu>() == 16 + 160 * MAX_FAR_BODIES);
-const _: () = assert!(std::mem::offset_of!(FarTableGpu, body) == 16);
+const _: () =
+    assert!(std::mem::size_of::<FarTableGpu>() == 16 + 16 * MAX_FAR_BODIES + 160 * MAX_FAR_BODIES);
+const _: () = assert!(std::mem::offset_of!(FarTableGpu, cone) == 16);
+const _: () = assert!(std::mem::offset_of!(FarTableGpu, body) == 16 + 16 * MAX_FAR_BODIES);
+
+/// Sine of the angular radius the shader can draw (`s = ‖ray × center‖`), or
+/// `-1` when a ray facing away can still hit. Matches `far_bodies()`: the
+/// sphere and rounded rims reach `1.05` times the body, the cube's corners
+/// sit at `√3` times the enlarged half-extent, and an inner sphere is the sky.
+fn cone_bound(body: &FarBody) -> f32 {
+    if !far_cull_enabled() {
+        return -1.0;
+    }
+    let rho = body.radius / body.distance;
+    let bound = match body.shape {
+        FarShape::InnerSphere => return -1.0,
+        FarShape::Sphere => 1.05 * rho,
+        FarShape::Cube => 3.0f32.sqrt() * 1.035 * rho,
+        FarShape::Rounded { exponent } => {
+            let p = exponent.clamp(2.0, 32.0);
+            let rho_b = rho * 3.0f32.powf(0.5 - 1.0 / p) * (1.0 + 2.0e-4);
+            1.05 * rho_b
+        }
+    };
+    // The camera is inside, or nearly inside, the bounding sphere: a ray
+    // facing away can still meet the body, so the cone must not reject it.
+    if !bound.is_finite() || bound >= 0.99 {
+        -1.0
+    } else {
+        bound
+    }
+}
 
 fn rgb4(c: crate::color::LinearRgb) -> [f32; 4] {
     [c.0[0], c.0[1], c.0[2], 0.0]
@@ -76,6 +118,8 @@ pub(crate) fn pack_table(bodies: &[FarBody]) -> FarTableGpu {
     let n = bodies.len().min(MAX_FAR_BODIES);
     table.header[0] = n as u32;
     for (i, body) in bodies.iter().take(n).enumerate() {
+        let d = body.dir;
+        table.cone[i] = [d.x, d.y, d.z, cone_bound(body)];
         table.body[i] = pack_one(body);
     }
     table
@@ -131,7 +175,7 @@ impl FarBodyRing {
 mod tests {
     use super::*;
     use crate::color::LinearRgb;
-    use crate::far_body::{store, FarBody, FarShape};
+    use crate::far_body::{FarBody, FarShape, store};
     use glam::{Quat, Vec3};
 
     #[test]
@@ -210,5 +254,76 @@ mod tests {
 
         let again = f32::from_bits(pack_one(&slot[0]).seed[1]);
         assert_eq!(again.to_bits(), 2.17f32.to_bits());
+    }
+
+    fn sample(shape: FarShape, distance: f32, radius: f32) -> FarBody {
+        FarBody {
+            dir: Vec3::Z,
+            distance,
+            radius,
+            shape,
+            rotation: Quat::IDENTITY,
+            albedo: [LinearRgb([0.2, 0.3, 0.4]); 6],
+            atmosphere: LinearRgb([0.0, 0.0, 0.0]),
+            seed: 1,
+        }
+    }
+
+    #[test]
+    fn cone_bound_matches_what_the_shader_can_draw() {
+        let sphere = sample(FarShape::Sphere, 1.0, 0.25);
+        let table = pack_table(std::slice::from_ref(&sphere));
+        assert_eq!(table.header[0], 1);
+        assert_eq!(table.cone[0][0].to_bits(), 0.0f32.to_bits());
+        assert_eq!(table.cone[0][1].to_bits(), 0.0f32.to_bits());
+        assert_eq!(table.cone[0][2].to_bits(), 1.0f32.to_bits());
+        assert_eq!(table.cone[0][3].to_bits(), (1.05f32 * 0.25).to_bits());
+        assert_eq!(table.cone[0][0..3], table.body[0].dir_rho[0..3]);
+
+        // 1.05 * rho >= 0.99: the camera is nearly inside the bounding sphere.
+        let inside = sample(FarShape::Sphere, 1.0, 0.95);
+        assert!(1.05 * 0.95 >= 0.99);
+        assert_eq!(
+            pack_table(std::slice::from_ref(&inside)).cone[0][3].to_bits(),
+            (-1.0f32).to_bits()
+        );
+
+        let cube = sample(FarShape::Cube, 1.0, 0.2);
+        let cube_bound = 3.0f32.sqrt() * 1.035 * 0.2;
+        assert!(cube_bound < 0.99);
+        assert_eq!(
+            pack_table(std::slice::from_ref(&cube)).cone[0][3].to_bits(),
+            cube_bound.to_bits()
+        );
+
+        let rounded = sample(FarShape::Rounded { exponent: 4.0 }, 1.0, 0.2);
+        let p = 4.0f32;
+        let rho_b = 0.2 * 3.0f32.powf(0.5 - 1.0 / p) * (1.0 + 2.0e-4);
+        assert_eq!(
+            pack_table(std::slice::from_ref(&rounded)).cone[0][3].to_bits(),
+            (1.05 * rho_b).to_bits()
+        );
+
+        // The shader clamps the exponent to 32; the cone uses that same p.
+        let steep = sample(FarShape::Rounded { exponent: 80.0 }, 1.0, 0.1);
+        let p32 = 32.0f32;
+        let rho_b32 = 0.1 * 3.0f32.powf(0.5 - 1.0 / p32) * (1.0 + 2.0e-4);
+        assert!(1.05 * rho_b32 < 0.99);
+        assert_eq!(
+            pack_table(std::slice::from_ref(&steep)).cone[0][3].to_bits(),
+            (1.05 * rho_b32).to_bits()
+        );
+
+        let wall = sample(FarShape::InnerSphere, 2.0, 5.0);
+        assert_eq!(
+            pack_table(std::slice::from_ref(&wall)).cone[0][3].to_bits(),
+            (-1.0f32).to_bits()
+        );
+
+        assert_eq!(std::mem::offset_of!(FarTableGpu, cone), 16);
+        assert_eq!(
+            std::mem::offset_of!(FarTableGpu, body),
+            16 + 16 * MAX_FAR_BODIES
+        );
     }
 }
