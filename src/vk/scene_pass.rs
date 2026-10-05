@@ -824,7 +824,8 @@ impl<'a> RenderPass<'a> {
 
     /// The procedural sky background pass (sky pipeline: fragment push constant,
     /// FrameUniforms at set 0 binding 1, cloud LUT at binding 0, far-body table
-    /// at binding 2, no vertex buffer). A single fullscreen triangle at the
+    /// at binding 2, datum buffer at binding 3, albedo cubes at binding 4, no
+    /// vertex buffer). A single fullscreen triangle at the
     /// reversed-Z far plane; the read-only depth test rejects it wherever
     /// terrain wrote closer depth, so it shades only background pixels. Skipped
     /// unless the frame set a sky palette.
@@ -864,6 +865,28 @@ impl<'a> RenderPass<'a> {
                 .buffer(far)
                 .offset(0)
                 .range(vk::WHOLE_SIZE)];
+            let datum = self.r.far_maps.buffer();
+            let datum_infos = [vk::DescriptorBufferInfo::default()
+                .buffer(datum)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+            let cube_sampler = self.r.far_maps.sampler();
+            let cube_info = |id: usize| {
+                vk::DescriptorImageInfo::default()
+                    .sampler(cube_sampler)
+                    .image_view(self.r.far_maps.view(id))
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            };
+            let cube_infos = [
+                cube_info(0),
+                cube_info(1),
+                cube_info(2),
+                cube_info(3),
+                cube_info(4),
+                cube_info(5),
+                cube_info(6),
+                cube_info(7),
+            ];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_binding(0)
@@ -877,6 +900,14 @@ impl<'a> RenderPass<'a> {
                     .dst_binding(2)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(&far_infos),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&datum_infos),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&cube_infos),
             ];
             self.r.device.push_descriptor.cmd_push_descriptor_set(
                 cmd,

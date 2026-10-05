@@ -10,6 +10,7 @@ use crate::skeleton::FrameSlot;
 
 use super::block_textures::BLOCK_TEXTURE_CONSUMER_STAGES;
 use super::buffers::{FRAMES_IN_FLIGHT, MESH_CONSUMER_STAGES};
+use super::far_maps::FAR_MAP_CONSUMER_STAGES;
 use super::gpu_timer::{GpuPass, PipeStatPass};
 use super::materials::MATERIAL_CONSUMER_STAGES;
 use super::pipeline;
@@ -221,8 +222,12 @@ impl Renderer {
                     self.render_extent.height,
                 )
             });
-            self.far_ring
-                .write(FrameSlot::new(slot), lists.far_slice(), view);
+            self.far_ring.write(
+                FrameSlot::new(slot),
+                lists.far_slice(),
+                view,
+                &self.far_maps.max_offsets(),
+            );
         } else {
             crate::profile::gauge(crate::profile::Gauge::FarBodies, 0);
             crate::profile::gauge(crate::profile::Gauge::FarDrawn, 0);
@@ -539,7 +544,10 @@ impl Renderer {
         // Overwrite of already-sampled layers: pending frames that still
         // sample SHADER_READ must be on the graphics queue before a
         // dedicated-family release (or a same-family extra wait).
-        if self.block_textures.has_overwrite_pending() || self.materials.has_overwrite_pending() {
+        if self.block_textures.has_overwrite_pending()
+            || self.materials.has_overwrite_pending()
+            || self.far_maps.has_overwrite_pending()
+        {
             self.flush_pending_submits();
         }
         // Begin render submission; this gets the timeline value to stamp mesh copies.
@@ -550,6 +558,7 @@ impl Renderer {
         let quad_wait_some;
         let tex_wait_some;
         let mat_wait_some;
+        let map_wait_some;
         unsafe {
             let device = &self.device.device;
             device
@@ -631,21 +640,37 @@ impl Renderer {
                 self.last_render_value,
                 done_at,
             );
+            let map_wait = self.far_maps.flush(
+                &self.instance.instance,
+                device,
+                self.device.physical,
+                &mut self.transfer_lane,
+                cmd,
+                self.device.graphics_queue,
+                self.device.graphics_family,
+                &self.timeline,
+                self.last_render_value,
+                done_at,
+            );
             self.pending_transfer_wait = fold_transfer_wait(
                 fold_transfer_wait(
-                    match (deferred, quad_wait) {
-                        (Some(a), Some(b)) => Some((a.max(b), MESH_CONSUMER_STAGES)),
-                        (Some(v), None) | (None, Some(v)) => Some((v, MESH_CONSUMER_STAGES)),
-                        (None, None) => None,
-                    },
-                    tex.transfer_wait
-                        .map(|v| (v, BLOCK_TEXTURE_CONSUMER_STAGES)),
+                    fold_transfer_wait(
+                        match (deferred, quad_wait) {
+                            (Some(a), Some(b)) => Some((a.max(b), MESH_CONSUMER_STAGES)),
+                            (Some(v), None) | (None, Some(v)) => Some((v, MESH_CONSUMER_STAGES)),
+                            (None, None) => None,
+                        },
+                        tex.transfer_wait
+                            .map(|v| (v, BLOCK_TEXTURE_CONSUMER_STAGES)),
+                    ),
+                    mat_wait.map(|v| (v, MATERIAL_CONSUMER_STAGES)),
                 ),
-                mat_wait.map(|v| (v, MATERIAL_CONSUMER_STAGES)),
+                map_wait.map(|v| (v, FAR_MAP_CONSUMER_STAGES)),
             );
             quad_wait_some = quad_wait.is_some();
             tex_wait_some = tex.transfer_wait.is_some();
             mat_wait_some = mat_wait.is_some();
+            map_wait_some = map_wait.is_some();
         }
 
         // Same-queue compute jobs: budgeted prefix before the scene.
@@ -655,7 +680,13 @@ impl Renderer {
 
         let minimap = unsafe { self.minimap.sync(&self.device.device, cmd, slot) };
         if profiling {
-            if copies_pending || quad_wait_some || tex_wait_some || mat_wait_some || grew || minimap
+            if copies_pending
+                || quad_wait_some
+                || tex_wait_some
+                || mat_wait_some
+                || map_wait_some
+                || grew
+                || minimap
             {
                 self.gpu_timer.recorded(slot);
             }

@@ -389,6 +389,19 @@ impl Device {
             log::info!("cull: per-thread atomics (no compute subgroup ballot)");
         }
 
+        // Sky set 0 pushes 12 descriptors (LUT, uniforms, far table, datum,
+        // eight albedo cubes). The layout is built later; fail here if the
+        // device cannot hold them.
+        let mut push_limits = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
+        let mut push_props = vk::PhysicalDeviceProperties2::default().push_next(&mut push_limits);
+        unsafe { instance.get_physical_device_properties2(best.physical, &mut push_props) };
+        log::info!("push descriptors: max {}", push_limits.max_push_descriptors);
+        assert!(
+            push_limits.max_push_descriptors >= 32,
+            "maxPushDescriptors {} is below 32",
+            push_limits.max_push_descriptors
+        );
+
         Self {
             physical: best.physical,
             device,

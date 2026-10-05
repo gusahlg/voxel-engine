@@ -140,6 +140,25 @@ pub(crate) enum RenderCmd {
         desc: ComputeDescOwned,
         reply: Sender<Result<ComputeKind, EngineError>>,
     },
+    /// Install a datum and (when `albedo_size > 0`) allocate its cube.
+    /// No reply: the caller must not wait. An allocation failure is logged
+    /// on the render thread and that map stays on flat per-face colours.
+    SetFarMap {
+        id: crate::FarMapId,
+        g: u32,
+        datum: Box<[f32]>,
+        albedo_size: u32,
+    },
+    /// One albedo face, RGBA8 sRGB. Recorded on the next frame; no reply.
+    SetFarMapFace {
+        id: crate::FarMapId,
+        face: u32,
+        bytes: Box<[u8]>,
+    },
+    /// Drop a map. The cube retires with the frames that may still sample it.
+    ClearFarMap {
+        id: crate::FarMapId,
+    },
     ComputeFlush {
         reply: Sender<()>,
     },
@@ -294,6 +313,13 @@ pub(crate) struct RenderClient {
     frames_rendered: Arc<AtomicU64>,
     /// Frames dropped by render-loop coalescing (monotonic).
     frames_coalesced: Arc<AtomicU64>,
+    /// Albedo edge of each installed map, or `None` when the slot is empty.
+    /// Written before the command is sent, so a face upload in the same turn
+    /// validates against the size just requested (the channel is FIFO).
+    /// `Some(0)` is a datum with no cube. A render-thread allocation failure
+    /// leaves this size in place: the face command is still sent and then
+    /// dropped until the next `set_far_map`.
+    far_map_albedo: [Option<u32>; crate::MAX_FAR_MAPS],
 }
 
 impl RenderClient {
@@ -423,6 +449,7 @@ impl RenderClient {
             join: Some(join),
             frames_rendered,
             frames_coalesced,
+            far_map_albedo: [None; crate::MAX_FAR_MAPS],
         };
         Ok((window, client))
     }
@@ -467,6 +494,57 @@ impl RenderClient {
 
     pub(crate) fn compute_pending(&self) -> usize {
         self.compute.pending()
+    }
+
+    /// Validate `desc`, enqueue the datum and cube allocation, and return.
+    /// Does not wait for the render thread. [`crate::FarMapError::OutOfMemory`]
+    /// is not returned; the render thread logs that failure and keeps the map
+    /// on flat per-face colours.
+    pub(crate) fn set_far_map(
+        &mut self,
+        id: crate::FarMapId,
+        desc: &crate::FarMapDesc<'_>,
+    ) -> Result<(), crate::FarMapError> {
+        crate::far_body::validate_far_map(id, desc)?;
+        // Before the send, so a face upload queued next still sees the size.
+        // The render thread may then fail the allocation and drop those faces.
+        if let Some(slot) = self.far_map_albedo.get_mut(id.0 as usize) {
+            *slot = Some(desc.albedo_size);
+        }
+        let _ = self.tx.send(RenderCmd::SetFarMap {
+            id,
+            g: desc.datum_res,
+            datum: desc.datum.to_vec().into_boxed_slice(),
+            albedo_size: desc.albedo_size,
+        });
+        Ok(())
+    }
+
+    /// Queue one face. `Err` when the slot has no map, the face is out of
+    /// range, or the byte length is not `albedo_size² * 4`. Does not wait.
+    pub(crate) fn set_far_map_face(
+        &mut self,
+        id: crate::FarMapId,
+        face: usize,
+        rgba8_srgb: &[u8],
+    ) -> Result<(), crate::FarMapError> {
+        let slot = self.far_map_albedo.get(id.0 as usize).copied().flatten();
+        crate::far_body::validate_far_map_face(id, face, rgba8_srgb.len(), slot)?;
+        let _ = self.tx.send(RenderCmd::SetFarMapFace {
+            id,
+            face: face as u32,
+            bytes: rgba8_srgb.to_vec().into_boxed_slice(),
+        });
+        Ok(())
+    }
+
+    /// Drop `id`. An id outside `0..MAX_FAR_MAPS` is a no-op. Does not wait.
+    pub(crate) fn clear_far_map(&mut self, id: crate::FarMapId) {
+        let Some(slot) = self.far_map_albedo.get_mut(id.0 as usize) else {
+            return;
+        };
+        *slot = None;
+        let _ = self.tx.send(RenderCmd::ClearFarMap { id });
     }
 
     pub(crate) fn register_compute(
@@ -1137,6 +1215,20 @@ fn render_loop(
                 RenderCmd::RegisterCompute { desc, reply } => {
                     let _ = reply.send(renderer.register_compute(desc));
                 }
+                RenderCmd::SetFarMap {
+                    id,
+                    g,
+                    datum,
+                    albedo_size,
+                } => {
+                    // BadId is rejected on the caller. Allocation failure is
+                    // logged inside and does not come back as an error.
+                    let _ = renderer.set_far_map(id.0, g, &datum, albedo_size);
+                }
+                RenderCmd::SetFarMapFace { id, face, bytes } => {
+                    renderer.set_far_map_face(id.0, face, bytes);
+                }
+                RenderCmd::ClearFarMap { id } => renderer.clear_far_map(id.0),
                 RenderCmd::ComputeFlush { reply } => {
                     renderer.flush_compute_blocking();
                     let _ = reply.send(());

@@ -254,7 +254,8 @@ pub struct Pipelines {
     pub tris2d_tex_present: vk::Pipeline,
     /// Vertex-less fullscreen background pass: geometry push constant + set 0
     /// binding 0 (cloud LUT), binding 1 (the shared per-frame `FrameUniforms`),
-    /// and binding 2 (far-body storage buffer). Depth-tests (read-only) at the
+    /// binding 2 (far-body storage buffer), binding 3 (datum storage) and
+    /// binding 4 (eight albedo cubes). Depth-tests (read-only) at the
     /// reversed-Z far plane so it shades only pixels the terrain left uncovered.
     pub sky: vk::Pipeline,
     pub layout_sky: vk::PipelineLayout,
@@ -339,9 +340,11 @@ impl Pipelines {
 
         // Sky layout: fragment push constant (inv VP + disc cosines) plus set 0
         // binding 0 = cloud LUT, binding 1 = FrameUniforms, binding 2 = far-body
-        // table. Dedicated rather than sharing mesh3d_set_layout: the LUT is a
+        // table, binding 3 = mapped-body datum, binding 4 = eight albedo cubes.
+        // Dedicated rather than sharing mesh3d_set_layout: the LUT is a
         // sampled image the mesh pass never touches. Push constants are full,
-        // so the bodies ride a storage buffer.
+        // so the bodies ride a storage buffer. Twelve descriptors in all
+        // (1+1+1+1+8); the device maxPushDescriptors limit is at least 32.
         let sky_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -357,6 +360,16 @@ impl Pipelines {
                 .binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(crate::MAX_FAR_MAPS as u32)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let (sky_set_layout, layout_sky) = pass::push_descriptor_layouts(
