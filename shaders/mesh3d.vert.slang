@@ -4,8 +4,9 @@
 //
 // SV_VulkanInstanceID (not SV_InstanceID) to read plain InstanceIndex.
 //
-// Shifts/masks mirror mesh.rs. UV derives from position and normal. Baked
-// sky/block/AO levels interpolate as scalars; the fragment multiplies by
+// Shifts/masks mirror mesh.rs. UV derives from position and normal. A morphing
+// side face (X or Z) uses the moved cell y so the texture does not stretch.
+// Baked sky/block/AO levels interpolate as scalars; the fragment multiplies by
 // frame light/candle (uniform × interpolated scalar == interpolated product).
 // Face index is packed — no float3 normal varying; the fragment looks
 // `FACE_NORMAL` up. The CAGED variant (build.rs `-DCAGED`) writes the bent
@@ -129,7 +130,12 @@ VertexOutput vertexMain(VertexInput input)
     int mz = int(w1 << 15) >> 30;
     float3 micro = float3(float(mx), float(my), float(mz)) * MICRO_STEP;
 
-    // UV mapping: X face (z,y), Y face (x,z), Z face (x,y).
+    // UV mapping from the unmoved cell: X face (z, y), Y face (x, z), Z face (x, y).
+    // While this vertex morphs, X and Z faces use (y + a*dy) instead of y, in
+    // cells, before the `* scale` below. Y faces stay (x, z). The write is
+    // skipped when a*dy == 0, so a clear morph flag leaves this path
+    // bit-identical. The CPU morph mirror has no UV function; this comment is
+    // that rule. The shadow vertex shader has no UVs and does not apply it.
     float2 uv;
     if (normal < 2)
         uv = float2(z, y);
@@ -152,35 +158,24 @@ VertexOutput vertexMain(VertexInput input)
     DrawDyn style = draw_dyn[input.instance];
     uint detail = rec.detail_pass & ((1u << DETAIL_GPU_BITS) - 1u);
     float scale = detail_scale(detail);
-#ifdef CAGED
     // `q` is the local cell position times the detail scale, in [0, 16·scale]³
-    // (micro can step slightly outside). UVs stay on the unbent cell.
+    // (micro can step slightly outside). Block UVs stay in this cell space,
+    // not on the bent cage; a morph only adds a*dy to side-face V.
     float3 q = (float3(x, y, z) + micro) * scale;
+#ifdef CAGED
     Cage cg = cages[rec.cage];
     float3 t = q / (16.0 * scale);
     float3 world = cage_trilinear(cg, t) + float3(cg.anchor - pc.cam_block) - pc.cam_frac;
-    // One uniform branch. Off leaves `world` and `t` untouched, so the bent
-    // normal below (taken at this unmoved `t`) stays bit-identical.
-    [branch]
-    if (frame.morph_flag.x != 0)
-    {
-        int dy = lod_morph_dy(w1);
-        if (dy != 0)
-        {
-            // The trilinear map is linear in t.y for fixed t.x, t.z, so moving
-            // q.y by a*dy*scale (t.y by a*dy/16) moves world by exactly
-            // (a*dy/16) * cage_dty. No second trilinear sample.
-            float a = lod_morph_a(detail, length(world));
-            world += (a * float(dy) / 16.0) * cage_dty(cg, t);
-        }
-    }
 #else
     // Camera-relative placement: block delta first, then fractional parts.
     // Integer subtraction wraps, matching the CPU `wrapping_sub`.
-    float3 q = (float3(x, y, z) + micro) * scale;
     float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
     float3 world = q + offset;
-    // World +Y is the flat terrain's up. Off does not add +0.
+#endif
+    // One uniform branch. Off leaves `world`, `t`, and `uv` untouched, so the
+    // bent normal below (taken at this unmoved `t`) and the texture stay
+    // bit-identical. Flat world +Y is the terrain's up; off does not add +0.
+    // `a` is computed once and reused for the position slide and the side-face V.
     [branch]
     if (frame.morph_flag.x != 0)
     {
@@ -188,10 +183,22 @@ VertexOutput vertexMain(VertexInput input)
         if (dy != 0)
         {
             float a = lod_morph_a(detail, length(world));
-            world.y += a * float(dy) * scale;
+            // One cell slide, shared by the position and the side-face V.
+            float ady = a * float(dy);
+#ifdef CAGED
+            // The trilinear map is linear in t.y for fixed t.x, t.z, so moving
+            // q.y by a*dy*scale (t.y by a*dy/16) moves world by exactly
+            // (a*dy/16) * cage_dty. No second trilinear sample.
+            world += (ady / 16.0) * cage_dty(cg, t);
+#else
+            world.y += ady * scale;
+#endif
+            // X (normal < 2) and Z (normal >= 4) store y in uv.y. Y faces do not.
+            // ady == 0 does not write `uv`.
+            if (ady != 0.0 && (normal < 2u || normal >= 4u))
+                uv.y = y + ady;
         }
     }
-#endif
 
     VertexOutput output;
     // Plain rectilinear projection; wide-FOV compression is a post-process.
