@@ -196,6 +196,7 @@ impl CullState {
         memory_props: &vk::PhysicalDeviceMemoryProperties,
         cache: vk::PipelineCache,
         wave_atomics: bool,
+        stats: Option<&super::shader_stats::Loader>,
     ) -> Self {
         // Bindings match cull.comp.slang.
         let storage = |binding: u32| {
@@ -238,6 +239,7 @@ impl CullState {
             layout,
             bytes,
             if wave_atomics { "cull-wave" } else { "cull" },
+            stats,
         );
         Self {
             set_layout,

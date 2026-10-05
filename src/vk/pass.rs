@@ -69,6 +69,7 @@ pub(crate) fn compute_pipeline(
     layout: vk::PipelineLayout,
     bytes: &[u8],
     label: &str,
+    stats: Option<&super::shader_stats::Loader>,
 ) -> vk::Pipeline {
     let module = shader_module(device, bytes, label);
     let stage = vk::PipelineShaderStageCreateInfo::default()
@@ -80,6 +81,7 @@ pub(crate) fn compute_pipeline(
             .create_compute_pipelines(
                 cache,
                 &[vk::ComputePipelineCreateInfo::default()
+                    .flags(super::shader_stats::capture_flags(stats))
                     .stage(stage)
                     .layout(layout)],
                 None,
@@ -88,6 +90,7 @@ pub(crate) fn compute_pipeline(
             .unwrap_or_else(|e| panic!("create {label} compute pipeline: {e:?}"))[0]
     };
     unsafe { device.destroy_shader_module(module, None) };
+    super::shader_stats::report_pipeline_stats(device, stats, pipeline, label);
     pipeline
 }
 

@@ -338,6 +338,7 @@ impl ShadowPass {
         cache: vk::PipelineCache,
         layout_3d: vk::PipelineLayout,
         layout_debug: vk::PipelineLayout,
+        stats: Option<&super::shader_stats::Loader>,
     ) -> Self {
         let pipeline = build_depth_only_pipeline(
             device,
@@ -346,6 +347,8 @@ impl ShadowPass {
             SHADOW_DEPTH_VERT,
             &[crate::mesh::MeshVertex::binding()],
             crate::mesh::MeshVertex::ATTRIBUTES,
+            "shadow",
+            stats,
         );
         let debug_pipeline = build_depth_only_pipeline(
             device,
@@ -354,6 +357,8 @@ impl ShadowPass {
             crate::vk::pipeline::DEBUG_VERT,
             &[crate::mesh::DebugVertex::binding()],
             crate::mesh::DebugVertex::ATTRIBUTES,
+            "shadow_debug",
+            stats,
         );
 
         let make_ubo = || {
@@ -411,6 +416,8 @@ fn build_depth_only_pipeline(
     vert: &[u8],
     bindings: &[vk::VertexInputBindingDescription],
     attributes: &[vk::VertexInputAttributeDescription],
+    name: &str,
+    stats: Option<&super::shader_stats::Loader>,
 ) -> vk::Pipeline {
     let module = shader_module(device, vert, "shadow-depth");
     let stages = [vk::PipelineShaderStageCreateInfo::default()
@@ -456,6 +463,7 @@ fn build_depth_only_pipeline(
         vk::PipelineRenderingCreateInfo::default().depth_attachment_format(SHADOW_FORMAT);
 
     let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .flags(super::shader_stats::capture_flags(stats))
         .stages(&stages)
         .vertex_input_state(&vertex_input)
         .input_assembly_state(&input_assembly)
@@ -475,6 +483,7 @@ fn build_depth_only_pipeline(
             .expect("Failed to create shadow depth pipeline")[0]
     };
     unsafe { device.destroy_shader_module(module, None) };
+    super::shader_stats::report_pipeline_stats(device, stats, pipeline, name);
     pipeline
 }
 

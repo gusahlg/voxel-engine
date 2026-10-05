@@ -41,6 +41,7 @@ pub(crate) mod recreate;
 pub(crate) mod render_client;
 pub(crate) mod retire;
 pub(crate) mod scene_pass;
+pub(crate) mod shader_stats;
 pub(crate) mod shadow;
 pub(crate) mod sky;
 pub(crate) mod submit;
@@ -452,6 +453,7 @@ impl Renderer {
             mesh3d_set_layout,
             device.fragment_shading_rate.as_ref(),
             device.independent_blend,
+            device.shader_stats.as_ref(),
         );
 
         // Per-slot command buffers plus one extra for the present copy.
@@ -540,15 +542,23 @@ impl Renderer {
             pipeline_cache,
             pipelines.layout_3d,
             pipelines.layout_debug,
+            device.shader_stats.as_ref(),
         );
         let exposure = exposure::ExposureState::new(
             &device.device,
             &memory_props,
             render_extent,
             pipeline_cache,
+            device.shader_stats.as_ref(),
         );
-        let bloom = bloom::BloomState::new(&device.device, &memory_props, pipeline_cache);
-        let sky_cloud = sky::SkyCloudState::new(&device.device, pipeline_cache);
+        let bloom = bloom::BloomState::new(
+            &device.device,
+            &memory_props,
+            pipeline_cache,
+            device.shader_stats.as_ref(),
+        );
+        let sky_cloud =
+            sky::SkyCloudState::new(&device.device, pipeline_cache, device.shader_stats.as_ref());
 
         let gpu_timer = GpuTimer::new(
             &device.device,
@@ -617,6 +627,7 @@ impl Renderer {
             &memory_props,
             pipeline_cache,
             device.cull_wave_atomics,
+            device.shader_stats.as_ref(),
         );
         // GPU-driven emission: opaque/cutout/shadow draws are always emitted
         // by the cull dispatch, so the device must support drawIndirectCount.
@@ -836,8 +847,7 @@ impl Renderer {
             self.arena_dir
                 .note_record_caged(slot, record.pass(), lod, aabb);
         } else {
-            self.arena_dir
-                .note_record(slot, record.pass(), lod, aabb);
+            self.arena_dir.note_record(slot, record.pass(), lod, aabb);
         }
         self.arena_dir.note_cull_draw(slot, &record);
         self.records.set_record(slot, record);

@@ -72,6 +72,10 @@ pub struct Device {
     pub min_storage_buffer_offset_alignment: u64,
     pub command_pool: vk::CommandPool,
     pub push_descriptor: khr::push_descriptor::Device,
+    /// `VK_KHR_pipeline_executable_properties` when `VOXEL_SHADER_STATS` is set
+    /// and the device supports `pipelineExecutableInfo`. `None` otherwise, in
+    /// which case pipeline creation does not capture statistics.
+    pub shader_stats: Option<crate::vk::shader_stats::Loader>,
     pub memory_budget: Option<MemoryBudget>,
     pub anisotropy: Option<Anisotropy>,
     pub fragment_shading_rate: Option<FragmentShadingRate>,
@@ -116,6 +120,7 @@ struct Candidate {
     pipeline_statistics_query: bool,
     host_query_reset: bool,
     memory_budget: bool,
+    pipeline_executable_info: bool,
     max_anisotropy: Option<f32>,
     fragment_shading_rate: Option<FragmentShadingRate>,
     score: u32,
@@ -159,6 +164,9 @@ impl Device {
         }
         if best.fragment_shading_rate.is_some() {
             device_extensions.push(khr::fragment_shading_rate::NAME.as_ptr());
+        }
+        if best.pipeline_executable_info {
+            device_extensions.push(khr::pipeline_executable_properties::NAME.as_ptr());
         }
 
         // Pick transfer tier based on available queues.
@@ -276,6 +284,9 @@ impl Device {
 
         let mut fsr_features = vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default()
             .attachment_fragment_shading_rate(true);
+        let mut exec_features =
+            vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
+                .pipeline_executable_info(true);
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&device_extensions)
@@ -286,6 +297,9 @@ impl Device {
         if best.fragment_shading_rate.is_some() {
             device_create_info = device_create_info.push_next(&mut fsr_features);
         }
+        if best.pipeline_executable_info {
+            device_create_info = device_create_info.push_next(&mut exec_features);
+        }
 
         let device = unsafe {
             instance
@@ -294,6 +308,18 @@ impl Device {
         };
 
         let push_descriptor = khr::push_descriptor::Device::new(instance, &device);
+        let shader_stats = if best.pipeline_executable_info {
+            Some(khr::pipeline_executable_properties::Device::new(
+                instance, &device,
+            ))
+        } else {
+            if crate::vk::shader_stats::enabled() {
+                eprintln!(
+                    "shader-stats unavailable (VK_KHR_pipeline_executable_properties / pipelineExecutableInfo)"
+                );
+            }
+            None
+        };
 
         let graphics_queue = unsafe { device.get_device_queue(best.graphics_family, 0) };
         let present_queue = unsafe { device.get_device_queue(best.present_family, 0) };
@@ -382,6 +408,7 @@ impl Device {
                 .min_storage_buffer_offset_alignment,
             command_pool,
             push_descriptor,
+            shader_stats,
             memory_budget,
             anisotropy: best.max_anisotropy.map(Anisotropy),
             fragment_shading_rate,
@@ -505,6 +532,17 @@ fn evaluate(
     // Optional: budget-aware allocation degrades gracefully when absent.
     let memory_budget = has_extension(ext::memory_budget::NAME);
 
+    // Queried only when stats were requested, so an unset VOXEL_SHADER_STATS
+    // does not enable the extension or add a feature chain.
+    let pipeline_executable_info = crate::vk::shader_stats::enabled()
+        && has_extension(khr::pipeline_executable_properties::NAME)
+        && {
+            let mut exec = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut exec);
+            unsafe { instance.get_physical_device_features2(physical, &mut f2) };
+            exec.pipeline_executable_info == vk::TRUE
+        };
+
     // Optional: attachment-based variable-rate shading. Requires both the
     // extension and the attachment feature; the texel size (tile a rate entry
     // covers) comes from the properties chain. Largest tile = smallest rate
@@ -595,6 +633,7 @@ fn evaluate(
         pipeline_statistics_query,
         host_query_reset,
         memory_budget,
+        pipeline_executable_info,
         max_anisotropy,
         fragment_shading_rate,
         score,

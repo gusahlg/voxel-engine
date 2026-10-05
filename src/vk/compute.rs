@@ -998,6 +998,7 @@ impl ComputeRuntime {
         device: &ash::Device,
         cache: vk::PipelineCache,
         desc: &ComputeDescOwned,
+        stats: Option<&super::shader_stats::Loader>,
     ) -> Result<ComputeKind, EngineError> {
         if !self.enabled {
             return Err(EngineError::NoCompute);
@@ -1018,6 +1019,7 @@ impl ComputeRuntime {
             &desc.spirv,
             &desc.entry,
             "compute-job",
+            stats,
         )
         .inspect_err(|_| unsafe {
             device.destroy_pipeline_layout(layout, None);
@@ -1580,6 +1582,7 @@ fn try_compute_pipeline(
     bytes: &[u8],
     entry: &str,
     label: &str,
+    stats: Option<&super::shader_stats::Loader>,
 ) -> Result<vk::Pipeline, EngineError> {
     let code =
         ash::util::read_spv(&mut Cursor::new(bytes)).map_err(|_| EngineError::Invalid("spirv"))?;
@@ -1597,6 +1600,7 @@ fn try_compute_pipeline(
         device.create_compute_pipelines(
             cache,
             &[vk::ComputePipelineCreateInfo::default()
+                .flags(super::shader_stats::capture_flags(stats))
                 .stage(stage)
                 .layout(layout)],
             None,
@@ -1604,7 +1608,10 @@ fn try_compute_pipeline(
     };
     unsafe { device.destroy_shader_module(module, None) };
     match result {
-        Ok(p) => Ok(p[0]),
+        Ok(p) => {
+            super::shader_stats::report_pipeline_stats(device, stats, p[0], label);
+            Ok(p[0])
+        }
         Err((_, err)) => {
             log::error!("create {label} compute pipeline: {err:?}");
             Err(EngineError::Pipeline)
@@ -1617,8 +1624,12 @@ impl super::Renderer {
         &mut self,
         desc: ComputeDescOwned,
     ) -> Result<ComputeKind, EngineError> {
-        self.compute
-            .register(&self.device.device, self.pipeline_cache, &desc)
+        self.compute.register(
+            &self.device.device,
+            self.pipeline_cache,
+            &desc,
+            self.device.shader_stats.as_ref(),
+        )
     }
 
     /// Dedicated / second-queue: submit queued jobs now. No-op on fallback
