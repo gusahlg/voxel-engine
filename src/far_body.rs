@@ -647,26 +647,62 @@ pub(crate) fn store(bodies: &[FarBody], out: &mut [FarBody; MAX_FAR_BODIES]) -> 
     n as u32
 }
 
-/// Manual bilinear of the equiangular datum. `g < 2` or a short slice is a flat
-/// zero offset. Four loads, matching the shader (no hardware filtering).
+/// Odd degree-13 polynomial for `atan` on `[-1, 1]`.
+///
+/// A face of the equiangular chart only feeds this range (`dot(d, tu) /
+/// dot(d, n)`), and the argument is clamped before the Horner step. Stepwise
+/// f32 Horner (`p = p * u + c`, each multiply and add rounded) stays within
+/// 6.61e-7 rad of `atan` on two million uniform samples, peaking near −0.972.
+/// A datum cell is `π / (4 * 32)` ≈ 2.5e-2 rad, so the error is far below a cell.
 #[cfg(test)]
-fn sample_datum(g: u32, datum: &[f32], d: Vec3) -> f32 {
+fn atan_approx(x: f32) -> f32 {
+    let z = x.clamp(-1.0, 1.0);
+    let u = z * z;
+    // c6 .. c0. Bits 3c04aa78 bd1aa180 3dad9679 be0aa033 3e4bb99e beaaa3a5 3f7ffffb.
+    let mut p = f32::from_bits(0x3c04_aa78);
+    p = p * u + f32::from_bits(0xbd1a_a180);
+    p = p * u + f32::from_bits(0x3dad_9679);
+    p = p * u + f32::from_bits(0xbe0a_a033);
+    p = p * u + f32::from_bits(0x3e4b_b99e);
+    p = p * u + f32::from_bits(0xbeaa_a3a5);
+    p = p * u + f32::from_bits(0x3f7f_fffb);
+    z * p
+}
+
+/// Bilinear equiangular sample and the chart derivatives of that interpolant.
+/// `g < 2` or a short slice is a flat zero. Four loads, matching the shader.
+#[cfg(test)]
+struct DatumSample {
+    value: f32,
+    /// `d(value) / dξ` inside the cell. Zero on the flat fallback.
+    dr_dxi: f32,
+    /// `d(value) / dη` inside the cell.
+    dr_deta: f32,
+}
+
+#[cfg(test)]
+fn sample_datum_d(g: u32, datum: &[f32], d: Vec3) -> DatumSample {
+    let flat = DatumSample {
+        value: 0.0,
+        dr_dxi: 0.0,
+        dr_deta: 0.0,
+    };
     if g < 2 {
-        return 0.0;
+        return flat;
     }
     let gg = g as usize;
     let need = 6 * gg * gg;
     if datum.len() < need {
-        return 0.0;
+        return flat;
     }
     let face = dom_face(d) as usize;
     let (tu, n, tv) = far_map_basis(face);
     let den = d.dot(n);
     if den.abs() < 1e-8 {
-        return 0.0;
+        return flat;
     }
-    let xi = (4.0 / std::f32::consts::PI) * (d.dot(tu) / den).atan();
-    let eta = (4.0 / std::f32::consts::PI) * (d.dot(tv) / den).atan();
+    let xi = (4.0 / std::f32::consts::PI) * atan_approx(d.dot(tu) / den);
+    let eta = (4.0 / std::f32::consts::PI) * atan_approx(d.dot(tv) / den);
     let scale = 0.5 * (g - 1) as f32;
     let u = ((xi + 1.0) * scale).clamp(0.0, (g - 1) as f32);
     let v = ((eta + 1.0) * scale).clamp(0.0, (g - 1) as f32);
@@ -683,7 +719,21 @@ fn sample_datum(g: u32, datum: &[f32], d: Vec3) -> f32 {
     let v11 = at(j1, i1);
     let a = v00 + (v10 - v00) * fu;
     let b = v01 + (v11 - v01) * fu;
-    a + (b - a) * fv
+    // `u = (ξ + 1) * scale`, so the in-cell slope scales by the same factor.
+    let dr_dfu = (v10 - v00) + ((v11 - v01) - (v10 - v00)) * fv;
+    let dr_dfv = b - a;
+    DatumSample {
+        value: a + (b - a) * fv,
+        dr_dxi: dr_dfu * scale,
+        dr_deta: dr_dfv * scale,
+    }
+}
+
+/// Manual bilinear of the equiangular datum. `g < 2` or a short slice is a flat
+/// zero offset. Four loads, matching the shader (no hardware filtering).
+#[cfg(test)]
+fn sample_datum(g: u32, datum: &[f32], d: Vec3) -> f32 {
+    sample_datum_d(g, datum, d).value
 }
 
 /// Near and far roots of a sphere of radius `rho` centred on the unit `dir`.
@@ -700,8 +750,8 @@ fn sphere_roots(facing: f32, rho: f32) -> Option<(f32, f32)> {
     Some((facing - sd, facing + sd))
 }
 
-/// Outward normal of `r(direction)` from two one-sided steps of half a datum
-/// cell. A flat datum is exactly radial.
+/// Finite-difference normal kept as the reference for the analytic one.
+/// Two one-sided steps of half a datum cell. A flat datum is exactly radial.
 #[cfg(test)]
 fn mapped_normal(
     rotation: Quat,
@@ -727,13 +777,63 @@ fn mapped_normal(
     rotate(rotation, n_body)
 }
 
-/// Ray from the origin against a datum-mapped body. `dir` is the unit centre.
-/// `rho` is `radius/distance`. Offsets are in the radius's unit. The search
-/// matches `far_ray_mapped` in `shaders/far_body.slang`: a lo-sphere bracket
-/// refined by 6 regula-falsi steps, otherwise 12 even steps across the hi
-/// chord and 5 regula-falsi steps. `horizon` skips `dot(ray, -dir) > horizon`.
+/// Outward normal of the bilinear patch at `u_world`.
+///
+/// `r(ξ, η)` is the interpolant already fetched for the hit. Differentiating
+/// `p = r û` with `û ∥ n + tu tan(ξ π/4) + tv tan(η π/4)` gives the tangent
+/// frame. On the +X face centre, `∂û/∂ξ × ∂û/∂η` points inward, so the outward
+/// normal is `∂p/∂η × ∂p/∂ξ`. A flat patch is exactly radial.
 #[cfg(test)]
-pub(crate) fn ray_mapped(
+fn mapped_normal_analytic(
+    rotation: Quat,
+    u_world: Vec3,
+    rho: f32,
+    distance: f32,
+    g: u32,
+    datum: &[f32],
+) -> Vec3 {
+    let u = rotate(conjugate(rotation), u_world);
+    let patch = sample_datum_d(g, datum, u);
+    let r = rho + patch.value / distance;
+    let dr_dxi = patch.dr_dxi / distance;
+    let dr_deta = patch.dr_deta / distance;
+    let face = dom_face(u) as usize;
+    let (tu, n, tv) = far_map_basis(face);
+    let den = u.dot(n);
+    if den.abs() < 1e-8 || !(distance > 0.0) {
+        return u_world;
+    }
+    let quarter = std::f32::consts::FRAC_PI_4;
+    let xi = (4.0 / std::f32::consts::PI) * atan_approx(u.dot(tu) / den);
+    let eta = (4.0 / std::f32::consts::PI) * atan_approx(u.dot(tv) / den);
+    let tx = (xi * quarter).tan();
+    let ty = (eta * quarter).tan();
+    let dtx = quarter * (1.0 + tx * tx);
+    let dty = quarter * (1.0 + ty * ty);
+    let q = n + tu * tx + tv * ty;
+    let s = q.length();
+    if !(s > 1e-8) {
+        return u_world;
+    }
+    let u_hat = q / s;
+    let dq_dxi = tu * dtx;
+    let dq_deta = tv * dty;
+    let du_dxi = dq_dxi / s - u_hat * (u_hat.dot(dq_dxi) / s);
+    let du_deta = dq_deta / s - u_hat * (u_hat.dot(dq_deta) / s);
+    let dp_dxi = u_hat * dr_dxi + du_dxi * r;
+    let dp_deta = u_hat * dr_deta + du_deta * r;
+    let n_body = dp_deta.cross(dp_dxi).normalize_or_zero();
+    if n_body.length_squared() < 1e-20 {
+        return u_world;
+    }
+    rotate(rotation, n_body)
+}
+
+/// Previous regula-falsi march, kept so the fixed-point solver can be checked
+/// against it on the same datum samples. A lo-sphere bracket takes 6 steps,
+/// otherwise 12 even steps across the hi chord and 5 regula-falsi steps.
+#[cfg(test)]
+fn ray_mapped_regula(
     ray: Vec3,
     dir: Vec3,
     rho: f32,
@@ -867,6 +967,450 @@ pub(crate) fn ray_mapped(
         }
     }
     finish(if fa.abs() <= fb.abs() { a } else { b })
+}
+
+/// Datum samples the march may spend. The analytic normal is one more fetch
+/// at the hit, replacing the two finite-difference evaluations.
+#[cfg(test)]
+const MAPPED_EVAL_CAP: u32 = 5;
+/// Early exit on `|rad - r(dir)|`. Normalised units, same space as `t`.
+#[cfg(test)]
+const MAPPED_F_TOL: f32 = 1e-8;
+
+#[cfg(test)]
+struct MappedMarch<'a> {
+    ray: Vec3,
+    center: Vec3,
+    rho: f32,
+    distance: f32,
+    rotation: Quat,
+    g: u32,
+    datum: &'a [f32],
+    evals: u32,
+}
+
+/// `d/dt (|p| - datum/distance)` at an already-sampled point. `patch` is the
+/// bilinear datum at the body-space direction. Uses `d(atan)/dx`, which tracks
+/// the equiangular polynomial closely enough for a Newton correction.
+#[cfg(test)]
+fn residual_slope(
+    march: &MappedMarch<'_>,
+    t: f32,
+    u_world: Vec3,
+    u_body: Vec3,
+    patch: &DatumSample,
+) -> Option<f32> {
+    let p = march.ray * t - march.center;
+    let rad = p.length();
+    if rad < 1e-8 || !(march.distance > 0.0) {
+        return None;
+    }
+    let slope_rad = u_world.dot(march.ray);
+    let face = dom_face(u_body) as usize;
+    let (tu, n, tv) = far_map_basis(face);
+    let beta = u_body.dot(n);
+    if beta.abs() < 1e-6 {
+        return None;
+    }
+    let du_world = (march.ray - u_world * slope_rad) / rad;
+    let du = rotate(conjugate(march.rotation), du_world);
+    let alpha = u_body.dot(tu);
+    let gamma = u_body.dot(tv);
+    let alpha_t = du.dot(tu);
+    let beta_t = du.dot(n);
+    let gamma_t = du.dot(tv);
+    let beta2 = beta * beta;
+    let chart = |num: f32, num_t: f32| {
+        let x = num / beta;
+        let x_t = (beta * num_t - num * beta_t) / beta2;
+        x_t / (1.0 + x * x)
+    };
+    let scale = 4.0 / std::f32::consts::PI;
+    let dxi_dt = scale * chart(alpha, alpha_t);
+    let deta_dt = scale * chart(gamma, gamma_t);
+    let ddatum_dt = patch.dr_dxi * dxi_dt + patch.dr_deta * deta_dt;
+    Some(slope_rad - ddatum_dt / march.distance)
+}
+
+#[cfg(test)]
+impl MappedMarch<'_> {
+    /// `(f, r, df/dt)` at `t`. `f = |p| - r(dir(p))`. One datum evaluation.
+    /// The slope chains the bilinear chart derivatives through the ray. A
+    /// degenerate chart reports the radial slope.
+    fn sample(&mut self, t: f32) -> (f32, f32, f32) {
+        self.evals += 1;
+        let p = self.ray * t - self.center;
+        let rad = p.length();
+        if rad < 1e-8 {
+            return (-self.rho, 0.0, 0.0);
+        }
+        let u_world = p / rad;
+        let body = rotate(conjugate(self.rotation), u_world);
+        let patch = sample_datum_d(self.g, self.datum, body);
+        let r = self.rho + patch.value / self.distance;
+        let f = rad - r;
+        let slope_rad = u_world.dot(self.ray);
+        let slope = residual_slope(self, t, u_world, body, &patch).unwrap_or(slope_rad);
+        (f, r, slope)
+    }
+
+    fn open(&self) -> bool {
+        self.evals < MAPPED_EVAL_CAP
+    }
+}
+
+/// Near positive root of a sphere of radius `radius` centred on the unit dir.
+#[cfg(test)]
+fn positive_root(facing: f32, radius: f32) -> Option<f32> {
+    let (t_near, t_far) = sphere_roots(facing, radius)?;
+    if t_near > 0.0 {
+        Some(t_near)
+    } else if t_far > 0.0 {
+        Some(t_far)
+    } else {
+        None
+    }
+}
+
+/// Illinois regula falsi inside an existing bracket. The retained endpoint's
+/// weight is halved so a stuck side does not burn the remaining samples.
+/// Stops at the eval cap, a tiny step, or `|f| <= MAPPED_F_TOL`. The weights
+/// used for the chord are not the values used to pick the final endpoint.
+#[cfg(test)]
+fn regula(march: &mut MappedMarch<'_>, mut a: f32, mut b: f32, mut fa: f32, mut fb: f32) -> f32 {
+    let mut wa = fa;
+    let mut wb = fb;
+    while march.open() {
+        let den = wb - wa;
+        if den.abs() < 1e-20 || (b - a).abs() < 1e-7 {
+            break;
+        }
+        let tn = b - wb * (b - a) / den;
+        if !(tn > a.min(b) && tn < a.max(b)) {
+            break;
+        }
+        let (ft, _, st) = march.sample(tn);
+        if ft.abs() <= MAPPED_F_TOL {
+            return tn;
+        }
+        // Shallow roots (grazes) make the chord lag. A Newton step from a
+        // small residual uses the chart slope and lands on the root.
+        if st.abs() > 1e-4 && ft.abs() < 2e-3 {
+            let t2 = tn - ft / st;
+            let lo = a.min(b);
+            let hi = a.max(b);
+            if t2 > lo && t2 < hi && (t2 - tn).abs() < 5e-3 {
+                if !march.open() {
+                    // Sphere curvature only. The datum's second derivative is
+                    // small next to (1 - (u·ray)^2) / |p| on a shallow graze,
+                    // and there is no sample left to measure it.
+                    let p = march.ray * tn - march.center;
+                    let rad = p.length();
+                    let srad = (p / rad).dot(march.ray);
+                    let curve = (1.0 - srad * srad) / rad;
+                    let denom = st - ft * curve / (2.0 * st);
+                    let t_h = if denom.abs() > 1e-4 && rad > 1e-8 {
+                        tn - ft / denom
+                    } else {
+                        t2
+                    };
+                    return if t_h.is_finite() && (t_h - tn).abs() < 5e-3 {
+                        t_h
+                    } else {
+                        t2
+                    };
+                }
+                let (f2, _, s2) = march.sample(t2);
+                if s2.abs() > 1e-4 && f2.abs() < 1e-3 {
+                    // Halley: fold in f'' from the two slopes so a shallow
+                    // curve does not leave a 1e-5 residual after Newton.
+                    let d2 = if (t2 - tn).abs() > 1e-6 {
+                        (s2 - st) / (t2 - tn)
+                    } else {
+                        0.0
+                    };
+                    let denom = s2 - f2 * d2 / (2.0 * s2);
+                    let t3 = if denom.abs() > 1e-4 {
+                        t2 - f2 / denom
+                    } else {
+                        t2 - f2 / s2
+                    };
+                    if t3.is_finite() && t3 > 0.0 && (t3 - t2).abs() < 1e-3 {
+                        return t3;
+                    }
+                }
+                if f2.abs() <= ft.abs() {
+                    return t2;
+                }
+            }
+        }
+        if fa * ft <= 0.0 {
+            b = tn;
+            fb = ft;
+            wb = ft;
+            wa *= 0.5;
+        } else {
+            a = tn;
+            fa = ft;
+            wa = ft;
+            wb *= 0.5;
+        }
+    }
+    // The budget is spent. The next chord is a better estimate than either
+    // endpoint and costs no further datum load.
+    if !march.open() {
+        let den = fb - fa;
+        if den.abs() > 1e-20 {
+            let tn = b - fb * (b - a) / den;
+            if tn > a.min(b) && tn < a.max(b) {
+                return tn;
+            }
+        }
+    }
+    if fa.abs() <= fb.abs() { a } else { b }
+}
+
+/// Ray from the origin against a datum-mapped body. `dir` is the unit centre.
+/// `rho` is `radius/distance`. Offsets are in the radius's unit.
+///
+/// Starts at the lo-sphere entrance and sets `t` to the near intersection of
+/// the ray with the sphere of radius `r(dir(p))`. Non-grazing rays settle in
+/// two or three steps; `|f| < 1e-6` returns early. A graze that misses the lo
+/// sphere, or a fixed point that does not settle, falls back to regula falsi.
+/// The march takes at most [`MAPPED_EVAL_CAP`] datum samples. The normal is
+/// the analytic patch derivative at the hit. `horizon` skips
+/// `dot(ray, -dir) > horizon`.
+#[cfg(test)]
+pub(crate) fn ray_mapped(
+    ray: Vec3,
+    dir: Vec3,
+    rho: f32,
+    distance: f32,
+    rotation: Quat,
+    horizon: f32,
+    g: u32,
+    datum: &[f32],
+    min_off: f32,
+    max_off: f32,
+) -> Option<FarHit> {
+    if !(rho > 0.0)
+        || !(distance > 0.0)
+        || !ray.is_finite()
+        || !dir.is_finite()
+        || !distance.is_finite()
+    {
+        return None;
+    }
+    if ray.dot(-dir) > horizon {
+        return None;
+    }
+    let rho_lo = rho + min_off / distance;
+    let rho_hi = rho + max_off / distance;
+    let facing = ray.dot(dir);
+    let (t_hi_in, t_hi_out) = sphere_roots(facing, rho_hi)?;
+    if !(t_hi_out > 0.0) {
+        return None;
+    }
+    let t_start = t_hi_in.max(0.0);
+    let finish = |t: f32| -> Option<FarHit> {
+        if !(t > 0.0) || !t.is_finite() {
+            return None;
+        }
+        let p = ray * t - dir;
+        let rad = p.length();
+        if rad < 1e-8 {
+            return None;
+        }
+        let u_world = p / rad;
+        let body = rotate(conjugate(rotation), u_world);
+        Some(FarHit {
+            t,
+            normal: mapped_normal_analytic(rotation, u_world, rho, distance, g, datum),
+            face: dom_face(body),
+        })
+    };
+    let mut march = MappedMarch {
+        ray,
+        center: dir,
+        rho,
+        distance,
+        rotation,
+        g,
+        datum,
+        evals: 0,
+    };
+    let lo_enter = sphere_roots(facing, rho_lo).and_then(|(t_lo, _)| (t_lo > 0.0).then_some(t_lo));
+    if let Some(t_lo) = lo_enter {
+        let b = t_lo.max(t_start);
+        if b - t_start < 1e-5 {
+            return finish(if t_lo > 0.0 { t_lo } else { t_start });
+        }
+        // Fixed-point pulls from the lo entrance: t <- ray ∩ sphere(r(dir)).
+        // A sign change is a bracket. Two pulls plus the lo sample are the
+        // non-grazing case; Illinois regula spends whatever is left. The hi
+        // entrance is sampled only when those pulls never bracket, or when
+        // the eye is already inside the hi sphere (t_start == 0), which the
+        // old march treats as a miss when f < 0.
+        let (mut f, mut r, _) = march.sample(t_lo);
+        if f.abs() <= MAPPED_F_TOL {
+            return finish(t_lo);
+        }
+        let mut t = t_lo;
+        let mut bracket: Option<(f32, f32, f32, f32)> = None;
+        for _ in 0..2 {
+            if !march.open() {
+                break;
+            }
+            let Some(tn) = positive_root(facing, r) else {
+                break;
+            };
+            if tn <= t_start || tn >= t_hi_out || (tn - t).abs() <= 1e-8 {
+                break;
+            }
+            if let Some((a, b, _, _)) = bracket
+                && (tn <= a || tn >= b)
+            {
+                break;
+            }
+            let (ft, rt, _) = march.sample(tn);
+            if f * ft <= 0.0 {
+                bracket = Some(if t < tn {
+                    (t, tn, f, ft)
+                } else {
+                    (tn, t, ft, f)
+                });
+            }
+            if ft.abs() <= MAPPED_F_TOL {
+                return finish(tn);
+            }
+            t = tn;
+            f = ft;
+            r = rt;
+        }
+        let need_entrance = bracket.is_none() || t_start == 0.0;
+        if need_entrance {
+            if !march.open() {
+                return finish(t);
+            }
+            let (fa, _, _) = march.sample(t_start);
+            if fa.abs() <= 1e-5 {
+                return finish(t_start);
+            }
+            if fa < 0.0 {
+                return None;
+            }
+            if bracket.is_none() {
+                if fa * f <= 0.0 {
+                    bracket = Some(if t_start < t {
+                        (t_start, t, fa, f)
+                    } else {
+                        (t, t_start, f, fa)
+                    });
+                } else {
+                    return finish(t);
+                }
+            }
+        }
+        let Some((a, b, fa, fb)) = bracket else {
+            return finish(t);
+        };
+        return finish(regula(&mut march, a, b, fa, fb));
+    }
+    // No lo-sphere hit: the ray only clips the datum above the lo sphere.
+    // Fixed-point pulls walk in from the hi entrance. A crossing becomes a
+    // bracket. A shallow graze stalls with a small residual and a small
+    // slope; one Newton step from that residual, then a second from the
+    // sample, finishes it without another load. A short chord scan is the
+    // last resort and only when a pull was not possible.
+    let (mut f, mut r, mut slope) = march.sample(t_start);
+    if f < -1e-5 {
+        return None;
+    }
+    if f.abs() <= 1e-5 {
+        return finish(t_start);
+    }
+    let f_enter = f;
+    let mut t = t_start;
+    let mut bracket: Option<(f32, f32, f32, f32)> = None;
+    // One evaluation stays spare for the Newton check below.
+    while march.evals + 1 < MAPPED_EVAL_CAP {
+        let Some(tn) = positive_root(facing, r).filter(|tn| *tn > t_start && *tn <= t_hi_out)
+        else {
+            break;
+        };
+        if (tn - t).abs() <= 1e-8 {
+            break;
+        }
+        let (ft, rt, st) = march.sample(tn);
+        if f * ft <= 0.0 {
+            bracket = Some(if t < tn {
+                (t, tn, f, ft)
+            } else {
+                (tn, t, ft, f)
+            });
+            break;
+        }
+        if ft.abs() <= MAPPED_F_TOL {
+            return finish(tn);
+        }
+        t = tn;
+        f = ft;
+        r = rt;
+        slope = st;
+    }
+    if bracket.is_none() && slope.abs() > 1e-4 && f.abs() < 0.05 {
+        let ts = t - f / slope;
+        if ts > t_start && ts < t_hi_out && (ts - t).abs() > 1e-8 && (ts - t).abs() < 0.05 {
+            if march.open() {
+                let (fs, _, ss) = march.sample(ts);
+                if fs.abs() <= 1e-5 {
+                    if ss.abs() > 1e-4 {
+                        let t2 = ts - fs / ss;
+                        if t2 > t_start && t2 < t_hi_out && (t2 - ts).abs() < 2e-3 {
+                            return finish(t2);
+                        }
+                    }
+                    return finish(ts);
+                }
+                if f * fs <= 0.0 {
+                    bracket = Some(if t < ts {
+                        (t, ts, f, fs)
+                    } else {
+                        (ts, t, fs, f)
+                    });
+                } else if fs.abs() < 1e-3 && ss.abs() > 1e-4 {
+                    let t2 = ts - fs / ss;
+                    if t2 > t_start && t2 < t_hi_out && (t2 - ts).abs() < 2e-3 {
+                        return finish(t2);
+                    }
+                }
+            } else if f.abs() < 1e-3 {
+                return finish(ts);
+            }
+        }
+    }
+    if let Some((a, b, fa, fb)) = bracket {
+        return finish(regula(&mut march, a, b, fa, fb));
+    }
+    let mut prev_t = t_start;
+    let mut prev_f = f_enter;
+    let left = MAPPED_EVAL_CAP.saturating_sub(march.evals);
+    for i in 1..=left {
+        if !march.open() {
+            break;
+        }
+        let tn = t_start + (t_hi_out - t_start) * (i as f32 / (left as f32));
+        let (ft, _, _) = march.sample(tn);
+        if ft.abs() <= MAPPED_F_TOL {
+            return finish(tn);
+        }
+        if prev_f * ft <= 0.0 {
+            return finish(regula(&mut march, prev_t, tn, prev_f, ft));
+        }
+        prev_t = tn;
+        prev_f = ft;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1616,5 +2160,148 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn atan_approx_stays_under_a_datum_cell() {
+        let mut max_err = 0.0f64;
+        let n = 200_001i32;
+        for i in 0..=n {
+            let x = -1.0 + 2.0 * f64::from(i) / f64::from(n);
+            let got = f64::from(atan_approx(x as f32));
+            max_err = max_err.max((got - x.atan()).abs());
+        }
+        // The stepwise f32 Horner peaks near −0.972. Sweep that neighbourhood.
+        for i in 0..20_000 {
+            let x = -0.99 + 0.04 * f64::from(i) / 20_000.0;
+            let got = f64::from(atan_approx(x as f32));
+            max_err = max_err.max((got - x.atan()).abs());
+        }
+        assert!(
+            max_err <= 6.7e-7,
+            "atan approx err {max_err} exceeds 6.7e-7 rad"
+        );
+    }
+
+    #[test]
+    fn analytic_normal_matches_the_finite_difference() {
+        let g = 33u32;
+        let gg = g as usize;
+        let mut datum = vec![0.0f32; 6 * gg * gg];
+        for face in 0..6 {
+            let (tu, n, tv) = far_map_basis(face);
+            for j in 0..g {
+                for i in 0..g {
+                    let edge = (g - 1) as f32;
+                    let xi = 2.0 * i as f32 / edge - 1.0;
+                    let eta = 2.0 * j as f32 / edge - 1.0;
+                    let quarter = std::f32::consts::FRAC_PI_4;
+                    let d =
+                        (n + tu * (xi * quarter).tan() + tv * (eta * quarter).tan()).normalize();
+                    // Small enough that a half-cell finite difference stays within
+                    // 1e-3 rad of the analytic slope, and large enough to tilt
+                    // the normal off the radius.
+                    let bump = 0.005 * (d.x * 1.3 + d.y * 0.7).sin() * (d.z * 1.1).cos();
+                    datum[face * gg * gg + j as usize * gg + i as usize] = bump;
+                }
+            }
+        }
+        let rho = 0.4f32;
+        let distance = 6.0f32;
+        let rotation = Quat::from_axis_angle(Vec3::new(0.2, 0.5, 0.8).normalize(), 0.4);
+        let mut worst = 0.0f32;
+        let mut tilt = 0.0f32;
+        for k in 0..64 {
+            let z = -1.0 + 2.0 * (k as f32) / 63.0;
+            let ang = k as f32 * 0.37;
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            let dir = Vec3::new(r * ang.cos(), r * ang.sin(), z);
+            let fd = mapped_normal(rotation, dir, rho, distance, g, &datum);
+            let an = mapped_normal_analytic(rotation, dir, rho, distance, g, &datum);
+            let err = fd.dot(an).clamp(-1.0, 1.0).acos();
+            worst = worst.max(err);
+            // `dir` is the world radius; the normal is world-space too.
+            tilt = tilt.max(dir.dot(an).clamp(-1.0, 1.0).acos());
+        }
+        assert!(tilt > 1e-3, "datum did not tilt the normal ({tilt})");
+        assert!(worst < 1e-3, "normal angle {worst} rad");
+    }
+
+    #[test]
+    fn fixed_point_hits_match_regula() {
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        // Low-frequency height. A texel of white noise makes the fixed point
+        // oscillate, and a planet datum does not look like that. Amplitude is
+        // a few percent of the radius, frequencies a few radians, phases random.
+        let g = 17u32;
+        let gg = g as usize;
+        let phase =
+            |rng: &mut dyn FnMut() -> u32| (rng() as f32 / u32::MAX as f32) * std::f32::consts::TAU;
+        let p1 = phase(&mut next);
+        let p2 = phase(&mut next);
+        let p3 = phase(&mut next);
+        let mut datum = vec![0.0f32; 6 * gg * gg];
+        for face in 0..6 {
+            let (tu, n, tv) = far_map_basis(face);
+            for j in 0..g {
+                for i in 0..g {
+                    let edge = (g - 1) as f32;
+                    let xi = 2.0 * i as f32 / edge - 1.0;
+                    let eta = 2.0 * j as f32 / edge - 1.0;
+                    let quarter = std::f32::consts::FRAC_PI_4;
+                    let d =
+                        (n + tu * (xi * quarter).tan() + tv * (eta * quarter).tan()).normalize();
+                    // A few percent of the radius. Steeper than terrain, flat
+                    // enough that two or three fixed-point steps settle.
+                    let bump = 0.05 * (d.x * 2.0 + p1).sin() * (d.y * 1.7 + p2).cos()
+                        + 0.025 * (d.z * 3.0 + p3).sin();
+                    datum[face * gg * gg + j as usize * gg + i as usize] = bump;
+                }
+            }
+        }
+        let unit = |rng: &mut dyn FnMut() -> u32| {
+            let z = (rng() as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            let ang = (rng() as f32 / u32::MAX as f32) * std::f32::consts::TAU;
+            let radial = (1.0 - z * z).max(0.0).sqrt();
+            Vec3::new(radial * ang.cos(), radial * ang.sin(), z)
+        };
+        let min_off = datum.iter().copied().fold(f32::MAX, f32::min);
+        let max_off = datum.iter().copied().fold(f32::MIN, f32::max);
+        let rho = 0.45f32;
+        let distance = 5.0f32;
+        let mut hits = 0u32;
+        let mut worst = 0.0f32;
+        for _ in 0..400 {
+            let dir = unit(&mut next);
+            let axis = unit(&mut next);
+            let turn = (next() as f32 / u32::MAX as f32) * 3.0;
+            let rotation = Quat::from_axis_angle(axis, turn);
+            let spread = (next() as f32 / u32::MAX as f32) * 0.7;
+            let ray = (dir + unit(&mut next) * spread).normalize();
+            let old = ray_mapped_regula(
+                ray, dir, rho, distance, rotation, 1.0, g, &datum, min_off, max_off,
+            );
+            let new = ray_mapped(
+                ray, dir, rho, distance, rotation, 1.0, g, &datum, min_off, max_off,
+            );
+            match (old, new) {
+                (None, None) => {}
+                (Some(a), Some(b)) => {
+                    hits += 1;
+                    worst = worst.max((a.t - b.t).abs());
+                }
+                (old, new) => {
+                    panic!("hit mismatch old {old:?} new {new:?} ray {ray:?} dir {dir:?}")
+                }
+            }
+        }
+        assert!(worst < 1e-6, "t delta {worst}");
+        assert!(hits > 50, "only {hits} rays hit");
     }
 }

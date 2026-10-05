@@ -440,6 +440,16 @@ const SLANG_CONST_ALLOWLIST: &[(&str, &str)] = &[
          and the surface chord in far_body.slang. Shader-internal: nothing on \
          the CPU reads it, and a genconst entry would be a public constant",
     ),
+    (
+        "FAR_MAP_CAP",
+        "datum samples one mapped ray may spend, the same cap as \
+         MAPPED_EVAL_CAP in src/far_body.rs. A search limit, not a scene tunable",
+    ),
+    (
+        "FAR_MAP_FTOL",
+        "early-out on |radius - r(dir)| during the mapped march, the same \
+         tolerance as MAPPED_F_TOL in src/far_body.rs",
+    ),
 ];
 
 /// Lint static consts; allowlist-exempt those referencing generated symbols.
