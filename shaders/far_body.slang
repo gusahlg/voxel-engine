@@ -1379,13 +1379,19 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 {
                     float rad = length(bodyP);
                     float3 bodyDir = rad > 1e-8 ? bodyP / rad : float3(0.0, 1.0, 0.0);
-                    float rWorld = rad * distance;
-                    float footprint = px * bestT * distance;
-                    float texel = (2.0 * rWorld) / float(albedoSize);
+                    // Footprint of this pixel on the surface. A graze stretches
+                    // it by 1/|ray·n|; the floor keeps a silhouette finite.
+                    // Texel is the face-centre size, (π/2 R) / albedo edge.
+                    float ndot = abs(dot(ray, bestN));
+                    if (ndot < 0.05)
+                        ndot = 0.05;
+                    float footprint = px * bestT * distance / ndot;
+                    float texel = (1.5707963267948966 * rho * distance) / float(albedoSize);
                     float lod = 0.0;
                     if (texel > 1e-20)
                         lod = log2(max(footprint / texel, 1e-20));
-                    alb = far_cube(map, bodyDir, clamp(lod, 0.0, 16.0));
+                    float mipMax = log2(float(albedoSize));
+                    alb = far_cube(map, bodyDir, clamp(lod, 0.0, mipMax));
                 }
             }
             float3 lit = far_lit(alb, bestN, ray, air, rho, false, false);

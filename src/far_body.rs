@@ -2547,4 +2547,47 @@ mod tests {
              at {worst_where}"
         );
     }
+
+    /// Cube LOD the shader derives from the pixel footprint. `ndot` is
+    /// `|ray · n|`. The face-centre texel is `(π/2) R / albedo_size`, and the
+    /// result is clamped to the mip range `[0, log2(albedo_size)]`.
+    fn mapped_albedo_lod(
+        px: f32,
+        t: f32,
+        distance: f32,
+        radius: f32,
+        ndot: f32,
+        albedo_size: u32,
+    ) -> f32 {
+        let nd = ndot.abs().max(0.05);
+        let footprint = px * t * distance / nd;
+        let texel = (std::f32::consts::FRAC_PI_2 * radius) / albedo_size as f32;
+        let lod = (footprint / texel).max(1e-20).log2();
+        let mip_max = (albedo_size as f32).log2();
+        lod.clamp(0.0, mip_max)
+    }
+
+    #[test]
+    fn albedo_lod_rises_toward_the_horizon() {
+        let px = 0.01f32;
+        let t = 0.5f32;
+        let distance = 1.0e7f32;
+        let radius = 3.101752e7f32;
+        let albedo = 1024u32;
+        let down = mapped_albedo_lod(px, t, distance, radius, 1.0, albedo);
+        let graze = mapped_albedo_lod(px, t, distance, radius, 0.05, albedo);
+        let flatter = mapped_albedo_lod(px, t, distance, radius, 0.01, albedo);
+        let levels = std::f32::consts::LN_2;
+        let expect = (20.0f32).ln() / levels;
+        assert!(
+            (graze - down - expect).abs() < 1e-4,
+            "nadir {down} graze {graze} expected +{expect}"
+        );
+        assert!((flatter - graze).abs() < 1e-5, "ndot below 0.05 must clamp");
+        assert!(down > 0.0 && graze < (albedo as f32).log2());
+        let tiny = mapped_albedo_lod(1e-6, 1e-4, distance, radius, 1.0, albedo);
+        let huge = mapped_albedo_lod(1.0, 10.0, distance, radius, 0.05, albedo);
+        assert_eq!(tiny, 0.0);
+        assert_eq!(huge, (albedo as f32).log2());
+    }
 }
