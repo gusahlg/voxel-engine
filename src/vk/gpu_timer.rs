@@ -14,8 +14,8 @@ use super::buffers::FRAMES_IN_FLIGHT;
 /// Each pass end is stamped at that pass's last real pipeline stage (color-out,
 /// late-Z, compute, or copy) — never `BOTTOM_OF_PIPE`, which would drain idle
 /// pipe stages between passes. Empty passes skip the stamp
-/// ([`GpuTimer::recorded`]) and read 0. A final union-stage stamp at command-
-/// buffer end times the idle gap (the present copy is timed apart, see
+/// ([`GpuTimer::recorded`]) and read 0. A final [`FRAME_END_STAGE`] stamp at
+/// command-buffer end times the idle gap (the present copy is timed apart, see
 /// [`GpuTimer::end_copy`]).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum GpuPass {
@@ -140,25 +140,45 @@ impl GpuPass {
     }
 }
 
-/// One start timestamp, one boundary per pass, and a union-stage frame end.
+/// One start timestamp, one boundary per pass, and an [`FRAME_END_STAGE`] stamp.
 const GPU_STAMPS: usize = GpuPass::COUNT + 2;
 /// The present copy's start/end pair lives after the per-slot render ranges.
 /// One pair suffices: a new copy is only recorded once the previous one has
 /// retired (`decide_present` probes/waits it), so its stamps are read first.
 const COPY_STAMP_BASE: u32 = (GPU_STAMPS * FRAMES_IN_FLIGHT as usize) as u32;
-/// Two frame-boundary stamps per slot (TOP / union-stage end), after the copy
-/// pair. Recorded only after [`crate::Engine::enable_gpu_load`]; the profiler
-/// stamps (`VOXEL_PROFILE`) use a separate range and are unaffected.
+/// Two frame-boundary stamps per slot (`TOP_OF_PIPE` / [`FRAME_END_STAGE`]),
+/// after the copy pair. Recorded only after [`crate::Engine::enable_gpu_load`];
+/// the profiler stamps (`VOXEL_PROFILE`) use a separate range and are unaffected.
 const LOAD_STAMP_BASE: u32 = COPY_STAMP_BASE + 2;
-/// Completion of this command buffer's real work: color-out, late-Z, compute,
-/// and copy. Used for the profiler frame-end stamp and the gpu_load end stamp
-/// instead of `BOTTOM_OF_PIPE`.
-const FRAME_END_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
-    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT.as_raw()
-        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw()
-        | vk::PipelineStageFlags2::COMPUTE_SHADER.as_raw()
-        | vk::PipelineStageFlags2::COPY.as_raw(),
-);
+/// Frame-end timestamp stage for the profiler and the gpu_load pair.
+/// `vkCmdWriteTimestamp2` accepts exactly one pipeline stage bit
+/// (VUID-vkCmdWriteTimestamp2-stage-03859). `ALL_COMMANDS` is that bit with
+/// the meaning "every command on this queue has finished" — the legal form of
+/// waiting until color-out, late-Z, compute, and copy are all done.
+const FRAME_END_STAGE: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::ALL_COMMANDS;
+
+/// `vkCmdWriteTimestamp2` rejects a stage mask. Exactly one bit is legal.
+fn timestamp_stage_is_one_bit(stage: vk::PipelineStageFlags2) -> bool {
+    stage.as_raw().count_ones() == 1
+}
+
+fn write_timestamp(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    stage: vk::PipelineStageFlags2,
+    pool: vk::QueryPool,
+    query: u32,
+) {
+    debug_assert!(
+        timestamp_stage_is_one_bit(stage),
+        "vkCmdWriteTimestamp2 stage must set exactly one pipeline stage bit \
+         (VUID-vkCmdWriteTimestamp2-stage-03859), got {stage:?}"
+    );
+    unsafe {
+        device.cmd_write_timestamp2(cmd, stage, pool, query);
+    }
+}
+
 const LOAD_STAMPS: u32 = 2;
 const QUERY_COUNT: u32 = LOAD_STAMP_BASE + LOAD_STAMPS * FRAMES_IN_FLIGHT as u32;
 
@@ -230,15 +250,16 @@ impl GpuLoadShared {
 }
 
 /// Per-pass GPU timing via a timestamp query pool: a `TOP_OF_PIPE` start, one
-/// last-real-stage stamp after each recorded pass, and a union-stage frame end.
+/// last-real-stage stamp after each recorded pass, and an [`FRAME_END_STAGE`]
+/// frame end.
 /// Only the passes that actually run write a pass stamp,
 /// and the label written alongside each stamp keeps deltas attributable even
 /// when a frame skips passes (no 3D, VRS off). A slot's results are read one
 /// reuse cycle later (`FRAMES_IN_FLIGHT` frames), after its fence is waited, so
 /// the read never stalls — and because that wait is in render order, consecutive
 /// `read_into` calls are consecutive rendered frames (possibly different slots).
-/// Their timestamps share the device clock, so `TOP(N) - union-end(N-1)` is the
-/// idle gap before this submit.
+/// Their timestamps share the device clock, so `TOP(N) - ALL_COMMANDS-end(N-1)`
+/// is the idle gap before this submit.
 ///
 /// `count`/`label` are [`Cell`]s so a mark needs only `&self`: the render pass
 /// holds an immutable `&Renderer` while recording, and all timer state is
@@ -370,13 +391,13 @@ impl GpuTimer {
             self.prev_end = None;
             return None;
         }
-        // Last stamp is the unlabeled union-stage frame end, not a pass.
+        // Last stamp is the unlabeled ALL_COMMANDS frame end, not a pass.
         for i in 1..n - 1 {
             let ms = ts[i].wrapping_sub(ts[i - 1]) as f64 * self.period_ns as f64 / 1.0e6;
             sink[self.label[slot][i].get() as usize] += ms;
         }
-        // Frame time is start → union-stage end so gap + frame tile the device clock.
-        // `ts[0]` is the TOP_OF_PIPE `begin`; `ts[n-1]` is the union-stage frame end.
+        // Frame time is start → ALL_COMMANDS end so gap + frame tile the device clock.
+        // `ts[0]` is the TOP_OF_PIPE `begin`; `ts[n-1]` is the frame-end stamp.
         let frame_ms = ts[n - 1].wrapping_sub(ts[0]) as f64 * self.period_ns as f64 / 1.0e6;
         let gap = self
             .prev_end
@@ -404,9 +425,13 @@ impl GpuTimer {
         }
         let base = slot as u32 * GPU_STAMPS as u32;
         self.reset_queries(device, cmd, base, GPU_STAMPS as u32);
-        unsafe {
-            device.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, self.pool, base);
-        }
+        write_timestamp(
+            device,
+            cmd,
+            vk::PipelineStageFlags2::TOP_OF_PIPE,
+            self.pool,
+            base,
+        );
         self.count[slot].set(1);
         self.pending[slot].set(false);
     }
@@ -435,23 +460,22 @@ impl GpuTimer {
             return;
         }
         let i = self.count[slot].get();
-        // Leave the last query for the union-stage frame end in [`Self::finish`].
+        // Leave the last query for the ALL_COMMANDS frame end in [`Self::finish`].
         if i as usize + 1 >= GPU_STAMPS {
             return;
         }
-        unsafe {
-            device.cmd_write_timestamp2(
-                cmd,
-                pass.stamp_stage(),
-                self.pool,
-                slot as u32 * GPU_STAMPS as u32 + i,
-            );
-        }
+        write_timestamp(
+            device,
+            cmd,
+            pass.stamp_stage(),
+            self.pool,
+            slot as u32 * GPU_STAMPS as u32 + i,
+        );
         self.label[slot][i as usize].set(pass);
         self.count[slot].set(i + 1);
     }
 
-    /// Reads this slot's previous load pair (TOP / union-stage end) after its fence wait
+    /// Reads this slot's previous load pair (TOP / [`FRAME_END_STAGE`]) after its fence wait
     /// and publishes [`GpuLoadShared`]. `None` until the first successful
     /// readback; a hole drops `load_prev_end` so the next gap is not invented.
     /// Skipped while [`crate::Engine::enable_gpu_load`] is off (drops a primed
@@ -500,18 +524,17 @@ impl GpuTimer {
             return;
         }
         self.reset_queries(device, cmd, load_query(slot, 0), LOAD_STAMPS);
-        unsafe {
-            device.cmd_write_timestamp2(
-                cmd,
-                vk::PipelineStageFlags2::TOP_OF_PIPE,
-                self.pool,
-                load_query(slot, 0),
-            );
-        }
+        write_timestamp(
+            device,
+            cmd,
+            vk::PipelineStageFlags2::TOP_OF_PIPE,
+            self.pool,
+            load_query(slot, 0),
+        );
         self.load_open[slot].set(true);
     }
 
-    /// Writes the union-stage end stamp and marks the pair readable next cycle.
+    /// Writes the [`FRAME_END_STAGE`] end stamp and marks the pair readable next cycle.
     /// Closes a pair `begin_load` actually opened, even if the setter flipped
     /// off mid-record (an unmatched TOP would leave the query incomplete).
     pub(super) unsafe fn end_load(
@@ -523,14 +546,12 @@ impl GpuTimer {
         if !self.enabled() || !self.load_open[slot].get() {
             return;
         }
-        unsafe {
-            device.cmd_write_timestamp2(cmd, FRAME_END_STAGES, self.pool, load_query(slot, 1));
-        }
+        write_timestamp(device, cmd, FRAME_END_STAGE, self.pool, load_query(slot, 1));
         self.load_open[slot].set(false);
         self.load_primed[slot] = true;
     }
 
-    /// Writes the union-stage frame-end stamp and marks `slot` readable next
+    /// Writes the [`FRAME_END_STAGE`] frame-end stamp and marks `slot` readable next
     /// cycle. Call after the last pass `mark`, before `vkEndCommandBuffer`.
     pub(super) unsafe fn finish(
         &mut self,
@@ -543,14 +564,13 @@ impl GpuTimer {
         }
         let i = self.count[slot].get();
         if (i as usize) < GPU_STAMPS {
-            unsafe {
-                device.cmd_write_timestamp2(
-                    cmd,
-                    FRAME_END_STAGES,
-                    self.pool,
-                    slot as u32 * GPU_STAMPS as u32 + i,
-                );
-            }
+            write_timestamp(
+                device,
+                cmd,
+                FRAME_END_STAGE,
+                self.pool,
+                slot as u32 * GPU_STAMPS as u32 + i,
+            );
             self.count[slot].set(i + 1);
         }
         self.primed[slot] = true;
@@ -584,14 +604,13 @@ impl GpuTimer {
             return;
         }
         self.reset_queries(device, cmd, COPY_STAMP_BASE, 2);
-        unsafe {
-            device.cmd_write_timestamp2(
-                cmd,
-                vk::PipelineStageFlags2::TOP_OF_PIPE,
-                self.pool,
-                COPY_STAMP_BASE,
-            );
-        }
+        write_timestamp(
+            device,
+            cmd,
+            vk::PipelineStageFlags2::TOP_OF_PIPE,
+            self.pool,
+            COPY_STAMP_BASE,
+        );
     }
 
     /// Writes the present-copy end stamp (after the last barrier, before the
@@ -600,14 +619,13 @@ impl GpuTimer {
         if !self.enabled() {
             return;
         }
-        unsafe {
-            device.cmd_write_timestamp2(
-                cmd,
-                vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
-                self.pool,
-                COPY_STAMP_BASE + 1,
-            );
-        }
+        write_timestamp(
+            device,
+            cmd,
+            vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+            self.pool,
+            COPY_STAMP_BASE + 1,
+        );
         self.copy_primed = true;
     }
 
@@ -812,7 +830,7 @@ mod tests {
         meters.sort_unstable();
         meters.dedup();
         assert_eq!(meters.len(), GpuPass::COUNT);
-        // Start + one boundary per pass + union-stage frame end.
+        // Start + one boundary per pass + ALL_COMMANDS frame end.
         assert_eq!(GPU_STAMPS, GpuPass::COUNT + 2);
         assert_eq!(
             QUERY_COUNT as usize,
@@ -875,11 +893,33 @@ mod tests {
             GpuPass::Clear.stamp_stage(),
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
         );
-        assert!(FRAME_END_STAGES.contains(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT));
-        assert!(FRAME_END_STAGES.contains(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS));
-        assert!(FRAME_END_STAGES.contains(vk::PipelineStageFlags2::COMPUTE_SHADER));
-        assert!(FRAME_END_STAGES.contains(vk::PipelineStageFlags2::COPY));
-        assert!(!FRAME_END_STAGES.contains(vk::PipelineStageFlags2::BOTTOM_OF_PIPE));
+        // Frame end is one bit meaning "all commands finished", not the old
+        // color-out | late-Z | compute | copy mask and not BOTTOM_OF_PIPE.
+        assert_eq!(FRAME_END_STAGE, vk::PipelineStageFlags2::ALL_COMMANDS);
+        assert!(timestamp_stage_is_one_bit(FRAME_END_STAGE));
+        assert_ne!(FRAME_END_STAGE, vk::PipelineStageFlags2::BOTTOM_OF_PIPE);
+    }
+
+    #[test]
+    fn stamp_stages_set_exactly_one_bit() {
+        let fixed = [
+            vk::PipelineStageFlags2::TOP_OF_PIPE,
+            vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+            FRAME_END_STAGE,
+        ];
+        for stage in fixed {
+            assert!(
+                timestamp_stage_is_one_bit(stage),
+                "{stage:?} must be one pipeline stage bit"
+            );
+        }
+        for pass in GpuPass::ALL {
+            let stage = pass.stamp_stage();
+            assert!(
+                timestamp_stage_is_one_bit(stage),
+                "{pass:?} stamp {stage:?} must be one pipeline stage bit"
+            );
+        }
     }
 
     #[test]

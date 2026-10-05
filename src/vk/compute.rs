@@ -58,6 +58,12 @@ pub(crate) const BUDGET_MAX_US: u32 = 2000;
 const MAX_PUSH_BYTES: u32 = 128;
 const MAX_INPUTS: u32 = 2;
 const QUERY_PAIRS: usize = 64;
+/// `vkCmdWriteTimestamp2` stage at the start of a recorded job. One bit.
+const JOB_STAMP_BEGIN: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::COMPUTE_SHADER;
+/// End stamp for a recorded job. The recording finishes in compute, or in the
+/// readback copy that follows. `ALL_COMMANDS` is the one stage bit that means
+/// both have finished; a compute|copy mask is illegal on this command.
+const JOB_STAMP_END: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::ALL_COMMANDS;
 
 /// Default host-cached input staging ring (16 MiB). One job for the first
 /// user is ~1.18 MiB of input; override with `VOXEL_COMPUTE_INPUT_MB`.
@@ -1326,12 +1332,8 @@ impl ComputeRuntime {
                 } else {
                     device.cmd_reset_query_pool(cmd, self.query_pool, q0, 2);
                 }
-                device.cmd_write_timestamp2(
-                    cmd,
-                    vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    self.query_pool,
-                    q0,
-                );
+                debug_assert_eq!(JOB_STAMP_BEGIN.as_raw().count_ones(), 1);
+                device.cmd_write_timestamp2(cmd, JOB_STAMP_BEGIN, self.query_pool, q0);
             }
 
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
@@ -1479,12 +1481,8 @@ impl ComputeRuntime {
             if let Some(pair) = timestamp_pair
                 && self.query_pool != vk::QueryPool::null()
             {
-                device.cmd_write_timestamp2(
-                    cmd,
-                    vk::PipelineStageFlags2::ALL_COMMANDS,
-                    self.query_pool,
-                    pair * 2 + 1,
-                );
+                debug_assert_eq!(JOB_STAMP_END.as_raw().count_ones(), 1);
+                device.cmd_write_timestamp2(cmd, JOB_STAMP_END, self.query_pool, pair * 2 + 1);
             }
         }
     }
@@ -1738,6 +1736,14 @@ pub(crate) fn compute_limits(props: &vk::PhysicalDeviceProperties) -> ComputeLim
 mod tests {
     use super::*;
     use crate::vk::mesh_staging::StagingRing;
+
+    #[test]
+    fn job_timestamp_stages_are_single_bits() {
+        assert_eq!(JOB_STAMP_BEGIN, vk::PipelineStageFlags2::COMPUTE_SHADER);
+        assert_eq!(JOB_STAMP_END, vk::PipelineStageFlags2::ALL_COMMANDS);
+        assert_eq!(JOB_STAMP_BEGIN.as_raw().count_ones(), 1);
+        assert_eq!(JOB_STAMP_END.as_raw().count_ones(), 1);
+    }
 
     #[test]
     fn budget_empty_is_zero() {
