@@ -36,6 +36,19 @@ struct FarTable
     uint4 header;
     float4 cone[32]; // xyz = dir, w = sine bound (-1 = never reject)
     FarGpu body[32];
+    // Azimuthal horizon tables for at most two Mapped bodies the eye is inside
+    // the hi+air ball of. x and y are the kept-body index of table 0 and 1,
+    // or 0xffffffff when that table is unused. z is the bin count (256). w is 0.
+    // Bin b of a table is an upper bound on sin(elevation) of any surface or
+    // air-shell point in that azimuth sector. Elevation is above the plane
+    // perpendicular to the body's local up (centre → eye). Azimuth 0 faces
+    // north in the frame east = normalize(cross(ref, up)), north = cross(up, east),
+    // with ref = +Y when |up.y| < 0.9 and +X otherwise, and increases toward east:
+    // atan2(dot(horiz, east), dot(horiz, north)), wrapped to [0, 2π).
+    // A ray whose sin(elevation) is above its bin skips the mapped march and
+    // the limb. Unused bins are 1, so they never reject.
+    uint4 horizon_id;
+    float horizon_sin[512];
     // Bit k is kept body k. One word per tile, row-major. Host cap is 8192.
     uint tile_mask[8192];
     // Tile-quad draws. Not read by far_bodies.

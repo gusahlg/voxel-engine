@@ -1117,6 +1117,35 @@ bool far_ray_mapped(
 }
 
 #ifndef FAR_NO_MAPPED
+// True when `ray` is strictly above body `bodyIndex`'s horizon table.
+// No table (or an unused slot) is never above. The frame matches the host:
+// up = normalise(centre → eye), the same east/north/atan2 as far_table.slang.
+bool far_above_horizon(uint bodyIndex, float3 ray, float3 center)
+{
+    uint slot = 2u;
+    if (farTable[0].horizon_id.x == bodyIndex)
+        slot = 0u;
+    else if (farTable[0].horizon_id.y == bodyIndex)
+        slot = 1u;
+    else
+        return false;
+    float3 up = -center;
+    float upLen = length(up);
+    if (!(upLen > 0.0))
+        return false;
+    up /= upLen;
+    float mu = dot(ray, up);
+    float3 refv = abs(up.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 east = normalize(cross(refv, up));
+    float3 north = cross(up, east);
+    float3 horiz = ray - up * mu;
+    float az = atan2(dot(horiz, east), dot(horiz, north));
+    if (az < 0.0)
+        az += 6.283185307179586;
+    uint bin = min(uint(floor(az * (256.0 / 6.283185307179586))), 255u);
+    return mu > farTable[0].horizon_sin[slot * 256u + bin];
+}
+
 // Air shell for a ray that missed the datum. The direction from the centre
 // at the ray's closest approach is the limb's body-space sample: rSurf is
 // the surface radius there, and the shell is
@@ -1476,8 +1505,10 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
             uint mapPlus = farTable[0].body[i].seed.z;
             float horizon = farTable[0].body[i].albedo0.w;
             float airThick = farTable[0].body[i].albedo1.w;
-            // Above the horizon plane before any intersection, including the limb.
-            if (mapPlus == 0u || mapPlus > 8u || !(distance > 0.0) || dot(ray, -center) > horizon)
+            // Above the scalar horizon plane, or above the azimuth table,
+            // before any intersection, including the limb.
+            if (mapPlus == 0u || mapPlus > 8u || !(distance > 0.0) || dot(ray, -center) > horizon
+                || far_above_horizon(i, ray, center))
                 continue;
             uint map = mapPlus - 1u;
             float4 rot = farTable[0].body[i].rot;

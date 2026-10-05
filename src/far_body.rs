@@ -1415,6 +1415,46 @@ pub(crate) fn ray_mapped(
     None
 }
 
+/// Air-shell limb, the host mirror of `far_mapped_limb`.
+///
+/// `px` is the pixel angle the shader passes (0 for the geometric shell).
+/// A ray aimed away from the centre, or one that misses the shell
+/// `r(approach) + max(air/distance, px)`, is not a limb.
+#[cfg(test)]
+pub(crate) fn ray_mapped_limb(
+    ray: Vec3,
+    dir: Vec3,
+    rho: f32,
+    distance: f32,
+    rotation: Quat,
+    g: u32,
+    datum: &[f32],
+    max_off: f32,
+    air: f32,
+    px: f32,
+) -> bool {
+    if !(distance > 0.0) || !ray.is_finite() || !dir.is_finite() {
+        return false;
+    }
+    let facing = ray.dot(dir);
+    if !(facing > 0.0) {
+        return false;
+    }
+    let s = ray.cross(dir).length();
+    let rho_hi = rho + max_off / distance;
+    let shell = (air / distance).max(px);
+    if !(rho_hi > 0.0 && s < rho_hi + shell) {
+        return false;
+    }
+    let from = ray * facing - dir;
+    if from.length_squared() <= 1e-16 {
+        return false;
+    }
+    let body_dir = rotate(conjugate(rotation), from.normalize());
+    let r_surf = rho + sample_datum(g, datum, body_dir) / distance;
+    r_surf > 0.0 && s < r_surf + shell
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

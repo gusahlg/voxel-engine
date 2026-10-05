@@ -11,6 +11,10 @@
 //! rest, and the heavy run is split into mapped-interior tiles, then the rest.
 //! A mapped-interior tile lies inside the horizon disc or, with the eye
 //! outside the lo sphere, inside that sphere's disc.
+//! Two azimuthal horizon tables follow the body records. Each is 256 sines
+//! of elevation around the local up of a Mapped body the eye is inside the
+//! hi+air ball of. A tile whose cone sits above its table loses that body's
+//! bit; the shader skips a ray above the same table.
 //! `list_header.x` stays the whole base count; the shader still indexes by
 //! instance id.
 
@@ -64,13 +68,19 @@ const MAX_FAR_TILES: usize = 8192;
 const TILE_FINE_PX: u32 = 64;
 const TILE_COARSE_PX: u32 = 128;
 
-/// Header, cones, body records, then one mask word per screen tile.
+/// Header, cones, body records, horizon tables, then one mask word per screen tile.
 /// `header[0]` is the live count. `header[1]` is the tile size in pixels,
 /// `header[2]` is `tiles_x`, `header[3]` is `tiles_y` (all zero with no view).
 /// `cone[i] = (dir.xyz, sine bound)` and a bound of `-1` means the pixel test
 /// must not reject that body and every tile keeps bit `i`.
-/// `tile_mask[ty * tiles_x + tx]` bit `k` is set when kept body `k` may cover
-/// that tile. Only the `tiles_x * tiles_y` prefix is live.
+/// `horizon_id.x` and `.y` are the kept-body index of each azimuth table, or
+/// `u32::MAX` when that table is unused. `.z` is [`HORIZON_BINS`]. `.w` is 0.
+/// `horizon_sin` is table 0 then table 1: bin `b` is an upper bound on the
+/// sine of elevation (above the plane perpendicular to centre→eye) of any
+/// surface or air-shell point in that azimuth sector. The frame matches
+/// `shaders/far_table.slang`. An unused table is filled with 1, so it never
+/// rejects. `tile_mask[ty * tiles_x + tx]` bit `k` is set when kept body `k`
+/// may cover that tile. Only the `tiles_x * tiles_y` prefix is live.
 ///
 /// `list_header` is `(n_base, n_full, width, height)`. `tile_index` holds the
 /// base tiles (mask == 0), then the full tiles. The base run is ascending
@@ -87,6 +97,10 @@ pub(crate) struct FarTableGpu {
     pub header: [u32; 4],
     pub cone: [[f32; 4]; MAX_FAR_BODIES],
     pub body: [FarBodyGpu; MAX_FAR_BODIES],
+    /// `.x` / `.y` kept-body index or `u32::MAX`. `.z` = [`HORIZON_BINS`].
+    pub horizon_id: [u32; 4],
+    /// Table 0 in `0..HORIZON_BINS`, table 1 after it.
+    pub horizon_sin: [f32; HORIZON_BINS * HORIZON_TABLES],
     pub tile_mask: [u32; MAX_FAR_TILES],
     pub list_header: [u32; 4],
     pub tile_index: [u32; MAX_FAR_TILES],
@@ -98,12 +112,25 @@ pub(crate) struct FarTableGpu {
 unsafe impl Zeroable for FarTableGpu {}
 unsafe impl Pod for FarTableGpu {}
 
+/// Bins in one azimuthal horizon table. Matches `horizon_sin` in
+/// `shaders/far_table.slang` (two tables, back to back).
+const HORIZON_BINS: usize = 256;
+/// Tables published per frame. The two Mapped bodies with the largest rho.
+const HORIZON_TABLES: usize = 2;
+/// Added to every stored sine. A sample sitting on the bound stays inside.
+const HORIZON_SIN_PAD: f32 = 1.0e-4;
+/// Eye motion that keeps a cached table, as a fraction of the altitude
+/// above the lo sphere.
+const HORIZON_MOVE_FRAC: f32 = 0.001;
+
 const _: () = assert!(std::mem::size_of::<FarBodyGpu>() == 160);
 const _: () = assert!(
     std::mem::size_of::<FarTableGpu>()
         == 16
             + 16 * MAX_FAR_BODIES
             + 160 * MAX_FAR_BODIES
+            + 16
+            + 4 * HORIZON_BINS * HORIZON_TABLES
             + 4 * MAX_FAR_TILES
             + 16
             + 4 * MAX_FAR_TILES
@@ -111,11 +138,20 @@ const _: () = assert!(
 const _: () = assert!(std::mem::offset_of!(FarTableGpu, cone) == 16);
 const _: () = assert!(std::mem::offset_of!(FarTableGpu, body) == 16 + 16 * MAX_FAR_BODIES);
 const _: () = assert!(
-    std::mem::offset_of!(FarTableGpu, tile_mask) == 16 + 16 * MAX_FAR_BODIES + 160 * MAX_FAR_BODIES
+    std::mem::offset_of!(FarTableGpu, horizon_id)
+        == 16 + 16 * MAX_FAR_BODIES + 160 * MAX_FAR_BODIES
+);
+const _: () = assert!(
+    std::mem::offset_of!(FarTableGpu, horizon_sin)
+        == std::mem::offset_of!(FarTableGpu, horizon_id) + 16
+);
+const _: () = assert!(
+    std::mem::offset_of!(FarTableGpu, tile_mask)
+        == std::mem::offset_of!(FarTableGpu, horizon_sin) + 4 * HORIZON_BINS * HORIZON_TABLES
 );
 const _: () = assert!(
     std::mem::offset_of!(FarTableGpu, list_header)
-        == 16 + 16 * MAX_FAR_BODIES + 160 * MAX_FAR_BODIES + 4 * MAX_FAR_TILES
+        == std::mem::offset_of!(FarTableGpu, tile_mask) + 4 * MAX_FAR_TILES
 );
 const _: () = assert!(
     std::mem::offset_of!(FarTableGpu, tile_index)
@@ -1588,7 +1624,7 @@ pub(crate) fn pack_table(
     *pack_table_cached(bodies, view.as_ref(), None, map_max, glam::Vec3::Y).0
 }
 
-/// The table is 71 KB. `Box::new(FarTableGpu::zeroed())` would build that on
+/// The table is 72 KB. `Box::new(FarTableGpu::zeroed())` would build that on
 /// the stack, and the render thread already holds `Renderer` there.
 fn zeroed_table() -> Box<FarTableGpu> {
     let layout = std::alloc::Layout::new::<FarTableGpu>();
@@ -1636,6 +1672,485 @@ pub(crate) fn horizon_dip(bodies: &[FarBody], sky_up: glam::Vec3) -> f32 {
     (1.0 - best * best).max(0.0).sqrt().clamp(0.0, 0.5)
 }
 
+/// `(east, north)` for `up`. `ref` is +Y when `|up.y| < 0.9`, else +X.
+/// `east = normalize(cross(ref, up))`, `north = cross(up, east)`.
+fn horizon_axes(up: glam::Vec3) -> Option<(glam::Vec3, glam::Vec3)> {
+    let len2 = up.length_squared();
+    if !(len2 > 0.0) || !up.is_finite() {
+        return None;
+    }
+    let up = up / len2.sqrt();
+    let reference = if up.y.abs() < 0.9 {
+        glam::Vec3::Y
+    } else {
+        glam::Vec3::X
+    };
+    let east = reference.cross(up);
+    let elen2 = east.length_squared();
+    if !(elen2 > 1.0e-20) || !east.is_finite() {
+        return None;
+    }
+    let east = east / elen2.sqrt();
+    let north = up.cross(east);
+    north.is_finite().then_some((east, north))
+}
+
+/// Azimuth of `dir` in `[0, 2π)`. `atan2(east, north)`, matching the shader.
+fn horizon_azimuth(dir: glam::Vec3, up: glam::Vec3, east: glam::Vec3, north: glam::Vec3) -> f32 {
+    let horiz = dir - up * dir.dot(up);
+    let az = horiz.dot(east).atan2(horiz.dot(north));
+    if az < 0.0 {
+        az + std::f32::consts::TAU
+    } else {
+        az
+    }
+}
+
+fn horizon_bin(az: f32) -> usize {
+    let n = HORIZON_BINS as f32;
+    let i = (az / std::f32::consts::TAU * n).floor() as i32;
+    i.rem_euclid(HORIZON_BINS as i32) as usize
+}
+
+/// Sine of the elevation of a point at normalised radius `rho` whose
+/// centre-direction has `dot(s, up) = mu`. The eye is the origin and the
+/// centre is `-up`. Highest radius is the higher elevation: the derivative
+/// in `rho` is non-negative. The derivative in `mu` peaks at `mu = rho`
+/// when `rho < 1`, and keeps rising up to the pole when `rho >= 1`.
+fn horizon_elev_sin(rho: f32, mu: f32) -> f32 {
+    let mu = mu.clamp(-1.0, 1.0);
+    if !(rho > 0.0) || !rho.is_finite() {
+        return -1.0;
+    }
+    let disc = (1.0 - rho) * (1.0 - rho) + 2.0 * rho * (1.0 - mu);
+    if !(disc > 1.0e-20) {
+        return 1.0;
+    }
+    let s = (rho * mu - 1.0) / disc.sqrt();
+    if s.is_finite() {
+        s.clamp(-1.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// `(mu_far, mu_near)` of a cap of angular radius `beta` around a direction
+/// with `dot(centre, up) = mu_c`. A cap that contains the pole reaches `±1`.
+fn cap_mu(mu_c: f32, beta: f32) -> (f32, f32) {
+    let mu_c = mu_c.clamp(-1.0, 1.0);
+    let gamma = mu_c.acos();
+    let near = if gamma <= beta {
+        1.0
+    } else {
+        (gamma - beta).cos()
+    };
+    let far = if gamma + beta >= std::f32::consts::PI {
+        -1.0
+    } else {
+        (gamma + beta).cos()
+    };
+    (far.min(near), near)
+}
+
+/// Upper bound on elevation over the cap. `mu*` is `rho` when the cap
+/// straddles the limb (`mu = rho`), otherwise the endpoint closer to it.
+fn cap_elev(rho: f32, mu_far: f32, mu_near: f32) -> f32 {
+    let mu = if rho >= 1.0 {
+        mu_near
+    } else {
+        rho.clamp(mu_far, mu_near)
+    };
+    horizon_elev_sin(rho, mu)
+}
+
+/// Azimuthal half-width of a cap of radius `beta` at polar angle `gamma`.
+/// `None` when the cap contains either pole and therefore every bin.
+fn azimuth_half(beta: f32, gamma: f32) -> Option<f32> {
+    if !(beta >= 0.0 && gamma >= 0.0) || !beta.is_finite() || !gamma.is_finite() {
+        return None;
+    }
+    if gamma <= beta + 1.0e-6 || gamma + beta >= std::f32::consts::PI - 1.0e-6 {
+        return None;
+    }
+    let s = (beta.sin() / gamma.sin()).clamp(0.0, 1.0);
+    Some(s.asin())
+}
+
+fn chart_dir(face: usize, xi: f32, eta: f32) -> Option<glam::Vec3> {
+    let (tu, n, tv) = crate::far_body::far_map_basis(face);
+    let a = (xi * std::f32::consts::FRAC_PI_4).tan();
+    let b = (eta * std::f32::consts::FRAC_PI_4).tan();
+    if !a.is_finite() || !b.is_finite() {
+        return None;
+    }
+    let d = n + tu * a + tv * b;
+    unit_dir(d)
+}
+
+fn raise_bins(bins: &mut [f32; HORIZON_BINS], az: f32, half: Option<f32>, elev: f32) {
+    if !elev.is_finite() {
+        return;
+    }
+    let elev = (elev + HORIZON_SIN_PAD).clamp(-1.0, 1.0);
+    let Some(half) = half else {
+        for bin in bins.iter_mut() {
+            *bin = bin.max(elev);
+        }
+        return;
+    };
+    let width = std::f32::consts::TAU / HORIZON_BINS as f32;
+    let mut i0 = ((az - half) / width).floor() as i32;
+    let i1 = ((az + half) / width).floor() as i32;
+    if i1 - i0 >= HORIZON_BINS as i32 {
+        for bin in bins.iter_mut() {
+            *bin = bin.max(elev);
+        }
+        return;
+    }
+    while i0 <= i1 {
+        let idx = i0.rem_euclid(HORIZON_BINS as i32) as usize;
+        bins[idx] = bins[idx].max(elev);
+        i0 += 1;
+    }
+}
+
+/// 256-bin horizon table for one Mapped body.
+///
+/// `up` is the unit centre→eye direction. A cell's radius is the max of its
+/// four corner offsets (exact for bilinear) plus `radius` plus the shell
+/// `max(air, px * distance)`. `px` is an upper bound on the shader's pixel
+/// angle, because the limb shell is `max(air/distance, px)`. Directions of
+/// the cell lie in a cap of the half-diagonal angle around the chart-midpoint
+/// direction. The cap's highest elevation at that radius is written into
+/// every azimuth bin the cap overlaps; a cap that contains the up axis
+/// covers every bin. An unwritten bin becomes 1 so it cannot reject.
+fn build_horizon_bins(
+    g: u32,
+    datum: &[f32],
+    rotation: glam::Quat,
+    up: glam::Vec3,
+    radius: f32,
+    distance: f32,
+    air: f32,
+    px: f32,
+) -> [f32; HORIZON_BINS] {
+    let full = [1.0; HORIZON_BINS];
+    if g < 2 || !(distance > 0.0) || !distance.is_finite() || !radius.is_finite() {
+        return full;
+    }
+    let gg = g as usize;
+    let n = 6 * gg * gg;
+    if datum.len() < n || datum.iter().take(n).any(|v| !v.is_finite()) {
+        return full;
+    }
+    let Some(up) = unit_dir(up) else {
+        return full;
+    };
+    let Some((east, north)) = horizon_axes(up) else {
+        return full;
+    };
+    let rotation = if rotation.is_finite() && rotation.length_squared() > 0.0 {
+        rotation.normalize()
+    } else {
+        glam::Quat::IDENTITY
+    };
+    let shell = air.max(0.0).max(px.max(0.0) * distance);
+    let mut bins = [-2.0f32; HORIZON_BINS];
+    let bin_w = std::f32::consts::TAU / HORIZON_BINS as f32;
+    let cells = g - 1;
+    for face in 0..6usize {
+        for j in 0..cells {
+            for i in 0..cells {
+                let edge = cells as f32;
+                let xi = |k: u32| 2.0 * k as f32 / edge - 1.0;
+                let corners = [(i, j), (i + 1, j), (i, j + 1), (i + 1, j + 1)];
+                let mut max_off = f32::NEG_INFINITY;
+                let mut corner_dir = [glam::Vec3::ZERO; 4];
+                let mut ok = true;
+                for (ncorner, (ci, cj)) in corners.iter().copied().enumerate() {
+                    let off = datum[face * gg * gg + cj as usize * gg + ci as usize];
+                    max_off = max_off.max(off);
+                    match chart_dir(face, xi(ci), xi(cj)) {
+                        Some(d) => corner_dir[ncorner] = d,
+                        None => ok = false,
+                    }
+                }
+                let xi_c = (2.0 * i as f32 + 1.0) / edge - 1.0;
+                let eta_c = (2.0 * j as f32 + 1.0) / edge - 1.0;
+                let Some(centre) = chart_dir(face, xi_c, eta_c) else {
+                    continue;
+                };
+                if !ok || !max_off.is_finite() {
+                    continue;
+                }
+                let mut min_cos = 1.0f32;
+                for corner in corner_dir {
+                    min_cos = min_cos.min(centre.dot(corner));
+                }
+                let beta = min_cos.clamp(-1.0, 1.0).acos();
+                let world = rotation * centre;
+                let Some(world) = unit_dir(world) else {
+                    continue;
+                };
+                let mu_c = world.dot(up).clamp(-1.0, 1.0);
+                let gamma = mu_c.acos();
+                let rho = (radius + max_off + shell) / distance;
+                if !(rho > 0.0) || !rho.is_finite() {
+                    continue;
+                }
+                let (mu_far, mu_near) = cap_mu(mu_c, beta);
+                let elev = cap_elev(rho, mu_far, mu_near);
+                let half = azimuth_half(beta, gamma).map(|h| h + bin_w);
+                let az = horizon_azimuth(world, up, east, north);
+                raise_bins(&mut bins, az, half, elev);
+            }
+        }
+    }
+    for bin in &mut bins {
+        if *bin < -1.5 {
+            *bin = 1.0;
+        }
+    }
+    bins
+}
+
+/// `true` when `ray` is strictly above `bins`. `ray` need not be unit.
+fn ray_above_horizon(
+    bins: &[f32; HORIZON_BINS],
+    up: glam::Vec3,
+    east: glam::Vec3,
+    north: glam::Vec3,
+    ray: glam::Vec3,
+) -> bool {
+    let Some(ray) = unit_dir(ray) else {
+        return false;
+    };
+    let Some(up) = unit_dir(up) else {
+        return false;
+    };
+    let mu = ray.dot(up);
+    let az = horizon_azimuth(ray, up, east, north);
+    mu > bins[horizon_bin(az)]
+}
+
+/// The whole tile cone, widened by `px_margin` radians (2 px when that is
+/// [`FarView::px_max`]), lies strictly above every bin its azimuth range
+/// overlaps. The stored cone already carries the tile's angular radius.
+fn tile_above_horizon(
+    tile: &TileSample,
+    bins: &[f32; HORIZON_BINS],
+    up: glam::Vec3,
+    east: glam::Vec3,
+    north: glam::Vec3,
+    px_margin: f32,
+) -> bool {
+    if !(px_margin.is_finite() && (0.0..std::f32::consts::FRAC_PI_2).contains(&px_margin)) {
+        return false;
+    }
+    let (sin_a, cos_a) = add_angles(tile.cos_r, px_margin.cos());
+    if sin_a > 1.0 || !(sin_a.is_finite() && cos_a.is_finite()) {
+        return false;
+    }
+    let mu = tile.centre.dot(up).clamp(-1.0, 1.0);
+    let sin_g = (1.0 - mu * mu).max(0.0).sqrt();
+    let min_elev = mu * cos_a - sin_g * sin_a;
+    if !min_elev.is_finite() {
+        return false;
+    }
+    let beta = sin_a.clamp(0.0, 1.0).asin();
+    let gamma = mu.acos();
+    let half = azimuth_half(beta, gamma).map(|h| h + std::f32::consts::TAU / HORIZON_BINS as f32);
+    let az = horizon_azimuth(tile.centre, up, east, north);
+    let max_bin = match half {
+        None => bins.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+        Some(h) => {
+            let width = std::f32::consts::TAU / HORIZON_BINS as f32;
+            let mut i0 = ((az - h) / width).floor() as i32;
+            let i1 = ((az + h) / width).floor() as i32;
+            if i1 - i0 >= HORIZON_BINS as i32 {
+                bins.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            } else {
+                let mut best = f32::NEG_INFINITY;
+                while i0 <= i1 {
+                    let idx = i0.rem_euclid(HORIZON_BINS as i32) as usize;
+                    best = best.max(bins[idx]);
+                    i0 += 1;
+                }
+                best
+            }
+        }
+    };
+    min_elev > max_bin
+}
+
+/// Drop a published body's bit from every tile whose cone is above that
+/// body's table. Refills the tile lists when a bit changes. Culling off
+/// leaves the mask alone; the shader test still runs.
+fn clear_tiles_above_horizon(table: &mut FarTableGpu, frames: &TileFrames, view: &FarView) -> bool {
+    if !far_cull_enabled() || !frames.matches(view) {
+        return false;
+    }
+    let Some(basis) = ViewBasis::from_view_proj(view.view_proj) else {
+        return false;
+    };
+    let n = used_tiles(table).min(frames.samples.len());
+    let mut changed = false;
+    for slot in 0..HORIZON_TABLES {
+        let id = table.horizon_id[slot];
+        if id == u32::MAX || id as usize >= MAX_FAR_BODIES {
+            continue;
+        }
+        let gpu = &table.body[id as usize];
+        let Some(dir) = unit_dir(glam::Vec3::new(
+            gpu.dir_rho[0],
+            gpu.dir_rho[1],
+            gpu.dir_rho[2],
+        )) else {
+            continue;
+        };
+        let up = -dir;
+        let Some((east, north)) = horizon_axes(up) else {
+            continue;
+        };
+        let Some(up_v) = unit_dir(basis.to_view(up)) else {
+            continue;
+        };
+        let Some(east_v) = unit_dir(basis.to_view(east)) else {
+            continue;
+        };
+        let Some(north_v) = unit_dir(basis.to_view(north)) else {
+            continue;
+        };
+        let mut bins = [1.0f32; HORIZON_BINS];
+        let start = slot * HORIZON_BINS;
+        bins.copy_from_slice(&table.horizon_sin[start..start + HORIZON_BINS]);
+        let bit = 1u32 << id;
+        for i in 0..n {
+            if table.tile_mask[i] & bit == 0 {
+                continue;
+            }
+            if tile_above_horizon(
+                &frames.samples[i],
+                &bins,
+                up_v,
+                east_v,
+                north_v,
+                view.px_max,
+            ) {
+                table.tile_mask[i] &= !bit;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        fill_tile_lists(table, view.width, view.height);
+    }
+    changed
+}
+
+/// One cached horizon table, keyed by the map and the body that was built.
+struct HorizonSlot {
+    live: bool,
+    map: u32,
+    generation: u32,
+    radius_bits: u32,
+    air_bits: u32,
+    px_bits: u32,
+    rot_bits: [u32; 4],
+    /// Centre → eye, world space, at the build.
+    eye: glam::Vec3,
+    /// Altitude above the lo sphere at the build. The motion limit is
+    /// [`HORIZON_MOVE_FRAC`] of this.
+    altitude: f32,
+    bins: [f32; HORIZON_BINS],
+}
+
+impl HorizonSlot {
+    fn empty() -> Self {
+        Self {
+            live: false,
+            map: u32::MAX,
+            generation: 0,
+            radius_bits: 0,
+            air_bits: 0,
+            px_bits: 0,
+            rot_bits: [0; 4],
+            eye: glam::Vec3::ZERO,
+            altitude: 0.0,
+            bins: [1.0; HORIZON_BINS],
+        }
+    }
+}
+
+struct HorizonCache {
+    slots: [HorizonSlot; HORIZON_TABLES],
+}
+
+impl HorizonCache {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| HorizonSlot::empty()),
+        }
+    }
+}
+
+/// `true` when `eye` is within 0.1% of the cached altitude above the lo
+/// sphere and the body inputs still match. A non-positive cached altitude
+/// keeps the table only when the eye has not moved.
+fn horizon_cache_hit(
+    slot: &HorizonSlot,
+    map: u32,
+    generation: u32,
+    radius_bits: u32,
+    air_bits: u32,
+    px_bits: u32,
+    rot_bits: [u32; 4],
+    eye: glam::Vec3,
+) -> bool {
+    if !slot.live
+        || slot.map != map
+        || slot.generation != generation
+        || slot.radius_bits != radius_bits
+        || slot.air_bits != air_bits
+        || slot.px_bits != px_bits
+        || slot.rot_bits != rot_bits
+    {
+        return false;
+    }
+    let moved = (slot.eye - eye).length();
+    if !moved.is_finite() {
+        return false;
+    }
+    let limit = if slot.altitude > 0.0 {
+        HORIZON_MOVE_FRAC * slot.altitude
+    } else {
+        0.0
+    };
+    moved <= limit
+}
+
+fn cache_dest(cache: &HorizonCache, used: &[bool; HORIZON_TABLES], map: u32) -> usize {
+    if let Some(i) = cache
+        .slots
+        .iter()
+        .enumerate()
+        .position(|(i, slot)| !used[i] && slot.live && slot.map == map)
+    {
+        return i;
+    }
+    if let Some(i) = used.iter().position(|u| !*u) {
+        return i;
+    }
+    0
+}
+
+/// Sentinel ids and sines. A zeroed table would name body 0 and reject every
+/// ray above the horizontal.
+fn prime_horizon(table: &mut FarTableGpu) {
+    table.horizon_id = [u32::MAX, u32::MAX, HORIZON_BINS as u32, 0];
+    table.horizon_sin.fill(1.0);
+}
+
 fn pack_table_cached(
     bodies: &[FarBody],
     view: Option<&FarView>,
@@ -1644,6 +2159,7 @@ fn pack_table_cached(
     sky_up: glam::Vec3,
 ) -> (Box<FarTableGpu>, f32) {
     let mut table = zeroed_table();
+    prime_horizon(&mut table);
     let n = bodies.len().min(MAX_FAR_BODIES);
     // Before the cull: see [`horizon_dip`].
     let dip = horizon_dip(&bodies[..n], sky_up);
@@ -1678,6 +2194,11 @@ pub(crate) struct FarBodyRing {
     last: PerSlot<Option<Box<FarTableGpu>>>,
     tiles: TileFrames,
     draw: PerSlot<SkyDraw>,
+    /// Reused across frames. Rebuilt when the eye moves more than 0.1% of
+    /// its altitude above the lo sphere, or the body's rotation, radius,
+    /// air, pixel angle, or datum generation changes.
+    horizon: HorizonCache,
+    datum_scratch: Vec<f32>,
 }
 
 impl FarBodyRing {
@@ -1697,12 +2218,157 @@ impl FarBodyRing {
             last: PerSlot::new(std::array::from_fn(|_| None)),
             tiles: TileFrames::empty(),
             draw: PerSlot::new(std::array::from_fn(|_| SkyDraw::default())),
+            horizon: HorizonCache::new(),
+            datum_scratch: Vec::new(),
         }
     }
 
     /// Draw the sky recorded for `slot` after [`Self::write`].
     pub(crate) fn sky_draw(&self, slot: FrameSlot) -> SkyDraw {
         self.draw[slot]
+    }
+
+    /// Fill the two horizon tables from the datum and drop tiles that sit
+    /// entirely above them. At most two Mapped bodies, the ones with the
+    /// largest reference rho whose hi+air ball contains the eye. A cache hit
+    /// skips the cell walk.
+    fn publish_horizons(
+        &mut self,
+        table: &mut FarTableGpu,
+        view: Option<&FarView>,
+        maps: &super::far_maps::FarMaps,
+        map_max: &[f32; MAX_FAR_MAPS],
+        map_min: &[f32; MAX_FAR_MAPS],
+    ) {
+        let kept = (table.header[0] as usize).min(MAX_FAR_BODIES);
+        let px = view.map(|v| v.px_max).unwrap_or(0.0);
+        struct Cand {
+            index: usize,
+            rho: f32,
+            map: usize,
+        }
+        let mut cands = Vec::new();
+        for k in 0..kept {
+            let gpu = &table.body[k];
+            let shape = gpu.atmosphere[3];
+            if !(3.5..4.5).contains(&shape) {
+                continue;
+            }
+            let map_plus = gpu.seed[2];
+            if map_plus == 0 || map_plus as usize > MAX_FAR_MAPS {
+                continue;
+            }
+            let map = (map_plus as usize) - 1;
+            let distance = gpu.albedo2[3];
+            let rho = gpu.dir_rho[3];
+            let air = gpu.albedo1[3];
+            let max_off = map_max[map];
+            if !(distance > 0.0)
+                || !distance.is_finite()
+                || !rho.is_finite()
+                || !air.is_finite()
+                || !max_off.is_finite()
+            {
+                continue;
+            }
+            let radius = rho * distance;
+            let reach = radius + max_off + air.max(0.0);
+            if !(distance <= reach + distance * 1.0e-5) {
+                continue;
+            }
+            cands.push(Cand { index: k, rho, map });
+        }
+        cands.sort_by(|a, b| b.rho.total_cmp(&a.rho).then(a.index.cmp(&b.index)));
+        cands.truncate(HORIZON_TABLES);
+
+        let mut used = [false; HORIZON_TABLES];
+        for (out_slot, cand) in cands.iter().enumerate() {
+            let gpu = table.body[cand.index];
+            let distance = gpu.albedo2[3];
+            let radius = gpu.dir_rho[3] * distance;
+            let air = gpu.albedo1[3].max(0.0);
+            let min_off = map_min[cand.map];
+            let altitude = distance - (radius + min_off);
+            let Some(dir) = unit_dir(glam::Vec3::new(
+                gpu.dir_rho[0],
+                gpu.dir_rho[1],
+                gpu.dir_rho[2],
+            )) else {
+                continue;
+            };
+            let eye = -dir * distance;
+            let rot_bits = [
+                gpu.rot[0].to_bits(),
+                gpu.rot[1].to_bits(),
+                gpu.rot[2].to_bits(),
+                gpu.rot[3].to_bits(),
+            ];
+            let Some((g_stamp, generation)) = maps.map_stamp(cand.map) else {
+                continue;
+            };
+            if g_stamp < 2 {
+                continue;
+            }
+            let map_id = cand.map as u32;
+            let px_bits = px.to_bits();
+            let radius_bits = radius.to_bits();
+            let air_bits = air.to_bits();
+            let hit = self.horizon.slots.iter().position(|slot| {
+                horizon_cache_hit(
+                    slot,
+                    map_id,
+                    generation,
+                    radius_bits,
+                    air_bits,
+                    px_bits,
+                    rot_bits,
+                    eye,
+                )
+            });
+            let bins = if let Some(i) = hit {
+                used[i] = true;
+                self.horizon.slots[i].bins
+            } else {
+                let Some(g) = maps.copy_datum(cand.map, &mut self.datum_scratch) else {
+                    continue;
+                };
+                let rotation =
+                    glam::Quat::from_xyzw(gpu.rot[0], gpu.rot[1], gpu.rot[2], gpu.rot[3]);
+                let built = build_horizon_bins(
+                    g,
+                    &self.datum_scratch,
+                    rotation,
+                    -dir,
+                    radius,
+                    distance,
+                    air,
+                    px,
+                );
+                let dest = cache_dest(&self.horizon, &used, map_id);
+                self.horizon.slots[dest] = HorizonSlot {
+                    live: true,
+                    map: map_id,
+                    generation,
+                    radius_bits,
+                    air_bits,
+                    px_bits,
+                    rot_bits,
+                    eye,
+                    altitude,
+                    bins: built,
+                };
+                used[dest] = true;
+                built
+            };
+            table.horizon_id[out_slot] = cand.index as u32;
+            let start = out_slot * HORIZON_BINS;
+            table.horizon_sin[start..start + HORIZON_BINS].copy_from_slice(&bins);
+        }
+        if let Some(view) = view
+            && self.tiles.matches(view)
+        {
+            clear_tiles_above_horizon(table, &self.tiles, view);
+        }
     }
 
     /// Pack and upload. Returns the horizon-dip sine for `sky_bitangent.w`
@@ -1712,16 +2378,18 @@ impl FarBodyRing {
         slot: FrameSlot,
         bodies: &[FarBody],
         view: Option<FarView>,
-        map_max: &[f32; MAX_FAR_MAPS],
-        map_min: &[f32; MAX_FAR_MAPS],
+        maps: &super::far_maps::FarMaps,
         coarse: Option<SkyCoarseQuery>,
         sky_up: glam::Vec3,
     ) -> f32 {
         if let Some(view) = view.as_ref() {
             self.tiles.rebuild_if_changed(view);
         }
+        let map_max = maps.max_offsets();
+        let map_min = maps.min_offsets();
         let (mut table, dip) =
-            pack_table_cached(bodies, view.as_ref(), Some(&self.tiles), map_max, sky_up);
+            pack_table_cached(bodies, view.as_ref(), Some(&self.tiles), &map_max, sky_up);
+        self.publish_horizons(&mut table, view.as_ref(), maps, &map_max, &map_min);
         let offered = bodies.len().min(MAX_FAR_BODIES) as u64;
         crate::profile::gauge(crate::profile::Gauge::FarBodies, offered);
         crate::profile::gauge(crate::profile::Gauge::FarDrawn, u64::from(table.header[0]));
@@ -1739,7 +2407,7 @@ impl FarBodyRing {
                 if self.tiles.matches(view) {
                     draw.n_coarse = split_coarse_base(&mut table, &self.tiles, view, query);
                     draw.n_coarse_far =
-                        split_coarse_far(&mut table, &self.tiles, view, query, map_min);
+                        split_coarse_far(&mut table, &self.tiles, view, query, &map_min);
                 }
             }
         }
@@ -1784,8 +2452,8 @@ mod tests {
     use crate::camera::{Camera3D, Lens, WarpMap, WarpStrength};
     use crate::color::LinearRgb;
     use crate::far_body::{
-        FarBody, FarMapId, FarShape, ray_cube, ray_inner_sphere, ray_mapped, ray_rounded,
-        ray_sphere, store,
+        FarBody, FarMapId, FarShape, ray_cube, ray_inner_sphere, ray_mapped, ray_mapped_limb,
+        ray_rounded, ray_sphere, store,
     };
 
     fn pack_table(bodies: &[FarBody], view: Option<FarView>) -> FarTableGpu {
@@ -2713,6 +3381,11 @@ mod tests {
             "shader tile_index length drifted from {MAX_FAR_TILES}"
         );
         assert!(src.contains("uint4 list_header"));
+        assert!(
+            src.contains("float horizon_sin[512]"),
+            "horizon table length drifted from 2 * {HORIZON_BINS}"
+        );
+        assert!(src.contains("uint4 horizon_id"));
         let vert = include_str!("../../shaders/sky_tile.vert.slang");
         assert!(
             vert.contains("(xf / float(width)) * 2.0 - 1.0"),
@@ -3991,5 +4664,334 @@ mod tests {
         }
         assert!(interiors > 0, "no lo-sphere interior tile in the sweep");
         assert!(checked > 1000, "checked only {checked} interior pixels");
+    }
+
+    #[test]
+    fn packed_horizon_tables_do_not_name_a_body() {
+        let table = pack_table(&[], None);
+        assert_eq!(table.horizon_id[0], u32::MAX);
+        assert_eq!(table.horizon_id[1], u32::MAX);
+        assert_eq!(table.horizon_id[2], HORIZON_BINS as u32);
+        assert!(table.horizon_sin.iter().all(|s| *s == 1.0));
+    }
+
+    #[test]
+    fn flat_horizon_puts_the_zenith_above_and_keeps_the_nadir() {
+        let g = 2u32;
+        let datum = vec![0.0f32; 24];
+        let radius = 1_000.0f32;
+        let air = 10.0f32;
+        let distance = radius + air + 100.0;
+        let up = Vec3::Y;
+        let bins = build_horizon_bins(g, &datum, Quat::IDENTITY, up, radius, distance, air, 0.0);
+        let (east, north) = horizon_axes(up).expect("axes");
+        assert!(ray_above_horizon(&bins, up, east, north, up));
+        assert!(!ray_above_horizon(&bins, up, east, north, -up));
+        let rho = radius / distance;
+        let hit = ray_mapped(
+            -up,
+            -up,
+            rho,
+            distance,
+            Quat::IDENTITY,
+            1.0,
+            g,
+            &datum,
+            0.0,
+            0.0,
+        );
+        assert!(
+            hit.is_some(),
+            "nadir misses a flat sphere outside the hi shell"
+        );
+    }
+
+    #[test]
+    fn horizon_cache_keeps_a_small_move_and_drops_rotation() {
+        let mut slot = HorizonSlot::empty();
+        slot.live = true;
+        slot.map = 1;
+        slot.generation = 4;
+        slot.radius_bits = 10.0f32.to_bits();
+        slot.air_bits = 2.0f32.to_bits();
+        slot.px_bits = 0.0f32.to_bits();
+        slot.rot_bits = [0, 0, 0, 1.0f32.to_bits()];
+        slot.eye = Vec3::new(0.0, 1_000.0, 0.0);
+        slot.altitude = 1_000.0;
+        let eye = slot.eye;
+        let rot = slot.rot_bits;
+        assert!(horizon_cache_hit(
+            &slot,
+            1,
+            4,
+            slot.radius_bits,
+            slot.air_bits,
+            slot.px_bits,
+            rot,
+            eye,
+        ));
+        // 0.05% of the altitude stays cached. 0.2% rebuilds.
+        let near = eye + Vec3::Y * (0.0005 * slot.altitude);
+        assert!(horizon_cache_hit(
+            &slot,
+            1,
+            4,
+            slot.radius_bits,
+            slot.air_bits,
+            slot.px_bits,
+            rot,
+            near,
+        ));
+        let far = eye + Vec3::Y * (0.002 * slot.altitude);
+        assert!(!horizon_cache_hit(
+            &slot,
+            1,
+            4,
+            slot.radius_bits,
+            slot.air_bits,
+            slot.px_bits,
+            rot,
+            far,
+        ));
+        let mut spun = rot;
+        spun[0] ^= 1;
+        assert!(!horizon_cache_hit(
+            &slot,
+            1,
+            4,
+            slot.radius_bits,
+            slot.air_bits,
+            slot.px_bits,
+            spun,
+            eye,
+        ));
+        slot.altitude = 0.0;
+        assert!(horizon_cache_hit(
+            &slot,
+            1,
+            4,
+            slot.radius_bits,
+            slot.air_bits,
+            slot.px_bits,
+            rot,
+            eye,
+        ));
+        assert!(!horizon_cache_hit(
+            &slot,
+            1,
+            4,
+            slot.radius_bits,
+            slot.air_bits,
+            slot.px_bits,
+            rot,
+            near,
+        ));
+    }
+
+    /// `horizon` is 1, so the scalar cone paints every tile. The eye is inside
+    /// the hi+air ball only because one cell is a mountain; the local ground
+    /// is below the eye. Tiles looking up lose the bit. The downward tile keeps it.
+    #[test]
+    fn upward_tiles_lose_the_bit_above_the_horizon_table() {
+        let radius = 10_000.0f32;
+        let air = 10.0f32;
+        let altitude = 100.0f32;
+        let g = 9u32;
+        let gg = g as usize;
+        let mut datum = vec![0.0f32; 6 * gg * gg];
+        // +X face centre cell. Far from a view that looks along −Z.
+        let mountain = 2_000.0f32;
+        datum[0 * gg * gg + 4 * gg + 4] = mountain;
+        let distance = radius + altitude;
+        assert!(distance < radius + mountain + air);
+        let mut body = mapped_down(distance, radius, 1.0, air);
+        body.rotation = Quat::IDENTITY;
+        let mut map_max = [0.0f32; MAX_FAR_MAPS];
+        map_max[0] = mountain;
+        let view = view_pitched(0.0, 70.0, 640, 360);
+        let frames = TileFrames::build(&view).expect("tiles");
+        let mut table = super::pack_table(std::slice::from_ref(&body), Some(view), &map_max);
+        assert_eq!(table.header[0], 1);
+        assert!(
+            table.tile_mask[..frames.samples.len()]
+                .iter()
+                .all(|m| *m == 1),
+            "horizon 1 inside the hi ball paints every tile"
+        );
+        let up = -body.dir;
+        let bins = build_horizon_bins(
+            g,
+            &datum,
+            body.rotation,
+            up,
+            radius,
+            distance,
+            air,
+            view.px_max,
+        );
+        table.horizon_id[0] = 0;
+        table.horizon_sin[..HORIZON_BINS].copy_from_slice(&bins);
+        assert!(clear_tiles_above_horizon(&mut table, &frames, &view));
+        let basis = ViewBasis::from_view_proj(view.view_proj).expect("basis");
+        let up_v = basis.to_view(up).normalize();
+        let mut highest = 0usize;
+        let mut lowest = 0usize;
+        let mut hi = f32::NEG_INFINITY;
+        let mut lo = f32::INFINITY;
+        for (i, tile) in frames.samples.iter().enumerate() {
+            let mu = tile.centre.dot(up_v);
+            if mu > hi {
+                hi = mu;
+                highest = i;
+            }
+            if mu < lo {
+                lo = mu;
+                lowest = i;
+            }
+        }
+        assert_eq!(
+            table.tile_mask[highest], 0,
+            "upward tile mu {hi} kept the bit"
+        );
+        assert_eq!(
+            table.tile_mask[lowest] & 1,
+            1,
+            "downward tile mu {lo} lost the bit"
+        );
+    }
+
+    /// No ray that hits the surface or the limb is classified above the table.
+    /// Relief is a few percent of the radius. Eyes run from 10 m to 2e6 m
+    /// above the lo sphere. `horizon` is 1 so the scalar plane does not reject.
+    #[test]
+    fn no_hit_or_limb_is_above_the_horizon_table() {
+        let radius = 31_017_520.0f32;
+        let mut state = 0xC0FF_EE01u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let unit = |rng: &mut dyn FnMut() -> u32| rng() as f32 / u32::MAX as f32;
+        let mut above_ok = 0u32;
+        let mut hits = 0u32;
+        for trial in 0..4u32 {
+            let g = if trial % 2 == 0 { 5u32 } else { 7u32 };
+            let gg = g as usize;
+            let mut datum = vec![0.0f32; 6 * gg * gg];
+            let amp = 0.04 + unit(&mut next) * 0.04;
+            for face in 0..6usize {
+                let (tu, n, tv) = crate::far_body::far_map_basis(face);
+                for j in 0..g {
+                    for i in 0..g {
+                        let edge = (g - 1) as f32;
+                        let xi = 2.0 * i as f32 / edge - 1.0;
+                        let eta = 2.0 * j as f32 / edge - 1.0;
+                        let quarter = std::f32::consts::FRAC_PI_4;
+                        let d = (n + tu * (xi * quarter).tan() + tv * (eta * quarter).tan())
+                            .normalize();
+                        let bump = radius
+                            * amp
+                            * ((d.x * 3.0 + trial as f32).sin() * (d.y * 2.0).cos()
+                                + 0.5 * (d.z * 5.0 + 0.7).sin());
+                        datum[face * gg * gg + j as usize * gg + i as usize] = bump;
+                    }
+                }
+            }
+            let min_off = datum.iter().copied().fold(f32::INFINITY, f32::min);
+            let max_off = datum.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            assert!(min_off < 0.0 && max_off > min_off + radius * 0.02);
+            let air = radius * 0.001;
+            let yaw = unit(&mut next) * std::f32::consts::TAU;
+            let rotation = Quat::from_rotation_y(yaw);
+            let px = 2.0e-4f32;
+            for alt_i in 0..6 {
+                let t = alt_i as f32 / 5.0;
+                let log_h = 10.0f32.ln() + t * ((2.0e6f32).ln() - 10.0f32.ln());
+                let altitude = log_h.exp();
+                let distance = radius + min_off + altitude;
+                let rho = radius / distance;
+                let dir = -Vec3::Y;
+                let up = Vec3::Y;
+                let bins = build_horizon_bins(g, &datum, rotation, up, radius, distance, air, px);
+                let (east, north) = horizon_axes(up).expect("axes");
+                let mut rays = Vec::new();
+                rays.push(-up);
+                rays.push(up);
+                for _ in 0..24 {
+                    let x = unit(&mut next) * 2.0 - 1.0;
+                    let y = unit(&mut next) * 2.0 - 1.0;
+                    let z = unit(&mut next) * 2.0 - 1.0;
+                    let v = Vec3::new(x, y, z);
+                    if v.length_squared() > 1.0e-6 {
+                        rays.push(v.normalize());
+                    }
+                }
+                for ray in rays {
+                    let above = ray_above_horizon(&bins, up, east, north, ray);
+                    let hit = ray_mapped(
+                        ray, dir, rho, distance, rotation, 1.0, g, &datum, min_off, max_off,
+                    );
+                    let limb = ray_mapped_limb(
+                        ray, dir, rho, distance, rotation, g, &datum, max_off, air, px,
+                    );
+                    if hit.is_some() {
+                        hits += 1;
+                    }
+                    if above {
+                        assert!(
+                            hit.is_none() && !limb,
+                            "trial {trial} alt {altitude} above a hit={hit:?} limb {limb} ray {ray:?}"
+                        );
+                        above_ok += 1;
+                    }
+                }
+            }
+        }
+        assert!(hits > 20, "the sweep barely hit the surface ({hits})");
+
+        // Flat underfoot, one mountain on +X. The eye is outside the local
+        // air shell and still inside the mountain's hi ball, so the zenith
+        // clears the table while a hit on the mountain does not.
+        let g = 9u32;
+        let gg = g as usize;
+        let mut datum = vec![0.0f32; 6 * gg * gg];
+        let mountain = radius * 0.1;
+        datum[4 * gg + 4] = mountain;
+        let air = 20_000.0f32;
+        let rotation = Quat::IDENTITY;
+        for altitude in [50_000.0f32, 2.0e6] {
+            let distance = radius + altitude;
+            assert!(distance > radius + air && distance < radius + mountain + air);
+            let up = Vec3::Y;
+            let bins = build_horizon_bins(g, &datum, rotation, up, radius, distance, air, 0.0);
+            let (east, north) = horizon_axes(up).expect("axes");
+            assert!(
+                ray_above_horizon(&bins, up, east, north, up),
+                "zenith at {altitude} was not above the local ground"
+            );
+            above_ok += 1;
+            let rho = radius / distance;
+            for ray in [-up, up, Vec3::X, Vec3::new(1.0, -0.2, 0.0).normalize()] {
+                let above = ray_above_horizon(&bins, up, east, north, ray);
+                let hit = ray_mapped(
+                    ray, -up, rho, distance, rotation, 1.0, g, &datum, 0.0, mountain,
+                );
+                let limb = ray_mapped_limb(
+                    ray, -up, rho, distance, rotation, g, &datum, mountain, air, 0.0,
+                );
+                if above {
+                    assert!(
+                        hit.is_none() && !limb,
+                        "mountain alt {altitude} above a hit ray {ray:?} limb {limb}"
+                    );
+                }
+            }
+        }
+        assert!(
+            above_ok > 0,
+            "the zenith was never above a directional horizon"
+        );
     }
 }
