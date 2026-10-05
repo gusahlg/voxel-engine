@@ -2346,4 +2346,249 @@ mod tests {
         assert!(worst < 1e-6, "t delta {worst}");
         assert!(hits > 50, "only {hits} rays hit");
     }
+
+    /// Home-planet radius, in blocks. Datum offsets sit in `[-278_000, 1_040_000]`.
+    const HOME_RADIUS: f64 = 31_017_520.0;
+
+    /// Low-order height, then an affine map onto the home offset range.
+    /// Smooth on the scale of a face: a sum of a few harmonics, not noise.
+    fn home_datum(g: u32) -> Vec<f32> {
+        let gg = g as usize;
+        let mut raw = vec![0.0f64; 6 * gg * gg];
+        for face in 0..6usize {
+            let (tu, n, tv) = far_map_basis(face);
+            let (tu, n, tv) = (tu.as_dvec3(), n.as_dvec3(), tv.as_dvec3());
+            for j in 0..g {
+                for i in 0..g {
+                    let edge = f64::from(g - 1);
+                    let xi = 2.0 * f64::from(i) / edge - 1.0;
+                    let eta = 2.0 * f64::from(j) / edge - 1.0;
+                    let quarter = std::f64::consts::FRAC_PI_4;
+                    let d =
+                        (n + tu * (xi * quarter).tan() + tv * (eta * quarter).tan()).normalize();
+                    let h = 0.55 * d.y
+                        + 0.28 * (d.x * d.x - d.z * d.z)
+                        + 0.22 * (2.0 * d.x * d.z)
+                        + 0.14 * d.y * (1.0 - 3.0 * d.y * d.y);
+                    raw[face * gg * gg + j as usize * gg + i as usize] = h;
+                }
+            }
+        }
+        let lo = raw.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = raw.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let min_t = -278_000.0;
+        let max_t = 1_040_000.0;
+        let scale = (max_t - min_t) / (hi - lo);
+        raw.iter()
+            .map(|v| ((v - lo) * scale + min_t) as f32)
+            .collect()
+    }
+
+    fn sphere_roots_f64(facing: f64, rho: f64) -> Option<(f64, f64)> {
+        if !(rho > 0.0) || !rho.is_finite() {
+            return None;
+        }
+        let disc = facing * facing - (1.0 - rho * rho);
+        if disc < 0.0 || !disc.is_finite() {
+            return None;
+        }
+        let sd = disc.sqrt();
+        Some((facing - sd, facing + sd))
+    }
+
+    /// Residual of the shader's bilinear datum along an f64 ray.
+    /// `t` is refined in f64; the height sample is the same f32 bilinear the
+    /// march uses, including the equiangular polynomial.
+    fn mapped_residual_f64(
+        t: f64,
+        ray: glam::DVec3,
+        center: glam::DVec3,
+        rho: f64,
+        distance: f64,
+        rotation: Quat,
+        g: u32,
+        datum: &[f32],
+    ) -> f64 {
+        let p = ray * t - center;
+        let rad = p.length();
+        if rad < 1e-12 {
+            return -rho;
+        }
+        let u = p / rad;
+        let u32 = Vec3::new(u.x as f32, u.y as f32, u.z as f32);
+        let body = rotate(conjugate(rotation), u32);
+        let height = f64::from(sample_datum(g, datum, body));
+        rad - (rho + height / distance)
+    }
+
+    /// f64 reference intersection. Dense march inside
+    /// `[max(t_hi_in, 0), min(t_lo_in, t_hi_out)]` (or `t_hi_out` when the ray
+    /// misses the lo sphere), with a step well under one datum cell projected
+    /// on the ray, then bisection to `1e-12` in normalised `t`.
+    fn ray_mapped_reference(
+        ray: Vec3,
+        dir: Vec3,
+        rho: f32,
+        distance: f32,
+        rotation: Quat,
+        g: u32,
+        datum: &[f32],
+        min_off: f32,
+        max_off: f32,
+    ) -> Option<f64> {
+        if !(rho > 0.0) || !(distance > 0.0) || !ray.is_finite() || !dir.is_finite() {
+            return None;
+        }
+        let ray_d = ray.as_dvec3().normalize();
+        let dir_d = dir.as_dvec3().normalize();
+        let rho_d = f64::from(rho);
+        let distance_d = f64::from(distance);
+        let rho_lo = rho_d + f64::from(min_off) / distance_d;
+        let rho_hi = rho_d + f64::from(max_off) / distance_d;
+        let facing = ray_d.dot(dir_d);
+        let (t_hi_in, t_hi_out) = sphere_roots_f64(facing, rho_hi)?;
+        if !(t_hi_out > 0.0) {
+            return None;
+        }
+        let t_start = t_hi_in.max(0.0);
+        let t_lo =
+            sphere_roots_f64(facing, rho_lo).and_then(|(t_lo, _)| (t_lo > 0.0).then_some(t_lo));
+        let t_end = t_lo.map(|t| t.min(t_hi_out)).unwrap_or(t_hi_out);
+        let f_at =
+            |t: f64| mapped_residual_f64(t, ray_d, dir_d, rho_d, distance_d, rotation, g, datum);
+        // Lo and hi spheres coincide on a constant datum: the entrance is the hit.
+        if !(t_end > t_start) {
+            let f0 = f_at(t_start);
+            return (t_start > 0.0 && f0.abs() <= 1e-5).then_some(t_start);
+        }
+        let f_start = f_at(t_start);
+        if f_start < -1e-5 {
+            return None;
+        }
+        if f_start.abs() <= 1e-8 {
+            return (t_start > 0.0).then_some(t_start);
+        }
+        // One datum cell is π / (2 (g-1)) radians. Along the ray that is
+        // `cell * rad / sin(phi)`. A tenth of that cannot step over the
+        // bilinear's single sign change inside a cell.
+        let cells = f64::from(g.max(2) - 1);
+        let cell = std::f64::consts::FRAC_PI_2 / cells;
+        let mut t = t_start;
+        let mut prev_f = f_start;
+        let mut bracket: Option<(f64, f64)> = None;
+        let mut guard = 0u32;
+        while t < t_end && guard < 100_000 {
+            guard += 1;
+            let p = ray_d * t - dir_d;
+            let rad = p.length().max(rho_d);
+            let sin_phi = if rad > 1e-8 {
+                ray_d.cross(p / rad).length()
+            } else {
+                0.0
+            };
+            let dt = (cell * rad / sin_phi.max(0.05)) * 0.1;
+            let next = (t + dt.max(1e-8)).min(t_end);
+            let ft = f_at(next);
+            if prev_f * ft <= 0.0 {
+                bracket = Some((t, next));
+                break;
+            }
+            t = next;
+            prev_f = ft;
+        }
+        let (mut a, mut b) = bracket?;
+        for _ in 0..80 {
+            if (b - a).abs() <= 1e-12 {
+                break;
+            }
+            let mid = 0.5 * (a + b);
+            let fm = f_at(mid);
+            let fa = f_at(a);
+            if fa * fm <= 0.0 {
+                b = mid;
+            } else {
+                a = mid;
+            }
+        }
+        let root = 0.5 * (a + b);
+        (root > 0.0 && root.is_finite()).then_some(root)
+    }
+
+    #[test]
+    fn reference_matches_spheres_of_constant_datum() {
+        let g = 33u32;
+        let gg = g as usize;
+        let distance = 4.0f32;
+        for offset in [0.0f32, 0.25] {
+            let datum = vec![offset; 6 * gg * gg];
+            let rho = 0.35f32;
+            // Facing stays above the graze of rho 0.35 (disc needs |ray·dir| ≳ 0.94).
+            for (ray, dir) in [
+                (Vec3::Z, Vec3::Z),
+                (Vec3::new(0.25, -0.1, 1.0).normalize(), Vec3::Z),
+                (
+                    Vec3::new(0.15, 0.05, 1.0).normalize(),
+                    Vec3::new(0.05, -0.08, 1.0).normalize(),
+                ),
+            ] {
+                // Same f64 ray the reference normalises, and the same radius
+                // the residual subtracts (f64 division, not the f32 sphere).
+                let facing = ray.as_dvec3().normalize().dot(dir.as_dvec3().normalize());
+                let radius = f64::from(rho) + f64::from(offset) / f64::from(distance);
+                let (t_near, _) = sphere_roots_f64(facing, radius).unwrap();
+                let got = ray_mapped_reference(
+                    ray,
+                    dir,
+                    rho,
+                    distance,
+                    Quat::IDENTITY,
+                    g,
+                    &datum,
+                    offset,
+                    offset,
+                )
+                .unwrap_or_else(|| panic!("reference missed offset {offset} ray {ray:?}"));
+                assert!(
+                    (got - t_near).abs() < 1e-9,
+                    "offset {offset} reference {got} analytic {t_near}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reference_straight_down_is_the_local_altitude() {
+        let g = 33u32;
+        let datum = home_datum(g);
+        let min_off = datum.iter().copied().fold(f32::MAX, f32::min);
+        let max_off = datum.iter().copied().fold(f32::MIN, f32::max);
+        assert!(min_off > -278_001.0 && max_off < 1_040_001.0);
+        assert!(max_off - min_off > 500_000.0, "harmonics collapsed");
+        let up = Vec3::Y;
+        let local = sample_datum(g, &datum, up);
+        for altitude in [10_000.0f32, 50_000.0, 1.0e5, 1.0e7] {
+            let distance = (HOME_RADIUS + f64::from(local) + f64::from(altitude)) as f32;
+            let rho = (HOME_RADIUS as f32) / distance;
+            let dir = -up;
+            let got = ray_mapped_reference(
+                dir,
+                dir,
+                rho,
+                distance,
+                Quat::IDENTITY,
+                g,
+                &datum,
+                min_off,
+                max_off,
+            )
+            .expect("straight down hits");
+            // f32 radius/distance, not the f64 altitude ratio: R is not an f32 integer.
+            let r = f64::from(rho) + f64::from(local) / f64::from(distance);
+            let expect = 1.0 - r;
+            assert!(
+                (got - expect).abs() < 1e-9,
+                "alt {altitude} reference {got} 1 - r(local) {expect}"
+            );
+        }
+    }
 }
