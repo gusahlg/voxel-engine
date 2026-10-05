@@ -196,6 +196,8 @@ const SKY_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.vert.spv")
 const SKY_TILE_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_tile.vert.spv"));
 const SKY_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv"));
 const SKY_BASE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_base.frag.spv"));
+const SKY_NOMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_nomap.frag.spv"));
+const SKY_SPHERE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_sphere.frag.spv"));
 const TONEMAP_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.vert.spv"));
 const TONEMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
 const TONEMAP_TAA_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap_taa.frag.spv"));
@@ -259,14 +261,18 @@ pub struct Pipelines {
     /// (far-body storage buffer), binding 3 (datum storage) and binding 4
     /// (eight albedo cubes). Depth-tests (read-only) at the reversed-Z far
     /// plane so it shades only pixels the terrain left uncovered.
-    /// `sky` is the full fragment on one triangle. `sky_base` is the same
-    /// triangle with the far-body call compiled out. `sky_tile` / `sky_tile_base`
-    /// are the instanced tile quads for the two fragment variants. All four
-    /// share `layout_sky`.
+    /// `sky` is the full fragment on one triangle. `sky_base` compiles the
+    /// far-body call out. `sky_nomap` drops the mapped march. `sky_sphere`
+    /// keeps spheres and inner spheres. The `sky_tile_*` pipelines are the
+    /// same fragments on instanced tile quads. All of them share `layout_sky`.
     pub sky: vk::Pipeline,
     pub sky_base: vk::Pipeline,
+    pub sky_nomap: vk::Pipeline,
+    pub sky_sphere: vk::Pipeline,
     pub sky_tile: vk::Pipeline,
     pub sky_tile_base: vk::Pipeline,
+    pub sky_tile_nomap: vk::Pipeline,
+    pub sky_tile_sphere: vk::Pipeline,
     pub layout_sky: vk::PipelineLayout,
     pub sky_set_layout: vk::DescriptorSetLayout,
     /// Linear-clamp sampler pushed with the octahedral cloud LUT.
@@ -492,6 +498,8 @@ impl Pipelines {
         let sky_tile_vert = pass::shader_module(device, SKY_TILE_VERT, "sky tile vertex");
         let sky_frag = pass::shader_module(device, SKY_FRAG, "sky fragment");
         let sky_base_frag = pass::shader_module(device, SKY_BASE_FRAG, "sky base fragment");
+        let sky_nomap_frag = pass::shader_module(device, SKY_NOMAP_FRAG, "sky nomap fragment");
+        let sky_sphere_frag = pass::shader_module(device, SKY_SPHERE_FRAG, "sky sphere fragment");
 
         let builder = PipelineBuilder {
             device,
@@ -763,7 +771,7 @@ impl Pipelines {
         // Sky: no vertex input (verts synthesised from SV_VertexID), depth
         // read-only at the far plane, opaque, no cull. Same GREATER_OR_EQUAL
         // compare as the scene, so it passes only where depth is still cleared.
-        // The four pipelines share that state and `layout_sky`.
+        // The eight pipelines share that state and `layout_sky`.
         let sky_cfg = || PipelineConfig {
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
             depth: DepthMode::ReadOnly,
@@ -798,6 +806,42 @@ impl Pipelines {
             &[],
             layout_sky,
             "sky_tile_base",
+            sky_cfg(),
+        );
+        let sky_nomap = builder.build(
+            sky_vert,
+            sky_nomap_frag,
+            &[],
+            &[],
+            layout_sky,
+            "sky_nomap",
+            sky_cfg(),
+        );
+        let sky_sphere = builder.build(
+            sky_vert,
+            sky_sphere_frag,
+            &[],
+            &[],
+            layout_sky,
+            "sky_sphere",
+            sky_cfg(),
+        );
+        let sky_tile_nomap = builder.build(
+            sky_tile_vert,
+            sky_nomap_frag,
+            &[],
+            &[],
+            layout_sky,
+            "sky_tile_nomap",
+            sky_cfg(),
+        );
+        let sky_tile_sphere = builder.build(
+            sky_tile_vert,
+            sky_sphere_frag,
+            &[],
+            &[],
+            layout_sky,
+            "sky_tile_sphere",
             sky_cfg(),
         );
 
@@ -951,6 +995,8 @@ impl Pipelines {
             device.destroy_shader_module(sky_tile_vert, None);
             device.destroy_shader_module(sky_frag, None);
             device.destroy_shader_module(sky_base_frag, None);
+            device.destroy_shader_module(sky_nomap_frag, None);
+            device.destroy_shader_module(sky_sphere_frag, None);
         }
 
         let vrs_compute = fsr.map(|_| create_vrs_compute(device, cache, stats));
@@ -981,8 +1027,12 @@ impl Pipelines {
             tris2d_tex_present,
             sky,
             sky_base,
+            sky_nomap,
+            sky_sphere,
             sky_tile,
             sky_tile_base,
+            sky_tile_nomap,
+            sky_tile_sphere,
             layout_sky,
             sky_set_layout,
             sky_lut_sampler,
@@ -1086,8 +1136,12 @@ impl Pipelines {
             }
             device.destroy_pipeline(self.sky, None);
             device.destroy_pipeline(self.sky_base, None);
+            device.destroy_pipeline(self.sky_nomap, None);
+            device.destroy_pipeline(self.sky_sphere, None);
             device.destroy_pipeline(self.sky_tile, None);
             device.destroy_pipeline(self.sky_tile_base, None);
+            device.destroy_pipeline(self.sky_tile_nomap, None);
+            device.destroy_pipeline(self.sky_tile_sphere, None);
             device.destroy_pipeline(self.tonemap, None);
             device.destroy_pipeline(self.tonemap_taa, None);
             device.destroy_pipeline_layout(self.layout_3d, None);

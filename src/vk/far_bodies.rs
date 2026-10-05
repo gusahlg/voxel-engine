@@ -4,8 +4,9 @@
 //! A 16-byte cone sits in front of each record so a pixel can reject the body
 //! before loading it. A tile mask follows the records: one bit per kept body,
 //! one word per screen tile, so a sky pixel skips bodies that miss its tile.
-//! After the mask, two compact tile-index lists (mask == 0, then mask != 0)
-//! feed the instanced tile-quad vertex shader.
+//! After the mask, compact tile-index lists feed the instanced tile-quad
+//! vertex shader: mask == 0, then sphere-only tiles, then tiles that meet a
+//! cube, rounded or mapped body.
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
@@ -856,47 +857,101 @@ fn framebuffer_ndc(xf: f32, yf: f32, width: u32, height: u32) -> [f32; 2] {
     [(xf / w) * 2.0 - 1.0, 1.0 - (yf / h) * 2.0]
 }
 
-/// Partition the live tiles into mask == 0 then mask != 0, each run ascending.
-/// `list_header` is `(n_base, n_full, width, height)`.
-fn fill_tile_lists(table: &mut FarTableGpu, width: u32, height: u32) {
+/// Kept bodies whose shader is not the sphere/inner pair. Bit i is kept index i.
+/// Shape 0 is the cube. An unrecognised shape stays on the full march.
+fn heavy_mask(table: &FarTableGpu) -> u32 {
+    let n = (table.header[0] as usize).min(MAX_FAR_BODIES);
+    let mut heavy = 0u32;
+    for i in 0..n {
+        let shape = table.body[i].atmosphere[3];
+        let light = (0.5..1.5).contains(&shape) || (1.5..2.5).contains(&shape);
+        if !light {
+            heavy |= 1u32 << i;
+        }
+    }
+    heavy
+}
+
+fn has_mapped(table: &FarTableGpu) -> bool {
+    let n = (table.header[0] as usize).min(MAX_FAR_BODIES);
+    (0..n).any(|i| {
+        let shape = table.body[i].atmosphere[3];
+        (3.5..4.5).contains(&shape)
+    })
+}
+
+/// `(n_base, n_sphere, n_heavy)` over the live tiles. Sphere tiles have a
+/// non-zero mask that misses every heavy body.
+fn tile_split(table: &FarTableGpu) -> (u32, u32, u32) {
+    let heavy = heavy_mask(table);
     let n = used_tiles(table);
     let mut n_base = 0u32;
-    let mut n_full = 0u32;
+    let mut n_sphere = 0u32;
+    let mut n_heavy = 0u32;
     for mask in &table.tile_mask[..n] {
         if *mask == 0 {
             n_base += 1;
+        } else if mask & heavy == 0 {
+            n_sphere += 1;
         } else {
-            n_full += 1;
+            n_heavy += 1;
         }
     }
+    (n_base, n_sphere, n_heavy)
+}
+
+/// Partition the live tiles into mask == 0, then sphere-only, then heavy.
+/// Each run is ascending row-major. `list_header.y` is `n_sphere + n_heavy`.
+fn fill_tile_lists(table: &mut FarTableGpu, width: u32, height: u32) {
+    let heavy = heavy_mask(table);
+    let (n_base, n_sphere, n_heavy) = tile_split(table);
+    let n = used_tiles(table);
     let mut base_i = 0u32;
-    let mut full_i = n_base;
+    let mut sphere_i = n_base;
+    let mut heavy_i = n_base + n_sphere;
     for (i, mask) in table.tile_mask[..n].iter().copied().enumerate() {
         if mask == 0 {
             table.tile_index[base_i as usize] = i as u32;
             base_i += 1;
+        } else if mask & heavy == 0 {
+            table.tile_index[sphere_i as usize] = i as u32;
+            sphere_i += 1;
         } else {
-            table.tile_index[full_i as usize] = i as u32;
-            full_i += 1;
+            table.tile_index[heavy_i as usize] = i as u32;
+            heavy_i += 1;
         }
     }
-    table.list_header = [n_base, n_full, width, height];
+    table.list_header = [n_base, n_sphere + n_heavy, width, height];
+}
+
+/// Which body fragment a draw needs. `Full` has every shape. `NoMap` drops the
+/// mapped march. `Sphere` keeps spheres and inner spheres.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkyBodyPipe {
+    Full,
+    NoMap,
+    Sphere,
 }
 
 /// How `record_sky` draws this frame. Tile quads only when the mask is a real
 /// per-tile classification: a view, culling on, a non-zero tile size, and at
 /// least one kept body. Otherwise one fullscreen triangle. No kept bodies use
-/// the body-free pipeline; that result matches the full shader.
+/// the body-free pipeline. A frame with no mapped body uses `NoMap`, and a
+/// frame of only spheres and inner spheres uses `Sphere`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SkyDraw {
     pub quads: bool,
     /// Fullscreen triangle uses the body-free pipeline.
     pub base: bool,
+    /// Fullscreen body pipeline, or the pipeline for heavy tiles.
+    pub body: SkyBodyPipe,
     pub n_base: u32,
+    /// Tiles whose mask is only spheres and inner spheres.
+    pub n_sphere: u32,
+    /// Tiles whose mask meets a cube, rounded or mapped body.
+    pub n_heavy: u32,
+    /// `n_sphere + n_heavy`. `far.tiles`.
     pub n_full: u32,
-    /// `firstInstance` of the full-pipeline draw. Base tiles occupy `0..n_base`.
-    /// The vertex shader reads Vulkan's instance index, which includes this.
-    pub first_full: u32,
 }
 
 impl Default for SkyDraw {
@@ -904,37 +959,53 @@ impl Default for SkyDraw {
         Self {
             quads: false,
             base: false,
+            body: SkyBodyPipe::Full,
             n_base: 0,
+            n_sphere: 0,
+            n_heavy: 0,
             n_full: 0,
-            first_full: 0,
         }
     }
 }
 
 impl SkyDraw {
+    fn body_pipe(table: &FarTableGpu) -> SkyBodyPipe {
+        if has_mapped(table) {
+            SkyBodyPipe::Full
+        } else if heavy_mask(table) != 0 {
+            SkyBodyPipe::NoMap
+        } else {
+            SkyBodyPipe::Sphere
+        }
+    }
+
     fn from_table(table: &FarTableGpu, cull: bool) -> Self {
         let bodies = table.header[0];
         let tile_px = table.header[1];
         let tiles_x = table.header[2];
         let tiles_y = table.header[3];
-        let n_base = table.list_header[0];
-        let n_full = table.list_header[1];
+        let (n_base, n_sphere, n_heavy) = tile_split(table);
+        let n_full = n_sphere + n_heavy;
         let tiled = cull && tile_px != 0 && tiles_x != 0 && tiles_y != 0 && bodies != 0;
         if tiled {
             Self {
                 quads: true,
                 base: false,
+                body: Self::body_pipe(table),
                 n_base,
+                n_sphere,
+                n_heavy,
                 n_full,
-                first_full: n_base,
             }
         } else {
             Self {
                 quads: false,
                 base: bodies == 0,
+                body: Self::body_pipe(table),
                 n_base: 0,
+                n_sphere: 0,
+                n_heavy: 0,
                 n_full: 0,
-                first_full: 0,
             }
         }
     }
@@ -1874,7 +1945,11 @@ mod tests {
         let tiles_x = width.div_ceil(tile_px);
         let tiles_y = height.div_ceil(tile_px);
         assert_eq!((tiles_x, tiles_y), (2, 2));
-        table.header = [1, tile_px, tiles_x, tiles_y];
+        table.header = [3, tile_px, tiles_x, tiles_y];
+        // Kept 0 is a sphere, kept 2 is a cube. Tile 1 carries the sphere,
+        // tile 3 carries the cube.
+        table.body[0].atmosphere[3] = 1.0;
+        table.body[2].atmosphere[3] = 0.0;
         table.tile_mask[0] = 0;
         table.tile_mask[1] = 0b001;
         table.tile_mask[2] = 0;
@@ -1883,7 +1958,8 @@ mod tests {
 
         assert_eq!(table.list_header, [2, 2, width, height]);
         assert_eq!(&table.tile_index[..2], &[0, 2]);
-        assert_eq!(&table.tile_index[2..4], &[1, 3]);
+        assert_eq!(table.tile_index[2], 1);
+        assert_eq!(table.tile_index[3], 3);
         let n = used_tiles(&table);
         let n_base = table.list_header[0] as usize;
         let n_full = table.list_header[1] as usize;
@@ -1927,7 +2003,11 @@ mod tests {
 
         let draw = SkyDraw::from_table(&table, true);
         assert!(draw.quads);
-        assert_eq!((draw.n_base, draw.n_full, draw.first_full), (2, 2, 2));
+        assert_eq!(
+            (draw.n_base, draw.n_sphere, draw.n_heavy, draw.n_full),
+            (2, 1, 1, 2)
+        );
+        assert_eq!(draw.body, SkyBodyPipe::NoMap);
 
         // No kept bodies: one body-free fullscreen triangle, even with a grid.
         table.header[0] = 0;
@@ -1935,14 +2015,23 @@ mod tests {
         assert!(!empty.quads);
         assert!(empty.base);
 
-        // Culling off, or no tile grid: the fullscreen triangle, full pipeline
-        // when any body was kept.
+        // Culling off, or no tile grid: one fullscreen triangle. A kept sphere
+        // uses the sphere pipeline; a kept cube uses the no-mapped pipeline.
         table.header[0] = 1;
+        table.body[0].atmosphere[3] = 1.0;
         let unculled = SkyDraw::from_table(&table, false);
         assert!(!unculled.quads && !unculled.base);
+        assert_eq!(unculled.body, SkyBodyPipe::Sphere);
+        table.body[0].atmosphere[3] = 0.0;
+        let cube = SkyDraw::from_table(&table, false);
+        assert_eq!(cube.body, SkyBodyPipe::NoMap);
+        table.body[0].atmosphere[3] = 4.0;
+        let mapped = SkyDraw::from_table(&table, false);
+        assert_eq!(mapped.body, SkyBodyPipe::Full);
         table.header[1] = 0;
         let no_grid = SkyDraw::from_table(&table, true);
         assert!(!no_grid.quads && !no_grid.base);
+        assert_eq!(no_grid.body, SkyBodyPipe::Full);
     }
 
     #[test]

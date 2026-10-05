@@ -40,10 +40,11 @@ struct FarTable
     uint tile_mask[8192];
     // Tile-quad draws. Not read by far_bodies.
     // x = n_base (mask == 0), y = n_full (mask != 0), z = width, w = height.
-    // tile_index[0..n_base) then tile_index[n_base..n_base+n_full) are
-    // ascending row-major tile indices. The full draw's firstInstance is
-    // n_base. The vertex shader reads Vulkan InstanceIndex (includes
-    // firstInstance), not D3D SV_InstanceID.
+    // tile_index is three ascending row-major runs: mask == 0, then tiles
+    // whose bits are only spheres or inner spheres, then the rest. n_full is
+    // the last two runs. The vertex shader reads Vulkan InstanceIndex
+    // (includes firstInstance), not D3D SV_InstanceID. The CPU's firstInstance
+    // selects the run.
     uint4 list_header;
     uint tile_index[8192];
 };

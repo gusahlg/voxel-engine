@@ -830,9 +830,11 @@ impl<'a> RenderPass<'a> {
     /// background pixels. Skipped unless the frame set a sky palette.
     ///
     /// With a real per-tile mask, body-free tiles draw as instanced quads on
-    /// the `SKY_BASE` pipeline and the rest on the full pipeline. No tile
-    /// classification (no view, culling off, no tile size, or no bodies) keeps
-    /// one fullscreen triangle; no bodies use the base pipeline.
+    /// the `SKY_BASE` pipeline. Sphere-only tiles use the sphere variant, and
+    /// tiles that meet a cube, rounded or mapped body use the no-mapped
+    /// variant, or the full variant when the frame kept a mapped body. No
+    /// tile classification keeps one fullscreen triangle on that same choice.
+    /// No bodies use the base pipeline.
     pub(super) unsafe fn record_sky(&self) {
         let Some(desc) = self.lists.sky_for_pass() else {
             return;
@@ -845,21 +847,37 @@ impl<'a> RenderPass<'a> {
         let jittered = self.scene_state.expect("a sky pass implies a 3D scene").0;
         let params = pipeline::SkyParams::compose(jittered.inverse(), &desc);
         let draw = self.r.far_ring.sky_draw(FrameSlot::new(self.slot));
-        let quads = draw.quads && (draw.n_base > 0 || draw.n_full > 0);
+        let quads = draw.quads && (draw.n_base > 0 || draw.n_sphere > 0 || draw.n_heavy > 0);
         let sky_full = self.r.pipelines.sky;
         let sky_base = self.r.pipelines.sky_base;
-        let sky_tile = self.r.pipelines.sky_tile;
+        let sky_nomap = self.r.pipelines.sky_nomap;
+        let sky_sphere = self.r.pipelines.sky_sphere;
         let sky_tile_base = self.r.pipelines.sky_tile_base;
+        let sky_tile_sphere = self.r.pipelines.sky_tile_sphere;
+        let sky_tile_heavy = match draw.body {
+            super::far_bodies::SkyBodyPipe::Full => self.r.pipelines.sky_tile,
+            super::far_bodies::SkyBodyPipe::NoMap => self.r.pipelines.sky_tile_nomap,
+            super::far_bodies::SkyBodyPipe::Sphere => self.r.pipelines.sky_tile_sphere,
+        };
+        let fullscreen = if draw.base {
+            sky_base
+        } else {
+            match draw.body {
+                super::far_bodies::SkyBodyPipe::Full => sky_full,
+                super::far_bodies::SkyBodyPipe::NoMap => sky_nomap,
+                super::far_bodies::SkyBodyPipe::Sphere => sky_sphere,
+            }
+        };
         let first = if quads {
             if draw.n_base > 0 {
                 sky_tile_base
+            } else if draw.n_sphere > 0 {
+                sky_tile_sphere
             } else {
-                sky_tile
+                sky_tile_heavy
             }
-        } else if draw.base {
-            sky_base
         } else {
-            sky_full
+            fullscreen
         };
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, first);
@@ -938,17 +956,30 @@ impl<'a> RenderPass<'a> {
                 &writes,
             );
             if quads {
-                // Base tiles occupy instance ids `0..n_base`. The full draw's
-                // firstInstance is `first_full`; the vertex shader reads Vulkan's
-                // instance index, which includes it, and indexes the combined list.
+                // Runs are base, then sphere, then heavy. firstInstance is the
+                // run start; the vertex shader's InstanceIndex includes it.
                 if draw.n_base > 0 {
                     device.cmd_draw(cmd, 6, draw.n_base, 0, 0);
                 }
-                if draw.n_full > 0 {
+                if draw.n_sphere > 0 {
                     if draw.n_base > 0 {
-                        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, sky_tile);
+                        device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            sky_tile_sphere,
+                        );
                     }
-                    device.cmd_draw(cmd, 6, draw.n_full, 0, draw.first_full);
+                    device.cmd_draw(cmd, 6, draw.n_sphere, 0, draw.n_base);
+                }
+                if draw.n_heavy > 0 {
+                    if draw.n_base > 0 || draw.n_sphere > 0 {
+                        device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            sky_tile_heavy,
+                        );
+                    }
+                    device.cmd_draw(cmd, 6, draw.n_heavy, 0, draw.n_base + draw.n_sphere);
                 }
             } else {
                 device.cmd_draw(cmd, 3, 1, 0, 0);

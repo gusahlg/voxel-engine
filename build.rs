@@ -292,6 +292,31 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             "sky_base.frag.spv",
         )
     });
+    // No mapped march. The game sends spheres, cubes, rounded and at most one
+    // inner sphere until it opts into FarShape::Mapped.
+    jobs.push(ShaderJob {
+        defines: &[("FAR_NO_MAPPED", None)],
+        ..job(
+            "shaders/sky.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "sky_nomap.frag.spv",
+        )
+    });
+    // Spheres and inner spheres only.
+    jobs.push(ShaderJob {
+        defines: &[
+            ("FAR_NO_MAPPED", None),
+            ("FAR_NO_CUBE", None),
+            ("FAR_NO_ROUNDED", None),
+        ],
+        ..job(
+            "shaders/sky.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "sky_sphere.frag.spv",
+        )
+    });
     // Present-time TAA tonemap fragment (`-DTAA_FUSED`).
     jobs.push(ShaderJob {
         defines: &[("TAA_FUSED", None)],

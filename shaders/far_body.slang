@@ -692,8 +692,14 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
     float3 air = atmo.rgb;
     float distance = farTable[0].body[i].albedo2.w;
     float facing = dot(ray, center);
+#ifndef FAR_NO_ROUNDED
     bool rounded = shape > 2.5 && shape < 3.5;
+#endif
+#ifndef FAR_NO_MAPPED
     bool mapped = shape > 3.5 && shape < 4.5;
+#else
+    bool mapped = false;
+#endif
     bool sphere = shape > 0.5 && shape < 1.5;
     // A sub-pixel body is a point blob, except a mapped body, whose datum is
     // the shape. This is the same gate pass 1 used to set the bit.
@@ -716,6 +722,7 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
         float rim = 1.0 - u;
         return air * (rim * rim);
     }
+#ifndef FAR_NO_ROUNDED
     if (rounded)
     {
         float pExp = asfloat(farTable[0].body[i].seed.y);
@@ -727,6 +734,8 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
         float rim = 1.0 - u;
         return air * (rim * rim);
     }
+#endif
+#ifndef FAR_NO_MAPPED
     if (mapped)
     {
         uint mapPlus = farTable[0].body[i].seed.z;
@@ -754,6 +763,8 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
         float daylight = saturate(dot(limbN, frame.sun_dir_elev.xyz) * flip);
         return air * ((1.0 - trans) * frame.light.rgb * daylight);
     }
+#endif
+#ifndef FAR_NO_CUBE
     float rhoRim = rho * 1.035 + px * 0.5;
     float tRim;
     float3 nRim;
@@ -765,6 +776,7 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
         fres = fres * fres * fres;
         return air * fres;
     }
+#endif
     return float3(0.0, 0.0, 0.0);
 }
 
@@ -827,10 +839,16 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
     float bestT = 0.0;
     uint bestI = 0u;
     uint bestFace = 0u;
-    float3 bestN = float3(0.0, 0.0, 0.0);
-    float bestCov = 1.0;
     // 0 none, 1 sphere (coverage lerp), 2 inner wall, 3 opaque replace, 4 mapped.
+    // Sphere and inner normals are rebuilt after the loop. A cube, rounded or
+    // mapped hit still carries its normal: repeating that march would inline
+    // it twice. A sphere-only compile has no such store, so the float3 is not
+    // live across the search.
     uint bestKind = 0u;
+#if !defined(FAR_NO_ROUNDED) || !defined(FAR_NO_MAPPED) || !defined(FAR_NO_CUBE)
+#define FAR_KEEP_NORMAL
+    float3 bestN = float3(0.0, 0.0, 0.0);
+#endif
     // Bit i: body i would have pushed one additive (see far_bodies).
     uint addMask = 0u;
 
@@ -856,8 +874,19 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         float rho = dirRho.w;
         float shape = atmo.w;
         bool inner = shape > 1.5 && shape < 2.5;
+#ifndef FAR_NO_ROUNDED
         bool rounded = shape > 2.5 && shape < 3.5;
+#else
+        bool rounded = false;
+#endif
+#ifndef FAR_NO_MAPPED
         bool mapped = shape > 3.5 && shape < 4.5;
+#else
+        bool mapped = false;
+#endif
+        // Divergent shapes stay out of a flattened branch. A warp of spheres
+        // does not issue the cube, rounded or mapped march.
+        [branch]
         if (inner)
         {
             if (!(rho > 1.0))
@@ -896,8 +925,6 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 bestT = t;
                 bestI = i;
                 bestFace = 0u;
-                bestN = nrm;
-                bestCov = 1.0;
                 bestKind = 2u;
             }
             continue;
@@ -906,6 +933,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         // Angular diameter in pixels. Under ~0.7 px the disc is a soft point.
         // A mapped body keeps its ray test: the datum is the shape, not a blob.
         float ang = (rho * 2.0) / px;
+        [branch]
         if (!mapped && ang < 0.7 && facing > 0.0)
         {
             float tPoint = 1.0 - rho;
@@ -919,6 +947,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         float3 nrm = float3(0.0, 0.0, 0.0);
         uint face = 0u;
         bool hit = false;
+        [branch]
         if (sphere)
         {
             float s = length(cross(ray, center));
@@ -931,8 +960,6 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                     bestT = t;
                     bestI = i;
                     bestFace = 0u;
-                    bestN = nrm;
-                    bestCov = saturate(0.5 + (rho - s) / px);
                     bestKind = 1u;
                 }
             }
@@ -943,6 +970,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                     addMask |= 1u << i;
             }
         }
+#ifndef FAR_NO_ROUNDED
         else if (rounded)
         {
             float pExp = asfloat(farTable[0].body[i].seed.y);
@@ -955,7 +983,6 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 bestI = i;
                 bestFace = face;
                 bestN = nrm;
-                bestCov = 1.0;
                 bestKind = 3u;
             }
             else if (!hit && hasAir)
@@ -968,6 +995,8 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                     addMask |= 1u << i;
             }
         }
+#endif
+#ifndef FAR_NO_MAPPED
         else if (mapped)
         {
             uint mapPlus = farTable[0].body[i].seed.z;
@@ -986,7 +1015,6 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 bestI = i;
                 bestFace = face;
                 bestN = nrm;
-                bestCov = 1.0;
                 bestKind = 4u;
             }
             else if (!hit && airThick > 0.0 && facing > 0.0 && facingDepth < bestDepth)
@@ -1001,6 +1029,8 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                     addMask |= 1u << i;
             }
         }
+#endif
+#ifndef FAR_NO_CUBE
         else
         {
             float4 rot = farTable[0].body[i].rot;
@@ -1012,7 +1042,6 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 bestI = i;
                 bestFace = face;
                 bestN = nrm;
-                bestCov = 1.0;
                 bestKind = 3u;
             }
             else if (!hit && hasAir)
@@ -1026,22 +1055,46 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                     addMask |= 1u << i;
             }
         }
+#endif
     }
 
     float3 add = float3(0.0, 0.0, 0.0);
+    // Pass 1 set addMask for every term the old array would have pushed.
+    // Walking only those bits is the same test, without a miss per other body.
+    bits &= addMask;
     [loop]
     while (bits != 0u)
     {
         uint i = firstbitlow(bits);
         bits &= bits - 1u;
-        if ((addMask & (1u << i)) == 0u)
-            continue;
         float distance = farTable[0].body[i].albedo2.w;
         float facingDepth = dot(ray, farTable[0].body[i].dir_rho.xyz) * distance;
         // Stored depth of every additive. Terms the running gate rejected
         // never have their bit set, so this is the array's post-loop test.
         if (facingDepth < bestDepth)
             add += far_add_rgb(i, ray, px, flip);
+    }
+
+    // Sphere and inner normals match far_ray_sphere / far_ray_inner exactly,
+    // including the un-normalised scale. Coverage uses the same cross length
+    // pass 1 tested. Heavy shapes already stored bestN.
+#ifndef FAR_KEEP_NORMAL
+    float3 bestN = float3(0.0, 0.0, 0.0);
+#endif
+    float bestCov = 1.0;
+    if (bestKind == 1u || bestKind == 2u)
+    {
+        float4 wonRho = farTable[0].body[bestI].dir_rho;
+        float wonR = wonRho.w;
+        float3 wonC = wonRho.xyz;
+        if (bestKind == 1u)
+        {
+            bestN = (ray * bestT - wonC) / wonR;
+            float s = length(cross(ray, wonC));
+            bestCov = saturate(0.5 + (wonR - s) / px);
+        }
+        else
+            bestN = (wonC - ray * bestT) / wonR;
     }
 
     if (bestKind != 0u)
@@ -1054,6 +1107,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         float3 bodyP = far_inv_rotate(rot, ray * bestT - center);
         if (bestKind == 4u)
         {
+#ifndef FAR_NO_MAPPED
             // Terrain fog, the same factor mesh3d applies, replaces far_through_air.
             uint mapPlus = farTable[0].body[bestI].seed.z;
             float distance = farTable[0].body[bestI].albedo2.w;
@@ -1084,6 +1138,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 shaded = lerp(lit, inscatter, fog);
             }
             col = shaded;
+#endif
         }
         else
         {
