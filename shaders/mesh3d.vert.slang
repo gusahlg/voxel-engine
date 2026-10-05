@@ -45,6 +45,8 @@ StructuredBuffer<MeshRecord> mesh_records;
 [[vk::binding(2, 0)]]
 ConstantBuffer<FrameUniforms> frame;
 
+#include "lod_morph.slang"
+
 [[vk::binding(6, 0)]]
 StructuredBuffer<DrawDyn> draw_dyn;
 
@@ -112,7 +114,8 @@ VertexOutput vertexMain(VertexInput input)
     float z = float((w0 >> 10) & 0x1F);
     uint normal = (w0 >> 15) & 0x7;   // 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
     uint layer = (w0 >> 18) & 0x3FFF;
-    // w1: AO [0:2], skylight [2:6], blocklight [6:10], water [10].
+    // w1: AO [0:2], skylight [2:6], blocklight [6:10], water [10],
+    // micro [11:17), morph [17:23) (decoded in lod_morph.slang).
     uint water = (w1 >> 10) & 0x1;
 
     // Per-axis 2-bit two's-complement micro-offsets. Truth: mesh.rs
@@ -150,14 +153,27 @@ VertexOutput vertexMain(VertexInput input)
     // `q` is the local cell position times the detail scale, in [0, 16·scale]³
     // (micro can step slightly outside). UVs stay on the unbent cell.
     float3 q = (float3(x, y, z) + micro) * scale;
+    // One uniform branch. Off leaves `q` (and therefore `t` and the bent normal) untouched.
+    if ((frame.morph_eye_block.w & 1) != 0)
+    {
+        // Add a*dy cells before `t`, so the cage bends the target along the chart's up.
+        float cells = lod_morph_cells(w1, detail, rec.block, q);
+        q.y += cells * scale;
+    }
     Cage cg = cages[rec.cage];
     float3 t = q / (16.0 * scale);
     float3 world = cage_trilinear(cg, t) + float3(cg.anchor - pc.cam_block) - pc.cam_frac;
 #else
     // Camera-relative placement: block delta first, then fractional parts.
     // Integer subtraction wraps, matching the CPU `wrapping_sub`.
+    float3 q = (float3(x, y, z) + micro) * scale;
     float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
-    float3 world = (float3(x, y, z) + micro) * scale + offset;
+    float3 world = q + offset;
+    // World +Y is the flat terrain's up. Off does not add +0.
+    if ((frame.morph_eye_block.w & 1) != 0)
+    {
+        world.y += lod_morph_cells(w1, detail, rec.block, q) * scale;
+    }
 #endif
 
     VertexOutput output;

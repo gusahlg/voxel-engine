@@ -198,8 +198,13 @@ impl Renderer {
                     1.0,
                 ];
             }
-            self.ubo_ring
-                .write_from_gpu(FrameSlot::new(slot), u, self.flags, lists.local_frame());
+            self.ubo_ring.write_from_gpu(
+                FrameSlot::new(slot),
+                u,
+                self.flags,
+                lists.local_frame(),
+                lists.lod_morph.to_gpu(),
+            );
         }
         // Far-body table (sky set 0 binding 2). Same slot fence as the UBO.
         // A sky with no bodies still uploads a zero count so the binding is live.
