@@ -367,10 +367,12 @@ pub enum Gauge {
     FarTiles,
     /// Body-free sky tiles drawn at a 2×2 fragment shading rate.
     SkyCoarse,
+    /// Mapped-interior sky tiles drawn at a 2×2 fragment shading rate.
+    SkyCoarseFar,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 34] = [
+    const ALL: [Gauge; 35] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
@@ -405,6 +407,7 @@ impl Gauge {
         Gauge::FarDrawn,
         Gauge::FarTiles,
         Gauge::SkyCoarse,
+        Gauge::SkyCoarseFar,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -444,6 +447,7 @@ impl Gauge {
             Gauge::FarDrawn => "far.drawn",
             Gauge::FarTiles => "far.tiles",
             Gauge::SkyCoarse => "sky.coarse",
+            Gauge::SkyCoarseFar => "sky.coarse_far",
         }
     }
 }

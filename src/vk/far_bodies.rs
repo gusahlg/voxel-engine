@@ -8,8 +8,9 @@
 //! vertex shader: mask == 0, then sphere-only tiles, then tiles that meet a
 //! cube, rounded or mapped body. When a coarse-shading query is passed, the
 //! base run is stably split into tiles the sun and moon discs miss, then the
-//! rest. `list_header.x` stays the whole base count; the shader still indexes
-//! by instance id.
+//! rest, and the heavy run is split into mapped-interior tiles, then the rest.
+//! `list_header.x` stays the whole base count; the shader still indexes by
+//! instance id.
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
@@ -667,6 +668,46 @@ fn mapped_horizon_half(horizon: f32, air: f32, distance: f32, px_max: f32) -> Op
     }
 }
 
+/// Half-angle of the mapped disc inset by the air limb and 3 px, as `(sin, cos)`.
+///
+/// This is the horizon cone ([`mapped_horizon_half`] without the widening)
+/// shrunk by `δ`, `sin δ = air/distance + 3 px`. A tile that lies strictly
+/// inside it holds no silhouette, limb, or air rim. `None` when `horizon >= 1`
+/// or the margin eats the cone (including a pad whose sine saturates).
+fn mapped_interior_half(horizon: f32, air: f32, distance: f32, px_max: f32) -> Option<(f32, f32)> {
+    if !(horizon < 1.0) || !horizon.is_finite() {
+        return None;
+    }
+    let h = horizon.clamp(-1.0, 1.0);
+    let cos_alpha = -h;
+    let sin_alpha = (1.0 - h * h).max(0.0).sqrt();
+    let shell = if distance.is_finite() && distance > 0.0 && air.is_finite() {
+        (air / distance).max(0.0)
+    } else {
+        return None;
+    };
+    let px = if px_max.is_finite() {
+        3.0 * px_max.max(0.0)
+    } else {
+        return None;
+    };
+    let pad = shell + px;
+    // A sine of 1 is 90°. Anything wider is not a margin we can subtract, and
+    // the limb could sit anywhere inside that shell.
+    if !pad.is_finite() || pad >= 1.0 {
+        return None;
+    }
+    let sin_delta = pad;
+    let cos_delta = (1.0 - sin_delta * sin_delta).max(0.0).sqrt();
+    let sin_b = sin_alpha * cos_delta - cos_alpha * sin_delta;
+    let cos_b = cos_alpha * cos_delta + sin_alpha * sin_delta;
+    if !(sin_b > 0.0) || !sin_b.is_finite() || !cos_b.is_finite() {
+        None
+    } else {
+        Some((sin_b, cos_b))
+    }
+}
+
 /// Maximum of `dot(unit ray, dir)` on the view's direction cone.
 ///
 /// `dir` is unit. The maximum on a convex spherical polygon is 1 when `dir`
@@ -767,6 +808,27 @@ fn tile_within(tile: &TileSample, dir_view: glam::Vec3, sin_body: f32, cos_body:
         return true;
     }
     dir_view.dot(tile.centre) + ANGULAR_COS_EPS >= cos_sum
+}
+
+/// The whole tile cone lies strictly inside the body's half-angle.
+///
+/// `angle(centre, dir) + a_tile < a_body`. A tile that only touches the
+/// boundary stays out, so the limb and the silhouette stay at 1×1.
+fn tile_strictly_inside(
+    tile: &TileSample,
+    dir_view: glam::Vec3,
+    sin_body: f32,
+    cos_body: f32,
+) -> bool {
+    if tile.sin_r > 1.0 || !(tile.sin_r.is_finite() && tile.cos_r.is_finite()) {
+        return false;
+    }
+    let sin_g = sin_body * tile.cos_r - cos_body * tile.sin_r;
+    let cos_g = cos_body * tile.cos_r + sin_body * tile.sin_r;
+    if !(sin_g > 0.0) || !sin_g.is_finite() || !cos_g.is_finite() {
+        return false;
+    }
+    dir_view.dot(tile.centre) > cos_g + ANGULAR_COS_EPS
 }
 
 /// Screen tiles touched by kept body `dir`/`bound`. `bound` is the cone sine,
@@ -1202,6 +1264,108 @@ fn split_coarse_base(
     n_coarse as u32
 }
 
+/// Stably partition the heavy run into mapped-interior tiles, then the rest.
+/// Returns the coarse count. A tile qualifies when its mask is exactly one
+/// mapped body with `horizon < 1`, its cone lies strictly inside that body's
+/// disc inset by the air limb and 3 px, and neither disc meets it. Stars, a
+/// missing frame, or an unusable disc leave the run unchanged and return 0.
+fn split_coarse_far(
+    table: &mut FarTableGpu,
+    frames: &TileFrames,
+    view: &FarView,
+    query: &SkyCoarseQuery,
+) -> u32 {
+    if query.stars {
+        return 0;
+    }
+    let (n_base, n_sphere, n_heavy) = tile_split(table);
+    if n_heavy == 0 || !frames.matches(view) {
+        return 0;
+    }
+    let Some(basis) = ViewBasis::from_view_proj(view.view_proj) else {
+        return 0;
+    };
+    let Some(sun) = unit_dir(query.sun_dir) else {
+        return 0;
+    };
+    let Some(sun_view) = unit_dir(basis.to_view(sun)) else {
+        return 0;
+    };
+    let Some(moon_view) = unit_dir(basis.to_view(-sun)) else {
+        return 0;
+    };
+    let Some((sun_sin, sun_cos)) = widened_disc(query.sun_cos_rim, view.px_max) else {
+        return 0;
+    };
+    let Some((moon_sin, moon_cos)) = widened_disc(query.moon_cos_rim, view.px_max) else {
+        return 0;
+    };
+    let kept = (table.header[0] as usize).min(MAX_FAR_BODIES);
+    let mut interior: [Option<(glam::Vec3, f32, f32)>; MAX_FAR_BODIES] = [None; MAX_FAR_BODIES];
+    for k in 0..kept {
+        let gpu = &table.body[k];
+        let shape = gpu.atmosphere[3];
+        let horizon = gpu.albedo0[3];
+        if !(3.5..4.5).contains(&shape) || !(horizon < 1.0) {
+            continue;
+        }
+        let Some((sin_b, cos_b)) =
+            mapped_interior_half(horizon, gpu.albedo1[3], gpu.albedo2[3], view.px_max)
+        else {
+            continue;
+        };
+        let dir = glam::Vec3::new(table.cone[k][0], table.cone[k][1], table.cone[k][2]);
+        let Some(dir) = unit_dir(dir) else {
+            continue;
+        };
+        let Some(dir_view) = unit_dir(basis.to_view(dir)) else {
+            continue;
+        };
+        interior[k] = Some((dir_view, sin_b, cos_b));
+    }
+    let start = (n_base + n_sphere) as usize;
+    let end = start + n_heavy as usize;
+    if end > table.tile_index.len() {
+        return 0;
+    }
+    // Classify before writing, so a bad index leaves the run untouched.
+    let mut take = Vec::with_capacity(n_heavy as usize);
+    for slot in start..end {
+        let index = table.tile_index[slot];
+        let Some(tile) = frames.samples.get(index as usize) else {
+            return 0;
+        };
+        let mask = table.tile_mask[index as usize];
+        let inside = mask.count_ones() == 1 && {
+            let k = mask.trailing_zeros() as usize;
+            match interior[k] {
+                Some((dir_view, sin_b, cos_b)) => {
+                    tile_strictly_inside(tile, dir_view, sin_b, cos_b)
+                        && !tile_within(tile, sun_view, sun_sin, sun_cos)
+                        && !tile_within(tile, moon_view, moon_sin, moon_cos)
+                }
+                None => false,
+            }
+        };
+        take.push(inside);
+    }
+    let mut coarse = Vec::with_capacity(n_heavy as usize);
+    let mut fine = Vec::with_capacity(n_heavy as usize);
+    for (offset, inside) in take.into_iter().enumerate() {
+        let index = table.tile_index[start + offset];
+        if inside {
+            coarse.push(index);
+        } else {
+            fine.push(index);
+        }
+    }
+    let n_coarse = coarse.len();
+    for (offset, index) in coarse.into_iter().chain(fine).enumerate() {
+        table.tile_index[start + offset] = index;
+    }
+    n_coarse as u32
+}
+
 /// Which body fragment a draw needs. `Full` has every shape. `NoMap` drops the
 /// mapped march. `Sphere` keeps spheres and inner spheres.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1233,6 +1397,9 @@ pub(crate) struct SkyDraw {
     /// Coarse-eligible prefix of the base run. `sky.coarse`. Zero unless a
     /// query actually split the prefix.
     pub n_coarse: u32,
+    /// Coarse-eligible prefix of the heavy run. `sky.coarse_far`. Zero unless
+    /// a query actually split that run.
+    pub n_coarse_far: u32,
 }
 
 impl Default for SkyDraw {
@@ -1246,6 +1413,7 @@ impl Default for SkyDraw {
             n_heavy: 0,
             n_full: 0,
             n_coarse: 0,
+            n_coarse_far: 0,
         }
     }
 }
@@ -1279,6 +1447,7 @@ impl SkyDraw {
                 n_heavy,
                 n_full,
                 n_coarse: 0,
+                n_coarse_far: 0,
             }
         } else {
             Self {
@@ -1290,6 +1459,7 @@ impl SkyDraw {
                 n_heavy: 0,
                 n_full: 0,
                 n_coarse: 0,
+                n_coarse_far: 0,
             }
         }
     }
@@ -1486,10 +1656,15 @@ impl FarBodyRing {
             if let (Some(query), Some(view)) = (coarse.as_ref(), view.as_ref()) {
                 if self.tiles.matches(view) {
                     draw.n_coarse = split_coarse_base(&mut table, &self.tiles, view, query);
+                    draw.n_coarse_far = split_coarse_far(&mut table, &self.tiles, view, query);
                 }
             }
         }
         crate::profile::gauge(crate::profile::Gauge::SkyCoarse, u64::from(draw.n_coarse));
+        crate::profile::gauge(
+            crate::profile::Gauge::SkyCoarseFar,
+            u64::from(draw.n_coarse_far),
+        );
         self.draw[slot] = draw;
         let bytes = table_bytes(&table);
         let lists = list_bytes(&table);
@@ -2541,6 +2716,7 @@ mod tests {
             (2, 1, 1, 2)
         );
         assert_eq!(draw.n_coarse, 0);
+        assert_eq!(draw.n_coarse_far, 0);
         assert_eq!(draw.body, SkyBodyPipe::NoMap);
 
         // No kept bodies: one body-free fullscreen triangle, even with a grid.
@@ -3410,5 +3586,113 @@ mod tests {
         for &index in fine {
             assert_eq!(table.tile_mask[index as usize], 0);
         }
+    }
+
+    fn heavy_run(table: &FarTableGpu) -> (usize, usize) {
+        let (n_base, n_sphere, n_heavy) = tile_split(table);
+        let start = (n_base + n_sphere) as usize;
+        (start, start + n_heavy as usize)
+    }
+
+    #[test]
+    fn coarse_far_is_the_mapped_interior_only() {
+        let view = view_pitched(0.0, 90.0, 1280, 720);
+        let frames = TileFrames::build(&view).expect("frames");
+        let map_max = [0.0f32; MAX_FAR_MAPS];
+        let body = mapped_down(4.0, 1.0, 0.0, 0.0);
+        let mut table = super::pack_table(std::slice::from_ref(&body), Some(view), &map_max);
+        assert_eq!(table.header[0], 1);
+        let (start, end) = heavy_run(&table);
+        let n_heavy = (end - start) as u32;
+        assert!(n_heavy > 1, "heavy {n_heavy}");
+        let before = table.tile_index[start..end].to_vec();
+        let header = table.list_header;
+        // Sun behind the camera. The moon sits on the view axis, on the horizon,
+        // so it only knocks out tiles near the limb.
+        let n = split_coarse_far(&mut table, &frames, &view, &coarse_query(Vec3::Z, false));
+        assert!(n > 0 && n < n_heavy, "coarse {n} of {n_heavy}");
+        assert_eq!(table.list_header, header);
+        let coarse = &table.tile_index[start..start + n as usize];
+        let fine = &table.tile_index[start + n as usize..end];
+        assert!(coarse.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(fine.windows(2).all(|pair| pair[0] < pair[1]));
+        let mut merged = table.tile_index[start..end].to_vec();
+        merged.sort_unstable();
+        let mut expect = before.clone();
+        expect.sort_unstable();
+        assert_eq!(merged, expect);
+
+        let (sin_b, cos_b) =
+            mapped_interior_half(0.0, 0.0, 4.0, view.px_max).expect("interior cone");
+        let basis = ViewBasis::from_view_proj(view.view_proj).expect("basis");
+        let dir_view = basis.to_view(-Vec3::Y).normalize();
+        let mut boundary = 0u32;
+        for &index in &before {
+            let tile = &frames.samples[index as usize];
+            let inside = tile_strictly_inside(tile, dir_view, sin_b, cos_b);
+            if inside {
+                assert!(
+                    coarse.contains(&index),
+                    "interior tile {index} stayed at 1x1"
+                );
+            } else {
+                assert!(fine.contains(&index), "limb tile {index} went coarse");
+                boundary += 1;
+            }
+        }
+        assert!(boundary > 0, "every heavy tile was interior");
+
+        // Stars, and a horizon that disables the cone, leave the heavy run put.
+        let mut starred = super::pack_table(std::slice::from_ref(&body), Some(view), &map_max);
+        let star_before = starred.tile_index[start..end].to_vec();
+        assert_eq!(
+            split_coarse_far(&mut starred, &frames, &view, &coarse_query(Vec3::Z, true)),
+            0
+        );
+        assert_eq!(&starred.tile_index[start..end], star_before.as_slice());
+
+        // rho 0.75 reaches the bottom of this view; horizon >= 1 stays on the
+        // per-pixel disc and must not join the coarse prefix.
+        let disabled = mapped_down(4.0, 3.0, 1.0, 0.0);
+        let mut off = super::pack_table(std::slice::from_ref(&disabled), Some(view), &map_max);
+        let (off_start, off_end) = heavy_run(&off);
+        assert!(off_end > off_start, "horizon >= 1 painted no heavy tile");
+        let off_before = off.tile_index[off_start..off_end].to_vec();
+        assert_eq!(
+            split_coarse_far(&mut off, &frames, &view, &coarse_query(Vec3::Z, false)),
+            0
+        );
+        assert_eq!(&off.tile_index[off_start..off_end], off_before.as_slice());
+
+        // A second body on the same tiles drops those tiles out of the prefix.
+        // Bottom-centre of this view, inside the mapped hemisphere and on screen.
+        let companion = placed(Vec3::new(0.0, -1.0, -1.0), 0.15, FarShape::Sphere, 2);
+        let mut both = super::pack_table(&[body, companion], Some(view), &map_max);
+        assert_eq!(both.header[0], 2);
+        let n_both = split_coarse_far(&mut both, &frames, &view, &coarse_query(Vec3::Z, false));
+        assert!(n_both > 0, "the companion erased every interior tile");
+        let (both_start, both_end) = heavy_run(&both);
+        let both_coarse = &both.tile_index[both_start..both_start + n_both as usize];
+        let mut shared = 0u32;
+        for &index in &both.tile_index[both_start..both_end] {
+            let mask = both.tile_mask[index as usize];
+            if mask.count_ones() != 1 {
+                shared += 1;
+                assert!(
+                    !both_coarse.contains(&index),
+                    "shared tile {index} mask {mask:#x} went coarse"
+                );
+            }
+        }
+        assert!(shared > 0, "the companion shared no tile");
+        for &index in both_coarse {
+            assert_eq!(both.tile_mask[index as usize], 1);
+        }
+
+        // A sun disc aimed down the body covers the interior. Nothing goes coarse.
+        let mut covered = super::pack_table(std::slice::from_ref(&body), Some(view), &map_max);
+        let mut query = coarse_query(-Vec3::Y, false);
+        query.sun_cos_rim = 0.0;
+        assert_eq!(split_coarse_far(&mut covered, &frames, &view, &query), 0);
     }
 }

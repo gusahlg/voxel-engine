@@ -190,6 +190,49 @@ const FAR_ALBEDO_SIZE: u32 = 64;
 /// Reference radius fraction for the mapped planet (`rho`).
 const FAR_MAPPED_RHO: f32 = 0.12;
 
+/// Next non-colliding `screenshots/watt-<utc-secs>.png`. Autoshot cannot use
+/// [`Engine::screenshot`](voxel_engine::Engine::screenshot): that encode is
+/// detached, and quitting the process drops it before the rename.
+fn autoshot_path() -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from("screenshots");
+    let _ = std::fs::create_dir_all(&dir);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut path = dir.join(format!("watt-{secs}.png"));
+    let mut n = 1u32;
+    while path.exists() {
+        path = dir.join(format!("watt-{secs}-{n}.png"));
+        n += 1;
+    }
+    path
+}
+
+/// `VOXEL_DEMO_MAPPED_RHO` when it parses as a finite value in `(0, 1)`.
+fn demo_mapped_override() -> Option<f32> {
+    let text = std::env::var("VOXEL_DEMO_MAPPED_RHO").ok()?;
+    let rho = text.parse::<f32>().ok()?;
+    (rho.is_finite() && rho > 0.0 && rho < 1.0).then_some(rho)
+}
+
+/// Showcase planet rho. Unset (or an unusable override) keeps [`FAR_MAPPED_RHO`].
+fn demo_mapped_rho() -> f32 {
+    demo_mapped_override().unwrap_or(FAR_MAPPED_RHO)
+}
+
+/// Horizon sine for the showcase planet. An override uses the hi-sphere limb
+/// (`-sqrt(1 - rho_hi²)`, rho_hi = rho × 1.12) so interior tiles exist. The
+/// datum's largest bump is `0.12 * radius`. Unset keeps 1, which disables the
+/// cull and is what the showcase tests lock.
+fn demo_mapped_horizon(rho: f32) -> f32 {
+    if demo_mapped_override().is_none() {
+        return 1.0;
+    }
+    let rho_hi = (rho * 1.12).clamp(0.0, 0.999);
+    -(1.0 - rho_hi * rho_hi).sqrt()
+}
+
 /// NDC on the startup frame. `y > 0` is the upper half of the view (the
 /// projection is GL-style y-up). Order: sphere, cube, rounded, mapped, point.
 /// Staggered in y so the mapped bulge and the cube's corners stay apart.
@@ -363,7 +406,8 @@ fn far_showcase_bodies() -> [FarBody; 5] {
         Color::GOLD,
     ]
     .map(Color::to_linear);
-    let mapped_r = FAR_MAPPED_RHO * distance;
+    let mapped_rho = demo_mapped_rho();
+    let mapped_r = mapped_rho * distance;
     let hot = LinearRgb([3.2, 2.8, 1.2]);
     [
         at(
@@ -395,10 +439,10 @@ fn far_showcase_bodies() -> [FarBody; 5] {
         ),
         at(
             3,
-            FAR_MAPPED_RHO,
+            mapped_rho,
             FarShape::Mapped {
                 map: FarMapId(0),
-                horizon: 1.0,
+                horizon: demo_mapped_horizon(mapped_rho),
                 air: 0.02 * mapped_r,
             },
             Quat::IDENTITY,
@@ -421,7 +465,7 @@ fn far_showcase_bodies() -> [FarBody; 5] {
 /// Datum and six albedo faces for map 0. Call once, before the first frame
 /// that submits far bodies; the upload lands over the following frames.
 fn install_far_showcase(eng: &mut voxel_engine::Engine) {
-    let radius = FAR_MAPPED_RHO * FAR_DEMO_DISTANCE;
+    let radius = demo_mapped_rho() * FAR_DEMO_DISTANCE;
     let datum = far_showcase_datum(radius);
     eng.set_far_map(
         FarMapId(0),
@@ -474,19 +518,20 @@ fn main() {
             if eng.should_close() || eng.is_key_pressed(Key::Escape) {
                 return false;
             }
-            // Headless verification: request a capture of the settled scene
-            // (queued now, written when this frame submits), then quit shortly
-            // after. `eng` is unborrowed here, before `begin_frame`.
+            // Headless verification: capture the settled scene, then quit.
+            // `screenshot` queues a detached encode that process exit kills
+            // before the rename, so this blocks on `screenshot_to` (the reply
+            // arrives only after the PNG is on disk). `eng` is unborrowed
+            // here, before `begin_frame`; the capture re-presents the last
+            // submitted frame.
             frame_n += 1;
-            if autoshot {
-                if frame_n == 30 {
-                    if let Some(p) = eng.screenshot() {
-                        log::info!("autoshot -> {}", p.display());
-                    }
+            if autoshot && frame_n == 30 {
+                let path = autoshot_path();
+                match voxel_engine::screenshot_to(eng, &path) {
+                    Ok(()) => log::info!("autoshot -> {}", path.display()),
+                    Err(e) => log::error!("autoshot failed ({}): {e}", path.display()),
                 }
-                if frame_n >= 36 {
-                    return false;
-                }
+                return false;
             }
             if eng.is_key_pressed(Key::F) {
                 let now = !eng.fullscreen();

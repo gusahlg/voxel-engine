@@ -286,6 +286,9 @@ pub struct Pipelines {
     /// `sky_tile_base` at a 2×2 fragment size. `None` when this sample count
     /// has no pipeline 2×2 rate, or `VOXEL_SKY_COARSE=0`.
     pub sky_tile_base_coarse: Option<vk::Pipeline>,
+    /// Full sky fragment (the mapped march included) at a 2×2 fragment size.
+    /// Same `None` conditions as [`Self::sky_tile_base_coarse`].
+    pub sky_tile_coarse: Option<vk::Pipeline>,
     pub sky_tile_nomap: vk::Pipeline,
     pub sky_tile_sphere: vk::Pipeline,
     pub layout_sky: vk::PipelineLayout,
@@ -795,8 +798,9 @@ impl Pipelines {
         // Sky: no vertex input (verts synthesised from SV_VertexID), depth
         // read-only at the far plane, opaque, no cull. Same GREATER_OR_EQUAL
         // compare as the scene, so it passes only where depth is still cleared.
-        // The eight pipelines share that state and `layout_sky`. The optional
-        // ninth is the same base-tile fragment at a 2×2 pipeline rate.
+        // The eight pipelines share that state and `layout_sky`. Two optional
+        // pipelines are 2×2: the base-tile fragment, and the full fragment
+        // (mapped march included) for interior tiles of a mapped body.
         let sky_cfg = || PipelineConfig {
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
             depth: DepthMode::ReadOnly,
@@ -870,6 +874,15 @@ impl Pipelines {
             "sky_tile_sphere",
             sky_cfg(),
         );
+        let coarse_cfg = || PipelineConfig {
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            depth: DepthMode::ReadOnly,
+            cull: vk::CullModeFlags::NONE,
+            blend: false,
+            vrs: false,
+            depth_bias: None,
+            coarse_2x2: true,
+        };
         // 2×2 only where the device lists that size for this sample count.
         // `vrs: false` so the 1×1 REPLACE state is not also chained; `coarse_2x2`
         // pushes KEEP/KEEP instead. The attachment create flag still follows
@@ -882,15 +895,18 @@ impl Pipelines {
                 &[],
                 layout_sky,
                 "sky_tile_base_coarse",
-                PipelineConfig {
-                    topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                    depth: DepthMode::ReadOnly,
-                    cull: vk::CullModeFlags::NONE,
-                    blend: false,
-                    vrs: false,
-                    depth_bias: None,
-                    coarse_2x2: true,
-                },
+                coarse_cfg(),
+            )
+        });
+        let sky_tile_coarse = sky_coarse.then(|| {
+            builder.build(
+                sky_tile_vert,
+                sky_frag,
+                &[],
+                &[],
+                layout_sky,
+                "sky_tile_coarse",
+                coarse_cfg(),
             )
         });
 
@@ -1084,6 +1100,7 @@ impl Pipelines {
             sky_tile,
             sky_tile_base,
             sky_tile_base_coarse,
+            sky_tile_coarse,
             sky_tile_nomap,
             sky_tile_sphere,
             layout_sky,
@@ -1194,6 +1211,9 @@ impl Pipelines {
             device.destroy_pipeline(self.sky_tile, None);
             device.destroy_pipeline(self.sky_tile_base, None);
             if let Some(p) = self.sky_tile_base_coarse {
+                device.destroy_pipeline(p, None);
+            }
+            if let Some(p) = self.sky_tile_coarse {
                 device.destroy_pipeline(p, None);
             }
             device.destroy_pipeline(self.sky_tile_nomap, None);
