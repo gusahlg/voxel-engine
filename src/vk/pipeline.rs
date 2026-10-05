@@ -54,8 +54,10 @@ impl EyeSplit {
     }
 }
 
-/// 3D push constant data. 112 bytes: the LOD box reuses the old clip lanes
+/// 3D push constant data. 128 bytes: the LOD box reuses the old clip lanes
 /// (`half_x`, `half_y`) and [`EyeSplit`]'s tail pad (`_pad1` = `half_z`).
+/// The box centre is a float3 at byte 112 (16-byte aligned) plus one pad float,
+/// which fills the guaranteed 128-byte push-constant budget exactly.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Mesh3dPush {
@@ -65,12 +67,17 @@ pub struct Mesh3dPush {
     /// 1/render_extent for previous-depth UV. Zero when that depth is invalid.
     pub inv_render_extent: [f32; 2],
     pub eye: EyeSplit,
+    /// Camera-relative centre of the coarse-LOD clip box. Zero keeps
+    /// `abs(world - centre)` bit-identical to `abs(world)`.
+    pub centre: [f32; 3],
+    pub _pad_centre: f32,
 }
 
 impl Mesh3dPush {
     pub(crate) fn pack(
         view_proj: Mat4,
         half: glam::Vec3,
+        centre: glam::Vec3,
         inv_render_extent: [f32; 2],
         mut eye: EyeSplit,
     ) -> Self {
@@ -81,16 +88,20 @@ impl Mesh3dPush {
             half_y: half.y,
             inv_render_extent,
             eye,
+            centre: centre.to_array(),
+            _pad_centre: 0.0,
         }
     }
 }
 
-// Struct must fit within 128-byte push budget. half_z lives at byte 108.
-const _: () = assert!(size_of::<Mesh3dPush>() == 112);
+// Struct fills the 128-byte push budget. half_z lives at byte 108; centre at 112.
+const _: () = assert!(size_of::<Mesh3dPush>() == 128);
 const _: () = assert!(std::mem::offset_of!(Mesh3dPush, half_x) == 64);
 const _: () = assert!(std::mem::offset_of!(Mesh3dPush, half_y) == 68);
 const _: () = assert!(std::mem::offset_of!(Mesh3dPush, eye) == 80);
 const _: () = assert!(std::mem::offset_of!(EyeSplit, _pad1) == 28);
+const _: () = assert!(std::mem::offset_of!(Mesh3dPush, centre) == 112);
+const _: () = assert!(std::mem::offset_of!(Mesh3dPush, _pad_centre) == 124);
 
 /// Debug push constant: view_proj only.
 #[repr(C)]

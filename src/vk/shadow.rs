@@ -729,6 +729,7 @@ impl Renderer {
                     let push = crate::vk::pipeline::Mesh3dPush::pack(
                         f.view_proj.0,
                         glam::Vec3::ZERO,
+                        glam::Vec3::ZERO,
                         [0.0; 2],
                         crate::vk::pipeline::EyeSplit::of(eye),
                     );

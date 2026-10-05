@@ -55,6 +55,11 @@ struct CullParams
     float half_x; // full-res box half-extents; a non-positive component covers nothing
     float half_y;
     float half_z;
+    // Centre fills the std140 tail (bytes 292..304). Three scalars, not a
+    // float3: a float3 would align to 16 and grow the block past 304.
+    float centre_x;
+    float centre_y;
+    float centre_z;
 };
 
 [[vk::binding(0, 0)]]
@@ -117,14 +122,15 @@ uint distance_bucket(float dist)
 }
 
 // True when every fragment of a camera-relative AABB would be discarded by the
-// coarse-LOD box clip (`mesh3d.frag.slang`). A non-positive half covers
-// nothing. The skip is exact: the farthest corner on each axis is strictly
-// inside. Host mirror: `lod_aabb_inside_box` in vk/cull_math.rs.
-bool lod_aabb_inside_box(float3 mn, float3 mx, float half_x, float half_y, float half_z)
+// coarse-LOD box clip (`mesh3d.frag.slang`): abs(p - centre) < half on every
+// axis. A non-positive half covers nothing. The skip is exact: the farthest
+// corner from the centre on each axis is strictly inside. centre 0 matches
+// the centred test. Host mirror: `lod_aabb_inside_box` in vk/cull_math.rs.
+bool lod_aabb_inside_box(float3 mn, float3 mx, float3 centre, float half_x, float half_y, float half_z)
 {
     if (!(half_x > 0.0 && half_y > 0.0 && half_z > 0.0))
         return false;
-    float3 far = max(abs(mn), abs(mx));
+    float3 far = max(abs(mn - centre), abs(mx - centre));
     return far.x < half_x && far.y < half_y && far.z < half_z;
 }
 
@@ -223,7 +229,8 @@ void computeMain(uint3 id: SV_DispatchThreadID)
                 : ((pass == 0u && scale > 1.0) ? 2u : pass);
             // LOD groups fully inside the slab would discard every fragment.
             bool lod_group = group == 2u || group == CULL_CAGED_LOD_GROUP;
-            if (!lod_group || !lod_aabb_inside_box(mn, mx, params.half_x, params.half_y, params.half_z))
+            float3 lod_centre = float3(params.centre_x, params.centre_y, params.centre_z);
+            if (!lod_group || !lod_aabb_inside_box(mn, mx, lod_centre, params.half_x, params.half_y, params.half_z))
             {
                 float dist = length(0.5 * (mn + mx));
                 uint bucket = distance_bucket(dist);

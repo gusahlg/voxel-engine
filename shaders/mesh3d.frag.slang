@@ -49,8 +49,8 @@ struct FragmentInput
 #endif
 };
 
-// View-proj and LOD box. Same 112-byte layout as mesh3d.vert: half_z is the
-// eye-split tail pad, so the unused camera fields stay to hold that offset.
+// View-proj and LOD box. Same 128-byte layout as mesh3d.vert: half_z is the
+// eye-split tail pad (byte 108); centre is the float3 at byte 112.
 struct PushConstants
 {
     float4x4 view_proj;
@@ -61,6 +61,8 @@ struct PushConstants
     int pad0;
     float3 cam_frac;
     float half_z;
+    float3 centre;
+    float centre_pad;
 };
 
 [[vk::push_constant]]
@@ -241,29 +243,30 @@ float sun_shadow(float3 world, float3 N, float raw_ndl, float ndl, float dist, f
 }
 #endif
 
+// Strict interior of the camera-relative clip box [centre - half, centre + half].
+// Full-res opaque compiles this module out (no discard).
+#if defined(MESH3D_LOD) || !defined(MESH3D_OPAQUE)
+bool lod_fragment_inside(float3 world)
+{
+    float3 d = abs(world - pc.centre);
+    return d.x < pc.half_x && d.y < pc.half_y && d.z < pc.half_z;
+}
+#endif
+
 [shader("fragment")]
 float4 fragmentMain(FragmentInput input) : SV_Target
 {
 #if defined(MESH3D_LOD)
     // Coarse-LOD partition is scale > 1 by construction; skip the scale test.
     // A non-positive half fails the strict compare, so the box stays closed.
-    {
-        bool inside = abs(input.world.x) < pc.half_x
-            && abs(input.world.y) < pc.half_y
-            && abs(input.world.z) < pc.half_z;
-        if (inside)
-            discard;
-    }
+    // centre 0 keeps abs(world - centre) bit-identical to abs(world).
+    if (lod_fragment_inside(input.world))
+        discard;
 #elif !defined(MESH3D_OPAQUE)
     // Blend module: mixed full-res / LOD draws share this path.
     float scale = detail_scale(input.ids.x >> 20);
-    if (scale > 1.0) {
-        bool inside = abs(input.world.x) < pc.half_x
-            && abs(input.world.y) < pc.half_y
-            && abs(input.world.z) < pc.half_z;
-        if (inside)
-            discard;
-    }
+    if (scale > 1.0 && lod_fragment_inside(input.world))
+        discard;
 #endif
 
     // Debug-flat (TerrainKey): output the flat key colour for every covered

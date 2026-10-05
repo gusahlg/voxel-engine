@@ -49,8 +49,11 @@ struct CullParamsGpu {
     half_x: f32,
     half_y: f32,
     half_z: f32,
-    // std140 rounds the block up to 16 bytes past half_z (292 → 304).
-    _pad: [f32; 3],
+    // std140 scalars in the 12-byte tail (292 → 304). A float3 would align
+    // to 16 and grow the block; three floats stay at 304.
+    centre_x: f32,
+    centre_y: f32,
+    centre_z: f32,
 }
 const _: () = assert!(size_of::<CullParamsGpu>() == 304);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, cam_planes) == 0);
@@ -64,6 +67,9 @@ const _: () = assert!(std::mem::offset_of!(CullParamsGpu, flags) == 276);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, half_x) == 280);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, half_y) == 284);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, half_z) == 288);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, centre_x) == 292);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, centre_y) == 296);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, centre_z) == 300);
 
 /// Device-local grow-only buffer for GPU scratch.
 struct DeviceBuffer {
@@ -296,9 +302,9 @@ impl CullState {
     ///
     /// `slot_count` bounds the dispatch (the caller trims it to the directory's
     /// live end); `visible` must cover it. `partitions` is last frame's table
-    /// handed back for reuse (its contents are discarded). `half` is the
-    /// full-res coverage box (`DrawLists::lod_half`); a non-positive component
-    /// covers nothing, matching the mesh3d push constants.
+    /// handed back for reuse (its contents are discarded). `half` / `centre`
+    /// are the full-res coverage box (`DrawLists::lod_half` / `lod_centre`);
+    /// a non-positive half covers nothing, matching the mesh3d push constants.
     ///
     /// When the directory's camera-group live count is at most `CPU_CULL_MAX`
     /// (or `VOXEL_CPU_CULL_MAX`), commands and counts are written to host-visible
@@ -319,6 +325,7 @@ impl CullState {
         shadow: Option<&[Frustum; 2]>,
         eye: super::pipeline::EyeSplit,
         half: [f32; 3],
+        centre: [f32; 3],
         visible: &[u32],
         mut partitions: Vec<PartitionGpu>,
     ) -> Option<CullFrame> {
@@ -348,6 +355,7 @@ impl CullState {
                 eye,
                 slot_count,
                 half,
+                centre,
                 face_cull,
                 &mut self.cpu_scratch,
             );
@@ -393,7 +401,9 @@ impl CullState {
             half_x: half[0],
             half_y: half[1],
             half_z: half[2],
-            _pad: [0.0; 3],
+            centre_x: centre[0],
+            centre_y: centre[1],
+            centre_z: centre[2],
         };
         if let Some(frusta) = shadow {
             for (c, f) in frusta.iter().enumerate() {
@@ -629,5 +639,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CullParamsGpu, half_x), 280);
         assert_eq!(std::mem::offset_of!(CullParamsGpu, half_y), 284);
         assert_eq!(std::mem::offset_of!(CullParamsGpu, half_z), 288);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, centre_x), 292);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, centre_y), 296);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, centre_z), 300);
     }
 }

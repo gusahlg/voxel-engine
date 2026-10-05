@@ -75,7 +75,11 @@ fn sun_dir(lists: &DrawLists) -> glam::DVec3 {
         u.sun_dir_elev[1] as f64,
         u.sun_dir_elev[2] as f64,
     );
-    if d.length_squared() > 1e-6 { d } else { glam::DVec3::Y }
+    if d.length_squared() > 1e-6 {
+        d
+    } else {
+        glam::DVec3::Y
+    }
 }
 
 impl Renderer {
@@ -700,8 +704,9 @@ impl Renderer {
         // (and skip `fit()`); the slot UBO is filled from the cached block so
         // sampling matches the resident depth.
         if let Some(scene) = &lists.scene {
-            let cfg =
-                crate::skeleton::ShadowCfg::for_coverage(lists.lod_half.x.max(lists.lod_half.z));
+            let cfg = crate::skeleton::ShadowCfg::for_coverage(
+                crate::frame::lod_clip_horizontal_reach(lists.lod_centre, lists.lod_half),
+            );
             let caster_verts = lists.cube_verts.len() as u32;
             let render = self.shadow_cache.pending_rebuild();
             if render {

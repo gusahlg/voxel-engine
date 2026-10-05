@@ -97,7 +97,10 @@ struct PushConstants
     int pad0;
     float3 cam_frac;
     float half_z;
-    // Lighting from per-frame UBO (binding 2).
+    // Box centre at byte 112 (16-byte aligned). With the trailing pad the
+    // block is 128 bytes, the guaranteed push-constant limit. Fragment only.
+    float3 centre;
+    float centre_pad;
 };
 
 [[vk::push_constant]]

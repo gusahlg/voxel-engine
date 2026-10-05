@@ -37,6 +37,8 @@ struct VertexInput
 struct PushConstants
 {
     // Light-space view-proj per cascade (mirrors Mesh3dPush layout).
+    // half/centre are the LOD clip tail. This pass does not discard by the box;
+    // the fields stay so cam_block/cam_frac keep the mesh3d offsets.
     float4x4 view_proj;
     float half_x;
     float half_y;
@@ -45,6 +47,8 @@ struct PushConstants
     int pad0;
     float3 cam_frac;
     float half_z;
+    float3 centre;
+    float centre_pad;
 };
 
 [[vk::push_constant]]

@@ -84,17 +84,17 @@ fn is_lod_group(group: u32) -> bool {
 }
 
 /// True when every fragment of a camera-relative AABB would be discarded by
-/// the coarse-LOD box clip (`mesh3d.frag.slang`). A non-positive half-extent
-/// covers nothing. The skip is exact: the farthest corner on each axis must
-/// sit strictly inside `half`. Mirrored by `lod_aabb_inside_box` in
-/// `cull.comp.slang`.
-fn lod_aabb_inside_box(mn: [f32; 3], mx: [f32; 3], half: [f32; 3]) -> bool {
+/// the coarse-LOD box clip (`mesh3d.frag.slang`): `abs(p - centre) < half` on
+/// every axis. A non-positive half covers nothing (`min >= max` on that axis).
+/// The skip is exact: the farthest corner from `centre` on each axis must sit
+/// strictly inside `half`. `centre == 0` matches the centred `abs` test.
+/// Mirrored by `lod_aabb_inside_box` in `cull.comp.slang`.
+fn lod_aabb_inside_box(mn: [f32; 3], mx: [f32; 3], centre: [f32; 3], half: [f32; 3]) -> bool {
     if half[0] <= 0.0 || half[1] <= 0.0 || half[2] <= 0.0 {
         return false;
     }
-    mn[0].abs().max(mx[0].abs()) < half[0]
-        && mn[1].abs().max(mx[1].abs()) < half[1]
-        && mn[2].abs().max(mx[2].abs()) < half[2]
+    let far = |i: usize| (mn[i] - centre[i]).abs().max((mx[i] - centre[i]).abs());
+    far(0) < half[0] && far(1) < half[1] && far(2) < half[2]
 }
 
 /// Camera-distance bucket of an AABB centre, matching `cull.comp.slang`.
@@ -368,6 +368,7 @@ pub(crate) fn cpu_cull_into(
     eye: EyeSplit,
     slot_count: u32,
     half: [f32; 3],
+    centre: [f32; 3],
     face_cull: bool,
     scratch: &mut CpuCullScratch,
 ) -> [u32; STATS_COUNT] {
@@ -405,6 +406,7 @@ pub(crate) fn cpu_cull_into(
             partitions,
             &cam_planes,
             half,
+            centre,
             slot_count,
             &scratch.live_vis,
             &mut scratch.part_cmds,
@@ -421,6 +423,7 @@ pub(crate) fn cpu_cull_into(
             visible,
             eye,
             half,
+            centre,
             slot_count,
             &scratch.live_vis,
             &mut scratch.part_cmds,
@@ -435,6 +438,7 @@ pub(crate) fn cpu_cull_into(
             visible,
             eye,
             half,
+            centre,
             slot_count,
             &scratch.live_vis,
             &mut scratch.part_cmds,
@@ -449,6 +453,7 @@ pub(crate) fn cpu_cull_into(
             visible,
             eye,
             half,
+            centre,
             slot_count,
             &scratch.live_vis,
             &mut scratch.part_cmds,
@@ -472,6 +477,7 @@ pub(crate) fn cpu_cull(
     eye: EyeSplit,
     slot_count: u32,
     half: [f32; 3],
+    centre: [f32; 3],
     face_cull: bool,
 ) -> (Vec<DrawIndexedIndirect>, Vec<u32>, [u32; STATS_COUNT]) {
     let mut scratch = CpuCullScratch::default();
@@ -486,6 +492,7 @@ pub(crate) fn cpu_cull(
         eye,
         slot_count,
         half,
+        centre,
         face_cull,
         &mut scratch,
     );
@@ -512,6 +519,7 @@ fn cpu_cull_legacy(
     eye: EyeSplit,
     slot_count: u32,
     half: [f32; 3],
+    centre: [f32; 3],
     face_cull: bool,
 ) -> (Vec<DrawIndexedIndirect>, Vec<u32>, [u32; STATS_COUNT]) {
     let total: usize = partitions.iter().map(|p| p.capacity as usize).sum();
@@ -558,7 +566,7 @@ fn cpu_cull_legacy(
 
         if cam_visible && aabb_in_planes_select(&cam_planes, mn, mx) {
             let group = if pass == 0 && scale > 1.0 { 2 } else { pass };
-            if group != 2 || !lod_aabb_inside_box(mn, mx, half) {
+            if group != 2 || !lod_aabb_inside_box(mn, mx, centre, half) {
                 let cx = 0.5 * (mn[0] + mx[0]);
                 let cy = 0.5 * (mn[1] + mx[1]);
                 let cz = 0.5 * (mn[2] + mx[2]);
@@ -620,6 +628,7 @@ fn cull_fast_solid(
     partitions: &[PartitionGpu],
     cam_planes: &[[f32; 4]; 5],
     half: [f32; 3],
+    centre: [f32; 3],
     slot_count: u32,
     live_vis: &[u32],
     part_cmds: &mut [Vec<DrawIndexedIndirect>],
@@ -658,7 +667,7 @@ fn cull_fast_solid(
         let pass = super::arena::cull_bits_pass(bits);
         let lod = super::arena::cull_bits_lod(bits);
         let group = camera_group(pass, lod, super::arena::cull_bits_caged(bits));
-        if is_lod_group(group) && lod_aabb_inside_box(mn, mx, half) {
+        if is_lod_group(group) && lod_aabb_inside_box(mn, mx, centre, half) {
             continue;
         }
         let cx = 0.5 * (mn[0] + mx[0]);
@@ -691,6 +700,7 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
     visible: &[u32],
     eye: EyeSplit,
     half: [f32; 3],
+    centre: [f32; 3],
     slot_count: u32,
     live_vis: &[u32],
     part_cmds: &mut [Vec<DrawIndexedIndirect>],
@@ -736,7 +746,7 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
         let mut part = 0usize;
         if cam_visible && aabb_in_planes(cam_planes, mn, mx) {
             group = camera_group(pass, lod, super::arena::cull_bits_caged(bits));
-            if !is_lod_group(group) || !lod_aabb_inside_box(mn, mx, half) {
+            if !is_lod_group(group) || !lod_aabb_inside_box(mn, mx, centre, half) {
                 let cx = 0.5 * (mn[0] + mx[0]);
                 let cy = 0.5 * (mn[1] + mx[1]);
                 let cz = 0.5 * (mn[2] + mx[2]);
@@ -913,49 +923,94 @@ mod tests {
         assert_eq!(CAMERA_GROUPS, Group::ALL.len());
     }
 
+    fn centred(mn: [f32; 3], mx: [f32; 3], half: [f32; 3]) -> bool {
+        lod_aabb_inside_box(mn, mx, [0.0; 3], half)
+    }
+
+    /// The pre-offset test: farthest corner from the origin, strictly inside.
+    fn centred_abs(mn: [f32; 3], mx: [f32; 3], half: [f32; 3]) -> bool {
+        if half[0] <= 0.0 || half[1] <= 0.0 || half[2] <= 0.0 {
+            return false;
+        }
+        mn[0].abs().max(mx[0].abs()) < half[0]
+            && mn[1].abs().max(mx[1].abs()) < half[1]
+            && mn[2].abs().max(mx[2].abs()) < half[2]
+    }
+
     #[test]
     fn lod_aabb_inside_box_matches_fragment_discard() {
         let half = [10.0, 8.0, 10.0];
+        let cases = [
+            ([-3.0, -2.0, -4.0], [1.0, 2.0, 2.0]),
+            ([-1.0, -1.0, -1.0], [8.0, 1.0, 8.0]),
+            ([0.0, -1.0, 0.0], [6.0, 1.0, 8.0]),
+            ([-3.0, -9.0, -4.0], [3.0, 1.0, 4.0]),
+            ([-1.0, -1.0, -1.0], [11.0, 1.0, 1.0]),
+            ([0.0, 0.0, 0.0], [10.0, 1.0, 1.0]),
+            ([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]),
+        ];
+        for (mn, mx) in cases {
+            assert_eq!(
+                centred(mn, mx, half),
+                centred_abs(mn, mx, half),
+                "centre 0 diverged for {mn:?}..{mx:?}"
+            );
+        }
         // Fully inside: farthest corner (3, 2, 4).
-        assert!(lod_aabb_inside_box(
-            [-3.0, -2.0, -4.0],
-            [1.0, 2.0, 2.0],
-            half
-        ));
+        assert!(centred([-3.0, -2.0, -4.0], [1.0, 2.0, 2.0], half));
         // A corner the old cylinder rejected (length ~11.3) is inside the box.
-        assert!(lod_aabb_inside_box(
-            [-1.0, -1.0, -1.0],
-            [8.0, 1.0, 8.0],
-            half
-        ));
+        assert!(centred([-1.0, -1.0, -1.0], [8.0, 1.0, 8.0], half));
         // |x| = 6 and |z| = 8 are both inside 10.
-        assert!(lod_aabb_inside_box([0.0, -1.0, 0.0], [6.0, 1.0, 8.0], half));
+        assert!(centred([0.0, -1.0, 0.0], [6.0, 1.0, 8.0], half));
         // |y| = 9 is outside half.y = 8.
-        assert!(!lod_aabb_inside_box(
-            [-3.0, -9.0, -4.0],
-            [3.0, 1.0, 4.0],
-            half
-        ));
+        assert!(!centred([-3.0, -9.0, -4.0], [3.0, 1.0, 4.0], half));
         // Outside on X.
-        assert!(!lod_aabb_inside_box(
-            [-1.0, -1.0, -1.0],
-            [11.0, 1.0, 1.0],
-            half
-        ));
+        assert!(!centred([-1.0, -1.0, -1.0], [11.0, 1.0, 1.0], half));
         // On the face (abs == half) is not strictly inside.
-        assert!(!lod_aabb_inside_box(
-            [0.0, 0.0, 0.0],
-            [10.0, 1.0, 1.0],
-            half
-        ));
+        assert!(!centred([0.0, 0.0, 0.0], [10.0, 1.0, 1.0], half));
         // A non-positive component covers nothing.
         for closed in [[0.0, 8.0, 10.0], [10.0, 0.0, 10.0], [10.0, 8.0, 0.0]] {
-            assert!(!lod_aabb_inside_box(
-                [-1.0, -1.0, -1.0],
-                [1.0, 1.0, 1.0],
-                closed
-            ));
+            assert!(!centred([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0], closed));
         }
+    }
+
+    #[test]
+    fn lod_aabb_inside_box_offset_covers_the_open_box_only() {
+        // [min, max] = (7, 13) × (−9, 1) × (−2, 6).
+        let centre = [10.0, -4.0, 2.0];
+        let half = [3.0, 5.0, 4.0];
+        let inside = |mn: [f32; 3], mx: [f32; 3]| lod_aabb_inside_box(mn, mx, centre, half);
+
+        assert!(inside([8.0, -8.0, -1.0], [12.0, 0.0, 5.0]));
+        // Same AABB is outside the centred box of this half.
+        assert!(!centred([8.0, -8.0, -1.0], [12.0, 0.0, 5.0], half));
+
+        // Straddling each face (the face itself is not strictly inside).
+        assert!(!inside([8.0, -1.0, 0.0], [13.0, 0.0, 1.0]), "+X");
+        assert!(!inside([7.0, -1.0, 0.0], [12.0, 0.0, 1.0]), "-X");
+        assert!(!inside([8.0, -1.0, 0.0], [12.0, 1.0, 1.0]), "+Y");
+        assert!(!inside([8.0, -9.0, 0.0], [12.0, 0.0, 1.0]), "-Y");
+        assert!(!inside([8.0, -1.0, 0.0], [12.0, 0.0, 6.0]), "+Z");
+        assert!(!inside([8.0, -1.0, -2.0], [12.0, 0.0, 1.0]), "-Z");
+
+        // Completely outside one face.
+        assert!(!inside([13.0, -1.0, 0.0], [20.0, 0.0, 1.0]));
+        assert!(!inside([-4.0, -1.0, 0.0], [6.0, 0.0, 1.0]));
+
+        // min >= max on an axis → non-positive half → covers nothing.
+        let degenerate = |min: [f32; 3], max: [f32; 3]| {
+            let centre = std::array::from_fn(|i| (min[i] + max[i]) * 0.5);
+            let half = std::array::from_fn(|i| (max[i] - min[i]) * 0.5);
+            assert!(
+                half[0] <= 0.0 || half[1] <= 0.0 || half[2] <= 0.0,
+                "expected an empty axis"
+            );
+            assert!(!lod_aabb_inside_box([-100.0; 3], [100.0; 3], centre, half));
+        };
+        degenerate([2.0, -1.0, -1.0], [2.0, 1.0, 1.0]);
+        degenerate([5.0, 0.0, 0.0], [1.0, 2.0, 2.0]);
+        degenerate([-1.0, 4.0, -1.0], [1.0, 4.0, 1.0]);
+        degenerate([-1.0, -1.0, 3.0], [1.0, 1.0, 1.0]);
     }
 
     #[test]
@@ -1043,6 +1098,7 @@ mod tests {
             eye,
             dir.live_end(),
             half,
+            [0.0; 3],
             face_cull,
         );
         (parts, cmds, counts, stats)
@@ -1283,7 +1339,7 @@ mod tests {
         rec.detail_pass = u32::from(crate::mesh::Detail(1).to_gpu_bits());
         let (mn, mx, scale) = cam_relative_aabb(&rec, origin_eye());
         assert!(scale > 1.0);
-        assert!(lod_aabb_inside_box(mn, mx, [100.0; 3]));
+        assert!(lod_aabb_inside_box(mn, mx, [0.0; 3], [100.0; 3]));
         let mut dir = ArenaDirectory::new();
         dir.note_upload(
             0,
@@ -1361,8 +1417,8 @@ mod tests {
         } else {
             crate::mesh::Detail::FULL
         };
-        rec.detail_pass = u32::from(detail.to_gpu_bits())
-            | ((pass as u32) << crate::genconst::DETAIL_GPU_BITS);
+        rec.detail_pass =
+            u32::from(detail.to_gpu_bits()) | ((pass as u32) << crate::genconst::DETAIL_GPU_BITS);
         rec
     }
 
@@ -1440,6 +1496,7 @@ mod tests {
                         eye,
                         dir.live_end(),
                         half,
+                        [0.0; 3],
                         face_cull,
                     );
                     let (new_cmds, new_counts, new_stats) = cpu_cull(
@@ -1453,6 +1510,7 @@ mod tests {
                         eye,
                         dir.live_end(),
                         half,
+                        [0.0; 3],
                         face_cull,
                     );
                     assert_same_emission(
@@ -1520,6 +1578,7 @@ mod tests {
                 eye,
                 slot_count,
                 [0.0; 3],
+                [0.0; 3],
                 false,
             );
             let _ = cpu_cull_into(
@@ -1532,6 +1591,7 @@ mod tests {
                 None,
                 eye,
                 slot_count,
+                [0.0; 3],
                 [0.0; 3],
                 false,
                 &mut scratch,
@@ -1557,6 +1617,7 @@ mod tests {
                 eye,
                 slot_count,
                 [0.0; 3],
+                [0.0; 3],
                 false,
             );
             let cmd_bytes: &[u8] = bytemuck::cast_slice(&cmds);
@@ -1576,6 +1637,7 @@ mod tests {
                 None,
                 eye,
                 slot_count,
+                [0.0; 3],
                 [0.0; 3],
                 false,
                 &mut scratch,
@@ -1637,12 +1699,7 @@ mod tests {
         hidden.cage = 2;
         let mut lod = opaque_rec(inside.min, inside.max);
         lod.cage = 3;
-        let records = [
-            opaque_rec(front.min, front.max),
-            kept,
-            hidden,
-            lod,
-        ];
+        let records = [opaque_rec(front.min, front.max), kept, hidden, lod];
         let (parts, cmds, counts, stats) = run_cpu(
             &mut dir,
             &records,

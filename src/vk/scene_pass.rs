@@ -341,7 +341,7 @@ impl<'a> RenderPass<'a> {
     /// incompatible layouts that disturb this state. Only sound when at least
     /// one mesh run exists (else the offsets SSBO can be a null buffer).
     ///
-    /// Push-constant bytes are identical for every mesh pass (`lists.lod_half`);
+    /// Push-constant bytes are identical for every mesh pass (the LOD clip box);
     /// the quad IBO binding survives pipeline/layout changes.
     /// Both are bound once and skipped until a foreign pass invalidates them
     /// (push constants) — the IBO is never invalidated.
@@ -350,7 +350,7 @@ impl<'a> RenderPass<'a> {
             self.push_mesh3d_descriptors();
             if !self.mesh_push_bound.get() {
                 // LOD box: LOD tiles hard-discard inside the full-res volume.
-                self.push_mesh3d_constants(self.lists.lod_half);
+                self.push_mesh3d_constants(self.lists.lod_half, self.lists.lod_centre);
                 self.mesh_push_bound.set(true);
             }
             if !self.index_bound.get() {
@@ -408,7 +408,7 @@ impl<'a> RenderPass<'a> {
 
     /// Pushes view-proj + LOD box extents. Identical for every mesh pass, so
     /// skipped while `mesh_push_bound`. Jitter packaged once in `begin`.
-    unsafe fn push_mesh3d_constants(&self, half: glam::Vec3) {
+    unsafe fn push_mesh3d_constants(&self, half: glam::Vec3, centre: glam::Vec3) {
         let r = self.r;
         let (view_proj, eye) = self.scene_state.expect("a mesh pass implies a 3D scene");
         let extent = r.render_extent;
@@ -417,7 +417,7 @@ impl<'a> RenderPass<'a> {
         } else {
             [0.0, 0.0]
         };
-        let push = pipeline::Mesh3dPush::pack(view_proj, half, inv_render_extent, eye);
+        let push = pipeline::Mesh3dPush::pack(view_proj, half, centre, inv_render_extent, eye);
         let layout = r.pipelines.layout_3d;
         unsafe {
             r.device.device.cmd_push_constants(
@@ -565,10 +565,7 @@ impl<'a> RenderPass<'a> {
                 // Flat then caged, full-res before LOD. Each pair shares one
                 // timestamp: caged calls add into the flat group's gauge.
                 unsafe {
-                    self.record_groups(&[
-                        (cull::Group::Opaque, full),
-                        (cull::Group::Caged, caged),
-                    ]);
+                    self.record_groups(&[(cull::Group::Opaque, full), (cull::Group::Caged, caged)]);
                     self.record_groups(&[
                         (cull::Group::OpaqueLod, lod),
                         (cull::Group::CagedLod, caged_lod),
@@ -594,8 +591,7 @@ impl<'a> RenderPass<'a> {
             let mut drew = false;
             let mut expected = 0u32;
             for &(group, pipeline) in groups {
-                expected +=
-                    cull::group_indirect_calls(&frame.partitions, group, frame.arena_count);
+                expected += cull::group_indirect_calls(&frame.partitions, group, frame.arena_count);
                 let span = frame.arena_count * cull::BUCKETS;
                 let base = group as usize * span;
                 if frame.partitions[base..base + span]

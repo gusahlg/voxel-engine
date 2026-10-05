@@ -99,9 +99,10 @@ pub(crate) fn sky_with_override(desc: SkyDesc, over: Option<SunOverride>) -> Sky
     }
 }
 
-/// Full-res coverage box, camera-relative. A fragment is covered when
+/// Symmetric full-res coverage box, camera-relative. A fragment is covered when
 /// `abs(world)` is strictly inside `half` on every axis. A non-positive
-/// component covers nothing on that axis.
+/// component covers nothing on that axis. The asymmetric form is
+/// [`Frame3D::set_lod_clip_box`].
 #[derive(Clone, Copy, PartialEq)]
 pub struct CoverageVolume {
     pub half: Vec3,
@@ -173,6 +174,14 @@ impl LodMorphFrame {
         }
         gpu
     }
+}
+
+/// Camera distance to the farther X or Z face of a coarse-LOD clip box stored
+/// as centre + half-extent. `centre == 0` is `max(half.x, half.z)`: a
+/// non-positive component is left unchanged and does not extend the reach.
+pub(crate) fn lod_clip_horizontal_reach(centre: Vec3, half: Vec3) -> f32 {
+    let face = |c: f32, h: f32| if h > 0.0 { c.abs() + h } else { h };
+    face(centre.x, half.x).max(face(centre.z, half.z))
 }
 
 /// Per-mesh style for [`Engine::set_mesh_style`](crate::Engine::set_mesh_style) — the
@@ -303,9 +312,12 @@ pub(crate) struct DrawLists {
     /// Point light standing in for the sun. `None` leaves the composed sun alone.
     /// Set via [`Frame3D::set_sun_override`]; same post-`begin_3d` lifetime as `sky`.
     pub sun_override: Option<SunOverride>,
-    /// Chunk→LOD box half-extents. A non-positive component disables that
-    /// axis. LOD tiles hard-discard inside the box. Set via
-    /// [`Frame3D::set_lod_clip`]; same post-`begin_3d` lifetime as `sky`.
+    /// Chunk→LOD clip box, camera-relative, stored as centre + half-extent.
+    /// A fragment is inside when `abs(world - centre) < half` on every axis.
+    /// A non-positive half covers nothing (`min >= max` on that axis). Set via
+    /// [`Frame3D::set_lod_clip`] / [`Frame3D::set_lod_clip_box`]; same
+    /// post-`begin_3d` lifetime as `sky`.
+    pub lod_centre: Vec3,
     pub lod_half: Vec3,
     /// Per-detail LOD morph bands. Default and [`Self::reset`] are off.
     /// Set via [`Frame3D::set_lod_morph`]; same post-`begin_3d` lifetime as `sky`.
@@ -335,6 +347,7 @@ impl DrawLists {
             far_bodies: [FarBody::default(); MAX_FAR_BODIES],
             far_count: 0,
             sun_override: None,
+            lod_centre: Vec3::ZERO,
             lod_half: Vec3::ZERO,
             lod_morph: LodMorphFrame::off(),
             debug_flat: None,
@@ -352,6 +365,7 @@ impl DrawLists {
         self.local = None;
         self.far_count = 0;
         self.sun_override = None;
+        self.lod_centre = Vec3::ZERO;
         self.lod_half = Vec3::ZERO;
         self.lod_morph = LodMorphFrame::off();
         self.debug_flat = None;
@@ -388,7 +402,8 @@ impl DrawLists {
     /// Sky descriptor for the pass, with the real disc hidden unless the
     /// override asks for it. `None` when the frame set no sky.
     pub(crate) fn sky_for_pass(&self) -> Option<SkyDesc> {
-        self.sky.map(|desc| sky_with_override(desc, self.sun_override))
+        self.sky
+            .map(|desc| sky_with_override(desc, self.sun_override))
     }
 }
 
@@ -608,7 +623,11 @@ fn shadow_corners(center: Vec3, normal: Vec3, radius: f32) -> [[f32; 3]; 4] {
             [cx + r, cy, cz - r],
         ];
     }
-    let helper = if normal.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+    let helper = if normal.y.abs() < 0.9 {
+        Vec3::Y
+    } else {
+        Vec3::X
+    };
     let u = normal.cross(helper).normalize();
     let v = u.cross(normal);
     let corner = |a: f32, b: f32| {
@@ -627,14 +646,41 @@ pub struct Frame3D<'f, 'e> {
     frame: &'f mut Frame<'e>,
 }
 
-impl Frame3D<'_, '_> {
-    /// Sets the chunk→LOD coverage box. Must equal the streamed full-res volume.
-    pub fn set_lod_clip(&mut self, v: CoverageVolume) {
-        let half = v.half.max(Vec3::ZERO);
-        if self.frame.eng.lists.lod_half == half {
+impl DrawLists {
+    /// `set_lod_clip(v)` is `set_lod_clip_box(-v.half, v.half)`: centre 0 and
+    /// the same half (a non-positive component covers nothing).
+    pub(crate) fn set_lod_clip(&mut self, v: CoverageVolume) {
+        self.set_lod_clip_box(-v.half, v.half);
+    }
+
+    /// Camera-relative clip box. Stored as centre + half so the shader test
+    /// `abs(world - centre) < half` matches a centred box when `centre` is 0.
+    /// `min >= max` on any axis yields a non-positive half, which covers nothing.
+    pub(crate) fn set_lod_clip_box(&mut self, min: Vec3, max: Vec3) {
+        let centre = (min + max) * 0.5;
+        let half = (max - min) * 0.5;
+        if self.lod_centre == centre && self.lod_half == half {
             return;
         }
-        self.frame.eng.lists.lod_half = half;
+        self.lod_centre = centre;
+        self.lod_half = half;
+    }
+}
+
+impl Frame3D<'_, '_> {
+    /// Sets the symmetric chunk→LOD coverage box. Must equal the streamed
+    /// full-res volume. Equivalent to `set_lod_clip_box(-v.half, v.half)`.
+    pub fn set_lod_clip(&mut self, v: CoverageVolume) {
+        self.frame.eng.lists.set_lod_clip(v);
+    }
+
+    /// Coarse-LOD clip as camera-relative extents. LOD fragments strictly inside
+    /// `[min, max]` on all three axes are discarded, and LOD groups fully inside
+    /// are culled. [`set_lod_clip`](Self::set_lod_clip) equals
+    /// `set_lod_clip_box(-v.half, v.half)`. A box with `min >= max` on any axis
+    /// covers nothing.
+    pub fn set_lod_clip_box(&mut self, min: Vec3, max: Vec3) {
+        self.frame.eng.lists.set_lod_clip_box(min, max);
     }
 
     /// Per-detail-level morph bands, index = detail level k (0..16; extra entries
@@ -1048,7 +1094,10 @@ mod tests {
         fn same_sky(a: SkyDesc, b: SkyDesc) {
             assert_eq!(a.sun_dir, b.sun_dir);
             assert_eq!(a.sun_tint, b.sun_tint);
-            assert_eq!(a.sun_angular_radius.to_bits(), b.sun_angular_radius.to_bits());
+            assert_eq!(
+                a.sun_angular_radius.to_bits(),
+                b.sun_angular_radius.to_bits()
+            );
         }
 
         let mut base = FrameUniformsGpu::full_bright();
@@ -1085,7 +1134,10 @@ mod tests {
         assert_eq!(lit.extras[0].to_bits(), base.extras[0].to_bits());
         assert_eq!(lit.extras[2].to_bits(), base.extras[2].to_bits());
         assert_eq!(lit.extras[3].to_bits(), base.extras[3].to_bits());
-        assert_eq!(lit.extras[1].to_bits(), crate::genconst::GLOW_POW_DAY.to_bits());
+        assert_eq!(
+            lit.extras[1].to_bits(),
+            crate::genconst::GLOW_POW_DAY.to_bits()
+        );
 
         let nan_dir = SunOverride {
             dir: Vec3::new(f32::NAN, 0.0, 0.0),
@@ -1093,7 +1145,14 @@ mod tests {
         };
         same_gpu(apply_sun_override(base, nan_dir, Vec3::Y), base);
         same_gpu(
-            apply_sun_override(base, SunOverride { dir: Vec3::ZERO, ..over }, Vec3::Y),
+            apply_sun_override(
+                base,
+                SunOverride {
+                    dir: Vec3::ZERO,
+                    ..over
+                },
+                Vec3::Y,
+            ),
             base,
         );
         let nan_color = SunOverride {
@@ -1179,7 +1238,12 @@ mod tests {
         let split = EyeSplit::of(eye);
         assert_eq!(
             gpu.eye_block,
-            [split.block[0], split.block[1], split.block[2], LOD_MORPH_FLAG]
+            [
+                split.block[0],
+                split.block[1],
+                split.block[2],
+                LOD_MORPH_FLAG
+            ]
         );
         assert_eq!(gpu.eye_frac[0].to_bits(), split.frac[0].to_bits());
         assert_eq!(gpu.eye_frac[1].to_bits(), split.frac[1].to_bits());
@@ -1194,5 +1258,58 @@ mod tests {
         lists.reset();
         assert_eq!(lists.lod_morph, LodMorphFrame::off());
         assert_eq!(lists.lod_morph.to_gpu().eye_block[3], 0);
+    }
+
+    #[test]
+    fn set_lod_clip_yields_zero_centre_and_the_same_half() {
+        let mut lists = DrawLists::new();
+        let half = Vec3::new(12.0, 0.1, -3.0);
+        lists.set_lod_clip(CoverageVolume { half });
+        assert_eq!(lists.lod_centre, Vec3::ZERO);
+        assert_eq!(lists.lod_half.to_array(), half.to_array());
+        for i in 0..3 {
+            assert_eq!(lists.lod_half[i].to_bits(), half[i].to_bits());
+        }
+
+        // The symmetric setter is the centred box, including a negative component.
+        lists.lod_centre = Vec3::ONE;
+        lists.lod_half = Vec3::ZERO;
+        lists.set_lod_clip_box(-half, half);
+        assert_eq!(lists.lod_centre, Vec3::ZERO);
+        for i in 0..3 {
+            assert_eq!(lists.lod_half[i].to_bits(), half[i].to_bits());
+        }
+
+        let min = Vec3::new(-2.0, -30.0, -8.0);
+        let max = Vec3::new(10.0, 6.0, 14.0);
+        lists.set_lod_clip_box(min, max);
+        assert_eq!(lists.lod_centre, (min + max) * 0.5);
+        assert_eq!(lists.lod_half, (max - min) * 0.5);
+
+        // min >= max on X: that half is non-positive, so the box covers nothing.
+        lists.set_lod_clip_box(Vec3::new(4.0, -1.0, -1.0), Vec3::new(1.0, 2.0, 3.0));
+        assert!(lists.lod_half.x <= 0.0);
+
+        lists.reset();
+        assert_eq!(lists.lod_centre, Vec3::ZERO);
+        assert_eq!(lists.lod_half, Vec3::ZERO);
+    }
+
+    #[test]
+    fn centred_clip_reach_matches_the_horizontal_half() {
+        let half = Vec3::new(3.0, 9.0, 5.0);
+        assert_eq!(
+            lod_clip_horizontal_reach(Vec3::ZERO, half),
+            half.x.max(half.z)
+        );
+        let closed = Vec3::new(-1.0, 4.0, -2.0);
+        assert_eq!(
+            lod_clip_horizontal_reach(Vec3::ZERO, closed),
+            closed.x.max(closed.z)
+        );
+        // Farther face of min=(-2, …) max=(10, …) on X and max z = 6.
+        let centre = Vec3::new(4.0, -3.0, 2.0);
+        let extent = Vec3::new(6.0, 7.0, 4.0);
+        assert_eq!(lod_clip_horizontal_reach(centre, extent), 10.0);
     }
 }
