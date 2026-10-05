@@ -424,6 +424,12 @@ float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air, float rho, bool c
 // `px` is the pixel angle, from fwidth in the entry point (uniform flow).
 // `pix` is SV_Position.xy (framebuffer pixels, origin top-left).
 // `inscatter` is the viewer's sky radiance along `ray` (no sun disc, moon or stars).
+// The loop only searches. Albedo and lighting run once, for the nearest hit, so a
+// pixel a single body covers matches the old per-hit shade. Additive rims and
+// point blobs are stashed with their depth (`facing`) and dropped when that depth
+// is not in front of the final hit: a farther rim a nearer body used to overwrite
+// stays overwritten. The inner sphere's far wall is the background; anything with
+// a smaller depth composites over it.
 float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix)
 {
     uint n = min(farTable[0].header.x, 32u);
@@ -452,6 +458,16 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
 
     float flip = frame.light.w * 2.0 - 1.0;
     float bestT = 1e30;
+    uint bestI = 0u;
+    uint bestFace = 0u;
+    float3 bestN = float3(0.0, 0.0, 0.0);
+    float bestCov = 1.0;
+    // 0 none, 1 sphere (coverage lerp), 2 inner wall, 3 opaque replace.
+    uint bestKind = 0u;
+    // rgb = contribution, w = depth (`facing` for rims and point blobs).
+    float4 addTerm[32];
+    uint nAdd = 0u;
+
     [loop]
     while (mask != 0u)
     {
@@ -499,10 +515,11 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
             if (far_ray_inner(ray, center, rho, facing, t, nrm) && t < bestT)
             {
                 bestT = t;
-                float4 rot = farTable[0].body[i].rot;
-                float3 bodyP = far_inv_rotate(rot, ray * t - center);
-                float3 alb = far_albedo(i, bodyP, 0u, true, rho);
-                col = far_lit(alb, nrm, ray, air, rho, true);
+                bestI = i;
+                bestFace = 0u;
+                bestN = nrm;
+                bestCov = 1.0;
+                bestKind = 2u;
             }
             continue;
         }
@@ -512,7 +529,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         if (ang < 0.7 && facing > 0.0)
         {
             float tPoint = 1.0 - rho;
-            if (tPoint < bestT)
+            if (tPoint < bestT && nAdd < 32u)
             {
                 float s = length(cross(ray, center));
                 float blob = exp(-4.0 * (s * s) / (px * px));
@@ -520,7 +537,9 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 float gain = max(phase, 0.15);
                 uint seed = farTable[0].body[i].seed.x;
                 float tw = 0.75 + 0.25 * (float(seed & 255u) * (1.0 / 255.0));
-                col += farTable[0].body[i].albedo0.rgb * (frame.light.rgb * gain + frame.ambient_glow.rgb) * (blob * tw);
+                float3 blobRgb = farTable[0].body[i].albedo0.rgb * (frame.light.rgb * gain + frame.ambient_glow.rgb) * (blob * tw);
+                addTerm[nAdd] = float4(blobRgb, facing);
+                nAdd++;
             }
             continue;
         }
@@ -538,21 +557,22 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 if (hit && t < bestT)
                 {
                     bestT = t;
-                    float4 rot = farTable[0].body[i].rot;
-                    float3 bodyP = far_inv_rotate(rot, ray * t - center);
-                    float3 alb = far_albedo(i, bodyP, 0u, true, rho);
-                    float cov = saturate(0.5 + (rho - s) / px);
-                    col = lerp(col, far_through_air(far_lit(alb, nrm, ray, air, rho, false), inscatter, rho), cov);
+                    bestI = i;
+                    bestFace = 0u;
+                    bestN = nrm;
+                    bestCov = saturate(0.5 + (rho - s) / px);
+                    bestKind = 1u;
                 }
             }
             else if (hasAir)
             {
                 float width = max(rho * 0.05, px * 1.25);
-                if (s < rho + width && facing < bestT)
+                if (s < rho + width && facing < bestT && nAdd < 32u)
                 {
                     float u = saturate((s - rho) / width);
                     float rim = 1.0 - u;
-                    col += air * (rim * rim);
+                    addTerm[nAdd] = float4(air * (rim * rim), facing);
+                    nAdd++;
                 }
             }
         }
@@ -564,9 +584,11 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
             if (hit && t < bestT)
             {
                 bestT = t;
-                float3 bodyP = far_inv_rotate(rot, ray * t - center);
-                float3 alb = far_albedo(i, bodyP, face, false, rho);
-                col = far_through_air(far_lit(alb, nrm, ray, air, rho, false), inscatter, rho);
+                bestI = i;
+                bestFace = face;
+                bestN = nrm;
+                bestCov = 1.0;
+                bestKind = 3u;
             }
             else if (!hit && hasAir)
             {
@@ -574,11 +596,12 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 float rhoB = rho * pow(3.0, 0.5 - 1.0 / pRim);
                 float s = length(cross(ray, center));
                 float width = max(rhoB * 0.05, px * 1.25);
-                if (s > rhoB && s < rhoB + width && facing < bestT)
+                if (s > rhoB && s < rhoB + width && facing < bestT && nAdd < 32u)
                 {
                     float u = saturate((s - rhoB) / width);
                     float rim = 1.0 - u;
-                    col += air * (rim * rim);
+                    addTerm[nAdd] = float4(air * (rim * rim), facing);
+                    nAdd++;
                 }
             }
         }
@@ -589,9 +612,11 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
             if (hit && t < bestT)
             {
                 bestT = t;
-                float3 bodyP = far_inv_rotate(rot, ray * t - center);
-                float3 alb = far_albedo(i, bodyP, face, false, rho);
-                col = far_through_air(far_lit(alb, nrm, ray, air, rho, false), inscatter, rho);
+                bestI = i;
+                bestFace = face;
+                bestN = nrm;
+                bestCov = 1.0;
+                bestKind = 3u;
             }
             else if (!hit && hasAir)
             {
@@ -599,15 +624,44 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 float tRim;
                 float3 nRim;
                 uint faceRim;
-                if (rhoRim < 1.0 && far_ray_cube(ray, center, rhoRim, rot, tRim, nRim, faceRim) && tRim < bestT)
+                if (rhoRim < 1.0 && far_ray_cube(ray, center, rhoRim, rot, tRim, nRim, faceRim) && tRim < bestT && nAdd < 32u)
                 {
                     float fres = 1.0 - saturate(dot(nRim, -ray));
                     fres = fres * fres * fres;
-                    col += air * fres;
+                    addTerm[nAdd] = float4(air * fres, facing);
+                    nAdd++;
                 }
             }
         }
     }
+
+    float3 add = float3(0.0, 0.0, 0.0);
+    [loop]
+    for (uint k = 0u; k < nAdd; k++)
+    {
+        if (addTerm[k].w < bestT)
+            add += addTerm[k].xyz;
+    }
+
+    if (bestKind != 0u)
+    {
+        float4 dirRho = farTable[0].body[bestI].dir_rho;
+        float rho = dirRho.w;
+        float3 center = dirRho.xyz;
+        float4 rot = farTable[0].body[bestI].rot;
+        float3 air = farTable[0].body[bestI].atmosphere.rgb;
+        float3 bodyP = far_inv_rotate(rot, ray * bestT - center);
+        bool sphereAlb = bestKind == 1u || bestKind == 2u;
+        float3 alb = far_albedo(bestI, bodyP, bestFace, sphereAlb, rho);
+        bool core = bestKind == 2u;
+        float3 lit = far_lit(alb, bestN, ray, air, rho, core);
+        float3 shaded = core ? lit : far_through_air(lit, inscatter, rho);
+        if (bestKind == 1u)
+            col = lerp(col, shaded, bestCov);
+        else
+            col = shaded;
+    }
+    col += add;
     return col;
 }
 
