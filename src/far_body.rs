@@ -39,7 +39,9 @@ pub enum FarShape {
     /// seen from the eye, above the plane whose normal is `-dir`. The shader
     /// skips rays with `dot(ray, -dir) > horizon`. `1.0` disables the cull.
     /// `air` is the air-shell thickness in the same unit as `radius` (`0`
-    /// draws no limb).
+    /// draws no limb). A miss ray's limb is that shell on the surface radius
+    /// at the ray's closest approach to the centre, not a shell on the
+    /// datum's maximum.
     Mapped {
         map: FarMapId,
         horizon: f32,

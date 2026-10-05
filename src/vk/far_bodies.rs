@@ -141,10 +141,13 @@ const _: () = assert!(
 ///   facing reject, and the branch runs before the facing gate). Always `-1`.
 /// * **Mapped.** No facing gate. The datum bulges out to the hi radius
 ///   `hi = (radius + map_max[map]) / distance` (`map_max[i]` is map `i`'s
-///   maximum datum offset, or 0 when that map is unset), and a ray aimed away
-///   from the centre can still meet the body once that sphere contains the
-///   camera. Sentinel when `hi >= 0.99`; otherwise the sine is `hi` (a
-///   negative value floors at 0, so it is not mistaken for the sentinel).
+///   maximum datum offset, or 0 when that map is unset). The air limb reaches
+///   `hi + air/distance`: the shader sits on the local surface, which is at
+///   most the hi sphere, and the shader's extra 3 px does not cover a thick
+///   shell. A ray aimed away from the centre can still meet the body once
+///   that sphere contains the camera. Sentinel when the widened bound is
+///   `>= 0.99`; otherwise the sine is `hi + air/distance` (a negative radius
+///   or air floors at 0, so it is not mistaken for the sentinel).
 fn cone_bound(body: &FarBody, map_max: &[f32; MAX_FAR_MAPS]) -> f32 {
     if !far_cull_enabled() {
         return -1.0;
@@ -180,17 +183,21 @@ fn cone_bound(body: &FarBody, map_max: &[f32; MAX_FAR_MAPS]) -> f32 {
                 bound
             }
         }
-        FarShape::Mapped { map, .. } => {
+        FarShape::Mapped { map, air, .. } => {
             let max_off = if (map.0 as usize) < MAX_FAR_MAPS {
                 map_max[map.0 as usize]
             } else {
                 0.0
             };
             let hi = ((body.radius + max_off) / body.distance).max(0.0);
-            if !hi.is_finite() || hi >= 0.99 {
+            // World air, same space as `hi`. The 3 px margin on this sine is
+            // not the shell.
+            let shell = (air / body.distance).max(0.0);
+            let bound = hi + shell;
+            if !bound.is_finite() || bound >= 0.99 {
                 -1.0
             } else {
-                hi
+                bound
             }
         }
     }
@@ -1041,8 +1048,8 @@ fn nonzero_tiles(table: &FarTableGpu) -> u64 {
 /// (the sky composite is order-dependent). `None` keeps every body. Each kept
 /// body then sets its bit in the screen tiles its drawable cone can reach.
 /// `map_max[i]` is map `i`'s maximum datum offset, used for a mapped body's
-/// hi-radius cone (`-1` when that sphere contains the camera, which paints
-/// every tile).
+/// cone. The sine is the hi radius plus `air/distance` (`-1` when that reach
+/// is at least 0.99, which paints every tile).
 #[cfg(test)]
 pub(crate) fn pack_table(
     bodies: &[FarBody],
@@ -1398,7 +1405,10 @@ mod tests {
             1.0,
         );
         let table = super::pack_table(std::slice::from_ref(&mapped), None, &map_max);
-        assert_eq!(table.cone[0][3].to_bits(), ((1.0f32 + 0.1) / 4.0).to_bits());
+        let hi = ((1.0f32 + 0.1) / 4.0).max(0.0);
+        let shell = (0.4f32 / 4.0).max(0.0);
+        assert!(hi + shell < 0.99);
+        assert_eq!(table.cone[0][3].to_bits(), (hi + shell).to_bits());
         let gpu = &table.body[0];
         assert_eq!(gpu.atmosphere[3].to_bits(), 4.0f32.to_bits());
         assert_eq!(gpu.seed[2], 4);
@@ -1418,6 +1428,78 @@ mod tests {
         assert_eq!(
             std::mem::offset_of!(FarTableGpu, body),
             16 + 16 * MAX_FAR_BODIES
+        );
+    }
+
+    #[test]
+    fn mapped_cone_widens_by_the_air_shell() {
+        let mut map_max = [0.0f32; MAX_FAR_MAPS];
+        map_max[2] = 30.0;
+        let distance = 1_000.0f32;
+        let radius = 200.0f32;
+        let air = 40.0f32;
+        let hi = ((radius + map_max[2]) / distance).max(0.0);
+        let shell = (air / distance).max(0.0);
+        assert!(hi + shell < 0.99, "precondition {hi} {shell}");
+        // 1080p at 60° is about a milliradian per pixel. This shell is many
+        // times the shader's 3 px margin, so the margin cannot stand in for it.
+        let px = 2.0 * (60.0f32.to_radians() * 0.5).tan() / 1080.0;
+        assert!(
+            shell > 3.0 * px,
+            "shell {shell} must exceed the 3 px margin {px}"
+        );
+
+        let bare = sample(
+            FarShape::Mapped {
+                map: FarMapId(2),
+                horizon: 1.0,
+                air: 0.0,
+            },
+            distance,
+            radius,
+        );
+        assert_eq!(
+            super::pack_table(std::slice::from_ref(&bare), None, &map_max).cone[0][3].to_bits(),
+            hi.to_bits(),
+            "no air leaves the hi radius"
+        );
+
+        let thick = sample(
+            FarShape::Mapped {
+                map: FarMapId(2),
+                horizon: 1.0,
+                air,
+            },
+            distance,
+            radius,
+        );
+        assert_eq!(
+            super::pack_table(std::slice::from_ref(&thick), None, &map_max).cone[0][3].to_bits(),
+            (hi + shell).to_bits()
+        );
+
+        // hi itself is inside the sine limit; the shell crosses it.
+        let close_distance = 100.0f32;
+        let close_radius = 50.0f32;
+        let close_air = 25.0f32;
+        let close_hi = ((close_radius + map_max[2]) / close_distance).max(0.0);
+        let close_bound = close_hi + (close_air / close_distance).max(0.0);
+        assert!(
+            close_hi < 0.99 && close_bound >= 0.99,
+            "{close_hi} {close_bound}"
+        );
+        let close = sample(
+            FarShape::Mapped {
+                map: FarMapId(2),
+                horizon: 1.0,
+                air: close_air,
+            },
+            close_distance,
+            close_radius,
+        );
+        assert_eq!(
+            super::pack_table(std::slice::from_ref(&close), None, &map_max).cone[0][3].to_bits(),
+            (-1.0f32).to_bits()
         );
     }
 

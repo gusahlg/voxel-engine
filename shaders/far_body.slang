@@ -680,6 +680,41 @@ bool far_ray_mapped(
     return true;
 }
 
+#ifndef FAR_NO_MAPPED
+// Air shell for a ray that missed the datum. The direction from the centre
+// at the ray's closest approach is the limb's body-space sample: rSurf is
+// the surface radius there, and the shell is
+// [rSurf, rSurf + max(air/distance, px)]. A shell on the hi sphere floats
+// off a lower silhouette. False when the ray misses that shell, including
+// a degenerate approach straight through the centre.
+bool far_mapped_limb(
+    float3 ray, float3 center, float facing, float rho, float distance,
+    float4 rot, uint map, float airThick, float px,
+    out float rSurf, out float outer, out float s)
+{
+    rSurf = 0.0;
+    outer = 0.0;
+    s = length(cross(ray, center));
+    // Closest approach is behind the camera when facing is not forward.
+    if (!(distance > 0.0) || !(facing > 0.0))
+        return false;
+    float maxOff = asfloat(farMaps[map * 8u + 3u]);
+    float rhoHi = rho + maxOff / distance;
+    float shell = max(airThick / distance, px);
+    // The local surface is at most the hi sphere, so a miss of that outer
+    // bound misses every local shell and can skip the datum sample.
+    if (!(rhoHi > 0.0 && s < rhoHi + shell))
+        return false;
+    float3 fromCenter = ray * facing - center;
+    if (!(dot(fromCenter, fromCenter) > 1e-16))
+        return false;
+    float3 bodyDir = far_inv_rotate(rot, normalize(fromCenter));
+    rSurf = rho + far_datum(map, bodyDir) / distance;
+    outer = rSurf + shell;
+    return rSurf > 0.0 && s < outer;
+}
+#endif
+
 // Colour of the one additive body `i` emitted. The caller has already decided
 // the term is in front of the final hit. Same formulas as the old array stash.
 float3 far_add_rgb(uint i, float3 ray, float px, float flip)
@@ -743,19 +778,20 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
         if (mapPlus == 0u || mapPlus > 8u || !(distance > 0.0))
             return float3(0.0, 0.0, 0.0);
         uint map = mapPlus - 1u;
-        float maxOff = asfloat(farMaps[map * 8u + 3u]);
-        float rhoHi = rho + maxOff / distance;
-        float outer = rhoHi + max(airThick / distance, px);
-        float s = length(cross(ray, center));
-        if (!(rhoHi > 0.0 && s < outer))
+        float4 rot = farTable[0].body[i].rot;
+        float rSurf;
+        float outer;
+        float s;
+        if (!far_mapped_limb(
+                ray, center, facing, rho, distance, rot, map, airThick, px, rSurf, outer, s))
             return float3(0.0, 0.0, 0.0);
-        // Shell on the hi sphere, at least one pixel thick. Chord is in
+        // Shell on the local surface, at least one pixel thick. Chord is in
         // world units. The denominator stays at least a pixel so the
         // widened shell does not go opaque. Daylight follows far_lit.
         float outerChord = sqrt(max(outer * outer - s * s, 0.0));
-        float chordN = s >= rhoHi
+        float chordN = s >= rSurf
             ? 2.0 * outerChord
-            : 2.0 * (outerChord - sqrt(max(rhoHi * rhoHi - s * s, 0.0)));
+            : 2.0 * (outerChord - sqrt(max(rSurf * rSurf - s * s, 0.0)));
         float chord = chordN * distance;
         float denom = max(airThick, px * distance);
         float trans = exp(-4.0 * chord / denom);
@@ -789,7 +825,7 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
 // the normalised `t` is kept for shading. The inner sphere's far wall is the
 // background; anything with a smaller world depth composites over it. A mapped
 // body is kind 4: one shade, then the terrain fog in place of far_through_air.
-// Its air limb is an additive term.
+// Its air limb is an additive term on the local surface, not the hi sphere.
 //
 // Pass 2 accumulates those additive rims and blobs. This matches the old
 // dynamically indexed `float4 addTerm[32]` (that array spilled to local
@@ -1020,12 +1056,12 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
             else if (!hit && airThick > 0.0 && facing > 0.0 && facingDepth < bestDepth)
             {
                 // The colour is rebuilt in pass 2. The bit records that the
-                // shell test passed against the running depth.
-                float maxOff = asfloat(farMaps[map * 8u + 3u]);
-                float rhoHi = rho + maxOff / distance;
-                float outer = rhoHi + max(airThick / distance, px);
-                float s = length(cross(ray, center));
-                if (rhoHi > 0.0 && s < outer)
+                // local shell test passed against the running depth.
+                float rSurf;
+                float outer;
+                float s;
+                if (far_mapped_limb(
+                        ray, center, facing, rho, distance, rot, map, airThick, px, rSurf, outer, s))
                     addMask |= 1u << i;
             }
         }
