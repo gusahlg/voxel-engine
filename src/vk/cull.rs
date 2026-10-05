@@ -10,7 +10,9 @@
 //! write) while only the LOD partition pays for the box clip. Coarse-LOD
 //! meshes whose camera-relative AABB lies entirely inside that box are not
 //! emitted (every fragment would be discarded). Caged meshes use the corner
-//! AABB and their own groups. Coarse-LOD groups bucket on splits scaled by
+//! AABB and their own groups. Face-run culling keeps their direction buckets,
+//! tested in the cage's affine frame; a singular frame draws the mesh whole.
+//! Shadows stay whole-mesh. Coarse-LOD groups bucket on splits scaled by
 //! `VOXEL_LOD_BUCKET_SCALE` (default 32); full-res groups keep 16/64/256.
 //! Shadow Near/Far stay unbucketed; capacity is full-res Opaque plus
 //! full-res caged.

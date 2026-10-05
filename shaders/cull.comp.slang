@@ -4,7 +4,9 @@
 // Opaque, 1 Cutout, 2 coarse-LOD Opaque (scale > 1), 3 full-res caged,
 // 4 coarse-LOD caged. Groups 2 and 4 whose AABB is fully inside the LOD box
 // are not emitted (every fragment would be discarded). A caged mesh is culled
-// by its eight corners; its face-run flag is clear, so it draws whole.
+// by its eight corners. Face-run culling keeps its direction buckets, tested
+// in the cage's affine frame (`cage_direction_mask`); a singular frame draws
+// the mesh whole. Shadows always draw whole.
 
 #include "common.slang"
 #include "cage.slang"
@@ -143,6 +145,67 @@ bool lod_aabb_inside_box(float3 mn, float3 mx, float3 centre, float half_x, floa
     return far.x < half_x && far.y < half_y && far.z < half_z;
 }
 
+// Direction mask for a caged mesh, or 0 when the affine frame is singular
+// (the caller draws the mesh whole). Bits 0..5 are upload order
+// +X,+Y,+Z,−X,−Y,−Z. Bit 6 marks a usable mask so "every direction culled"
+// cannot be confused with a singular frame.
+//
+// P_i = corners[i] + (anchor − cam_block) − cam_frac, the vertex shader's
+// placement of corner i. E = [P1−P0, P2−P0, P4−P0], t_cam = E⁻¹(−P0).
+// d is the max error of corners 3,5,6,7 against that frame, over the min
+// edge; eps = 2d + 1e-3. Full cage range [0,1] (not the mesh's local
+// bounds) is conservative. Host mirror: `cage_direction_vis` in
+// vk/cull_math.rs. Shadows do not call this.
+uint cage_direction_mask(Cage c)
+{
+    float3 o = float3(c.anchor - params.cam_block) - params.cam_frac;
+    float3 P0 = c.corners[0].xyz + o;
+    float3 P1 = c.corners[1].xyz + o;
+    float3 P2 = c.corners[2].xyz + o;
+    float3 P3 = c.corners[3].xyz + o;
+    float3 P4 = c.corners[4].xyz + o;
+    float3 P5 = c.corners[5].xyz + o;
+    float3 P6 = c.corners[6].xyz + o;
+    float3 P7 = c.corners[7].xyz + o;
+    float3 e0 = P1 - P0;
+    float3 e1 = P2 - P0;
+    float3 e2 = P4 - P0;
+    float3 c12 = cross(e1, e2);
+    float3 c20 = cross(e2, e0);
+    float3 c01 = cross(e0, e1);
+    float det = dot(e0, c12);
+    float l0 = length(e0);
+    float l1 = length(e1);
+    float l2 = length(e2);
+    float vol = l0 * l1 * l2;
+    // Same cutoff as CAGE_DET_REL in vk/cull_math.rs.
+    if (!(abs(det) > 1.0e-8 * max(vol, 1.0)))
+        return 0u;
+    float3 b = -P0;
+    float inv = 1.0 / det;
+    float3 t_cam = float3(dot(b, c12), dot(b, c20), dot(b, c01)) * inv;
+    float min_edge = min(l0, min(l1, l2));
+    float dev = length(P3 - (P0 + e0 + e1));
+    dev = max(dev, length(P5 - (P0 + e0 + e2)));
+    dev = max(dev, length(P6 - (P0 + e1 + e2)));
+    dev = max(dev, length(P7 - (P0 + e0 + e1 + e2)));
+    float eps = 2.0 * (dev / min_edge) + 1.0e-3;
+    uint mask = 0x40u;
+    if (t_cam.x > -eps)
+        mask |= 1u;
+    if (t_cam.y > -eps)
+        mask |= 2u;
+    if (t_cam.z > -eps)
+        mask |= 4u;
+    if (t_cam.x < 1.0 + eps)
+        mask |= 8u;
+    if (t_cam.y < 1.0 + eps)
+        mask |= 16u;
+    if (t_cam.z < 1.0 + eps)
+        mask |= 32u;
+    return mask;
+}
+
 void emit(uint part, DrawCmd cmd)
 {
 #ifdef USE_WAVE_ATOMICS
@@ -245,7 +308,32 @@ void computeMain(uint3 id: SV_DispatchThreadID)
                 float bucket_scale = lod_group ? params.lod_bucket_scale : 1.0;
                 uint bucket = distance_bucket(dist, bucket_scale);
                 uint part = (group * params.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
-                if ((params.flags & 1u) == 0u || (rec.flags & 1u) == 0u)
+                bool face_runs = (params.flags & 1u) != 0u && (rec.flags & 1u) != 0u;
+                bool vis[6];
+                if (face_runs && caged)
+                {
+                    // Singular frame (mask 0) draws whole. Otherwise bits 0..5.
+                    uint mask = cage_direction_mask(cages[rec.cage]);
+                    if (mask == 0u)
+                        face_runs = false;
+                    else
+                    {
+                        [unroll]
+                        for (uint k = 0u; k < 6u; k++)
+                            vis[k] = (mask & (1u << k)) != 0u;
+                    }
+                }
+                else if (face_runs)
+                {
+                    // +axis vis iff mn[axis] < 0; −axis iff mx[axis] > 0.
+                    vis[0] = mn.x < 0.0;
+                    vis[1] = mn.y < 0.0;
+                    vis[2] = mn.z < 0.0;
+                    vis[3] = mx.x > 0.0;
+                    vis[4] = mx.y > 0.0;
+                    vis[5] = mx.z > 0.0;
+                }
+                if (!face_runs)
                 {
                     emit(part, cmd);
                     if ((pc.flags & 1u) != 0)
@@ -267,14 +355,6 @@ void computeMain(uint3 id: SV_DispatchThreadID)
                         b[i * 2u + 1u] = b[i * 2u] + 6u * (packed & 0xFFFFu);
                         b[i * 2u + 2u] = b[i * 2u + 1u] + 6u * (packed >> 16);
                     }
-                    // +axis vis iff mn[axis] < 0; −axis iff mx[axis] > 0.
-                    bool vis[6];
-                    vis[0] = mn.x < 0.0;
-                    vis[1] = mn.y < 0.0;
-                    vis[2] = mn.z < 0.0;
-                    vis[3] = mx.x > 0.0;
-                    vis[4] = mx.y > 0.0;
-                    vis[5] = mx.z > 0.0;
                     // Merge consecutive visible non-empty buckets. emit may be called
                     // ≤3 times per lane; the wave path already handles divergent callers.
                     uint start = ~0u;

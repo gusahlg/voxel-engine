@@ -272,7 +272,8 @@ fn cam_relative_aabb(rec: &MeshRecord, eye: EyeSplit) -> ([f32; 3], [f32; 3], f3
 }
 
 /// Per-axis face visibility, matching `cull.comp.slang`: +axis iff `mn[axis] < 0`,
-/// −axis iff `mx[axis] > 0`.
+/// −axis iff `mx[axis] > 0`. Flat meshes only. Caged slots use
+/// [`cage_direction_vis`].
 fn face_vis(mn: [f32; 3], mx: [f32; 3]) -> [bool; 6] {
     [
         mn[0] < 0.0,
@@ -282,6 +283,121 @@ fn face_vis(mn: [f32; 3], mx: [f32; 3]) -> [bool; 6] {
         mx[1] > 0.0,
         mx[2] > 0.0,
     ]
+}
+
+/// `|det|` at or below this fraction of the edge-length product (or of 1,
+/// when that product is smaller) is a singular frame: draw the mesh whole.
+/// `cage_direction_mask` in `cull.comp.slang` uses the same cutoff.
+const CAGE_DET_REL: f32 = 1e-8;
+/// Added to `2 * d`. Same literal as the cull shader.
+const CAGE_VIS_BIAS: f32 = 1e-3;
+
+#[derive(Clone, Copy, Debug)]
+struct CageFaceVis {
+    /// Upload order +X,+Y,+Z,−X,−Y,−Z.
+    vis: [bool; 6],
+    /// Max corner error of corners 3,5,6,7, in min-edge lengths. `eps = 2d + bias`.
+    /// The cull reads `vis` only; tests assert `d`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    d: f32,
+}
+
+#[inline(always)]
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+#[inline(always)]
+fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+#[inline(always)]
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+#[inline(always)]
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+#[inline(always)]
+fn len3(a: [f32; 3]) -> f32 {
+    dot3(a, a).sqrt()
+}
+
+/// Camera-relative cage corners. `corners` are anchor-relative; the offset is
+/// the vertex shader's `(anchor − cam_block) − cam_frac`.
+#[inline(always)]
+fn cam_relative_corners(
+    corners: [[f32; 3]; 8],
+    anchor: [i32; 3],
+    eye_block: [i32; 3],
+    eye_frac: [f32; 3],
+) -> [[f32; 3]; 8] {
+    let d = [
+        anchor[0].wrapping_sub(eye_block[0]) as f32 - eye_frac[0],
+        anchor[1].wrapping_sub(eye_block[1]) as f32 - eye_frac[1],
+        anchor[2].wrapping_sub(eye_block[2]) as f32 - eye_frac[2],
+    ];
+    std::array::from_fn(|i| {
+        [
+            corners[i][0] + d[0],
+            corners[i][1] + d[1],
+            corners[i][2] + d[2],
+        ]
+    })
+}
+
+/// Per-direction visibility of a caged mesh, or `None` when the affine frame
+/// is singular (draw the mesh whole). `corners` are camera-relative.
+/// Mirrors `cage_direction_mask` in `cull.comp.slang`.
+///
+/// `E = [P1−P0, P2−P0, P4−P0]`, `t_cam = E⁻¹(−P0)`. A local +X face is
+/// front-facing when `t_cam.x` is past that face's parameter; testing the
+/// full cage range `[0, 1]` (plus the non-affinity margin) is conservative.
+fn cage_direction_vis(p: [[f32; 3]; 8]) -> Option<CageFaceVis> {
+    let e0 = sub3(p[1], p[0]);
+    let e1 = sub3(p[2], p[0]);
+    let e2 = sub3(p[4], p[0]);
+    let c12 = cross3(e1, e2);
+    let c20 = cross3(e2, e0);
+    let c01 = cross3(e0, e1);
+    let det = dot3(e0, c12);
+    let l0 = len3(e0);
+    let l1 = len3(e1);
+    let l2 = len3(e2);
+    let vol = l0 * l1 * l2;
+    if !(det.abs() > CAGE_DET_REL * vol.max(1.0)) {
+        return None;
+    }
+    let b = [-p[0][0], -p[0][1], -p[0][2]];
+    let inv = 1.0 / det;
+    let t_cam = [dot3(b, c12) * inv, dot3(b, c20) * inv, dot3(b, c01) * inv];
+    let min_edge = l0.min(l1).min(l2);
+    let err = |idx: usize, predict: [f32; 3]| len3(sub3(p[idx], predict));
+    let dev = err(3, add3(p[0], add3(e0, e1)))
+        .max(err(5, add3(p[0], add3(e0, e2))))
+        .max(err(6, add3(p[0], add3(e1, e2))))
+        .max(err(7, add3(p[0], add3(e0, add3(e1, e2)))));
+    let d = dev / min_edge;
+    let eps = 2.0 * d + CAGE_VIS_BIAS;
+    Some(CageFaceVis {
+        vis: [
+            t_cam[0] > -eps,
+            t_cam[1] > -eps,
+            t_cam[2] > -eps,
+            t_cam[0] < 1.0 + eps,
+            t_cam[1] < 1.0 + eps,
+            t_cam[2] < 1.0 + eps,
+        ],
+        d,
+    })
 }
 
 /// Cumulative index bounds `b[0..=6]` from packed u16 quad pairs (upload
@@ -558,9 +674,9 @@ pub(crate) fn cpu_cull(
     )
 }
 
-/// Pre-SoA CPU cull: walks `0..slot_count`, loads the 80-byte [`MeshRecord`],
-/// and uses the shader's `?:` p-vertex. Kept as the emission reference for
-/// the old-vs-new test.
+/// Record-walking mirror of `computeMain`: the shader's `?:` p-vertex, and
+/// the same caged face-run rule as [`cull_slots`]. Kept as the emission
+/// reference for the old-vs-new test.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn cpu_cull_legacy(
@@ -610,7 +726,24 @@ fn cpu_cull_legacy(
         if pass > 1 {
             continue;
         }
-        let (mn, mx, scale) = cam_relative_aabb(rec, eye);
+        let bits = dir.cull_bits().get(slot as usize).copied().unwrap_or(0);
+        let caged = super::arena::cull_bits_caged(bits);
+        let (mn, mx, scale) = if caged {
+            let aabb = dir
+                .cull_aabbs()
+                .get(slot as usize)
+                .copied()
+                .unwrap_or([0.0; 6]);
+            let block = dir
+                .cull_blocks()
+                .get(slot as usize)
+                .copied()
+                .unwrap_or([0; 3]);
+            let (mn, mx) = cam_relative_soa(aabb, block, eye.block, eye.frac);
+            (mn, mx, rec.detail_scale())
+        } else {
+            cam_relative_aabb(rec, eye)
+        };
         let arena = word - 1;
         let cmd = DrawIndexedIndirect {
             index_count: rec.index_count,
@@ -621,13 +754,12 @@ fn cpu_cull_legacy(
         };
 
         if cam_visible && aabb_in_planes_select(&cam_planes, mn, mx) {
-            let group = if pass == 0 && scale > 1.0 { 2 } else { pass };
-            if group != 2 || !lod_aabb_inside_box(mn, mx, centre, half) {
+            let group = camera_group(pass, scale > 1.0, caged);
+            if !is_lod_group(group) || !lod_aabb_inside_box(mn, mx, centre, half) {
                 let cx = 0.5 * (mn[0] + mx[0]);
                 let cy = 0.5 * (mn[1] + mx[1]);
                 let cz = 0.5 * (mn[2] + mx[2]);
-                // Group 2 is the only LOD group this pre-cage path emits.
-                let edges = if group == 2 {
+                let edges = if is_lod_group(group) {
                     lod_sq
                 } else {
                     FULL_BUCKET_EDGE_SQ
@@ -635,12 +767,29 @@ fn cpu_cull_legacy(
                 let bucket = distance_bucket_sq(cx * cx + cy * cy + cz * cz, edges);
                 let part = ((group * arena_count + arena) * crate::genconst::CULL_DISTANCE_BUCKETS
                     + bucket) as usize;
-                if !face_cull || (rec.flags & MESH_FLAG_FACE_RUNS) == 0 {
-                    emit_cmd(part, cmd, partitions, &mut cmds, &mut counts);
-                    stats[group as usize * 2] += 1;
-                    stats[group as usize * 2 + 1] += cmd.index_count;
+                let vis = if face_cull && (rec.flags & MESH_FLAG_FACE_RUNS) != 0 {
+                    if caged {
+                        let corners = dir
+                            .cull_corners()
+                            .get(slot as usize)
+                            .copied()
+                            .unwrap_or([[0.0; 3]; 8]);
+                        let block = dir
+                            .cull_blocks()
+                            .get(slot as usize)
+                            .copied()
+                            .unwrap_or([0; 3]);
+                        cage_direction_vis(cam_relative_corners(
+                            corners, block, eye.block, eye.frac,
+                        ))
+                        .map(|v| v.vis)
+                    } else {
+                        Some(face_vis(mn, mx))
+                    }
                 } else {
-                    let vis = face_vis(mn, mx);
+                    None
+                };
+                if let Some(vis) = vis {
                     let bounds = packed_face_bounds(rec.face_quads);
                     let mut runs = [FaceRun {
                         first_index: 0,
@@ -655,6 +804,10 @@ fn cpu_cull_legacy(
                         stats[group as usize * 2] += 1;
                         stats[group as usize * 2 + 1] += drawn.index_count;
                     }
+                } else {
+                    emit_cmd(part, cmd, partitions, &mut cmds, &mut counts);
+                    stats[group as usize * 2] += 1;
+                    stats[group as usize * 2 + 1] += cmd.index_count;
                 }
             }
         }
@@ -780,6 +933,7 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
     let index_counts = dir.cull_index_counts();
     let vertex_offsets = dir.cull_vertex_offsets();
     let face_quads = dir.cull_face_quads();
+    let corners_soa = dir.cull_corners();
     let eye_block = eye.block;
     let eye_frac = eye.frac;
     let arena_count = dir.arena_count() as u32;
@@ -851,8 +1005,19 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
         };
 
         if cam_ok {
-            if FACE && super::arena::cull_bits_face(bits) {
-                let vis = face_vis(mn, mx);
+            // `None` draws the mesh whole: face runs off, or a singular cage.
+            let vis = if FACE && super::arena::cull_bits_face(bits) {
+                if super::arena::cull_bits_caged(bits) {
+                    let raw = unsafe { *corners_soa.get_unchecked(i) };
+                    cage_direction_vis(cam_relative_corners(raw, block, eye_block, eye_frac))
+                        .map(|v| v.vis)
+                } else {
+                    Some(face_vis(mn, mx))
+                }
+            } else {
+                None
+            };
+            if let Some(vis) = vis {
                 let bounds = packed_face_bounds(unsafe { *face_quads.get_unchecked(i) });
                 let mut runs = [FaceRun {
                     first_index: 0,
@@ -1560,7 +1725,15 @@ mod tests {
             let base = records.len() as u32;
             dir.note_upload(base, G1, buf(arena as u64 + 1), Pass::Opaque, FULL, aabb);
             dir.note_upload(base + 1, G1, buf(arena as u64 + 1), Pass::Opaque, LOD, aabb);
-            dir.note_upload_caged(base + 2, G1, buf(arena as u64 + 1), Pass::Opaque, LOD, aabb);
+            dir.note_upload_caged(
+                base + 2,
+                G1,
+                buf(arena as u64 + 1),
+                Pass::Opaque,
+                LOD,
+                aabb,
+                aabb.box_corners(),
+            );
             records.extend([full, lod, caged]);
         }
         let (parts, cmds, counts, stats) =
@@ -1672,7 +1845,8 @@ mod tests {
     }
 
     /// Mixed synthetic slot table: holes, Blend, LOD, face-runs, Cutout,
-    /// two arenas, some hidden, some not-yet-arrived.
+    /// two arenas, some hidden, some not-yet-arrived. Slot 48 is a Y-rotated
+    /// caged mesh so the agreement covers cage direction runs.
     fn synthetic_slots() -> (ArenaDirectory, Vec<MeshRecord>, Vec<u32>, Vec<bool>) {
         const N: usize = 64;
         let mut dir = ArenaDirectory::new();
@@ -1687,26 +1861,48 @@ mod tests {
             let z = -10.0 - (slot % 17) as f32 * 8.0;
             let mn = [-1.0, -1.0, z - 1.0];
             let mx = [1.0, 1.0, z + 1.0];
-            let rec = match slot % 7 {
-                0 => opaque_rec([mn[0], mn[1], 9.0], [mx[0], mx[1], 11.0]), // behind
-                1 => rec_pass(mn, mx, Pass::Cutout, false),
-                2 => rec_pass(mn, mx, Pass::Opaque, true),
-                3 => face_rec(mn, mx),
-                4 => rec_pass(mn, mx, Pass::Blend, false),
-                5 if slot % 5 == 0 => continue, // hole
-                _ => opaque_rec(mn, mx),
+            // Slot 48: Y-rotated cage in front. Its direction mask is not the
+            // AABB mask, so a path that skips the cage frame disagrees.
+            let (rec, corners) = if slot == 48 {
+                let corners = y90_cage_at([0.0, 0.0, -40.0]);
+                let (min, max) = crate::cage::corner_aabb(corners);
+                let mut rec = face_rec(min, max);
+                rec.cage = 1;
+                (rec, Some(corners))
+            } else {
+                (
+                    match slot % 7 {
+                        0 => opaque_rec([mn[0], mn[1], 9.0], [mx[0], mx[1], 11.0]), // behind
+                        1 => rec_pass(mn, mx, Pass::Cutout, false),
+                        2 => rec_pass(mn, mx, Pass::Opaque, true),
+                        3 => face_rec(mn, mx),
+                        4 => rec_pass(mn, mx, Pass::Blend, false),
+                        5 if slot % 5 == 0 => continue, // hole
+                        _ => opaque_rec(mn, mx),
+                    },
+                    None,
+                )
             };
             records[i] = rec;
             let lod = rec.detail_scale() > 1.0;
             let buf_id = 1 + u64::from(slot % 2);
-            dir.note_upload(
-                slot,
-                G1,
-                buf(buf_id),
-                rec.pass(),
-                lod,
-                MeshAabb::from_record(&rec),
-            );
+            if let Some(corners) = corners {
+                let aabb = MeshAabb {
+                    block: rec.block,
+                    min: rec.aabb_min,
+                    max: rec.aabb_max,
+                };
+                dir.note_upload_caged(slot, G1, buf(buf_id), rec.pass(), lod, aabb, corners);
+            } else {
+                dir.note_upload(
+                    slot,
+                    G1,
+                    buf(buf_id),
+                    rec.pass(),
+                    lod,
+                    MeshAabb::from_record(&rec),
+                );
+            }
             if slot % 11 == 0 {
                 vis_bits[(slot >> 5) as usize] &= !(1 << (slot & 31));
             }
@@ -1936,9 +2132,33 @@ mod tests {
         };
         let mut dir = ArenaDirectory::new();
         dir.note_upload(0, G1, buf(1), Pass::Opaque, false, front);
-        dir.note_upload_caged(1, G1, buf(1), Pass::Opaque, false, front);
-        dir.note_upload_caged(2, G1, buf(1), Pass::Opaque, false, behind);
-        dir.note_upload_caged(3, G1, buf(1), Pass::Opaque, true, inside);
+        dir.note_upload_caged(
+            1,
+            G1,
+            buf(1),
+            Pass::Opaque,
+            false,
+            front,
+            front.box_corners(),
+        );
+        dir.note_upload_caged(
+            2,
+            G1,
+            buf(1),
+            Pass::Opaque,
+            false,
+            behind,
+            behind.box_corners(),
+        );
+        dir.note_upload_caged(
+            3,
+            G1,
+            buf(1),
+            Pass::Opaque,
+            true,
+            inside,
+            inside.box_corners(),
+        );
 
         let mut kept = opaque_rec(behind.min, behind.max);
         kept.cage = 1;
@@ -1991,5 +2211,508 @@ mod tests {
         );
         assert_eq!(stats[Group::Caged as usize * 2], 1);
         assert_eq!(stats[Group::Caged as usize * 2 + 1], 36);
+    }
+
+    /// Half-8 cube, 90° about Y: `(x, y, z) → (z, y, −x)`, then translated so
+    /// the cube centre sits at `center`. Local +X becomes world −Z.
+    fn y90_cage_at(center: [f32; 3]) -> [[f32; 3]; 8] {
+        let half = 8.0;
+        std::array::from_fn(|i| {
+            let local = [
+                if i & 1 == 0 { -half } else { half },
+                if i & 2 == 0 { -half } else { half },
+                if i & 4 == 0 { -half } else { half },
+            ];
+            [
+                local[2] + center[0],
+                local[1] + center[1],
+                -local[0] + center[2],
+            ]
+        })
+    }
+
+    fn aa_corners(mn: [f32; 3], mx: [f32; 3]) -> [[f32; 3]; 8] {
+        std::array::from_fn(|i| {
+            [
+                if i & 1 == 0 { mn[0] } else { mx[0] },
+                if i & 2 == 0 { mn[1] } else { mx[1] },
+                if i & 4 == 0 { mn[2] } else { mx[2] },
+            ]
+        })
+    }
+
+    fn cam_shift(corners: [[f32; 3]; 8], cam: [f32; 3]) -> [[f32; 3]; 8] {
+        std::array::from_fn(|i| sub3(corners[i], cam))
+    }
+
+    fn rotated_cage(q: glam::Quat, center: glam::Vec3) -> [[f32; 3]; 8] {
+        let half = 8.0;
+        std::array::from_fn(|i| {
+            let local = glam::Vec3::new(
+                if i & 1 == 0 { -half } else { half },
+                if i & 2 == 0 { -half } else { half },
+                if i & 4 == 0 { -half } else { half },
+            );
+            (q * local + center).to_array()
+        })
+    }
+
+    /// Four parameter-corners of the plane `t[axis] = s`. Free axes are
+    /// `(axis+1)%3` then `(axis+2)%3`, so `cross(+a, +b)` is the +face normal.
+    fn plane_corners(corners: [[f32; 3]; 8], axis: usize, s: f32) -> [glam::Vec3; 4] {
+        let a = (axis + 1) % 3;
+        let b = (axis + 2) % 3;
+        std::array::from_fn(|i| {
+            let mut t = [0.0; 3];
+            t[axis] = s;
+            t[a] = if i & 1 == 0 { 0.0 } else { 1.0 };
+            t[b] = if i & 2 == 0 { 0.0 } else { 1.0 };
+            glam::Vec3::from(crate::cage::trilinear(corners, t))
+        })
+    }
+
+    /// Camera at the origin, in front of triangle `(a, b, c)`. Degenerate
+    /// area is not a front face.
+    fn tri_faces_camera(a: glam::Vec3, b: glam::Vec3, c: glam::Vec3) -> bool {
+        let n = (b - a).cross(c - a);
+        let area = n.length();
+        area >= 1.0e-4 && n.dot(a) < -1.0e-4 * area
+    }
+
+    /// Upload slot `slot` (+X,+Y,+Z,−X,−Y,−Z) has a front-facing triangle on
+    /// some plane `s = i/16`. +faces wind `(A,B,D)` and `(A,D,C)`; −faces flip.
+    fn direction_has_front_triangle(corners: [[f32; 3]; 8], slot: usize) -> bool {
+        let axis = slot % 3;
+        let neg = slot >= 3;
+        for i in 0..=16 {
+            let p = plane_corners(corners, axis, i as f32 / 16.0);
+            let front = if neg {
+                tri_faces_camera(p[0], p[2], p[3]) || tri_faces_camera(p[0], p[3], p[1])
+            } else {
+                tri_faces_camera(p[0], p[1], p[3]) || tri_faces_camera(p[0], p[3], p[2])
+            };
+            if front {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A culled direction has no front-facing sample. Singular frames draw
+    /// whole, so they are not checked here.
+    fn assert_cull_keeps_front_triangles(corners: [[f32; 3]; 8]) {
+        let Some(got) = cage_direction_vis(corners) else {
+            return;
+        };
+        for slot in 0..6 {
+            if got.vis[slot] {
+                continue;
+            }
+            let axis = slot % 3;
+            let neg = slot >= 3;
+            for i in 0..=16 {
+                let s = i as f32 / 16.0;
+                let p = plane_corners(corners, axis, s);
+                let hit = if neg {
+                    tri_faces_camera(p[0], p[2], p[3]) || tri_faces_camera(p[0], p[3], p[1])
+                } else {
+                    tri_faces_camera(p[0], p[1], p[3]) || tri_faces_camera(p[0], p[3], p[2])
+                };
+                if hit {
+                    let e0 = sub3(corners[1], corners[0]);
+                    let e1 = sub3(corners[2], corners[0]);
+                    let e2 = sub3(corners[4], corners[0]);
+                    panic!(
+                        "culled slot {slot} s={s} faces the camera (d={}, vis={:?})\nP0={:?} e0={:?} e1={:?} e2={:?}\ntri={:?}",
+                        got.d, got.vis, corners[0], e0, e1, e2, p
+                    );
+                }
+            }
+        }
+    }
+
+    /// Affine cages: the kept set is exactly the directions with a front face.
+    fn assert_affine_vis_matches_triangles(corners: [[f32; 3]; 8]) {
+        let got = cage_direction_vis(corners).expect("affine frame");
+        assert!(got.d < 1.0e-4, "affine cage d={}", got.d);
+        for slot in 0..6 {
+            assert_eq!(
+                got.vis[slot],
+                direction_has_front_triangle(corners, slot),
+                "slot {slot} vis={:?} d={}",
+                got.vis,
+                got.d
+            );
+        }
+    }
+
+    fn face_near_camera(mn: [f32; 3], mx: [f32; 3]) -> bool {
+        (0..3).any(|k| (-1.0..1.0).contains(&mn[k]) || (-1.0..1.0).contains(&mx[k]))
+    }
+
+    #[test]
+    fn cage_direction_vis_matches_aabb_keeps_inside_and_follows_rotation() {
+        let samples = [-80.0, -20.0, 0.0, 20.0, 80.0];
+        let half = 8.0;
+        for x in samples {
+            for y in samples {
+                for z in samples {
+                    let mn = [x - half, y - half, z - half];
+                    let mx = [x + half, y + half, z + half];
+                    if face_near_camera(mn, mx) {
+                        continue;
+                    }
+                    let corners = aa_corners(mn, mx);
+                    let got = cage_direction_vis(corners).unwrap();
+                    assert_eq!(got.vis, face_vis(mn, mx), "centre ({x}, {y}, {z})");
+                    assert!(got.d < 1.0e-5, "d={}", got.d);
+                    assert_affine_vis_matches_triangles(corners);
+                }
+            }
+        }
+
+        // On the +X plane the bias keeps the bucket; the AABB test drops it.
+        let on_plane = aa_corners([0.0, -8.0, -8.0], [16.0, 8.0, 8.0]);
+        assert!(cage_direction_vis(on_plane).unwrap().vis[0]);
+        assert!(!face_vis([0.0, -8.0, -8.0], [16.0, 8.0, 8.0])[0]);
+
+        let inside = aa_corners([-8.0; 3], [8.0; 3]);
+        assert_eq!(cage_direction_vis(inside).unwrap().vis, [true; 6]);
+        assert_affine_vis_matches_triangles(inside);
+
+        let y90 = glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let mapped = y90 * glam::Vec3::X;
+        assert!(
+            (mapped - glam::Vec3::new(0.0, 0.0, -1.0)).length() < 1.0e-5,
+            "glam Y+90 sent +X to {mapped}"
+        );
+        let y_front = y90_cage_at([0.0, 0.0, -40.0]);
+        for i in 0..8 {
+            let d = sub3(
+                y_front[i],
+                rotated_cage(y90, glam::Vec3::new(0.0, 0.0, -40.0))[i],
+            );
+            assert!(len3(d) < 1.0e-4, "corner {i} disagrees with glam");
+        }
+        let got = cage_direction_vis(y_front).unwrap();
+        assert_eq!(got.vis, [false, true, true, true, true, true]);
+        assert!(got.d < 1.0e-5, "d={}", got.d);
+        let (mn, mx) = crate::cage::corner_aabb(y_front);
+        // A Y-rotated cube has the same world AABB; that mask is the wrong one.
+        assert_ne!(got.vis, face_vis(mn, mx));
+        assert_affine_vis_matches_triangles(y_front);
+
+        let y_back = y90_cage_at([0.0, 0.0, 40.0]);
+        assert_eq!(
+            cage_direction_vis(y_back).unwrap().vis,
+            [true, true, true, false, true, true]
+        );
+        assert_affine_vis_matches_triangles(y_back);
+
+        let y_in = y90_cage_at([0.0, 0.0, 0.0]);
+        assert_eq!(cage_direction_vis(y_in).unwrap().vis, [true; 6]);
+        assert_affine_vis_matches_triangles(y_in);
+
+        // 30° about (1,1,1). Camera sits 40 blocks from the centre along the
+        // rotated local +X, so t_cam ≈ (3, 0.5, 0.5).
+        let axis = glam::Vec3::new(1.0, 1.0, 1.0).normalize();
+        let q = glam::Quat::from_axis_angle(axis, 30.0_f32.to_radians());
+        let local_px = q * glam::Vec3::X;
+        let plus = rotated_cage(q, -local_px * 40.0);
+        let got = cage_direction_vis(plus).unwrap();
+        assert_eq!(got.vis, [true, true, true, false, true, true]);
+        assert!(got.d < 1.0e-4, "d={}", got.d);
+        assert!(dot3((-local_px * 40.0).to_array(), sub3(plus[1], plus[0])) < 0.0);
+        assert_affine_vis_matches_triangles(plus);
+
+        let minus = rotated_cage(q, local_px * 40.0);
+        assert_eq!(
+            cage_direction_vis(minus).unwrap().vis,
+            [false, true, true, true, true, true]
+        );
+        assert_affine_vis_matches_triangles(minus);
+    }
+
+    #[test]
+    fn bent_cage_widens_eps_and_never_culls_a_front_face() {
+        let flat = aa_corners([0.0; 3], [16.0; 3]);
+        let mut bent = flat;
+        bent[3] = add3(bent[3], [0.0, 6.0, 0.0]);
+        bent[5] = add3(bent[5], [4.0, 0.0, -3.0]);
+        bent[6] = add3(bent[6], [-2.0, 5.0, 4.0]);
+        bent[7] = add3(bent[7], [3.0, -8.0, 6.0]);
+        let expect_d = 109.0_f32.sqrt() / 16.0;
+        let got = cage_direction_vis(bent).unwrap();
+        assert!(
+            (got.d - expect_d).abs() < 1.0e-5,
+            "d={} expect {expect_d}",
+            got.d
+        );
+        assert!(got.d > 0.2);
+
+        // Corner 7 only, offset (0, 8, 0): d = 8/16 exactly.
+        let mut poke = flat;
+        poke[7][1] += 8.0;
+        let poke_d = cage_direction_vis(poke).unwrap().d;
+        assert!((poke_d - 0.5).abs() < 1.0e-6, "d={poke_d}");
+
+        // Flat at camera-relative mn.x = 0.05 culls +X (t.x = -0.003125, eps = 0.001).
+        // Both bends keep it.
+        let cam = [-0.05, 8.0, 8.0];
+        let flat_vis = cage_direction_vis(cam_shift(flat, cam)).unwrap();
+        assert!(flat_vis.d < 1.0e-5);
+        assert!(!flat_vis.vis[0], "flat should cull +X");
+        assert!(cage_direction_vis(cam_shift(bent, cam)).unwrap().vis[0]);
+        assert!(cage_direction_vis(cam_shift(poke, cam)).unwrap().vis[0]);
+
+        // Neighbourhood of the cage, step 4. Both strong bends keep every
+        // sampled front face here; the flat cage matches triangle-for-triangle
+        // except on the 1e-3 band around a face plane.
+        for x in (-16..=32).step_by(4) {
+            for y in (-16..=32).step_by(4) {
+                for z in (-16..=32).step_by(4) {
+                    let at = [x as f32, y as f32, z as f32];
+                    let flat_rel = cam_shift(flat, at);
+                    assert_cull_keeps_front_triangles(flat_rel);
+                    assert_cull_keeps_front_triangles(cam_shift(bent, at));
+                    assert_cull_keeps_front_triangles(cam_shift(poke, at));
+                    // Skip the 1e-3 band, where the bias keeps a direction the
+                    // triangle test (strict half-space) does not call front.
+                    let on_plane = (0..3).any(|k| at[k].abs() < 1.0 || (at[k] - 16.0).abs() < 1.0);
+                    if !on_plane {
+                        assert_affine_vis_matches_triangles(flat_rel);
+                    }
+                }
+            }
+        }
+
+        // One-block kink (d = 1/16, eps ≈ 0.126). Checked through the view
+        // distances of a chunk: still no culled front face.
+        let mut kink = flat;
+        kink[7][1] += 1.0;
+        let kink_d = cage_direction_vis(kink).unwrap().d;
+        assert!((kink_d - 1.0 / 16.0).abs() < 1.0e-6, "d={kink_d}");
+        let far = [-40.0, -4.0, 8.0, 24.0, 64.0];
+        for x in far {
+            for y in far {
+                for z in far {
+                    assert_cull_keeps_front_triangles(cam_shift(kink, [x, y, z]));
+                    assert_cull_keeps_front_triangles(cam_shift(flat, [x, y, z]));
+                }
+            }
+        }
+        for x in (-48..=64).step_by(4) {
+            for y in (-48..=64).step_by(4) {
+                for z in (-48..=64).step_by(4) {
+                    let at = [x as f32, y as f32, z as f32];
+                    assert_cull_keeps_front_triangles(cam_shift(kink, at));
+                }
+            }
+        }
+
+        // Affine centre (corners 0, 1, 2, 4) puts t_cam at 0.5: all six stay.
+        let e0 = sub3(bent[1], bent[0]);
+        let e1 = sub3(bent[2], bent[0]);
+        let e2 = sub3(bent[4], bent[0]);
+        let mid = add3(
+            bent[0],
+            [
+                0.5 * (e0[0] + e1[0] + e2[0]),
+                0.5 * (e0[1] + e1[1] + e2[1]),
+                0.5 * (e0[2] + e1[2] + e2[2]),
+            ],
+        );
+        assert_eq!(
+            cage_direction_vis(cam_shift(bent, mid)).unwrap().vis,
+            [true; 6]
+        );
+        assert_eq!(
+            cage_direction_vis(cam_shift(flat, mid)).unwrap().vis,
+            [true; 6]
+        );
+        assert_eq!(
+            cage_direction_vis(cam_shift(poke, mid)).unwrap().vis,
+            [true; 6]
+        );
+
+        let mut dead = flat;
+        dead[1] = dead[0];
+        assert!(cage_direction_vis(dead).is_none());
+        assert!(cage_direction_vis([[0.0; 3]; 8]).is_none());
+    }
+
+    fn caged_camera_cmds<'a>(
+        parts: &[PartitionGpu],
+        cmds: &'a [DrawIndexedIndirect],
+        counts: &[u32],
+        slot: u32,
+    ) -> Vec<&'a DrawIndexedIndirect> {
+        let mut out = Vec::new();
+        for bucket in 0..BUCKETS {
+            let idx = camera_part(Group::Caged as usize, 0, bucket, 1);
+            for cmd in part_cmds(parts, cmds, counts, idx) {
+                if cmd.first_instance == slot {
+                    out.push(cmd);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn caged_face_runs_agree_between_paths_and_shadows_stay_whole() {
+        let camera = look_neg_z();
+        let shadow_frusta = [look_neg_z(), look_neg_z()];
+        let eye = origin_eye();
+
+        let side_mn = [-10.0, -1.0, -15.0];
+        let side_mx = [-5.0, 1.0, -10.0];
+        let mut side = face_rec(side_mn, side_mx);
+        side.cage = 1;
+        let side_corners = aa_corners(side_mn, side_mx);
+        assert_eq!(
+            cage_direction_vis(side_corners).unwrap().vis,
+            [true, true, true, false, true, false]
+        );
+
+        let y_corners = y90_cage_at([0.0, 0.0, -40.0]);
+        let (y_mn, y_mx) = crate::cage::corner_aabb(y_corners);
+        let mut rotated = face_rec(y_mn, y_mx);
+        rotated.cage = 2;
+        rotated.vertex_offset = 11;
+        assert_eq!(
+            cage_direction_vis(y_corners).unwrap().vis,
+            [false, true, true, true, true, true]
+        );
+        // AABB face_vis of this box is [T,T,T,T,T,F] (one run 0..30).
+        assert_ne!(
+            cage_direction_vis(y_corners).unwrap().vis,
+            face_vis(y_mn, y_mx)
+        );
+
+        let mut singular = face_rec([-1.0, -1.0, -12.0], [1.0, 1.0, -8.0]);
+        singular.cage = 3;
+        singular.vertex_offset = 13;
+        assert!(cage_direction_vis([[0.0; 3]; 8]).is_none());
+
+        let records = [side, rotated, singular];
+        let mut dir = ArenaDirectory::new();
+        dir.note_upload_caged(
+            0,
+            G1,
+            buf(1),
+            Pass::Opaque,
+            false,
+            MeshAabb {
+                block: [0; 3],
+                min: side_mn,
+                max: side_mx,
+            },
+            side_corners,
+        );
+        dir.note_upload_caged(
+            1,
+            G1,
+            buf(1),
+            Pass::Opaque,
+            false,
+            MeshAabb {
+                block: [0; 3],
+                min: y_mn,
+                max: y_mx,
+            },
+            y_corners,
+        );
+        dir.note_upload_caged(
+            2,
+            G1,
+            buf(1),
+            Pass::Opaque,
+            false,
+            MeshAabb {
+                block: [0; 3],
+                min: singular.aabb_min,
+                max: singular.aabb_max,
+            },
+            [[0.0; 3]; 8],
+        );
+        for (i, rec) in records.iter().enumerate() {
+            dir.note_cull_draw(i as u32, rec);
+        }
+
+        let mut parts = Vec::new();
+        dir.partitions_into(&mut parts, MAX_FACE_RUNS, Some(eye));
+        let visible = [0b111u32];
+        let (new_cmds, new_counts, new_stats) = cpu_cull(
+            &records,
+            &dir,
+            |_| true,
+            &visible,
+            &parts,
+            &camera,
+            Some(&shadow_frusta),
+            eye,
+            dir.live_end(),
+            [0.0; 3],
+            [0.0; 3],
+            true,
+        );
+        let (old_cmds, old_counts, old_stats) = cpu_cull_legacy(
+            &records,
+            &dir,
+            |_| true,
+            &visible,
+            &parts,
+            &camera,
+            Some(&shadow_frusta),
+            eye,
+            dir.live_end(),
+            [0.0; 3],
+            [0.0; 3],
+            true,
+        );
+        assert_same_emission(
+            &parts,
+            &old_cmds,
+            &old_counts,
+            old_stats,
+            &new_cmds,
+            &new_counts,
+            new_stats,
+        );
+        assert_eq!(new_stats[Group::Caged as usize * 2], 4);
+        assert_eq!(new_stats[Group::Caged as usize * 2 + 1], 18 + 6 + 30 + 36);
+
+        let side_cmds = caged_camera_cmds(&parts, &new_cmds, &new_counts, 0);
+        assert_eq!(side_cmds.len(), 2, "side box should emit two runs");
+        assert_eq!(side_cmds[0].first_index, 0);
+        assert_eq!(side_cmds[0].index_count, 18);
+        assert_eq!(side_cmds[1].first_index, 24);
+        assert_eq!(side_cmds[1].index_count, 6);
+
+        let rot_cmds = caged_camera_cmds(&parts, &new_cmds, &new_counts, 1);
+        assert_eq!(rot_cmds.len(), 1, "rotated cage should emit one run");
+        assert_eq!(rot_cmds[0].first_index, 6);
+        assert_eq!(rot_cmds[0].index_count, 30);
+        assert_eq!(rot_cmds[0].vertex_offset, 11);
+
+        let whole = caged_camera_cmds(&parts, &new_cmds, &new_counts, 2);
+        assert_eq!(whole.len(), 1, "singular frame draws the mesh whole");
+        assert_eq!(whole[0].first_index, 0);
+        assert_eq!(whole[0].index_count, 36);
+        assert_eq!(whole[0].vertex_offset, 13);
+
+        for cascade in 0..2 {
+            let idx = shadow_part(cascade, 0, 1);
+            let sh = part_cmds(&parts, &new_cmds, &new_counts, idx);
+            assert_eq!(sh.len(), 3, "cascade {cascade} keeps every caster whole");
+            let mut seen = [false; 3];
+            for cmd in sh {
+                assert_eq!(cmd.first_index, 0);
+                assert_eq!(cmd.index_count, 36);
+                seen[cmd.first_instance as usize] = true;
+            }
+            assert_eq!(seen, [true; 3]);
+        }
     }
 }

@@ -24,6 +24,7 @@ pub struct MeshRecord {
     pub face_quads: [u32; 3],
     /// Bit 0 ([`MESH_FLAG_FACE_RUNS`]): `face_quads` are valid u16 counts.
     /// Clear → the cull shader emits a whole-mesh draw for this record.
+    /// Caged meshes keep the bit; their direction test uses the cage frame.
     pub flags: u32,
 }
 
@@ -57,12 +58,10 @@ impl MeshRecord {
 
     /// Compose a GPU record from mesh metadata and placement.
     pub(crate) fn compose(meta: &MeshMeta, p: crate::mesh::MeshPlacement) -> Self {
-        let (face_quads, mut flags) = Self::pack_face_quads(&meta.bounds);
-        // Face-run culling assumes axis-aligned faces. A bent mesh draws whole.
+        let (face_quads, flags) = Self::pack_face_quads(&meta.bounds);
+        // Caged meshes keep the flag. Direction tests run in the cage's affine
+        // frame (`cull.comp.slang`); only a u16 overflow clears it.
         let cage = p.cage.map(|h| h.gpu_index()).unwrap_or(0);
-        if cage != 0 {
-            flags &= !MESH_FLAG_FACE_RUNS;
-        }
         Self {
             block: p.block.to_array(),
             // Detail in the low DETAIL_GPU_BITS, pass in the next two.
@@ -418,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_caged_stores_the_gpu_index_and_clears_face_runs() {
+    fn compose_caged_stores_the_gpu_index_and_keeps_face_runs() {
         use std::num::NonZeroU32;
 
         use super::super::handles::{DrawDyn, MeshMeta, PlacementState};
@@ -443,8 +442,8 @@ mod tests {
         assert_eq!(rec.local_off, [0.0; 3]);
         assert_eq!(
             rec.flags & MESH_FLAG_FACE_RUNS,
-            0,
-            "a bent mesh draws whole, even when the buckets fit in u16"
+            MESH_FLAG_FACE_RUNS,
+            "a bent mesh keeps packed face-runs; the cull shader tests cage directions"
         );
     }
 

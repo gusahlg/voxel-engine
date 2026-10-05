@@ -427,7 +427,9 @@ impl Engine {
     }
 
     /// GPU per-direction face-run culling: the cull shader emits contiguous
-    /// camera-facing quad runs instead of a whole-mesh draw.
+    /// camera-facing quad runs instead of a whole-mesh draw. Caged meshes
+    /// keep the same runs, tested in the cage's affine frame; shadows stay
+    /// whole-mesh.
     ///
     /// On by default (`Config` has no field). Safe to toggle at runtime — the
     /// change is sent on the render-thread command stream and lands at the next

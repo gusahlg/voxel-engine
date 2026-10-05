@@ -824,7 +824,7 @@ impl Renderer {
     ) {
         // Grow the shared quad IBO to index this mesh before its draws record.
         self.quad_ibo.require(quads);
-        let (caged, aabb) = self.placement_aabb(&record);
+        let (caged, aabb, corners) = self.placement_aabb(&record);
         let lod = record.detail_scale() > 1.0;
         if caged {
             self.arena_dir.note_upload_caged(
@@ -834,6 +834,7 @@ impl Renderer {
                 record.pass(),
                 lod,
                 aabb,
+                corners,
             );
         } else {
             self.arena_dir.note_upload(
@@ -853,11 +854,11 @@ impl Renderer {
     /// Replaces a mover's recomposed record, keeping the cull lane counts in
     /// step should its detail (LOD lane) have changed.
     pub(crate) fn apply_set_record(&mut self, slot: u32, record: buffers::MeshRecord) {
-        let (caged, aabb) = self.placement_aabb(&record);
+        let (caged, aabb, corners) = self.placement_aabb(&record);
         let lod = record.detail_scale() > 1.0;
         if caged {
             self.arena_dir
-                .note_record_caged(slot, record.pass(), lod, aabb);
+                .note_record_caged(slot, record.pass(), lod, aabb, corners);
         } else {
             self.arena_dir.note_record(slot, record.pass(), lod, aabb);
         }
@@ -912,6 +913,7 @@ impl Renderer {
                         rec.pass(),
                         lod,
                         cull::MeshAabb::from_cage(&entry),
+                        entry.corners3(),
                     );
                 }
                 None => {
@@ -926,17 +928,21 @@ impl Renderer {
         }
     }
 
-    /// `(caged, world AABB)`. A missing cage slot is the zero cage, which is
-    /// what the shader reads until the upload lands.
-    fn placement_aabb(&self, record: &buffers::MeshRecord) -> (bool, cull::MeshAabb) {
+    /// `(caged, world AABB, anchor-relative corners)`. A missing cage slot is
+    /// the zero cage, which is what the shader reads until the upload lands.
+    /// Flat meshes return a zero corner block; the cull does not read it.
+    fn placement_aabb(
+        &self,
+        record: &buffers::MeshRecord,
+    ) -> (bool, cull::MeshAabb, [[f32; 3]; 8]) {
         if record.cage == 0 {
-            return (false, cull::MeshAabb::from_record(record));
+            return (false, cull::MeshAabb::from_record(record), [[0.0; 3]; 8]);
         }
         let entry = self
             .cages
             .entry(record.cage)
             .unwrap_or(crate::cage::CageGpu::ZERO);
-        (true, cull::MeshAabb::from_cage(&entry))
+        (true, cull::MeshAabb::from_cage(&entry), entry.corners3())
     }
 
     /// Set one word of the visibility mask.
