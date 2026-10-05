@@ -1180,7 +1180,7 @@ pub(crate) fn pack_table(
     view: Option<FarView>,
     map_max: &[f32; MAX_FAR_MAPS],
 ) -> FarTableGpu {
-    *pack_table_cached(bodies, view.as_ref(), None, map_max)
+    *pack_table_cached(bodies, view.as_ref(), None, map_max, glam::Vec3::Y).0
 }
 
 /// The table is 71 KB. `Box::new(FarTableGpu::zeroed())` would build that on
@@ -1196,14 +1196,52 @@ fn zeroed_table() -> Box<FarTableGpu> {
     unsafe { Box::from_raw(ptr) }
 }
 
+/// Sine of the geometric horizon dip below the local horizontal.
+///
+/// The ground body is the outside body (`rho = radius/distance < 1`) with the
+/// largest rho whose centre lies under the viewer: `dot(dir, -sky_up) > 0.5`.
+/// `sky_up` is the same local up [`super::uniforms::local_sky_basis`] uses, so
+/// a zero or non-unit up matches the sky frame. No such body yields `0`.
+/// Otherwise `s = sqrt(max(1 - rho², 0))`, clamped to `[0, 0.5]`.
+///
+/// Called from packing on the bodies that pack keeps (the list past `keep`,
+/// not the frustum survivors). Fog and water evaluate `sky_radiance` too, so
+/// the dip must not pop when the ground body leaves the sky frustum.
+pub(crate) fn horizon_dip(bodies: &[FarBody], sky_up: glam::Vec3) -> f32 {
+    let (_, up, _) = super::uniforms::local_sky_basis(sky_up);
+    let down = -up;
+    let mut best = -1.0f32;
+    for body in bodies.iter().take(MAX_FAR_BODIES) {
+        let rho = body.radius / body.distance;
+        if !(rho.is_finite() && rho > 0.0 && rho < 1.0) {
+            continue;
+        }
+        let dir = body.dir;
+        let len2 = dir.length_squared();
+        if !(len2 > 0.0) || !dir.is_finite() {
+            continue;
+        }
+        if dir.dot(down) > 0.5 * len2.sqrt() && rho > best {
+            best = rho;
+        }
+    }
+    if !(best >= 0.0) {
+        return 0.0;
+    }
+    (1.0 - best * best).max(0.0).sqrt().clamp(0.0, 0.5)
+}
+
 fn pack_table_cached(
     bodies: &[FarBody],
     view: Option<&FarView>,
     frames: Option<&TileFrames>,
     map_max: &[f32; MAX_FAR_MAPS],
-) -> Box<FarTableGpu> {
+    sky_up: glam::Vec3,
+) -> (Box<FarTableGpu>, f32) {
     let mut table = zeroed_table();
     let n = bodies.len().min(MAX_FAR_BODIES);
+    // Before the cull: see [`horizon_dip`].
+    let dip = horizon_dip(&bodies[..n], sky_up);
     let cull = far_cull_enabled();
     let mut kept = 0usize;
     for body in bodies.iter().take(n) {
@@ -1222,7 +1260,7 @@ fn pack_table_cached(
     }
     table.header[0] = kept as u32;
     stamp_tiles(&mut table, view, frames);
-    table
+    (table, dip)
 }
 
 /// Per-slot far-body SSBO. Identical bytes skip the map write.
@@ -1262,6 +1300,8 @@ impl FarBodyRing {
         self.draw[slot]
     }
 
+    /// Pack and upload. Returns the horizon-dip sine for `sky_bitangent.w`
+    /// ([`horizon_dip`]), including when the table bytes are unchanged.
     pub(crate) fn write(
         &mut self,
         slot: FrameSlot,
@@ -1269,11 +1309,13 @@ impl FarBodyRing {
         view: Option<FarView>,
         map_max: &[f32; MAX_FAR_MAPS],
         coarse: Option<SkyCoarseQuery>,
-    ) {
+        sky_up: glam::Vec3,
+    ) -> f32 {
         if let Some(view) = view.as_ref() {
             self.tiles.rebuild_if_changed(view);
         }
-        let mut table = pack_table_cached(bodies, view.as_ref(), Some(&self.tiles), map_max);
+        let (mut table, dip) =
+            pack_table_cached(bodies, view.as_ref(), Some(&self.tiles), map_max, sky_up);
         let offered = bodies.len().min(MAX_FAR_BODIES) as u64;
         crate::profile::gauge(crate::profile::Gauge::FarBodies, offered);
         crate::profile::gauge(crate::profile::Gauge::FarDrawn, u64::from(table.header[0]));
@@ -1301,13 +1343,14 @@ impl FarBodyRing {
             .as_ref()
             .is_some_and(|prev| table_bytes(prev) == bytes && list_bytes(prev) == lists)
         {
-            return;
+            return dip;
         }
         unsafe {
             self.bufs[slot].write(0, bytes);
             self.bufs[slot].write(std::mem::offset_of!(FarTableGpu, list_header) as u64, lists);
         }
         self.last[slot] = Some(table);
+        dip
     }
 
     pub(crate) fn buffer(&self, slot: FrameSlot) -> vk::Buffer {
@@ -1684,6 +1727,124 @@ mod tests {
         (0..table.header[0] as usize)
             .map(|i| table.body[i].seed[0])
             .collect()
+    }
+
+    /// `rho = R/(R+h)` straight down. The exact dip is `sqrt(1-rho²)`; for
+    /// small `h` that is `sqrt(2h/R)`.
+    fn dip_below(rho: f32, up: Vec3) -> f32 {
+        horizon_dip(
+            std::slice::from_ref(&placed(-up, rho, FarShape::Sphere, 1)),
+            up,
+        )
+    }
+
+    #[test]
+    fn horizon_dip_is_zero_without_a_ground_body() {
+        assert_eq!(horizon_dip(&[], Vec3::Y).to_bits(), 0.0f32.to_bits());
+        // Above the viewer, and level with the horizon: neither is ground.
+        let above = placed(Vec3::Y, 0.9, FarShape::Sphere, 1);
+        let sideways = placed(Vec3::X, 0.9, FarShape::Sphere, 2);
+        // Just outside the 60° cone (`dot` a hair under 0.5). The compare is strict.
+        let edge = placed(
+            Vec3::new(0.87, -0.5, 0.0),
+            0.9,
+            FarShape::Mapped {
+                map: crate::far_body::FarMapId(0),
+                horizon: 1.0,
+                air: 0.0,
+            },
+            3,
+        );
+        assert_eq!(horizon_dip(&[above], Vec3::Y).to_bits(), 0.0f32.to_bits());
+        assert_eq!(
+            horizon_dip(&[sideways], Vec3::Y).to_bits(),
+            0.0f32.to_bits()
+        );
+        assert_eq!(horizon_dip(&[edge], Vec3::Y).to_bits(), 0.0f32.to_bits());
+        // Inside the body (rho >= 1), including an inner sphere underfoot.
+        let inside = placed(-Vec3::Y, 1.5, FarShape::InnerSphere, 4);
+        assert_eq!(horizon_dip(&[inside], Vec3::Y).to_bits(), 0.0f32.to_bits());
+        // A body above must not win over "no ground", even with a larger rho
+        // than a body that fails the outside test.
+        assert_eq!(
+            horizon_dip(&[above, inside], Vec3::Y).to_bits(),
+            0.0f32.to_bits()
+        );
+    }
+
+    #[test]
+    fn horizon_dip_of_the_body_below_matches_sqrt_2h_over_r() {
+        let r = 6_371_000.0f32;
+        let h = 10_000.0f32;
+        let rho = r / (r + h);
+        let s = dip_below(rho, Vec3::Y);
+        let approx = (2.0 * h / r).sqrt();
+        let exact = (1.0 - rho * rho).max(0.0).sqrt();
+        assert!((s - exact).abs() <= exact * 1e-6, "s {s} exact {exact}");
+        assert!(
+            (s - approx).abs() < 1e-4,
+            "small-h dip {s} should track sqrt(2h/R) {approx}"
+        );
+        assert!(s < 0.5, "10 km on an Earth-sized body is under the clamp");
+        // Non-unit up, and a ground body that is not world -Y.
+        let up = Vec3::Z * 4.0;
+        let s_z = dip_below(rho, up);
+        assert_eq!(s_z.to_bits(), s.to_bits());
+        assert_eq!(
+            horizon_dip(
+                std::slice::from_ref(&placed(-Vec3::Y, rho, FarShape::Sphere, 1)),
+                up
+            )
+            .to_bits(),
+            0.0f32.to_bits()
+        );
+    }
+
+    #[test]
+    fn horizon_dip_ignores_bodies_above_or_sideways_and_clamps() {
+        let ground = placed(-Vec3::Y, 0.98, FarShape::Sphere, 1);
+        let above = placed(Vec3::Y, 0.99, FarShape::Sphere, 2);
+        let side = placed(Vec3::X, 0.995, FarShape::Cube, 3);
+        let s = horizon_dip(&[above, side, ground], Vec3::Y);
+        let expect = (1.0 - 0.98 * 0.98f32).sqrt();
+        assert!((s - expect).abs() < 1e-6, "{s} vs {expect}");
+        // Largest rho wins, not the largest dip. The tiny body would clamp.
+        let tiny = placed(
+            Vec3::new(0.0, -1.0, 0.1).normalize(),
+            0.2,
+            FarShape::Sphere,
+            4,
+        );
+        let s_large = horizon_dip(&[tiny, ground], Vec3::Y);
+        assert!(
+            (s_large - expect).abs() < 1e-6,
+            "largest rho, got {s_large}"
+        );
+        // A small disc underfoot: sqrt(1-rho²) > 0.5, so the lane saturates.
+        let s_clamp = dip_below(0.2, Vec3::Y);
+        assert_eq!(s_clamp.to_bits(), 0.5f32.to_bits());
+        // Just inside the 60° cone still counts.
+        let inside_cone = placed(
+            Vec3::new((1.0 - 0.6 * 0.6f32).sqrt(), -0.6, 0.0),
+            0.97,
+            FarShape::Sphere,
+            5,
+        );
+        let s_cone = horizon_dip(&[inside_cone], Vec3::Y);
+        let cone_expect = (1.0 - 0.97 * 0.97f32).sqrt();
+        assert!((s_cone - cone_expect).abs() < 1e-6, "{s_cone}");
+    }
+
+    #[test]
+    fn pack_reports_the_same_horizon_dip() {
+        let bodies = [
+            placed(Vec3::Y, 0.4, FarShape::Sphere, 1),
+            placed(-Vec3::Y, 0.96, FarShape::Sphere, 2),
+        ];
+        let (table, dip) = pack_table_cached(&bodies, None, None, &[0.0; MAX_FAR_MAPS], Vec3::Y);
+        assert_eq!(table.header[0], 2);
+        assert_eq!(dip.to_bits(), horizon_dip(&bodies, Vec3::Y).to_bits());
+        assert!(dip > 0.0 && dip < 0.5);
     }
 
     #[test]
@@ -2623,11 +2784,12 @@ mod tests {
         }
         // A turn reuses the frames, and the packed mask matches a fresh pack.
         let planet = placed(-Vec3::Y, 0.99999, FarShape::Sphere, 1);
-        let from_cache = pack_table_cached(
+        let (from_cache, _) = pack_table_cached(
             std::slice::from_ref(&planet),
             Some(&up),
             Some(&cache),
             &[0.0; MAX_FAR_MAPS],
+            Vec3::Y,
         );
         let fresh_pack = pack_table(std::slice::from_ref(&planet), Some(up));
         let n = used_tiles(&fresh_pack);

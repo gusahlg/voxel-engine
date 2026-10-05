@@ -111,7 +111,10 @@ pub(crate) struct LocalFrame {
 
 impl Default for LocalFrame {
     fn default() -> Self {
-        Self { up: Vec3::Y, altitude: 0.0 }
+        Self {
+            up: Vec3::Y,
+            altitude: 0.0,
+        }
     }
 }
 
@@ -147,8 +150,15 @@ impl FrameUniformsExt {
     /// fragment: ambient floor colour, sky-halo exponent, halo tint×scale,
     /// the shadow-fallback day factor, the sky-dome shadow fill, and the
     /// shadows/blocklight/ambient lane-enable bits in `shadow_bounce.w`,
-    /// and the local sky basis. Mirrors `common.slang`.
-    pub(crate) fn derive(u: FrameUniformsGpu, flags: RenderFlags, local: LocalFrame) -> Self {
+    /// and the local sky basis. `horizon_dip` is the sine packed from the
+    /// ground far body (`sky_bitangent.w`); `0` leaves the sky clamp unchanged.
+    /// Mirrors `common.slang`.
+    pub(crate) fn derive(
+        u: FrameUniformsGpu,
+        flags: RenderFlags,
+        local: LocalFrame,
+        horizon_dip: f32,
+    ) -> Self {
         let zenith = Vec3::new(u.zenith[0], u.zenith[1], u.zenith[2]);
         let light = Vec3::new(u.light[0], u.light[1], u.light[2]);
         let floor = u.candle[3];
@@ -176,7 +186,7 @@ impl FrameUniformsExt {
             shadow_bounce: [bounce.x, bounce.y, bounce.z, lane_enable_bits(&flags)],
             sky_tangent: [tangent.x, tangent.y, tangent.z, 0.0],
             sky_up: [up.x, up.y, up.z, local.altitude],
-            sky_bitangent: [bitangent.x, bitangent.y, bitangent.z, 0.0],
+            sky_bitangent: [bitangent.x, bitangent.y, bitangent.z, horizon_dip],
             morph_eye_block: [0; 4],
             morph_eye_frac: [0.0; 4],
             morph_band: [[0.0; 4]; 16],
@@ -214,7 +224,7 @@ pub const FRAME_UNIFORMS_VERSION: u32 = 8;
 pub(crate) struct UboRing {
     bufs: PerSlot<HostBuffer>,
     last: PerSlot<Option<FrameUniformsExt>>,
-    last_gpu: PerSlot<Option<(FrameUniformsGpu, RenderFlags, LocalFrame, LodMorphGpu)>>,
+    last_gpu: PerSlot<Option<(FrameUniformsGpu, RenderFlags, LocalFrame, LodMorphGpu, f32)>>,
 }
 
 impl UboRing {
@@ -257,7 +267,9 @@ impl UboRing {
     }
 
     /// Derive the engine tail and write, skipping both when this slot already
-    /// holds `u` and `morph` (sky/lighting-dependent work independent of jittered view-proj).
+    /// holds `u`, `morph`, and `horizon_dip` (sky/lighting-dependent work
+    /// independent of jittered view-proj). `horizon_dip` is the ground-body
+    /// sine from far-body packing; it lives in `sky_bitangent.w`.
     pub(crate) fn write_from_gpu(
         &mut self,
         slot: FrameSlot,
@@ -265,14 +277,15 @@ impl UboRing {
         flags: RenderFlags,
         local: LocalFrame,
         morph: LodMorphGpu,
+        horizon_dip: f32,
     ) {
-        if self.last_gpu[slot] == Some((u, flags, local, morph)) {
+        if self.last_gpu[slot] == Some((u, flags, local, morph, horizon_dip)) {
             return;
         }
-        let mut ext = FrameUniformsExt::derive(u, flags, local);
+        let mut ext = FrameUniformsExt::derive(u, flags, local, horizon_dip);
         ext.apply_lod_morph(morph);
         self.write(slot, &ext);
-        self.last_gpu[slot] = Some((u, flags, local, morph));
+        self.last_gpu[slot] = Some((u, flags, local, morph, horizon_dip));
     }
 
     /// The buffer bound at set 0, binding 2 for `slot`. The per-frame UBO is
@@ -297,7 +310,7 @@ mod tests {
     use crate::engine::RenderFlags;
 
     fn derive_default(u: FrameUniformsGpu) -> FrameUniformsExt {
-        FrameUniformsExt::derive(u, RenderFlags::default(), LocalFrame::default())
+        FrameUniformsExt::derive(u, RenderFlags::default(), LocalFrame::default(), 0.0)
     }
 
     #[test]
@@ -416,12 +429,27 @@ mod tests {
         let ext = FrameUniformsExt::derive(
             u,
             RenderFlags::default(),
-            LocalFrame { up: Vec3::Y, altitude: 7.0 },
+            LocalFrame {
+                up: Vec3::Y,
+                altitude: 7.0,
+            },
+            0.0,
         );
         assert_eq!(ext.sky_tangent, [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(ext.sky_up, [0.0, 1.0, 0.0, 7.0]);
         assert_eq!(ext.sky_bitangent, [0.0, 0.0, 1.0, 0.0]);
         assert_eq!(ext.base.anim[3], 42.0);
+        let dipped = FrameUniformsExt::derive(
+            u,
+            RenderFlags::default(),
+            LocalFrame {
+                up: Vec3::Y,
+                altitude: 7.0,
+            },
+            0.25,
+        );
+        assert_eq!(dipped.sky_bitangent[3].to_bits(), 0.25f32.to_bits());
+        assert_eq!(dipped.sky_bitangent[0..3], [0.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -518,7 +546,12 @@ mod tests {
             lane_enable_bits(&f).to_bits(),
             LANE_BIT_SHADOWS | LANE_BIT_BLOCKLIGHT | LANE_BIT_AMBIENT
         );
-        let ext = FrameUniformsExt::derive(FrameUniformsGpu::full_bright(), f, LocalFrame::default());
+        let ext = FrameUniformsExt::derive(
+            FrameUniformsGpu::full_bright(),
+            f,
+            LocalFrame::default(),
+            0.0,
+        );
         assert_eq!(
             ext.shadow_bounce[3].to_bits(),
             lane_enable_bits(&f).to_bits()

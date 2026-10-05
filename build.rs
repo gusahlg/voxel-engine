@@ -1189,7 +1189,7 @@ fn derived_lane_table() -> Vec<Lane> {
         },
         Lane {
             name: "sky_bitangent",
-            doc: "Engine-derived. xyz = bitangent = tangent × up, right-handed (+Y up yields +Z).\nw unused.",
+            doc: "Engine-derived. xyz = bitangent = tangent × up, right-handed (+Y up yields +Z).\nw = horizon-dip sine. While packing far bodies, the ground body is the kept\noutside body (rho < 1) with the largest rho and dot(dir, -sky_up) > 0.5.\ns = sqrt(max(1 - rho^2, 0)) clamped to [0, 0.5], or 0 when there is no such\nbody. sky_radiance lowers the horizon colour by s. Stars and the cloud\nhorizon do not read this lane. 0 keeps the old elevation clamp.",
         },
     ]
 }

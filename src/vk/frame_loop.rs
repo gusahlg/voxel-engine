@@ -175,45 +175,10 @@ impl Renderer {
             offsets
         };
 
-        // Per-frame UBO (set 0, binding 2). A 3D scene always carries lighting
-        // (`Frame::begin_3d` takes it as a required `Lighting` argument, so
-        // `Scene3D::frame_uniforms` is never optional). This `None` branch is
-        // therefore reached ONLY by pure-2D frames, where the mesh shaders never
-        // sample the block; the full-bright filler just keeps the binding live
-        // and validated.
-        {
-            let mut u = if lists.scene.is_some() {
-                lists.lit_uniforms()
-            } else {
-                crate::skeleton::FrameUniformsGpu::full_bright()
-            };
-            // `prepare_derived` already ran in `Frame::begin_3d` (`gate_uniforms`)
-            // or `full_bright`; do not redo it here.
-            // Debug-flat: claim the `extras` lane as [r, g, b, enabled] —
-            // sRGB-encoded key channels + an enable flag. mesh3d.frag linearises rgb
-            // (as it does every CPU colour) and outputs it flat while depth writes.
-            // Overwriting `extras.x` (the stars gain) is safe: the lane's only
-            // other consumer is sky.frag, and the app never draws the sky in the
-            // debug-flat (TerrainKey) view.
-            if let Some(c) = lists.debug_flat {
-                u.extras = [
-                    c.r as f32 / 255.0,
-                    c.g as f32 / 255.0,
-                    c.b as f32 / 255.0,
-                    1.0,
-                ];
-            }
-            self.ubo_ring.write_from_gpu(
-                FrameSlot::new(slot),
-                u,
-                self.flags,
-                lists.local_frame(),
-                lists.lod_morph.to_gpu(),
-            );
-        }
         // Far-body table (sky set 0 binding 2). Same slot fence as the UBO.
         // A sky with no bodies still uploads a zero count so the binding is live.
-        if self.flags.sky && lists.sky.is_some() {
+        // The pack also returns the horizon-dip sine the UBO stamps below.
+        let horizon_dip = if self.flags.sky && lists.sky.is_some() {
             let view = lists.scene.as_ref().map(|scene| {
                 super::far_bodies::far_view(
                     scene.fovy_tan_half,
@@ -250,12 +215,51 @@ impl Renderer {
                 view,
                 &self.far_maps.max_offsets(),
                 coarse,
-            );
+                lists.local_frame().up,
+            )
         } else {
             crate::profile::gauge(crate::profile::Gauge::FarBodies, 0);
             crate::profile::gauge(crate::profile::Gauge::FarDrawn, 0);
             crate::profile::gauge(crate::profile::Gauge::FarTiles, 0);
             crate::profile::gauge(crate::profile::Gauge::SkyCoarse, 0);
+            0.0
+        };
+        // Per-frame UBO (set 0, binding 2). A 3D scene always carries lighting
+        // (`Frame::begin_3d` takes it as a required `Lighting` argument, so
+        // `Scene3D::frame_uniforms` is never optional). This `None` branch is
+        // therefore reached ONLY by pure-2D frames, where the mesh shaders never
+        // sample the block; the full-bright filler just keeps the binding live
+        // and validated.
+        {
+            let mut u = if lists.scene.is_some() {
+                lists.lit_uniforms()
+            } else {
+                crate::skeleton::FrameUniformsGpu::full_bright()
+            };
+            // `prepare_derived` already ran in `Frame::begin_3d` (`gate_uniforms`)
+            // or `full_bright`; do not redo it here.
+            // Debug-flat: claim the `extras` lane as [r, g, b, enabled] —
+            // sRGB-encoded key channels + an enable flag. mesh3d.frag linearises rgb
+            // (as it does every CPU colour) and outputs it flat while depth writes.
+            // Overwriting `extras.x` (the stars gain) is safe: the lane's only
+            // other consumer is sky.frag, and the app never draws the sky in the
+            // debug-flat (TerrainKey) view.
+            if let Some(c) = lists.debug_flat {
+                u.extras = [
+                    c.r as f32 / 255.0,
+                    c.g as f32 / 255.0,
+                    c.b as f32 / 255.0,
+                    1.0,
+                ];
+            }
+            self.ubo_ring.write_from_gpu(
+                FrameSlot::new(slot),
+                u,
+                self.flags,
+                lists.local_frame(),
+                lists.lod_morph.to_gpu(),
+                horizon_dip,
+            );
         }
         let warp_map = lists
             .scene

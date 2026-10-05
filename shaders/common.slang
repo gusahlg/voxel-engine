@@ -102,12 +102,23 @@ float3 sky_local(float3 ray, FrameUniforms frame)
 // Analytic sky radiance along `ray` — THE sky formula, single source of truth
 // for the sky background, the distance fog (fog == sky evaluated at the
 // fragment), and water reflection: an elevation gradient between the horizon
-// and zenith anchors, plus a turbidity-scaled sun halo. Local up below the
-// horizon clamps to the horizon colour. The sun halo stays in world space.
-// Halo exponent and tint×scale are hoisted to `ambient_glow.w` / `glow_day.rgb`.
+// and zenith anchors, plus a turbidity-scaled sun halo. Elevation below the
+// geometric horizon clamps to the horizon colour. At altitude that horizon
+// sits below the local horizontal by the dip sine in `sky_bitangent.w`
+// (`up = saturate((y + s) / (1 + s))`). s = 0 takes the old `clamp(y, 0, 1)`
+// so the surface case stays bit-identical; `(y+0)/(1+0)` is not guaranteed
+// under the compiler. Stars and the cloud horizon do not use this remap.
+// The sun halo stays in world space. Halo exponent and tint×scale are
+// hoisted to `ambient_glow.w` / `glow_day.rgb`.
 float3 sky_radiance(float3 ray, FrameUniforms frame)
 {
-    float up = clamp(sky_local(ray, frame).y, 0.0, 1.0);
+    float y = sky_local(ray, frame).y;
+    float s = frame.sky_bitangent.w;
+    float up;
+    if (s > 0.0)
+        up = saturate((y + s) / (1.0 + s));
+    else
+        up = clamp(y, 0.0, 1.0);
     float3 base = lerp(frame.horizon.rgb, frame.zenith.rgb, sqrt(up));
     float c = max(dot(ray, frame.sun_dir_elev.xyz), 0.0);
     float3 glow = frame.glow_day.rgb * pow(c, frame.ambient_glow.w);

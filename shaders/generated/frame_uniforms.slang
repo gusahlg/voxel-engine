@@ -58,7 +58,11 @@ struct FrameUniforms
     // the same altitude, or f32::MAX when clouds are off).
     float4 sky_up;
     // Engine-derived. xyz = bitangent = tangent × up, right-handed (+Y up yields +Z).
-    // w unused.
+    // w = horizon-dip sine. While packing far bodies, the ground body is the kept
+    // outside body (rho < 1) with the largest rho and dot(dir, -sky_up) > 0.5.
+    // s = sqrt(max(1 - rho^2, 0)) clamped to [0, 0.5], or 0 when there is no such
+    // body. sky_radiance lowers the horizon colour by s. Stars and the cloud
+    // horizon do not read this lane. 0 keeps the old elevation clamp.
     float4 sky_bitangent;
     // --- LOD morph (engine-derived; not in FrameUniformsGpu) ---
     // xyz = integer block of set_lod_morph's eye, split like the camera.
