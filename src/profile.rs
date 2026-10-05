@@ -363,10 +363,12 @@ pub enum Gauge {
     FarBodies,
     /// Far bodies kept after the frustum cull and written into the sky table.
     FarDrawn,
+    /// Screen tiles whose far-body mask is non-zero.
+    FarTiles,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 32] = [
+    const ALL: [Gauge; 33] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
@@ -399,6 +401,7 @@ impl Gauge {
         Gauge::PoolAabbFallback,
         Gauge::FarBodies,
         Gauge::FarDrawn,
+        Gauge::FarTiles,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -436,6 +439,7 @@ impl Gauge {
             Gauge::PoolAabbFallback => "pool.aabb",
             Gauge::FarBodies => "far.bodies",
             Gauge::FarDrawn => "far.drawn",
+            Gauge::FarTiles => "far.tiles",
         }
     }
 }

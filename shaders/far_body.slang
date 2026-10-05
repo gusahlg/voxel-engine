@@ -26,9 +26,13 @@ struct FarGpu
 
 struct FarTable
 {
-    uint4 header; // x = count
+    // x = count, y = tile size in pixels, z = tiles_x, w = tiles_y.
+    // yzw are 0 when the host has no view; the shader then walks every body.
+    uint4 header;
     float4 cone[32]; // xyz = dir, w = sine bound (-1 = never reject)
     FarGpu body[32];
+    // Bit k is kept body k. One word per tile, row-major. Host cap is 8192.
+    uint tile_mask[8192];
 };
 
 // Set 0, binding 2: the host far-body table.
@@ -418,18 +422,41 @@ float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air, float rho, bool c
 }
 
 // `px` is the pixel angle, from fwidth in the entry point (uniform flow).
+// `pix` is SV_Position.xy (framebuffer pixels, origin top-left).
 // `inscatter` is the viewer's sky radiance along `ray` (no sun disc, moon or stars).
-float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
+float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix)
 {
     uint n = min(farTable[0].header.x, 32u);
     if (n == 0u)
         return col;
 
+    // One mask for the whole tile. Bits are kept-index order, so walking the
+    // lowest set bit keeps the original composite order.
+    uint live = n == 32u ? 0xffffffffu : ((1u << n) - 1u);
+    uint tilePx = farTable[0].header.y;
+    uint tilesX = farTable[0].header.z;
+    uint tilesY = farTable[0].header.w;
+    uint mask;
+    if (tilePx == 0u || tilesX == 0u || tilesY == 0u)
+        mask = live;
+    else
+    {
+        // Helpers at the quad edge can sit just outside the framebuffer.
+        float2 p = max(pix, float2(0.0, 0.0));
+        uint tx = min(uint(p.x) / tilePx, tilesX - 1u);
+        uint ty = min(uint(p.y) / tilePx, tilesY - 1u);
+        mask = farTable[0].tile_mask[ty * tilesX + tx] & live;
+    }
+    if (mask == 0u)
+        return col;
+
     float flip = frame.light.w * 2.0 - 1.0;
     float bestT = 1e30;
     [loop]
-    for (uint i = 0u; i < n; i++)
+    while (mask != 0u)
     {
+        uint i = firstbitlow(mask);
+        mask &= mask - 1u;
         // Reject before touching the 160-byte record. `f <= 0` also drops the
         // rounded air rim's ghost ring at the antipode (that rim has no facing test).
         float4 c = farTable[0].cone[i];

@@ -217,6 +217,7 @@ impl Renderer {
         } else {
             crate::profile::gauge(crate::profile::Gauge::FarBodies, 0);
             crate::profile::gauge(crate::profile::Gauge::FarDrawn, 0);
+            crate::profile::gauge(crate::profile::Gauge::FarTiles, 0);
         }
         let warp_map = lists
             .scene
