@@ -153,6 +153,11 @@ const _: () = assert!(
 ///   that sphere contains the camera. Sentinel when the widened bound is
 ///   `>= 0.99`; otherwise the sine is `hi + air/distance` (a negative radius
 ///   or air floors at 0, so it is not mistaken for the sentinel).
+///
+///   The sentinel is only the per-pixel reject. The tile mask uses the horizon
+///   cone ([`mapped_horizon_half`]) whenever `horizon < 1`, including when this
+///   bound is `-1`, so sky tiles above the limb do not take the mapped march.
+///   `horizon >= 1` disables that cone and keeps today's tile coverage.
 fn cone_bound(body: &FarBody, map_max: &[f32; MAX_FAR_MAPS]) -> f32 {
     if !far_cull_enabled() {
         return -1.0;
@@ -622,8 +627,135 @@ fn add_angles(cos_a: f32, cos_b: f32) -> (f32, f32) {
     }
 }
 
+/// Half-angle of a mapped body's tile cone, as `(sin, cos)`.
+///
+/// The shader keeps a ray when `dot(ray, -dir) <= horizon`: a cone around
+/// `+dir` of half-angle `π/2 + asin(horizon)`. `cos` of that angle is
+/// `-horizon`, so a positive horizon (terrain above the plane normal to
+/// `-dir`) is wider than a hemisphere and `cos` is negative. The air limb
+/// widens the angle by `δ` with `sin δ = air/distance` (a negative thickness
+/// floors at 0), then by the same 3 px sine pad as every other cone. `None`
+/// paints every tile: `horizon >= 1`, a non-finite input, or a sum past π.
+fn mapped_horizon_half(horizon: f32, air: f32, distance: f32, px_max: f32) -> Option<(f32, f32)> {
+    if !(horizon < 1.0) || !horizon.is_finite() {
+        return None;
+    }
+    let cos_alpha = -horizon.clamp(-1.0, 1.0);
+    let shell = if distance.is_finite() && distance > 0.0 && air.is_finite() {
+        (air / distance).max(0.0)
+    } else {
+        return None;
+    };
+    let px = if px_max.is_finite() {
+        3.0 * px_max.max(0.0)
+    } else {
+        return None;
+    };
+    let pad = shell + px;
+    if !pad.is_finite() {
+        return None;
+    }
+    // `δ = 90°` when the pad's sine saturates. A wider cone falls out of
+    // [`add_angles`] as the full-sphere flag.
+    let sin_delta = pad.min(1.0);
+    let cos_delta = (1.0 - sin_delta * sin_delta).max(0.0).sqrt();
+    let (sin_r, cos_r) = add_angles(cos_alpha, cos_delta);
+    if sin_r > 1.0 || !sin_r.is_finite() || !cos_r.is_finite() {
+        None
+    } else {
+        Some((sin_r, cos_r))
+    }
+}
+
+/// Maximum of `dot(unit ray, dir)` on the view's direction cone.
+///
+/// `dir` is unit. The maximum on a convex spherical polygon is 1 when `dir`
+/// lies inside, otherwise on an edge. An edge's maximum is a corner or the
+/// point where the great circle passes closest to `dir`, so the four corners
+/// alone miss a graze through the middle of a side. `None` keeps the body.
+fn max_dir_dot_on_frustum(dir: glam::Vec3, view_proj: glam::Mat4) -> Option<f32> {
+    let inv = view_proj.try_inverse()?;
+    let mut corners = [glam::Vec3::ZERO; 4];
+    let mut i = 0;
+    for y in [-1.0f32, 1.0] {
+        for x in [-1.0f32, 1.0] {
+            let ray = (inv * glam::Vec4::new(x, y, 0.0, 1.0)).truncate();
+            let len2 = ray.length_squared();
+            if !(len2 > 0.0) || !ray.is_finite() {
+                return None;
+            }
+            corners[i] = ray / len2.sqrt();
+            i += 1;
+        }
+    }
+    let clip = view_proj * glam::Vec4::new(dir.x, dir.y, dir.z, 0.0);
+    if clip.is_finite() && clip.w > 0.0 {
+        let slack = 1.0e-4 * clip.w.abs();
+        if clip.x.abs() <= clip.w + slack && clip.y.abs() <= clip.w + slack {
+            return Some(1.0);
+        }
+    }
+    let mut best = f32::NEG_INFINITY;
+    for corner in corners {
+        best = best.max(dir.dot(corner));
+    }
+    // NDC order from the loops above: (-1,-1), (1,-1), (-1,1), (1,1).
+    for (ia, ib) in [(0usize, 1usize), (2, 3), (0, 2), (1, 3)] {
+        let (a, b) = (corners[ia], corners[ib]);
+        let n = a.cross(b);
+        let nlen2 = n.length_squared();
+        if !(nlen2 > 1.0e-20) {
+            continue;
+        }
+        let n = n / nlen2.sqrt();
+        let proj = dir - n * dir.dot(n);
+        let plen2 = proj.length_squared();
+        if !(plen2 > 1.0e-20) {
+            continue;
+        }
+        let u = proj / plen2.sqrt();
+        let ab = a.cross(b);
+        let on_arc = a.cross(u).dot(ab) >= -1.0e-5 && u.cross(b).dot(ab) >= -1.0e-5;
+        if on_arc {
+            best = best.max(dir.dot(u));
+        }
+    }
+    best.is_finite().then_some(best)
+}
+
+/// The widened horizon cone meets the view. A missing inverse keeps the body.
+fn horizon_cone_meets_frustum(dir: glam::Vec3, cos_alpha: f32, view_proj: glam::Mat4) -> bool {
+    let len2 = dir.length_squared();
+    if !(len2 > 0.0) || !dir.is_finite() || !cos_alpha.is_finite() {
+        return true;
+    }
+    let dir = dir / len2.sqrt();
+    match max_dir_dot_on_frustum(dir, view_proj) {
+        Some(max_dot) => max_dot >= cos_alpha - 1.0e-4,
+        None => true,
+    }
+}
+
+/// Frustum keep. A mapped body with `horizon < 1` uses the widened horizon
+/// cone, including when [`cone_bound`] is the per-pixel sentinel. `horizon >= 1`
+/// and every other shape keep the pixel-cone test.
+fn body_meets_view(body: &FarBody, bound: f32, view: &FarView) -> bool {
+    if let FarShape::Mapped { horizon, air, .. } = body.shape {
+        if horizon < 1.0 {
+            return match mapped_horizon_half(horizon, air, body.distance, view.px_max) {
+                None => true,
+                Some((_, cos_alpha)) => {
+                    horizon_cone_meets_frustum(body.dir, cos_alpha, view.view_proj)
+                }
+            };
+        }
+    }
+    cone_in_view(body.dir, bound, view)
+}
+
 /// `angle(tile centre, dir) <= a_body + a_tile`, compared in cosines.
-/// `sin_body` / `cos_body` are the body's drawable half-angle.
+/// `sin_body` / `cos_body` are the body's drawable half-angle. `cos_body` is
+/// negative when the half-angle is wider than a hemisphere.
 fn tile_within(tile: &TileSample, dir_view: glam::Vec3, sin_body: f32, cos_body: f32) -> bool {
     if tile.sin_r > 1.0 {
         return true;
@@ -745,12 +877,29 @@ fn stamp_tiles(table: &mut FarTableGpu, view: Option<&FarView>, cached: Option<&
     let tile_count = tiles_x as usize * tiles_y as usize;
     let kept = (table.header[0] as usize).min(MAX_FAR_BODIES);
     let mut blanket = 0u32;
-    let mut angular = [(0u32, glam::Vec3::ZERO, 0.0f32); MAX_FAR_BODIES];
+    // `(bit, dir, sin, cos)` of the drawable half-angle. `cos` may be negative.
+    let mut angular = [(0u32, glam::Vec3::ZERO, 0.0f32, 0.0f32); MAX_FAR_BODIES];
     let mut n_angular = 0usize;
     for k in 0..kept {
         let bit = 1u32 << k;
         let cone = table.cone[k];
         let dir = glam::Vec3::new(cone[0], cone[1], cone[2]);
+        let gpu = &table.body[k];
+        let shape = gpu.atmosphere[3];
+        let horizon = gpu.albedo0[3];
+        // Mapped + a real horizon: the tile cone is the horizon gate, even
+        // when `cone.w` is the per-pixel sentinel. `horizon >= 1` falls
+        // through to that sentinel and paints every tile.
+        if (3.5..4.5).contains(&shape) && horizon < 1.0 {
+            match mapped_horizon_half(horizon, gpu.albedo1[3], gpu.albedo2[3], view.px_max) {
+                None => blanket |= bit,
+                Some((sin_b, cos_b)) => {
+                    angular[n_angular] = (bit, dir, sin_b, cos_b);
+                    n_angular += 1;
+                }
+            }
+            continue;
+        }
         match tile_cover(dir, cone[3], view, tile_px, tiles_x, tiles_y) {
             TileCover::All => blanket |= bit,
             TileCover::None => {}
@@ -763,8 +912,14 @@ fn stamp_tiles(table: &mut FarTableGpu, view: Option<&FarView>, cached: Option<&
                 }
             }
             TileCover::Angular => {
-                angular[n_angular] = (bit, dir, cone[3]);
-                n_angular += 1;
+                let sin_body = (cone[3] + 3.0 * view.px_max).clamp(0.0, 1.0);
+                if !sin_body.is_finite() {
+                    blanket |= bit;
+                } else {
+                    let cos_body = (1.0 - sin_body * sin_body).max(0.0).sqrt();
+                    angular[n_angular] = (bit, dir, sin_body, cos_body);
+                    n_angular += 1;
+                }
             }
         }
     }
@@ -779,15 +934,15 @@ fn stamp_tiles(table: &mut FarTableGpu, view: Option<&FarView>, cached: Option<&
     fill_tile_lists(table, view.width, view.height);
 }
 
-/// Set bit `k` on each tile whose view-space cone meets the body's.
-/// `a_body = asin(min(bound + 3 px_max, 1))` (bound 1 is 90°). A missing frame
-/// cache is built for this view; a projection that yields no basis paints the
-/// body into every tile.
+/// Set bit `k` on each tile whose view-space cone meets the body's half-angle
+/// `(sin, cos)`. `cos` is negative past 90°. A missing frame cache is built
+/// for this view; a projection that yields no basis paints the body into
+/// every tile.
 fn paint_angular(
     table: &mut FarTableGpu,
     view: &FarView,
     cached: Option<&TileFrames>,
-    angular: &[(u32, glam::Vec3, f32)],
+    angular: &[(u32, glam::Vec3, f32, f32)],
     blanket: &mut u32,
 ) {
     let owned = if cached.is_some_and(|frames| frames.matches(view)) {
@@ -799,19 +954,19 @@ fn paint_angular(
         .filter(|frames| frames.matches(view))
         .or(owned.as_ref())
     else {
-        for (bit, _, _) in angular {
+        for (bit, _, _, _) in angular {
             *blanket |= *bit;
         }
         return;
     };
     let Some(basis) = ViewBasis::from_view_proj(view.view_proj) else {
-        for (bit, _, _) in angular {
+        for (bit, _, _, _) in angular {
             *blanket |= *bit;
         }
         return;
     };
     let n = frames.samples.len().min(table.tile_mask.len());
-    for &(bit, dir, bound) in angular {
+    for &(bit, dir, sin_body, cos_body) in angular {
         let len2 = dir.length_squared();
         if !(len2 > 0.0) || !len2.is_finite() {
             *blanket |= bit;
@@ -824,12 +979,10 @@ fn paint_angular(
             continue;
         }
         let dir_view = dir_view / dir_len2.sqrt();
-        let sin_body = (bound + 3.0 * view.px_max).clamp(0.0, 1.0);
-        if !sin_body.is_finite() {
+        if !(sin_body.is_finite() && cos_body.is_finite()) {
             *blanket |= bit;
             continue;
         }
-        let cos_body = (1.0 - sin_body * sin_body).max(0.0).sqrt();
         for (i, tile) in frames.samples.iter().enumerate().take(n) {
             if tile_within(tile, dir_view, sin_body, cos_body) {
                 table.tile_mask[i] |= bit;
@@ -1172,8 +1325,9 @@ fn nonzero_tiles(table: &FarTableGpu) -> u64 {
 /// (the sky composite is order-dependent). `None` keeps every body. Each kept
 /// body then sets its bit in the screen tiles its drawable cone can reach.
 /// `map_max[i]` is map `i`'s maximum datum offset, used for a mapped body's
-/// cone. The sine is the hi radius plus `air/distance` (`-1` when that reach
-/// is at least 0.99, which paints every tile).
+/// per-pixel cone. That sine is the hi radius plus `air/distance` (`-1` when
+/// that reach is at least 0.99). A mapped body with `horizon < 1` paints tiles
+/// from the horizon cone instead, so the sentinel does not cover the sky.
 #[cfg(test)]
 pub(crate) fn pack_table(
     bodies: &[FarBody],
@@ -1248,7 +1402,7 @@ fn pack_table_cached(
         let bound = cone_bound(body, map_max);
         if cull {
             if let Some(view) = view {
-                if !cone_in_view(body.dir, bound, view) {
+                if !body_meets_view(body, bound, view) {
                     continue;
                 }
             }
@@ -2837,6 +2991,220 @@ mod tests {
             table.tile_mask[bottom] & 1,
             0,
             "bottom-centre tile missed the planet"
+        );
+    }
+
+    fn mapped_down(distance: f32, radius: f32, horizon: f32, air: f32) -> FarBody {
+        FarBody {
+            dir: -Vec3::Y,
+            distance,
+            radius,
+            shape: FarShape::Mapped {
+                map: FarMapId(0),
+                horizon,
+                air,
+            },
+            rotation: Quat::IDENTITY,
+            albedo: [LinearRgb([0.2, 0.2, 0.2]); 6],
+            atmosphere: LinearRgb([0.1, 0.2, 0.3]),
+            seed: 7,
+        }
+    }
+
+    /// The per-pixel cone stays the hi-sphere sentinel. Tiles use the horizon
+    /// cone widened by the air limb, so a gate pixel and a limb pixel keep the
+    /// bit and the sky above that cone does not.
+    #[test]
+    fn mapped_horizon_tiles_cover_the_gate_and_leave_the_sky_clear() {
+        let mut map_max = [0.0f32; MAX_FAR_MAPS];
+        // (radius + max) / distance = 11/4 > 0.99, so cone.w is the sentinel.
+        map_max[0] = 10.0;
+        let distance = 4.0f32;
+        let horizon = 0.04f32;
+        // 0.15 rad of air is several 64 px tiles at 1440p, so the limb pulls
+        // in tiles the raw horizon cone misses.
+        let air = 0.6f32;
+        let body = mapped_down(distance, 1.0, horizon, air);
+
+        let wide = view_pitched(0.0, 70.0, 3440, 1440);
+        let disabled = mapped_down(distance, 1.0, 1.0, air);
+        let all = super::pack_table(std::slice::from_ref(&disabled), Some(wide), &map_max);
+        assert_eq!(all.cone[0][3].to_bits(), (-1.0f32).to_bits());
+        let wide_tiles = used_tiles(&all);
+        assert_eq!(wide_tiles, 1242);
+        assert!(
+            all.tile_mask[..wide_tiles].iter().all(|mask| mask & 1 != 0),
+            "horizon >= 1 must keep today's full-sky mask"
+        );
+
+        let level = super::pack_table(std::slice::from_ref(&body), Some(wide), &map_max);
+        assert_eq!(level.header[0], 1);
+        assert_eq!(
+            level.cone[0][3].to_bits(),
+            (-1.0f32).to_bits(),
+            "the per-pixel cone is still the sentinel"
+        );
+        let painted = level.tile_mask[..wide_tiles]
+            .iter()
+            .filter(|mask| *mask & 1 != 0)
+            .count();
+        assert!(
+            painted > 0 && painted < wide_tiles,
+            "painted {painted} of {wide_tiles}"
+        );
+
+        let (sin_air, cos_air) =
+            mapped_horizon_half(horizon, air, distance, wide.px_max).expect("widened cone");
+        let (sin_raw, cos_raw) =
+            mapped_horizon_half(horizon, 0.0, distance, wide.px_max).expect("raw cone");
+        let frames = TileFrames::build(&wide).expect("frames");
+        let basis = ViewBasis::from_view_proj(wide.view_proj).expect("basis");
+        let dir_view = basis.to_view(-Vec3::Y);
+        let mut limb_tiles = 0u32;
+        let mut clear_tiles = 0u32;
+        for (i, tile) in frames.samples.iter().enumerate() {
+            let in_air = tile_within(tile, dir_view, sin_air, cos_air);
+            let in_raw = tile_within(tile, dir_view, sin_raw, cos_raw);
+            if in_air && !in_raw {
+                assert_ne!(level.tile_mask[i] & 1, 0, "limb tile {i} missed the bit");
+                limb_tiles += 1;
+            }
+            if !in_air {
+                assert_eq!(level.tile_mask[i] & 1, 0, "sky tile {i} kept the bit");
+                clear_tiles += 1;
+            }
+        }
+        assert!(
+            limb_tiles > 0,
+            "the air limb painted no tile past the raw gate"
+        );
+        assert!(clear_tiles > 0, "no tile sits outside the horizon cone");
+
+        // 85° up, 50° vertical fov: the whole view is above the widened cone.
+        let steep = view_pitched(85.0, 50.0, 800, 600);
+        let culled = super::pack_table(std::slice::from_ref(&body), Some(steep), &map_max);
+        assert_eq!(culled.header[0], 0, "a sky-only view kept the planet");
+
+        let mut gate_pixels = 0u32;
+        let mut limb_pixels = 0u32;
+        let frames_px = [
+            (40.0f32, 60.0f32, 382u32, 160u32),
+            (0.0, 70.0, 382, 160),
+            (0.0, 90.0, 640, 360),
+            (-25.0, 70.0, 640, 360),
+            (-70.0, 60.0, 382, 160),
+            (0.0, 70.0, 3440, 1440),
+            (30.0, 70.0, 3440, 1440),
+            (85.0, 50.0, 800, 600),
+        ];
+        for &(pitch, fovy, w, h) in &frames_px {
+            let view = view_pitched(pitch, fovy, w, h);
+            let table = super::pack_table(std::slice::from_ref(&body), Some(view), &map_max);
+            let Some((_, cos_b)) = mapped_horizon_half(horizon, air, distance, view.px_max) else {
+                continue;
+            };
+            let kept = table.header[0] == 1;
+            if kept {
+                assert_eq!(table.cone[0][3].to_bits(), (-1.0f32).to_bits());
+            }
+            let tile_px = table.header[1];
+            let tiles_x = table.header[2];
+            let n_tiles = used_tiles(&table);
+            let inv = view.view_proj.inverse();
+            for y in 0..h {
+                for x in 0..w {
+                    let ray = ray_at(&inv, w, h, x as f32 + 0.5, y as f32 + 0.5);
+                    if !ray.is_finite() {
+                        continue;
+                    }
+                    // Shader gate: `dot(ray, -dir) <= horizon`. dir is −Y.
+                    let gate = ray.dot(Vec3::Y) <= horizon;
+                    let along = ray.dot(-Vec3::Y);
+                    let in_limb = along >= cos_b + 1.0e-4;
+                    if !gate && !in_limb {
+                        continue;
+                    }
+                    assert!(
+                        kept,
+                        "pitch {pitch} fov {fovy} {w}x{h} dropped a ray inside the cone"
+                    );
+                    let tile_i = tile_at(x as f32 + 0.5, y as f32 + 0.5, tile_px, tiles_x);
+                    assert!(
+                        tile_i < n_tiles && table.tile_mask[tile_i] & 1 != 0,
+                        "pitch {pitch} fov {fovy} {w}x{h} pixel {x},{y} gate {gate} along {along} cos {cos_b}"
+                    );
+                    if gate {
+                        gate_pixels += 1;
+                    } else {
+                        limb_pixels += 1;
+                    }
+                }
+            }
+        }
+        assert!(gate_pixels > 1000, "gate scan never passed, {gate_pixels}");
+        assert!(
+            limb_pixels > 0,
+            "no pixel sat in the air limb past the raw gate"
+        );
+
+        // Finite per-pixel sine. The horizon cone is wider, so a gate ray the
+        // pixel cone rejects still carries the bit.
+        map_max[0] = 0.0;
+        let far = mapped_down(10.0, 1.0, -0.2, 0.05);
+        let down = view_pitched(-40.0, 70.0, 640, 360);
+        let finite = super::pack_table(std::slice::from_ref(&far), Some(down), &map_max);
+        assert_eq!(finite.header[0], 1);
+        let bound = finite.cone[0][3];
+        assert!(
+            bound > 0.0 && bound < 0.2,
+            "expected the hi-sphere sine, got {bound}"
+        );
+        let inv = down.view_proj.inverse();
+        let tile_px = finite.header[1];
+        let tiles_x = finite.header[2];
+        let mut gate = 0u32;
+        let mut past_pixel_cone = 0u32;
+        for y in 0..down.height {
+            for x in 0..down.width {
+                let (ray, px) = ray_and_px(
+                    &inv,
+                    down.width,
+                    down.height,
+                    x as f32 + 0.5,
+                    y as f32 + 0.5,
+                );
+                if !ray.is_finite() || ray.dot(Vec3::Y) > -0.2 {
+                    continue;
+                }
+                gate += 1;
+                let tile_i = tile_at(x as f32 + 0.5, y as f32 + 0.5, tile_px, tiles_x);
+                assert!(
+                    finite.tile_mask[tile_i] & 1 != 0,
+                    "gate pixel {x},{y} missed the horizon-cone bit"
+                );
+                if !shader_accepts(ray, finite.cone[0], px) {
+                    past_pixel_cone += 1;
+                }
+            }
+        }
+        assert!(gate > 100, "finite-cone view held no gate pixel");
+        assert!(
+            past_pixel_cone > 0,
+            "the horizon cone was no wider than the per-pixel sine"
+        );
+
+        // horizon >= 1 with a finite sine keeps today's disc, not the whole sky.
+        // The disc is ~6° around nadir, so the view has to look nearly straight down.
+        let nadir = view_pitched(-85.0, 40.0, 640, 360);
+        let off = mapped_down(10.0, 1.0, 1.0, 0.0);
+        let today = super::pack_table(std::slice::from_ref(&off), Some(nadir), &map_max);
+        assert_eq!(today.header[0], 1);
+        assert!(today.cone[0][3] > 0.0);
+        let n = used_tiles(&today);
+        let painted_today = today.tile_mask[..n].iter().filter(|m| *m & 1 != 0).count();
+        assert!(
+            painted_today > 0 && painted_today < n,
+            "horizon >= 1 painted {painted_today} of {n}"
         );
     }
 
