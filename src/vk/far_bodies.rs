@@ -1360,46 +1360,32 @@ fn split_coarse_base(
 
 /// Stably partition the heavy run into mapped-interior tiles, then the rest.
 /// Returns the coarse count. A tile qualifies when its mask is exactly one
-/// mapped body (no other body, and so no nearer body, can cover it), neither
-/// disc meets it, and its cone lies strictly inside one of:
+/// mapped body (no other body, and so no nearer body, can cover it) and its
+/// cone lies strictly inside one of:
 ///
 /// * the horizon disc inset by the air limb and 3 px, when `horizon < 1`;
 /// * the lo-sphere disc inset by 2 px, when the eye is outside that sphere.
 ///   The tile cone already carries the tile's angular radius, so the inset
 ///   is the rest of the margin.
 ///
-/// Stars, a missing frame, or an unusable disc leave the run unchanged and
-/// return 0. `map_min[i]` is map `i`'s minimum datum offset.
+/// Every pixel of that tile is a surface hit, and the hit replaces the sky
+/// colour. Stars and the sun/moon discs are composited before far bodies, so
+/// they do not keep the tile at 1×1 — that gate is only for empty base-sky
+/// tiles ([`split_coarse_base`]). A missing frame leaves the run unchanged
+/// and returns 0. `map_min[i]` is map `i`'s minimum datum offset. `query` is
+/// the same value the base split uses; the interior does not read it.
 fn split_coarse_far(
     table: &mut FarTableGpu,
     frames: &TileFrames,
     view: &FarView,
-    query: &SkyCoarseQuery,
+    _query: &SkyCoarseQuery,
     map_min: &[f32; MAX_FAR_MAPS],
 ) -> u32 {
-    if query.stars {
-        return 0;
-    }
     let (n_base, n_sphere, n_heavy) = tile_split(table);
     if n_heavy == 0 || !frames.matches(view) {
         return 0;
     }
     let Some(basis) = ViewBasis::from_view_proj(view.view_proj) else {
-        return 0;
-    };
-    let Some(sun) = unit_dir(query.sun_dir) else {
-        return 0;
-    };
-    let Some(sun_view) = unit_dir(basis.to_view(sun)) else {
-        return 0;
-    };
-    let Some(moon_view) = unit_dir(basis.to_view(-sun)) else {
-        return 0;
-    };
-    let Some((sun_sin, sun_cos)) = widened_disc(query.sun_cos_rim, view.px_max) else {
-        return 0;
-    };
-    let Some((moon_sin, moon_cos)) = widened_disc(query.moon_cos_rim, view.px_max) else {
         return 0;
     };
     let kept = (table.header[0] as usize).min(MAX_FAR_BODIES);
@@ -1460,9 +1446,7 @@ fn split_coarse_far(
                 }
                 None => false,
             };
-            (in_horizon || in_lo)
-                && !tile_within(tile, sun_view, sun_sin, sun_cos)
-                && !tile_within(tile, moon_view, moon_sin, moon_cos)
+            in_horizon || in_lo
         };
         take.push(inside);
     }
@@ -4405,22 +4389,6 @@ mod tests {
         }
         assert!(boundary > 0, "every heavy tile was interior");
 
-        // Stars leave the heavy run put. A horizon of 1 does not: the lo sphere
-        // still classifies tiles, covered below.
-        let mut starred = super::pack_table(std::slice::from_ref(&body), Some(view), &map_max);
-        let star_before = starred.tile_index[start..end].to_vec();
-        assert_eq!(
-            split_coarse_far(
-                &mut starred,
-                &frames,
-                &view,
-                &coarse_query(Vec3::Z, true),
-                &map_min,
-            ),
-            0
-        );
-        assert_eq!(&starred.tile_index[start..end], star_before.as_slice());
-
         // horizon >= 1 disables the horizon disc. The lo sphere still admits
         // tiles: min offset 0 makes rho_lo = rho = 0.75, and a downward view
         // puts the centre inside that disc while the corners stay out.
@@ -4442,22 +4410,13 @@ mod tests {
         let (sin_lo, cos_lo) = lo_disc_interior(0.75, down.px_max).expect("lo disc");
         let down_basis = ViewBasis::from_view_proj(down.view_proj).expect("down basis");
         let down_dir = down_basis.to_view(-Vec3::Y).normalize();
-        let Some(sun) = unit_dir(Vec3::Y) else {
-            panic!("sun");
-        };
-        let sun_view = down_basis.to_view(sun).normalize();
-        let moon_view = down_basis.to_view(-sun).normalize();
-        let (sun_sin, sun_cos) =
-            widened_disc(coarse_query(Vec3::Y, false).sun_cos_rim, down.px_max).expect("sun disc");
-        let (moon_sin, moon_cos) =
-            widened_disc(coarse_query(Vec3::Y, false).moon_cos_rim, down.px_max).expect("moon");
         let lo_coarse = &off.tile_index[off_start..off_start + n_lo as usize];
         let lo_fine = &off.tile_index[off_start + n_lo as usize..off_end];
         for &index in &off_before {
             let tile = &down_frames.samples[index as usize];
-            let inside = tile_strictly_inside(tile, down_dir, sin_lo, cos_lo)
-                && !tile_within(tile, sun_view, sun_sin, sun_cos)
-                && !tile_within(tile, moon_view, moon_sin, moon_cos);
+            // Stars and discs do not knock an interior tile out: the hit
+            // covers them. The sun sits on +Y here and would have done so.
+            let inside = tile_strictly_inside(tile, down_dir, sin_lo, cos_lo);
             if inside {
                 assert!(
                     lo_coarse.contains(&index),
@@ -4499,20 +4458,57 @@ mod tests {
             assert_eq!(both.tile_mask[index as usize], 1);
         }
 
-        // A sun disc aimed down the body covers the interior. Nothing goes coarse.
+        // A sun disc aimed down the body used to empty the prefix. The surface
+        // hit replaces the disc, so the interior still goes coarse.
         let mut covered = super::pack_table(std::slice::from_ref(&body), Some(view), &map_max);
-        let mut query = coarse_query(-Vec3::Y, false);
+        let mut query = coarse_query(-Vec3::Y, true);
         query.sun_cos_rim = 0.0;
-        assert_eq!(
-            split_coarse_far(&mut covered, &frames, &view, &query, &map_min),
-            0
+        assert!(
+            split_coarse_far(&mut covered, &frames, &view, &query, &map_min) > 0,
+            "a sun over the interior suppressed every coarse tile"
         );
+    }
+
+    /// Daytime with the star floor up, and the sun disc covering the ground
+    /// body's interior. Tiles below the horizon still join the 2×2 run.
+    #[test]
+    fn stars_and_a_sun_in_view_still_coarse_the_interior() {
+        let view = view_pitched(0.0, 90.0, 1280, 720);
+        let frames = TileFrames::build(&view).expect("frames");
+        let map_max = [0.0f32; MAX_FAR_MAPS];
+        let map_min = [0.0f32; MAX_FAR_MAPS];
+        let body = mapped_down(4.0, 1.0, 0.0, 0.0);
+        let mut table = super::pack_table(std::slice::from_ref(&body), Some(view), &map_max);
+        let (start, end) = heavy_run(&table);
+        assert!(end > start);
+        let mut query = coarse_query(-Vec3::Y, true);
+        // cos 0 is a 90° rim: the sun disc meets every tile that sees the body.
+        query.sun_cos_rim = 0.0;
+        let n = split_coarse_far(&mut table, &frames, &view, &query, &map_min);
+        assert!(n > 0, "stars and the sun left the interior at 1x1");
+        let (sin_b, cos_b) =
+            mapped_interior_half(0.0, 0.0, 4.0, view.px_max).expect("interior cone");
+        let basis = ViewBasis::from_view_proj(view.view_proj).expect("basis");
+        let dir_view = basis.to_view(-Vec3::Y).normalize();
+        let coarse = &table.tile_index[start..start + n as usize];
+        let mut interiors = 0u32;
+        for &index in &table.tile_index[start..end] {
+            let tile = &frames.samples[index as usize];
+            if tile_strictly_inside(tile, dir_view, sin_b, cos_b) {
+                interiors += 1;
+                assert!(
+                    coarse.contains(&index),
+                    "interior tile {index} stayed at 1x1 under stars and the sun"
+                );
+            }
+        }
+        assert!(interiors > 0, "no tile sat below the horizon");
     }
 
     /// Every pixel of a lo-sphere interior tile meets the datum. Altitudes run
     /// from 10 m to 1e6 m above the lo sphere; the horizon lane stays at 1 so
-    /// only the lo disc can admit a tile. The sun and moon sit on ±X, ninety
-    /// degrees off a view in the YZ plane, so a disc does not knock a tile out.
+    /// only the lo disc can admit a tile. Stars stay off here; a disc no longer
+    /// removes an interior tile.
     #[test]
     fn lo_interior_pixels_hit_the_mapped_surface() {
         let radius = 31_017_520.0f32;
