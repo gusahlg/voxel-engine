@@ -177,20 +177,44 @@ impl FrameUniformsExt {
             sky_tangent: [tangent.x, tangent.y, tangent.z, 0.0],
             sky_up: [up.x, up.y, up.z, local.altitude],
             sky_bitangent: [bitangent.x, bitangent.y, bitangent.z, 0.0],
+            morph_eye_block: [0; 4],
+            morph_eye_frac: [0.0; 4],
+            morph_band: [[0.0; 4]; 16],
         }
+    }
+
+    /// Copy the LOD-morph tail. `derive` leaves it zero (morphing off).
+    pub(crate) fn apply_lod_morph(&mut self, morph: LodMorphGpu) {
+        self.morph_eye_block = morph.eye_block;
+        self.morph_eye_frac = morph.eye_frac;
+        self.morph_band = morph.bands;
     }
 }
 
+/// Bit 0 of `morph_eye_block.w`: this frame's LOD morph bands are live.
+pub(crate) const LOD_MORPH_FLAG: i32 = 1;
+
+/// Engine-derived LOD morph block appended after the float4 lanes.
+/// xyz of `eye_block` / `eye_frac` are the camera-style split of `set_lod_morph`'s
+/// eye; `eye_block.w` bit 0 is [`LOD_MORPH_FLAG`]. `bands[k]` is `(half.xyz, start)`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct LodMorphGpu {
+    pub eye_block: [i32; 4],
+    pub eye_frac: [f32; 4],
+    pub bands: [[f32; 4]; 16],
+}
+
 // Bumped when the GPU `FrameUniforms` layout changes (public prefix or the
-// engine-derived tail). 7 adds the local sky basis.
-pub const FRAME_UNIFORMS_VERSION: u32 = 7;
+// engine-derived tail). 8 adds the LOD morph tail (eye split + 16 bands).
+pub const FRAME_UNIFORMS_VERSION: u32 = 8;
 
 /// The per-frame UBO ring. Indexed only by [`FrameSlot`],
 /// so raw-usize slot confusion is inexpressible here.
 pub(crate) struct UboRing {
     bufs: PerSlot<HostBuffer>,
     last: PerSlot<Option<FrameUniformsExt>>,
-    last_gpu: PerSlot<Option<(FrameUniformsGpu, RenderFlags, LocalFrame)>>,
+    last_gpu: PerSlot<Option<(FrameUniformsGpu, RenderFlags, LocalFrame, LodMorphGpu)>>,
 }
 
 impl UboRing {
@@ -233,19 +257,22 @@ impl UboRing {
     }
 
     /// Derive the engine tail and write, skipping both when this slot already
-    /// holds `u` (sky/lighting-dependent work independent of jittered view-proj).
+    /// holds `u` and `morph` (sky/lighting-dependent work independent of jittered view-proj).
     pub(crate) fn write_from_gpu(
         &mut self,
         slot: FrameSlot,
         u: FrameUniformsGpu,
         flags: RenderFlags,
         local: LocalFrame,
+        morph: LodMorphGpu,
     ) {
-        if self.last_gpu[slot] == Some((u, flags, local)) {
+        if self.last_gpu[slot] == Some((u, flags, local, morph)) {
             return;
         }
-        self.write(slot, &FrameUniformsExt::derive(u, flags, local));
-        self.last_gpu[slot] = Some((u, flags, local));
+        let mut ext = FrameUniformsExt::derive(u, flags, local);
+        ext.apply_lod_morph(morph);
+        self.write(slot, &ext);
+        self.last_gpu[slot] = Some((u, flags, local, morph));
     }
 
     /// The buffer bound at set 0, binding 2 for `slot`. The per-frame UBO is
@@ -305,13 +332,39 @@ mod tests {
     #[test]
     fn public_wire_stays_eight_lanes() {
         assert_eq!(size_of::<FrameUniformsGpu>(), 128);
-        assert_eq!(size_of::<FrameUniformsExt>(), 224);
+        assert_eq!(size_of::<FrameUniformsExt>(), 512);
+        assert_eq!(size_of::<LodMorphGpu>(), 288);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, ambient_glow), 128);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, glow_day), 144);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, shadow_bounce), 160);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, sky_tangent), 176);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, sky_up), 192);
         assert_eq!(std::mem::offset_of!(FrameUniformsExt, sky_bitangent), 208);
+        assert_eq!(std::mem::offset_of!(FrameUniformsExt, morph_eye_block), 224);
+        assert_eq!(std::mem::offset_of!(FrameUniformsExt, morph_eye_frac), 240);
+        assert_eq!(std::mem::offset_of!(FrameUniformsExt, morph_band), 256);
+        assert_eq!(size_of::<FrameUniformsExt>() % 16, 0);
+        assert!(size_of::<FrameUniformsExt>() <= 16384);
+    }
+
+    #[test]
+    fn derive_zeroes_lod_morph_and_apply_writes_the_tail() {
+        let ext = derive_default(FrameUniformsGpu::full_bright());
+        assert_eq!(ext.morph_eye_block, [0; 4]);
+        assert_eq!(ext.morph_eye_frac, [0.0; 4]);
+        assert_eq!(ext.morph_band, [[0.0; 4]; 16]);
+        assert_eq!(ext.base.extras[0], 1.0);
+        let mut morph = LodMorphGpu::default();
+        morph.eye_block = [9, -3, 4, LOD_MORPH_FLAG];
+        morph.eye_frac = [0.25, 0.5, 0.75, 0.0];
+        morph.bands[3] = [10.0, 20.0, 30.0, 0.5];
+        let mut ext = ext;
+        ext.apply_lod_morph(morph);
+        assert_eq!(ext.morph_eye_block, morph.eye_block);
+        assert_eq!(ext.morph_eye_frac, morph.eye_frac);
+        assert_eq!(ext.morph_band[3], morph.bands[3]);
+        assert_eq!(ext.morph_band[2], [0.0; 4]);
+        assert_eq!(ext.base.extras[0], 1.0);
     }
 
     #[test]

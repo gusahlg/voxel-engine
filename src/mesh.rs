@@ -5,7 +5,7 @@
 /// See bit shifts below (SHIFT_*/MASK_*); mirrored by Slang unpack in mesh3d.vert.
 ///
 /// Word 0: x[0:5] y[5:10] z[10:15] normal[15:18] layer[18:32]
-/// Word 1: ao[0:2] skylight[2:6] blocklight[6:10] water[10] micro[11:17]
+/// Word 1: ao[0:2] skylight[2:6] blocklight[6:10] water[10] micro[11:17) morph[17:23)
 ///
 /// AO, skylight, blocklight baked per-vertex; read as diffuse multiplier + amounts.
 ///
@@ -33,6 +33,10 @@ pub const SHIFT_MICRO_Y: u32 = 13;
 pub const SHIFT_MICRO_Z: u32 = 15;
 /// Two-bit mask for one micro-offset axis.
 pub const MASK_MICRO: u32 = 0x3;
+/// Morph target in w1[17:23): 6-bit two's complement, -31..=31 cells along local +Y.
+pub const SHIFT_MORPH: u32 = 17;
+/// Six-bit mask for [`SHIFT_MORPH`].
+pub const MASK_MORPH: u32 = 0x3F;
 
 // Field masks (applied on pack so a debug-only out-of-range value can never
 // corrupt an adjacent field; the typed API keeps values in range anyway).
@@ -198,6 +202,30 @@ impl MeshVertex {
         })
     }
 
+    /// Morph target: signed offset, in this mesh's cells along local +Y, to the parent level's surface.
+    /// Clamped to -31..=31. 0 = never moves. Stored in w1 bits [17:23) (6-bit two's complement).
+    pub const fn with_morph(mut self, dy: i8) -> Self {
+        let clamped = if dy < -31 {
+            -31
+        } else if dy > 31 {
+            31
+        } else {
+            dy
+        };
+        let bits = (clamped as u32) & MASK_MORPH;
+        self.packed[1] = (self.packed[1] & !(MASK_MORPH << SHIFT_MORPH)) | (bits << SHIFT_MORPH);
+        self
+    }
+
+    /// The morph target stored by [`Self::with_morph`], sign-extended from w1 bits [17:23).
+    ///
+    /// The shift is the shader's: `int(w1 << 9) >> 26` moves bit 22 onto the sign and bit 17
+    /// down to bit 0. `as` binds tighter than the shifts, so the cast is parenthesized.
+    pub const fn morph(&self) -> i8 {
+        let w1 = self.packed[1];
+        (((w1 << 9) as i32) >> 26) as i8
+    }
+
     /// Decodes the chunk-local integer position as floats (for CPU-side AABBs).
     pub fn local_pos(&self) -> [f32; 3] {
         let ([x, y, z], ..) = unpack(self.packed);
@@ -233,8 +261,8 @@ impl MeshVertex {
 /// The sole CPU-side mirror of the Slang unpack in `mesh3d.vert.slang`. Returns
 /// raw field integers (`pos`, normal index, layer, ao, sky, block); typed
 /// callers map from there. Keeping one decoder means the shift/mask consts are
-/// applied in exactly one place per direction (pack/unpack). Word-1's water/micro
-/// bits are decoded separately (they are not part of this tuple).
+/// applied in exactly one place per direction (pack/unpack). Word-1's water, micro,
+/// and morph bits are decoded separately (they are not part of this tuple).
 const fn unpack(packed: [u32; 2]) -> ([u32; 3], u8, u16, u8, u8, u8) {
     let [w0, w1] = packed;
     let pos = [
@@ -430,7 +458,8 @@ pub use crate::producer::Detail;
 /// shader subtracts the camera's integer block before any float narrowing, so
 /// far terrain never jitters); `local_off` covers non-integer placements
 /// (movers such as avatars) and stays zero for terrain. `cage` bends the mesh
-/// through eight corners; `None` is the flat path.
+/// through eight corners; `None` is the flat path. For [`Self::caged_at`],
+/// `block` is the LOD-morph metric origin while the cage still places vertices.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct MeshPlacement {
     pub block: glam::IVec3,
@@ -452,10 +481,23 @@ impl MeshPlacement {
 
     /// A mesh bent through `cage`. The anchor lives on the cage, so `block`
     /// and `local_off` stay zero. Freeing the cage while a mesh still names it
-    /// drops that mesh back to the origin.
+    /// drops that mesh back to the origin. Use [`Self::caged_at`] when the
+    /// morph metric needs that origin to be the section's frontier-frame block.
     pub fn caged(cage: crate::CageHandle, detail: Detail) -> Self {
         Self {
             block: glam::IVec3::ZERO,
+            local_off: glam::Vec3::ZERO,
+            detail,
+            cage: Some(cage),
+        }
+    }
+
+    /// A caged mesh whose LOD-morph metric origin is `origin` (the section's
+    /// origin in the caller's LOD frontier frame, in blocks). Placement still
+    /// comes from the cage; `block` stores `origin`.
+    pub fn caged_at(cage: crate::CageHandle, detail: Detail, origin: glam::IVec3) -> Self {
+        Self {
+            block: origin,
             local_off: glam::Vec3::ZERO,
             detail,
             cage: Some(cage),
@@ -585,6 +627,101 @@ mod tests {
         // The default constructor decodes to no offset.
         let plain = MeshVertex::new([0, 0, 0], Normal::PosX, 0, Ao::NONE, Light::DAY, false);
         assert_eq!(plain.micro(), [0, 0, 0]);
+    }
+
+    /// Shader decode of w1 bits [17:23). `as` binds tighter than `<<` / `>>`.
+    fn shader_morph(w1: u32) -> i8 {
+        (((w1 << 9) as i32) >> 26) as i8
+    }
+
+    #[test]
+    fn morph_round_trip_is_bits_17_through_22() {
+        let base = MeshVertex::new(
+            [3, 5, 7],
+            Normal::NegY,
+            42,
+            Ao::new(2),
+            Light::new(11, 4),
+            true,
+        )
+        .with_micro([-2, 1, -1]);
+        let mut base = base;
+        // Bits [23:32) are unused today; a morph write must leave them alone.
+        base.packed[1] |= 0x1FF << 23;
+        let field = MASK_MORPH << SHIFT_MORPH;
+        for dy in -31i8..=31 {
+            let v = base.with_morph(dy);
+            assert_eq!(v.morph(), dy, "dy {dy}");
+            assert_eq!(shader_morph(v.packed[1]), dy, "shader shift dy {dy}");
+            assert_eq!(
+                v.packed[1] & !field,
+                base.packed[1] & !field,
+                "other bits dy {dy}"
+            );
+            assert_eq!(
+                (v.packed[1] >> SHIFT_MORPH) & MASK_MORPH,
+                (dy as u32) & MASK_MORPH
+            );
+            assert_eq!(v.micro(), [-2, 1, -1]);
+            assert!(v.is_water());
+            assert_eq!(typed_unpack(v), typed_unpack(base));
+            assert_eq!(v.with_morph(dy).packed, v.packed, "idempotent dy {dy}");
+        }
+        assert_eq!(base.with_morph(-128).morph(), -31);
+        assert_eq!(base.with_morph(127).morph(), 31);
+        assert_eq!(base.with_morph(-32).morph(), -31);
+        assert_eq!(base.with_morph(32).morph(), 31);
+        // Micro and morph occupy different bits, either order. `with_micro` ors
+        // its field, so this starts from a vertex that has neither set.
+        let plain = MeshVertex::new(
+            [3, 5, 7],
+            Normal::NegY,
+            42,
+            Ao::new(2),
+            Light::new(11, 4),
+            true,
+        );
+        let morph_then_micro = plain.with_morph(-17).with_micro([1, -2, 0]);
+        let micro_then_morph = plain.with_micro([1, -2, 0]).with_morph(-17);
+        assert_eq!(morph_then_micro.morph(), -17);
+        assert_eq!(micro_then_morph.morph(), -17);
+        assert_eq!(morph_then_micro.micro(), [1, -2, 0]);
+        assert_eq!(micro_then_morph.micro(), [1, -2, 0]);
+        assert_eq!(base.morph(), 0);
+    }
+
+    #[test]
+    fn caged_at_stores_the_morph_origin() {
+        use crate::vk::handles::{DrawDyn, GpuHandle, MeshMeta, PlacementState};
+        use crate::vk::records::MeshRecord;
+
+        let detail = Detail::FULL;
+        let cage = crate::CageHandle::from_parts(3, std::num::NonZeroU32::new(2).unwrap());
+        let origin = glam::IVec3::new(40, -8, 1000);
+        let at = MeshPlacement::caged_at(cage, detail, origin);
+        assert_eq!(at.block, origin);
+        assert_eq!(at.local_off, glam::Vec3::ZERO);
+        assert_eq!(at.detail, detail);
+        assert_eq!(at.cage, Some(cage));
+        let zero = MeshPlacement::caged(cage, detail);
+        assert_eq!(zero.block, glam::IVec3::ZERO);
+        assert!(at.supersedes(&zero));
+        let moved = MeshPlacement::caged_at(cage, detail, origin + glam::IVec3::X);
+        assert!(moved.supersedes(&at));
+        assert!(!at.supersedes(&at));
+
+        let meta = MeshMeta {
+            aabb_min: glam::Vec3::ZERO,
+            aabb_max: glam::Vec3::ONE,
+            bounds: [0; 7],
+            vertex_offset: 0,
+            pass: Pass::Opaque,
+            placement: PlacementState::Pinned,
+            dyn_lane: DrawDyn::resting(),
+        };
+        let rec = MeshRecord::compose(&meta, at);
+        assert_eq!(rec.block, origin.to_array());
+        assert_eq!(rec.cage, cage.gpu_index());
     }
 
     #[test]

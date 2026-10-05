@@ -671,11 +671,21 @@ impl Renderer {
                     .buffer(bufs.cages)
                     .offset(0)
                     .range(vk::WHOLE_SIZE)];
+                // The occluder vertex shader reads the morph tail. The UBO was
+                // written earlier this frame; binding 2 is already in layout_3d.
+                let ubo_info = [vk::DescriptorBufferInfo::default()
+                    .buffer(self.ubo_ring.buffer(FrameSlot::new(slot)))
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)];
                 let write = [
                     vk::WriteDescriptorSet::default()
                         .dst_binding(super::mesh3d_desc::MESH3D_BINDING_RECORDS)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .buffer_info(&records_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_binding(super::mesh3d_desc::MESH3D_BINDING_FRAME_UBO)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .buffer_info(&ubo_info),
                     vk::WriteDescriptorSet::default()
                         .dst_binding(super::mesh3d_desc::MESH3D_BINDING_CAGES)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)

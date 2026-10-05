@@ -26,6 +26,7 @@ pub(crate) mod host_buffer;
 pub(crate) mod image;
 pub(crate) mod image_upload;
 pub(crate) mod instance;
+pub(crate) mod lod_morph;
 pub(crate) mod materials;
 pub(crate) mod mesh3d_desc;
 pub(crate) mod mesh_residency;

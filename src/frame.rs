@@ -9,9 +9,9 @@ use crate::engine::Engine;
 use crate::far_body::{FarBody, MAX_FAR_BODIES};
 use crate::font;
 use crate::mesh::DebugVertex;
-use crate::vk::pipeline::Vertex2D;
+use crate::vk::pipeline::{EyeSplit, Vertex2D};
 use crate::vk::taa::JitterOffset;
-use crate::vk::uniforms::{FrameUniformsGpu, LocalFrame};
+use crate::vk::uniforms::{FrameUniformsGpu, LOD_MORPH_FLAG, LocalFrame, LodMorphGpu};
 
 /// Sky-pass-private state, set by the app inside a `begin_3d` scope: sun
 /// geometry plus the disc tint. The sky COLOURS (zenith/horizon gradient, fog
@@ -105,6 +105,74 @@ pub(crate) fn sky_with_override(desc: SkyDesc, over: Option<SunOverride>) -> Sky
 #[derive(Clone, Copy, PartialEq)]
 pub struct CoverageVolume {
     pub half: Vec3,
+}
+
+/// One detail level's LOD-morph band, in blocks, around the morph eye.
+///
+/// `half` is the band box's half-extent. `start` is the smoothstep edge in
+/// units of that box (`d = 0` at the eye, `d = 1` on the box surface). A
+/// non-positive `half` component disables morphing for the level.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LodMorph {
+    /// Half-extent of the band, in blocks.
+    pub half: Vec3,
+    /// Smoothstep start. The blend is 0 at and inside `start`, and 1 at the box edge.
+    pub start: f32,
+}
+
+/// Bands for one frame. `count == 0` is morphing off (eye and bands zero).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LodMorphFrame {
+    eye: DVec3,
+    bands: [LodMorph; 16],
+    count: u8,
+}
+
+impl LodMorphFrame {
+    fn off() -> Self {
+        Self {
+            eye: DVec3::ZERO,
+            bands: [LodMorph {
+                half: Vec3::ZERO,
+                start: 0.0,
+            }; 16],
+            count: 0,
+        }
+    }
+
+    /// Empty `bands` is the off state, whatever `eye` was. Entries past 16 are dropped.
+    pub(crate) fn from_api(eye: DVec3, bands: &[LodMorph]) -> Self {
+        if bands.is_empty() {
+            return Self::off();
+        }
+        let mut out = Self::off();
+        let n = bands.len().min(16);
+        out.bands[..n].copy_from_slice(&bands[..n]);
+        out.count = n as u8;
+        out.eye = eye;
+        out
+    }
+
+    /// GPU tail. The eye is split like the camera (`EyeSplit::of`) only while morphing is on.
+    pub(crate) fn to_gpu(self) -> LodMorphGpu {
+        if self.count == 0 {
+            return LodMorphGpu::default();
+        }
+        let split = EyeSplit::of(self.eye);
+        let mut gpu = LodMorphGpu::default();
+        gpu.eye_block = [
+            split.block[0],
+            split.block[1],
+            split.block[2],
+            LOD_MORPH_FLAG,
+        ];
+        gpu.eye_frac = [split.frac[0], split.frac[1], split.frac[2], 0.0];
+        for i in 0..self.count as usize {
+            let b = self.bands[i];
+            gpu.bands[i] = [b.half.x, b.half.y, b.half.z, b.start];
+        }
+        gpu
+    }
 }
 
 /// Per-mesh style for [`Engine::set_mesh_style`](crate::Engine::set_mesh_style) — the
@@ -239,6 +307,9 @@ pub(crate) struct DrawLists {
     /// axis. LOD tiles hard-discard inside the box. Set via
     /// [`Frame3D::set_lod_clip`]; same post-`begin_3d` lifetime as `sky`.
     pub lod_half: Vec3,
+    /// Per-detail LOD morph bands. Default and [`Self::reset`] are off.
+    /// Set via [`Frame3D::set_lod_morph`]; same post-`begin_3d` lifetime as `sky`.
+    pub lod_morph: LodMorphFrame,
     /// Debug-flat override (`DebugView::TerrainKey`): when set, every 3D mesh
     /// fragment outputs this flat key colour while still writing depth.
     /// `None` renders normally. Set via [`Frame3D::set_debug_flat`]; same
@@ -265,6 +336,7 @@ impl DrawLists {
             far_count: 0,
             sun_override: None,
             lod_half: Vec3::ZERO,
+            lod_morph: LodMorphFrame::off(),
             debug_flat: None,
             cube_verts: Vec::new(),
             line_verts: Vec::new(),
@@ -281,6 +353,7 @@ impl DrawLists {
         self.far_count = 0;
         self.sun_override = None;
         self.lod_half = Vec3::ZERO;
+        self.lod_morph = LodMorphFrame::off();
         self.debug_flat = None;
         self.cube_verts.clear();
         self.line_verts.clear();
@@ -562,6 +635,19 @@ impl Frame3D<'_, '_> {
             return;
         }
         self.frame.eng.lists.lod_half = half;
+    }
+
+    /// Per-detail-level morph bands, index = detail level k (0..16; extra entries
+    /// ignored), measured around `eye` in the same frame as mesh `block`s (world
+    /// for flat meshes, the caller's frontier frame for `caged_at` meshes). A
+    /// level whose band has a non-positive half component does not morph.
+    /// An empty slice turns morphing off (the default).
+    pub fn set_lod_morph(&mut self, eye: DVec3, bands: &[LodMorph]) {
+        let next = LodMorphFrame::from_api(eye, bands);
+        if self.frame.eng.lists.lod_morph == next {
+            return;
+        }
+        self.frame.eng.lists.lod_morph = next;
     }
 
     /// Sets the procedural sky drawn behind this frame's geometry. The
@@ -1065,5 +1151,48 @@ mod tests {
         // No scene: the override is not consulted, and the filler stays full-bright.
         lists.sun_override = Some(over);
         same_gpu(lists.lit_uniforms(), FrameUniformsGpu::full_bright());
+    }
+
+    #[test]
+    fn lod_morph_packs_the_eye_split_and_reset_clears_it() {
+        let mut lists = DrawLists::new();
+        assert_eq!(lists.lod_morph.count, 0);
+        assert_eq!(
+            LodMorphFrame::from_api(DVec3::new(1.0, 2.0, 3.0), &[]),
+            LodMorphFrame::off()
+        );
+        let eye = DVec3::new(1_200_000_000.25, -8.5, 3.0);
+        let mut bands = vec![
+            LodMorph {
+                half: Vec3::new(10.0, 20.0, 30.0),
+                start: 0.25,
+            };
+            17
+        ];
+        bands[1].half = Vec3::new(0.0, 1.0, 1.0);
+        bands[15].start = 0.1;
+        bands[16].start = 0.9;
+        lists.lod_morph = LodMorphFrame::from_api(eye, &bands);
+        assert_eq!(lists.lod_morph.count, 16);
+        assert_eq!(lists.lod_morph.bands[15].start, 0.1);
+        let gpu = lists.lod_morph.to_gpu();
+        let split = EyeSplit::of(eye);
+        assert_eq!(
+            gpu.eye_block,
+            [split.block[0], split.block[1], split.block[2], LOD_MORPH_FLAG]
+        );
+        assert_eq!(gpu.eye_frac[0].to_bits(), split.frac[0].to_bits());
+        assert_eq!(gpu.eye_frac[1].to_bits(), split.frac[1].to_bits());
+        assert_eq!(gpu.eye_frac[2].to_bits(), split.frac[2].to_bits());
+        assert_eq!(gpu.eye_frac[3].to_bits(), 0.0f32.to_bits());
+        assert_eq!(gpu.bands[0], [10.0, 20.0, 30.0, 0.25]);
+        assert_eq!(gpu.bands[1][0].to_bits(), 0.0f32.to_bits());
+        assert_eq!(gpu.bands[15][3].to_bits(), 0.1f32.to_bits());
+        lists.lod_morph = LodMorphFrame::from_api(eye, &[]);
+        assert_eq!(lists.lod_morph.to_gpu(), LodMorphGpu::default());
+        lists.lod_morph = LodMorphFrame::from_api(eye, &bands);
+        lists.reset();
+        assert_eq!(lists.lod_morph, LodMorphFrame::off());
+        assert_eq!(lists.lod_morph.to_gpu().eye_block[3], 0);
     }
 }
