@@ -461,12 +461,19 @@ float3 far_through_air(float3 lit, float3 inscatter, float rho)
     return lit + inscatter * (1.0 - far_near(rho));
 }
 
-float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air, float rho, bool core)
+// Optical depth per air thickness. The mapped limb and the mapped surface
+// chord share this. A vertical path equal to the shell thickness keeps
+// exp(-0.35) of the surface; the old limb coefficient of 4 did not.
+static const float FAR_AIR_K = 0.35;
+
+float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air, float rho, bool core, bool rim)
 {
     // Same night flip as the terrain: light.w is 1 by day and 0 by night,
     // so the lit hemisphere follows the moon once the sun is down.
     // `core` is the inner wall: the light is at the centre and the normal points
     // there, so the whole wall faces it. No outdoor sky-dome fill.
+    // `rim` is the fresnel air edge. Mapped hits pass false and composite the
+    // shell along the view chord instead; every other shape passes true.
     float flip = frame.light.w * 2.0 - 1.0;
     float ndl = core ? 1.0 : saturate(dot(nrm, frame.sun_dir_elev.xyz) * flip);
     // Standing on a body (it fills half the sky) its disc continues the terrain at the horizon, so
@@ -475,6 +482,8 @@ float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air, float rho, bool c
     float near = core ? 0.0 : far_near(rho);
     float diffuse = lerp(ndl, 0.45 + 0.55 * ndl, near);
     float3 lit = alb * (frame.light.rgb * diffuse + frame.ambient_glow.rgb + frame.shadow_bounce.rgb * near);
+    if (!rim)
+        return lit;
     float fres = 1.0 - saturate(dot(nrm, -ray));
     fres = fres * fres * fres;
     return lit + air * fres;
@@ -794,7 +803,7 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
             : 2.0 * (outerChord - sqrt(max(rSurf * rSurf - s * s, 0.0)));
         float chord = chordN * distance;
         float denom = max(airThick, px * distance);
-        float trans = exp(-4.0 * chord / denom);
+        float trans = exp(-FAR_AIR_K * chord / denom);
         float3 limbN = normalize(ray * facing - center);
         float daylight = saturate(dot(limbN, frame.sun_dir_elev.xyz) * flip);
         return air * ((1.0 - trans) * frame.light.rgb * daylight);
@@ -824,8 +833,10 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
 // world depth `t * distance` and rims and point blobs by `facing * distance`;
 // the normalised `t` is kept for shading. The inner sphere's far wall is the
 // background; anything with a smaller world depth composites over it. A mapped
-// body is kind 4: one shade, then the terrain fog in place of far_through_air.
-// Its air limb is an additive term on the local surface, not the hi sphere.
+// body is kind 4: one shade without the fresnel air rim, then the terrain fog
+// in place of far_through_air, then the air shell along the view chord above
+// the hit. Its miss-ray limb is an additive term on the local surface, not
+// the hi sphere.
 //
 // Pass 2 accumulates those additive rims and blobs. This matches the old
 // dynamically indexed `float4 addTerm[32]` (that array spilled to local
@@ -1166,14 +1177,43 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                     alb = far_cube(map, bodyDir, clamp(lod, 0.0, 16.0));
                 }
             }
-            float3 lit = far_lit(alb, bestN, ray, air, rho, false);
+            float3 lit = far_lit(alb, bestN, ray, air, rho, false, false);
             float3 shaded = lit;
             if (frame.horizon.w > 0.0)
             {
                 float fog = 1.0 - exp(-bestT * distance * frame.horizon.w);
                 shaded = lerp(lit, inscatter, fog);
             }
+            // Air shell on the sphere of radius r_s(hit) + air. The chord is
+            // the view segment inside that shell, in world units (0 when the
+            // ray never enters). Daylight matches the mapped limb.
+            float airThick = farTable[0].body[bestI].albedo1.w;
+            float trans = 1.0;
+            float facing = dot(ray, center);
+            if (airThick > 0.0 && distance > 0.0)
+            {
+                float rSurf = length(ray * bestT - center);
+                float outer = rSurf + airThick / distance;
+                float tEnter;
+                float tExit;
+                if (far_sphere_roots(facing, outer, tEnter, tExit))
+                {
+                    float chord = (bestT - max(tEnter, 0.0)) * distance;
+                    if (chord > 0.0)
+                        trans = exp(-FAR_AIR_K * chord / airThick);
+                }
+            }
             col = shaded;
+            if (trans < 1.0)
+            {
+                float3 approach = ray * facing - center;
+                float3 radial = ray * bestT - center;
+                float3 limbN = dot(approach, approach) > 1e-16
+                    ? normalize(approach)
+                    : (dot(radial, radial) > 1e-16 ? normalize(radial) : -ray);
+                float daylight = saturate(dot(limbN, frame.sun_dir_elev.xyz) * flip);
+                col = shaded * trans + air * (1.0 - trans) * daylight;
+            }
 #endif
         }
         else
@@ -1181,7 +1221,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
             bool sphereAlb = bestKind == 1u || bestKind == 2u;
             float3 alb = far_albedo(bestI, bodyP, bestFace, sphereAlb, rho);
             bool core = bestKind == 2u;
-            float3 lit = far_lit(alb, bestN, ray, air, rho, core);
+            float3 lit = far_lit(alb, bestN, ray, air, rho, core, true);
             float3 shaded = core ? lit : far_through_air(lit, inscatter, rho);
             if (bestKind == 1u)
                 col = lerp(col, shaded, bestCov);

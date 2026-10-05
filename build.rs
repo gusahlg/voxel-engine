@@ -428,11 +428,19 @@ fn compile_probe(base: &Options) {
 
 /// Names allowed as hand-written constants because they're math facts, not tunables.
 /// Each entry must carry a justification.
-const SLANG_CONST_ALLOWLIST: &[(&str, &str)] = &[(
-    "FACE_NORMAL",
-    "the 6 unit cube-face normals are fixed by the packed-vertex normal \
+const SLANG_CONST_ALLOWLIST: &[(&str, &str)] = &[
+    (
+        "FACE_NORMAL",
+        "the 6 unit cube-face normals are fixed by the packed-vertex normal \
          index convention (mesh.rs), not a tunable value",
-)];
+    ),
+    (
+        "FAR_AIR_K",
+        "optical depth of one mapped air-shell thickness, shared by the limb \
+         and the surface chord in far_body.slang. Shader-internal: nothing on \
+         the CPU reads it, and a genconst entry would be a public constant",
+    ),
+];
 
 /// Lint static consts; allowlist-exempt those referencing generated symbols.
 fn lint_slang_constants() {
