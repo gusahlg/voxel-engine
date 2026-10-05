@@ -118,7 +118,7 @@ VertexOutput vertexMain(VertexInput input)
     uint normal = (w0 >> 15) & 0x7;   // 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
     uint layer = (w0 >> 18) & 0x3FFF;
     // w1: AO [0:2], skylight [2:6], blocklight [6:10], water [10],
-    // micro [11:17), morph [17:23) (decoded in lod_morph.slang).
+    // micro [11:17), morph [17:25) (decoded in lod_morph.slang).
     uint water = (w1 >> 10) & 0x1;
 
     // Per-axis 2-bit two's-complement micro-offsets. Truth: mesh.rs
@@ -156,16 +156,24 @@ VertexOutput vertexMain(VertexInput input)
     // `q` is the local cell position times the detail scale, in [0, 16·scale]³
     // (micro can step slightly outside). UVs stay on the unbent cell.
     float3 q = (float3(x, y, z) + micro) * scale;
-    // One uniform branch. Off leaves `q` (and therefore `t` and the bent normal) untouched.
-    if ((frame.morph_eye_block.w & 1) != 0)
-    {
-        // Add a*dy cells before `t`, so the cage bends the target along the chart's up.
-        float cells = lod_morph_cells(w1, detail, rec.block, q);
-        q.y += cells * scale;
-    }
     Cage cg = cages[rec.cage];
     float3 t = q / (16.0 * scale);
     float3 world = cage_trilinear(cg, t) + float3(cg.anchor - pc.cam_block) - pc.cam_frac;
+    // One uniform branch. Off leaves `world` and `t` untouched, so the bent
+    // normal below (taken at this unmoved `t`) stays bit-identical.
+    [branch]
+    if (frame.morph_flag.x != 0)
+    {
+        int dy = lod_morph_dy(w1);
+        if (dy != 0)
+        {
+            // The trilinear map is linear in t.y for fixed t.x, t.z, so moving
+            // q.y by a*dy*scale (t.y by a*dy/16) moves world by exactly
+            // (a*dy/16) * cage_dty. No second trilinear sample.
+            float a = lod_morph_a(detail, length(world));
+            world += (a * float(dy) / 16.0) * cage_dty(cg, t);
+        }
+    }
 #else
     // Camera-relative placement: block delta first, then fractional parts.
     // Integer subtraction wraps, matching the CPU `wrapping_sub`.
@@ -173,9 +181,15 @@ VertexOutput vertexMain(VertexInput input)
     float3 offset = float3(rec.block - pc.cam_block) - pc.cam_frac + rec.local_off;
     float3 world = q + offset;
     // World +Y is the flat terrain's up. Off does not add +0.
-    if ((frame.morph_eye_block.w & 1) != 0)
+    [branch]
+    if (frame.morph_flag.x != 0)
     {
-        world.y += lod_morph_cells(w1, detail, rec.block, q) * scale;
+        int dy = lod_morph_dy(w1);
+        if (dy != 0)
+        {
+            float a = lod_morph_a(detail, length(world));
+            world.y += a * float(dy) * scale;
+        }
     }
 #endif
 
@@ -194,6 +208,9 @@ VertexOutput vertexMain(VertexInput input)
     output.uv = uv * scale;
     output.world = world;
 #ifdef CAGED
+    // Bent face normal stays at the unmoved `t`. The morph slides the vertex
+    // along ∂/∂t.y; a second tangent pair at t.y + a*dy/16 is a sub-cell
+    // change and is not worth the extra derivatives.
     output.face_n = cage_face_normal(cg, t, normal);
 #endif
     output.light_lv = float3(sky_amount, block_amount, ao_factor);

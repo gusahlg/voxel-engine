@@ -1137,11 +1137,13 @@ struct Lane {
     doc: &'static str,
 }
 
-/// LOD morph tail after the float4 lanes: `int4` eye block, `float4` eye frac,
-/// `float4` band[16]. 18 std140 slots, 288 bytes. Not a [`Lane`]: the eye block
-/// is integers, and the bands are an array. Flat fields, not a nested struct,
-/// so a Slang struct's 16-byte align cannot insert padding of its own.
-const MORPH_TAIL_BYTES: usize = 18 * 16;
+/// LOD morph tail after the float4 lanes: `float4 morph_band[8]` plus one
+/// `int4` flag. 9 std140 slots, 144 bytes. Not a [`Lane`]: the flag is integers
+/// and the bands are an array. Flat fields, not a nested struct, so a Slang
+/// struct's 16-byte align cannot insert padding of its own. No spare float4
+/// lane was free (`sky_tangent.w` is the only unused channel, and it stays 0
+/// so the sky basis is unchanged), so the flag is its own int4.
+const MORPH_TAIL_BYTES: usize = 9 * 16;
 
 fn lane_table() -> Vec<Lane> {
     vec![
@@ -1266,15 +1268,15 @@ fn emit_rust_uniforms(public: &[Lane], derived: &[Lane]) -> String {
         doc_lines(l.doc, "    /// ", &mut s);
         s.push_str(&format!("    pub {}: [f32; 4],\n", l.name));
     }
-    s.push_str("    /// LOD morph eye. xyz = integer block of `set_lod_morph`'s eye, split\n");
-    s.push_str("    /// like the camera. w bit 0 = morphing is on this frame.\n");
-    s.push_str("    pub morph_eye_block: [i32; 4],\n");
-    s.push_str("    /// Fractional part of the morph eye, in [0, 1). w unused.\n");
-    s.push_str("    pub morph_eye_frac: [f32; 4],\n");
-    s.push_str("    /// Per-detail morph bands, index = k (0..16). xyz = half-extent in\n");
-    s.push_str("    /// blocks, w = smoothstep start. A non-positive half component disables\n");
-    s.push_str("    /// that level.\n");
-    s.push_str("    pub morph_band: [[f32; 4]; 16],\n");
+    s.push_str("    /// Per-detail morph bands. Slot i holds levels 2i and 2i+1:\n");
+    s.push_str("    /// xy = (start, end) of level 2i, zw = (start, end) of level 2i+1,\n");
+    s.push_str("    /// in blocks of Euclidean camera distance. An invalid band (not\n");
+    s.push_str("    /// `end > start`, or a non-finite or negative component) is zero.\n");
+    s.push_str("    pub morph_band: [[f32; 4]; 8],\n");
+    s.push_str("    /// x = 1 when any level's band is valid this frame, else 0. yzw = 0.\n");
+    s.push_str("    /// The mesh vertex shaders take one uniform branch on x; 0 leaves\n");
+    s.push_str("    /// positions unchanged (lean draws included).\n");
+    s.push_str("    pub morph_flag: [i32; 4],\n");
     s.push_str("}\n\n");
     let morph_at = (public.len() + derived.len()) * 16;
     s.push_str(&format!(
@@ -1290,15 +1292,11 @@ fn emit_rust_uniforms(public: &[Lane], derived: &[Lane]) -> String {
         ));
     }
     s.push_str(&format!(
-        "const _: () = assert!(std::mem::offset_of!(FrameUniformsExt, morph_eye_block) == {morph_at});\n"
+        "const _: () = assert!(std::mem::offset_of!(FrameUniformsExt, morph_band) == {morph_at});\n"
     ));
     s.push_str(&format!(
-        "const _: () = assert!(std::mem::offset_of!(FrameUniformsExt, morph_eye_frac) == {});\n",
-        morph_at + 16
-    ));
-    s.push_str(&format!(
-        "const _: () = assert!(std::mem::offset_of!(FrameUniformsExt, morph_band) == {});\n",
-        morph_at + 32
+        "const _: () = assert!(std::mem::offset_of!(FrameUniformsExt, morph_flag) == {});\n",
+        morph_at + 8 * 16
     ));
     s.push_str("const _: () = assert!(size_of::<FrameUniformsExt>() % 16 == 0);\n");
     s.push_str("const _: () = assert!(size_of::<FrameUniformsExt>() <= 16384);\n");
@@ -1331,14 +1329,12 @@ fn emit_slang_uniforms(public: &[Lane], derived: &[Lane]) -> String {
         }
     }
     s.push_str("    // --- LOD morph (engine-derived; not in FrameUniformsGpu) ---\n");
-    s.push_str("    // xyz = integer block of set_lod_morph's eye, split like the camera.\n");
-    s.push_str("    // w bit 0 = morphing on.\n");
-    s.push_str("    int4 morph_eye_block;\n");
-    s.push_str("    // xyz = fractional part in [0, 1). w unused.\n");
-    s.push_str("    float4 morph_eye_frac;\n");
-    s.push_str("    // index = k (0..16). xyz = half-extent in blocks, w = smoothstep start.\n");
-    s.push_str("    // A non-positive half component disables that level.\n");
-    s.push_str("    float4 morph_band[16];\n");
+    s.push_str("    // Slot i: levels 2i (xy = start, end) and 2i+1 (zw = start, end),\n");
+    s.push_str("    // in blocks of Euclidean camera distance. Invalid bands are zero.\n");
+    s.push_str("    float4 morph_band[8];\n");
+    s.push_str("    // x = 1 when any band is valid, else 0. yzw unused.\n");
+    s.push_str("    // Mesh vertex shaders branch once on x; 0 leaves the position unchanged.\n");
+    s.push_str("    int4 morph_flag;\n");
     s.push_str("};\n");
     s
 }

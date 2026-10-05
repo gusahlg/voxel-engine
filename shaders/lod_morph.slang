@@ -1,32 +1,45 @@
 // LOD geomorph. Included only by the mesh vertex shaders (color + shadow),
 // after `ConstantBuffer<FrameUniforms> frame` is declared. Twin of
-// `morph_offset` in src/vk/lod_morph.rs.
+// `morph_a` / `band_valid` in src/vk/lod_morph.rs.
 //
-// `q` is the unmorphed local position in block units, before the cage and
-// before the placement offset. Returns `a * dy` cells along local +Y.
+// dy is a signed cell offset along the mesh's local +Y (w1 bits [17:25)).
+// a = smoothstep over that detail level's Euclidean camera-distance band.
+// The caller has already formed the unmorphed camera-relative world position;
+// d = length(world). Flat adds a*dy*scale to world.y. Caged adds
+// (a*dy/16) * cage_dty, because the trilinear map is linear in t.y.
 
 #ifndef VOXEL_LOD_MORPH_SLANG
 #define VOXEL_LOD_MORPH_SLANG
 
-float lod_morph_cells(uint w1, uint detail, int3 block, float3 q)
+// Bits [17:25) of w1, 8-bit two's complement. Twin of MeshVertex::morph:
+// `<< 7` parks bit 24 on the sign, `>> 24` brings bit 17 down to bit 0.
+int lod_morph_dy(uint w1)
 {
-    // Bits [17:23) of w1, 6-bit two's complement. Twin of MeshVertex::morph:
-    // `<< 9` parks bit 22 on the sign, `>> 26` brings bit 17 down to bit 0.
-    int dy = int(w1 << 9) >> 26;
-    if (dy == 0)
-        return 0.0;
+    return int(w1 << 7) >> 24;
+}
+
+// True when the band can produce a non-zero blend. !(end > start) covers
+// inverted, equal, and NaN. Negative and +inf are rejected on their own:
+// +inf can still satisfy end > start.
+bool lod_morph_band_ok(float start, float end)
+{
+    return start >= 0.0 && end > start && !isinf(start) && !isinf(end);
+}
+
+// Blend factor for detail level k. 0 when k is outside 0..16 or the band is
+// invalid. Does not look at dy; the caller skips the add when dy is 0.
+float lod_morph_a(uint detail, float d)
+{
     int k = int(detail & ((1u << DETAIL_GPU_BITS) - 1u)) - int(DETAIL_GPU_BIAS);
     if (k < 0 || k >= 16)
         return 0.0;
-    float4 band = frame.morph_band[uint(k)];
-    // A non-positive half (and NaN) disables the level.
-    if (!(band.x > 0.0 && band.y > 0.0 && band.z > 0.0))
+    // Level 2i in xy, level 2i+1 in zw.
+    float4 packed = frame.morph_band[uint(k) >> 1];
+    float start = ((k & 1) == 0) ? packed.x : packed.z;
+    float end = ((k & 1) == 0) ? packed.y : packed.w;
+    if (!lod_morph_band_ok(start, end))
         return 0.0;
-    // Integer subtraction wraps, matching the CPU `wrapping_sub`.
-    float3 p = float3(block - frame.morph_eye_block.xyz) - frame.morph_eye_frac.xyz + q;
-    float d = max(abs(p.x) / band.x, max(abs(p.y) / band.y, abs(p.z) / band.z));
-    float a = smoothstep(band.w, 1.0, d);
-    return a * float(dy);
+    return smoothstep(start, end, d);
 }
 
 #endif

@@ -1,59 +1,84 @@
-//! CPU mirror of `lod_morph_cells` in `shaders/lod_morph.slang`.
+//! CPU mirror of `lod_morph_a` in `shaders/lod_morph.slang`.
 //!
 //! `k` is the detail level the vertex shader already derives:
-//! `(detail_bits & mask) - DETAIL_GPU_BIAS`. `q` is the unmorphed position in
-//! block units, before the cage and before the placement offset.
+//! `(detail_bits & mask) - DETAIL_GPU_BIAS`. `d` is the Euclidean length of the
+//! unmorphed camera-relative world position. A caged slide is
+//! `(a * dy / 16) * cage_dty` — the trilinear map is linear in `t.y`, so that
+//! equals a second sample at the moved `t`.
 //!
-//! The shader is the production caller. Host tests are the Rust caller, so the
-//! mirror is allowed to look unused to the library build.
+//! The shader is the production caller. Host tests are the Rust caller, so
+//! most of the mirror is allowed to look unused to the library build.
+//! [`band_valid`] is also how the frame packs the GPU flag.
 
 #![allow(dead_code)]
 
-/// Cells along local +Y (`a * dy`). A level with no positive band, `dy == 0`,
-/// or morphing off contributes nothing.
-///
-/// `bands[k]` is `(half.xyz, start)`. A short slice is a missing band; `k`
-/// outside `0..16` is too, matching the 16-wide GPU array.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn morph_offset(
-    morph_on: bool,
-    eye_block: [i32; 3],
-    eye_frac: [f32; 3],
-    bands: &[[f32; 4]],
-    block: [i32; 3],
-    k: i32,
-    q: [f32; 3],
-    dy: i32,
-) -> f32 {
-    if !morph_on || dy == 0 || k < 0 || k >= 16 {
-        return 0.0;
-    }
-    let Some(band) = bands.get(k as usize) else {
-        return 0.0;
-    };
-    if !(band[0] > 0.0 && band[1] > 0.0 && band[2] > 0.0) {
-        return 0.0;
-    }
-    let p = morph_position(block, eye_block, eye_frac, q);
-    let d = (p[0].abs() / band[0])
-        .max(p[1].abs() / band[1])
-        .max(p[2].abs() / band[2]);
-    smoothstep(band[3], 1.0, d) * dy as f32
+/// A band produces a blend when `end > start` and both ends are finite and
+/// non-negative. Twin of `lod_morph_band_ok`: `!(end > start)` already rejects
+/// NaN, and `is_finite` rejects ±infinity the way the shader's `isinf` does.
+pub(crate) fn band_valid(start: f32, end: f32) -> bool {
+    start >= 0.0 && end > start && start.is_finite() && end.is_finite()
 }
 
-/// `float3(block - eye_block) - eye_frac + q`, with wrapping integer subtraction
-/// so a large eye stays exact. Twin of the shader's `p`.
-pub(crate) fn morph_position(
-    block: [i32; 3],
-    eye_block: [i32; 3],
-    eye_frac: [f32; 3],
-    q: [f32; 3],
-) -> [f32; 3] {
+/// `a = smoothstep(start, end, d)`, or 0 when the band is not [`band_valid`].
+pub(crate) fn morph_a(start: f32, end: f32, d: f32) -> f32 {
+    if !band_valid(start, end) {
+        return 0.0;
+    }
+    smoothstep(start, end, d)
+}
+
+/// Level `k`'s blend from the packed `morph_band[8]` tail. A short slice, a
+/// level outside `0..16`, or morphing off is a missing band (`a = 0`).
+/// Slot `i` holds level `2i` in xy and level `2i+1` in zw.
+pub(crate) fn level_a(morph_on: bool, bands: &[[f32; 4]], k: i32, d: f32) -> f32 {
+    if !morph_on || !(0..16).contains(&k) {
+        return 0.0;
+    }
+    let Some(slot) = bands.get((k as usize) / 2) else {
+        return 0.0;
+    };
+    let (start, end) = if k % 2 == 0 {
+        (slot[0], slot[1])
+    } else {
+        (slot[2], slot[3])
+    };
+    morph_a(start, end, d)
+}
+
+/// Flat morph: `world.y += a * dy * scale`. `dy == 0` or `a == 0` does not move.
+pub(crate) fn flat_world(world: [f32; 3], a: f32, dy: i32, scale: f32) -> [f32; 3] {
+    let mut out = world;
+    if dy != 0 {
+        out[1] += a * dy as f32 * scale;
+    }
+    out
+}
+
+/// ∂/∂t.y of the trilinear cage map. Twin of `cage_dty` in `shaders/cage.slang`.
+pub(crate) fn cage_dty(corners: [[f32; 3]; 8], t: [f32; 3]) -> [f32; 3] {
+    let c0 = lerp3(corners[0], corners[1], t[0]);
+    let c1 = lerp3(corners[2], corners[3], t[0]);
+    let c2 = lerp3(corners[4], corners[5], t[0]);
+    let c3 = lerp3(corners[6], corners[7], t[0]);
+    lerp3(sub3(c1, c0), sub3(c3, c2), t[2])
+}
+
+/// World delta of a caged morph: `(a * dy / 16) * dty`.
+pub(crate) fn caged_delta(a: f32, dy: i32, dty: [f32; 3]) -> [f32; 3] {
+    let s = a * dy as f32 / 16.0;
+    [dty[0] * s, dty[1] * s, dty[2] * s]
+}
+
+fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [
-        block[0].wrapping_sub(eye_block[0]) as f32 - eye_frac[0] + q[0],
-        block[1].wrapping_sub(eye_block[1]) as f32 - eye_frac[1] + q[1],
-        block[2].wrapping_sub(eye_block[2]) as f32 - eye_frac[2] + q[2],
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
     ]
+}
+
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
 /// HLSL `smoothstep`: saturate, then the Hermite cubic.
@@ -65,133 +90,6 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vk::pipeline::EyeSplit;
-
-    fn band(half: [f32; 3], start: f32) -> [f32; 4] {
-        [half[0], half[1], half[2], start]
-    }
-
-    fn along_x(q_x: f32, start: f32, dy: i32) -> f32 {
-        morph_offset(
-            true,
-            [0; 3],
-            [0.0; 3],
-            &[band([1.0, 1.0, 1.0], start)],
-            [0; 3],
-            0,
-            [q_x, 0.0, 0.0],
-            dy,
-        )
-    }
-
-    #[test]
-    fn blend_is_zero_inside_the_start_and_one_at_the_edge() {
-        assert_eq!(along_x(0.1, 0.5, 1), 0.0);
-        assert_eq!(along_x(0.5, 0.5, 1), 0.0);
-        assert_eq!(along_x(1.0, 0.5, 1), 1.0);
-        assert_eq!(along_x(2.0, 0.5, 1), 1.0);
-        assert_eq!(along_x(2.0, 0.5, -4), -4.0);
-        // Midpoint of smoothstep(0.25, 1, 0.625) is t = 0.5, so a = 0.5.
-        assert_eq!(along_x(0.625, 0.25, 1).to_bits(), 0.5f32.to_bits());
-    }
-
-    #[test]
-    fn blend_is_monotonic_between_the_edges() {
-        let mut prev = along_x(0.25, 0.25, 1);
-        assert_eq!(prev, 0.0);
-        for i in 1..=8 {
-            let d = 0.25 + (i as f32) * (0.75 / 8.0);
-            let next = along_x(d, 0.25, 1);
-            assert!(next > prev, "d {d}: {next} <= {prev}");
-            prev = next;
-        }
-        assert_eq!(prev.to_bits(), 1.0f32.to_bits());
-    }
-
-    #[test]
-    fn distance_is_chebyshev_not_a_sum() {
-        let half = band([10.0, 10.0, 10.0], 0.5);
-        let at = |q: [f32; 3]| morph_offset(true, [0; 3], [0.0; 3], &[half], [0; 3], 0, q, 1);
-        // Each axis is 0.4 of the box. A sum of ratios would be 0.8 and already blend.
-        assert_eq!(at([4.0, 4.0, 0.0]), 0.0);
-        // A corner where every ratio equals d blends the same as one axis at that d.
-        assert_eq!(at([8.0, 8.0, 8.0]).to_bits(), at([8.0, 0.0, 0.0]).to_bits());
-    }
-
-    #[test]
-    fn fractional_eye_cancels_a_matching_q() {
-        // p.x = 0 - 0.5 + 0.5 = 0, so a = 0. Dropping the frac term would yield 0.5.
-        let offset = morph_offset(
-            true,
-            [10, 0, 0],
-            [0.5, 0.0, 0.0],
-            &[band([1.0, 1.0, 1.0], 0.0)],
-            [10, 0, 0],
-            0,
-            [0.5, 0.0, 0.0],
-            1,
-        );
-        assert_eq!(offset, 0.0);
-    }
-
-    #[test]
-    fn a_level_without_a_band_does_not_move() {
-        let live = band([10.0, 10.0, 10.0], 0.0);
-        let outside = [100.0, 0.0, 0.0];
-        let go = |bands: &[[f32; 4]], k: i32, on: bool, dy: i32| {
-            morph_offset(on, [0; 3], [0.0; 3], bands, [0; 3], k, outside, dy)
-        };
-        assert_eq!(go(&[live], 1, true, 4), 0.0);
-        assert_eq!(go(&[], 0, true, 4), 0.0);
-        assert_eq!(go(&[live], -1, true, 4), 0.0);
-        assert_eq!(go(&[live; 16], 16, true, 4), 0.0);
-        assert_eq!(go(&[band([0.0, 10.0, 10.0], 0.0)], 0, true, 4), 0.0);
-        assert_eq!(go(&[band([10.0, -1.0, 10.0], 0.0)], 0, true, 4), 0.0);
-        assert_eq!(go(&[band([10.0, 10.0, 0.0], 0.0)], 0, true, 4), 0.0);
-        assert_eq!(go(&[band([f32::NAN, 10.0, 10.0], 0.0)], 0, true, 4), 0.0);
-        assert_eq!(go(&[live], 0, false, 4), 0.0);
-        assert_eq!(go(&[live], 0, true, 0), 0.0);
-        assert_eq!(go(&[live], 0, true, -4), -4.0);
-    }
-
-    #[test]
-    fn a_large_eye_keeps_p_exact_and_i32_wraps() {
-        let eye = glam::DVec3::new(1_200_000_000.25, -1_200_000_000.75, 1_200_000_000.125);
-        let split = EyeSplit::of(eye);
-        assert_eq!(split.block[0], 1_200_000_000);
-        assert_eq!(split.block[1], -1_200_000_001);
-        assert_eq!(split.block[2], 1_200_000_000);
-        assert_eq!(split.frac[0].to_bits(), 0.25f32.to_bits());
-        assert_eq!(split.frac[1].to_bits(), 0.25f32.to_bits());
-        assert_eq!(split.frac[2].to_bits(), 0.125f32.to_bits());
-
-        let delta = [3i32, -5, 7];
-        let block = [
-            split.block[0].wrapping_add(delta[0]),
-            split.block[1].wrapping_add(delta[1]),
-            split.block[2].wrapping_add(delta[2]),
-        ];
-        let q = [0.25f32, -0.5, 0.125];
-        let p = morph_position(block, split.block, split.frac, q);
-        for i in 0..3 {
-            let truth = delta[i] as f64 + q[i] as f64 - split.frac[i] as f64;
-            assert!(
-                (p[i] as f64 - truth).abs() < 1e-3,
-                "axis {i}: p {} truth {truth}",
-                p[i]
-            );
-            let naive = block[i] as f32 - eye[i] as f32 + q[i];
-            let geometric = block[i] as f64 + q[i] as f64 - eye[i];
-            assert!(
-                (naive as f64 - geometric).abs() > 1.0,
-                "naive f32 subtraction should miss at |eye| ~ 1.2e9"
-            );
-        }
-
-        let wrapped = morph_position([i32::MIN, 0, 0], [i32::MAX, 0, 0], [0.0; 3], [0.0; 3]);
-        assert_eq!(wrapped[0], 1.0);
-        assert_eq!(i32::MIN.wrapping_sub(i32::MAX), 1);
-    }
 
     fn spirv_words(name: &str) -> Vec<u32> {
         let path = std::path::Path::new(env!("OUT_DIR")).join(name);
@@ -241,7 +139,7 @@ mod tests {
         offset
     }
 
-    /// Slang lowers `float4 morph_band[16]` to a std140 wrapper struct whose
+    /// Slang lowers `float4 morph_band[8]` to a std140 wrapper struct whose
     /// member is the array. The stride lives on that array, not on the wrapper.
     fn array_stride(words: &[u32], type_id: u32) -> Option<u32> {
         let mut stride = None;
@@ -307,13 +205,12 @@ mod tests {
     fn assert_morph_tail(name: &str) {
         let words = spirv_words(name);
         assert_eq!(member_offset(&words, "sky_bitangent"), Some(208), "{name}");
-        assert_eq!(
-            member_offset(&words, "morph_eye_block"),
-            Some(224),
-            "{name}"
+        assert_eq!(member_offset(&words, "morph_band"), Some(224), "{name}");
+        assert_eq!(member_offset(&words, "morph_flag"), Some(352), "{name}");
+        assert!(
+            member_offset(&words, "morph_eye_block").is_none(),
+            "{name} still has the old eye"
         );
-        assert_eq!(member_offset(&words, "morph_eye_frac"), Some(240), "{name}");
-        assert_eq!(member_offset(&words, "morph_band"), Some(256), "{name}");
         assert_eq!(
             member_array_stride(&words, "morph_band"),
             Some(16),
@@ -328,10 +225,9 @@ mod tests {
         assert_morph_tail("shadow_depth.vert.spv");
         let lean = spirv_words("mesh3d_opaque_lean.frag.spv");
         assert_eq!(member_offset(&lean, "sky_bitangent"), Some(208));
-        if member_offset(&lean, "morph_eye_block").is_some() {
-            assert_eq!(member_offset(&lean, "morph_eye_block"), Some(224));
-            assert_eq!(member_offset(&lean, "morph_eye_frac"), Some(240));
-            assert_eq!(member_offset(&lean, "morph_band"), Some(256));
+        if member_offset(&lean, "morph_band").is_some() {
+            assert_eq!(member_offset(&lean, "morph_band"), Some(224));
+            assert_eq!(member_offset(&lean, "morph_flag"), Some(352));
         }
         let shadow = spirv_words("shadow_depth.vert.spv");
         let bindings = descriptor_bindings(&shadow);
@@ -339,5 +235,155 @@ mod tests {
             bindings.contains(&(0, 2)),
             "shadow vertex shader must bind the frame UBO at set 0 binding 2, got {bindings:?}"
         );
+    }
+
+    #[test]
+    fn blend_is_zero_inside_start_and_one_at_and_past_end() {
+        let start = 4.0;
+        let end = 10.0;
+        assert_eq!(morph_a(start, end, 0.0), 0.0);
+        assert_eq!(morph_a(start, end, start), 0.0);
+        assert_eq!(morph_a(start, end, end).to_bits(), 1.0f32.to_bits());
+        assert_eq!(morph_a(start, end, end + 25.0).to_bits(), 1.0f32.to_bits());
+        // Midpoint: t = 0.5, so a = 0.5.
+        assert_eq!(morph_a(start, end, 7.0).to_bits(), 0.5f32.to_bits());
+        let moved = flat_world([1.0, 2.0, 3.0], 1.0, -4, 2.0);
+        assert_eq!(moved, [1.0, 2.0 + -4.0 * 2.0, 3.0]);
+        let still = flat_world([1.0, 2.0, 3.0], 0.0, -4, 2.0);
+        assert_eq!(still[1].to_bits(), 2.0f32.to_bits());
+        assert_eq!(flat_world([1.0, 2.0, 3.0], 1.0, 0, 2.0), [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn blend_is_monotonic_between_the_edges() {
+        let start = 4.0;
+        let end = 10.0;
+        let mut prev = morph_a(start, end, start);
+        assert_eq!(prev, 0.0);
+        for i in 1..=8 {
+            let d = start + (end - start) * (i as f32) / 8.0;
+            let next = morph_a(start, end, d);
+            assert!(next > prev, "d {d}: {next} <= {prev}");
+            prev = next;
+        }
+        assert_eq!(prev.to_bits(), 1.0f32.to_bits());
+    }
+
+    #[test]
+    fn invalid_or_missing_bands_do_not_move() {
+        assert!(!band_valid(5.0, 1.0), "inverted");
+        assert!(!band_valid(2.0, 2.0), "equal");
+        assert!(!band_valid(f32::NAN, 4.0));
+        assert!(!band_valid(1.0, f32::NAN));
+        assert!(!band_valid(-1.0, 8.0));
+        assert!(!band_valid(-4.0, -1.0));
+        assert!(!band_valid(0.0, f32::INFINITY));
+        assert!(!band_valid(f32::INFINITY, f32::INFINITY));
+        assert!(!band_valid(f32::NEG_INFINITY, 1.0));
+        assert!(band_valid(0.0, 1.0));
+        for (start, end) in [
+            (5.0, 1.0),
+            (2.0, 2.0),
+            (f32::NAN, 4.0),
+            (1.0, f32::NAN),
+            (-1.0, 8.0),
+            (-4.0, -1.0),
+            (0.0, f32::INFINITY),
+            (f32::NEG_INFINITY, 4.0),
+        ] {
+            assert_eq!(morph_a(start, end, 100.0), 0.0, "{start}..{end}");
+        }
+        // Empty tail, morphing off, and a level with no slot.
+        let live = [[0.0, 8.0, 0.0, 0.0]];
+        assert_eq!(level_a(true, &[], 0, 100.0), 0.0);
+        assert_eq!(level_a(false, &live, 0, 100.0), 0.0);
+        assert_eq!(level_a(true, &live, 1, 100.0), 0.0);
+        assert_eq!(level_a(true, &live, -1, 100.0), 0.0);
+        assert_eq!(level_a(true, &live, 16, 100.0), 0.0);
+        assert_eq!(level_a(true, &live, 0, 0.0), 0.0);
+        assert_eq!(level_a(true, &live, 0, 8.0).to_bits(), 1.0f32.to_bits());
+        // Level 3 lives in zw of slot 1.
+        let odd = [[0.0, 0.0, 0.0, 0.0], [1.0, 3.0, 4.0, 6.0]];
+        assert_eq!(level_a(true, &odd, 2, 3.0).to_bits(), 1.0f32.to_bits());
+        assert_eq!(level_a(true, &odd, 3, 4.0), 0.0);
+        assert_eq!(level_a(true, &odd, 3, 6.0).to_bits(), 1.0f32.to_bits());
+    }
+
+    fn xorshift(state: &mut u32) -> u32 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *state = x;
+        x
+    }
+
+    fn rand_f(state: &mut u32, lo: f32, hi: f32) -> f32 {
+        let u = (xorshift(state) >> 8) as f32 / (1u32 << 24) as f32;
+        lo + (hi - lo) * u
+    }
+
+    #[test]
+    fn caged_dty_shortcut_matches_a_second_trilinear() {
+        let id = crate::cage::identity_corners().map(|v| v.to_array());
+        let t = [0.25, 0.5, 0.75];
+        let dy = 6;
+        let a = 0.5;
+        let shortcut = caged_delta(a, dy, cage_dty(id, t));
+        let moved = [t[0], t[1] + a * dy as f32 / 16.0, t[2]];
+        let full = sub3(
+            crate::cage::trilinear(id, moved),
+            crate::cage::trilinear(id, t),
+        );
+        for i in 0..3 {
+            assert!(
+                (shortcut[i] - full[i]).abs() < 1e-5,
+                "identity axis {i}: shortcut {} full {}",
+                shortcut[i],
+                full[i]
+            );
+        }
+        // The identity box is 16 tall, so the slide in cells is a * dy.
+        assert!((shortcut[1] - a * dy as f32).abs() < 1e-5);
+
+        // Chunk-sized random cages. The map is exactly linear in t.y; the gap is
+        // f32 rounding of the two samples. |dy| stays inside ±16 so the slide
+        // stays under a few tens of cells: a full i8 dy on this cage reaches
+        // ~100, where one f32 ulp is already 1.5e-5.
+        let mut state = 0xA5A5_1234u32;
+        for n in 0..64 {
+            let corners = std::array::from_fn(|corner| {
+                let on = |bit: u32, span: f32| {
+                    if corner & (1 << bit) != 0 { span } else { 0.0 }
+                };
+                [
+                    on(0, 16.0) + rand_f(&mut state, -4.0, 4.0),
+                    on(1, 16.0) + rand_f(&mut state, -4.0, 4.0),
+                    on(2, 16.0) + rand_f(&mut state, -4.0, 4.0),
+                ]
+            });
+            let t = [
+                rand_f(&mut state, -0.25, 1.25),
+                rand_f(&mut state, -0.25, 1.25),
+                rand_f(&mut state, -0.25, 1.25),
+            ];
+            let a = rand_f(&mut state, 0.0, 1.0);
+            let dy = (xorshift(&mut state) % 33) as i32 - 16;
+            let shortcut = caged_delta(a, dy, cage_dty(corners, t));
+            let moved = [t[0], t[1] + a * dy as f32 / 16.0, t[2]];
+            let full = sub3(
+                crate::cage::trilinear(corners, moved),
+                crate::cage::trilinear(corners, t),
+            );
+            for i in 0..3 {
+                let err = (shortcut[i] - full[i]).abs();
+                assert!(
+                    err < 1e-5,
+                    "cage {n} axis {i}: shortcut {} full {} err {err} dy {dy} a {a}",
+                    shortcut[i],
+                    full[i],
+                );
+            }
+        }
     }
 }

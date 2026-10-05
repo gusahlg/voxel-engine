@@ -65,12 +65,10 @@ struct FrameUniforms
     // horizon do not read this lane. 0 keeps the old elevation clamp.
     float4 sky_bitangent;
     // --- LOD morph (engine-derived; not in FrameUniformsGpu) ---
-    // xyz = integer block of set_lod_morph's eye, split like the camera.
-    // w bit 0 = morphing on.
-    int4 morph_eye_block;
-    // xyz = fractional part in [0, 1). w unused.
-    float4 morph_eye_frac;
-    // index = k (0..16). xyz = half-extent in blocks, w = smoothstep start.
-    // A non-positive half component disables that level.
-    float4 morph_band[16];
+    // Slot i: levels 2i (xy = start, end) and 2i+1 (zw = start, end),
+    // in blocks of Euclidean camera distance. Invalid bands are zero.
+    float4 morph_band[8];
+    // x = 1 when any band is valid, else 0. yzw unused.
+    // Mesh vertex shaders branch once on x; 0 leaves the position unchanged.
+    int4 morph_flag;
 };
