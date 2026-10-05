@@ -2591,4 +2591,150 @@ mod tests {
             );
         }
     }
+
+    /// Angle from the centre direction. `0` looks straight down.
+    fn ray_from_nadir(dir: Vec3, azimuth: f32, angle: f32) -> Vec3 {
+        let down = dir.normalize();
+        let up = -down;
+        let reference = if up.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+        let east = reference.cross(up).normalize();
+        let north = up.cross(east);
+        let horiz = east * azimuth.sin() + north * azimuth.cos();
+        (down * angle.cos() + horiz * angle.sin()).normalize()
+    }
+
+    /// Outermost reference hit, sweeping from nadir toward the anti-centre.
+    fn reference_horizon_angle(
+        dir: Vec3,
+        azimuth: f32,
+        rho: f32,
+        distance: f32,
+        g: u32,
+        datum: &[f32],
+        min_off: f32,
+        max_off: f32,
+    ) -> f64 {
+        let hits = |angle: f64| {
+            let ray = ray_from_nadir(dir, azimuth, angle as f32);
+            ray_mapped_reference(
+                ray,
+                dir,
+                rho,
+                distance,
+                Quat::IDENTITY,
+                g,
+                datum,
+                min_off,
+                max_off,
+            )
+            .is_some()
+        };
+        assert!(hits(0.0), "nadir missed");
+        let mut lo = 0.0f64;
+        let mut hi = std::f64::consts::PI;
+        if hits(hi) {
+            return hi;
+        }
+        for _ in 0..50 {
+            let mid = 0.5 * (lo + hi);
+            if hits(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+
+    #[test]
+    fn mapped_solver_matches_the_reference_near_the_ground() {
+        let g = 33u32;
+        let datum = home_datum(g);
+        let min_off = datum.iter().copied().fold(f32::MAX, f32::min);
+        let max_off = datum.iter().copied().fold(f32::MIN, f32::max);
+        let local = sample_datum(g, &datum, Vec3::Y);
+        let radius = HOME_RADIUS as f32;
+        let mut worst = 0.0f64;
+        let mut worst_where = String::new();
+        let mut mismatches = 0u32;
+        let mut compared = 0u32;
+        for altitude in [10_000.0f32, 50_000.0, 1.0e5, 1.0e7] {
+            let distance = radius + local + altitude;
+            let rho = radius / distance;
+            let dir = -Vec3::Y;
+            for azimuth in [0.0f32, 1.3, 2.6, 4.2] {
+                let horizon = reference_horizon_angle(
+                    dir, azimuth, rho, distance, g, &datum, min_off, max_off,
+                );
+                let mut angles = vec![0.0f64, 0.4, 0.8, 1.2217304763960306];
+                for delta in [
+                    -0.2, -0.05, -0.02, -0.01, -0.005, -0.002, -2.0e-4, 2.0e-4, 0.02,
+                ] {
+                    let angle = horizon + delta;
+                    if angle > 0.0 && angle < std::f64::consts::PI {
+                        angles.push(angle);
+                    }
+                }
+                for angle in angles {
+                    let ray = ray_from_nadir(dir, azimuth, angle as f32);
+                    let reference = ray_mapped_reference(
+                        ray,
+                        dir,
+                        rho,
+                        distance,
+                        Quat::IDENTITY,
+                        g,
+                        &datum,
+                        min_off,
+                        max_off,
+                    );
+                    let got = ray_mapped(
+                        ray,
+                        dir,
+                        rho,
+                        distance,
+                        Quat::IDENTITY,
+                        1.0,
+                        g,
+                        &datum,
+                        min_off,
+                        max_off,
+                    );
+                    let from_horizon = (angle - horizon).abs();
+                    if from_horizon < 1.0e-4 {
+                        continue;
+                    }
+                    compared += 1;
+                    match (reference, got) {
+                        (None, None) => {}
+                        (Some(t_ref), Some(hit)) => {
+                            let rel = (f64::from(hit.t) - t_ref).abs() / t_ref;
+                            if rel > worst {
+                                worst = rel;
+                                worst_where = format!(
+                                    "alt {altitude} az {azimuth} angle {angle} t {t_ref} got {}",
+                                    hit.t
+                                );
+                            }
+                        }
+                        (reference, got) => {
+                            mismatches += 1;
+                            if mismatches <= 8 {
+                                eprintln!(
+                                    "hit/miss alt {altitude} az {azimuth} angle {angle} \
+                                     horizon {horizon} ref {reference:?} got {got:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            mismatches == 0 && worst < 2.0e-4,
+            "solver disagrees with the f64 reference: {mismatches} hit/miss \
+             mismatches over {compared} rays, worst relative |Δt|/t = {worst} \
+             at {worst_where}"
+        );
+    }
 }
