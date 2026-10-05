@@ -55,6 +55,20 @@ impl MeshAabb {
             max,
         }
     }
+
+    /// Axis-aligned corners of this box, relative to `block`. Bit 0 = +x,
+    /// bit 1 = +y, bit 2 = +z, the cage SSBO order. Used when a test cage is
+    /// the corner box itself.
+    #[cfg(test)]
+    pub(crate) fn box_corners(self) -> [[f32; 3]; 8] {
+        std::array::from_fn(|i| {
+            [
+                if i & 1 == 0 { self.min[0] } else { self.max[0] },
+                if i & 2 == 0 { self.min[1] } else { self.max[1] },
+                if i & 4 == 0 { self.min[2] } else { self.max[2] },
+            ]
+        })
+    }
 }
 
 /// Conservative union of live camera-group AABBs for one arena, stored relative
@@ -224,6 +238,10 @@ pub(crate) struct ArenaDirectory {
     cull_vertex_offset: Vec<i32>,
     /// CPU-cull SoA: packed face-quad counts, parallel to `slots`.
     cull_face_quads: Vec<[u32; 3]>,
+    /// CPU-cull SoA: anchor-relative cage corners (bit 0 = +x, bit 1 = +y,
+    /// bit 2 = +z). Meaningful for caged slots; face-run culling reads them.
+    /// Parallel to `slots`.
+    cull_corners: Vec<[[f32; 3]; 8]>,
     /// Per-slot live-to-cull bitset (camera-group slots only). Rebuilt into the
     /// per-frame live+visible mask; maintained on register/free.
     live_bits: Vec<u32>,
@@ -263,6 +281,7 @@ impl ArenaDirectory {
             cull_index_count: Vec::new(),
             cull_vertex_offset: Vec::new(),
             cull_face_quads: Vec::new(),
+            cull_corners: Vec::new(),
             live_bits: Vec::new(),
             unions: Vec::new(),
             members: Vec::new(),
@@ -299,10 +318,12 @@ impl ArenaDirectory {
         lod: bool,
         aabb: MeshAabb,
     ) -> u32 {
-        self.note_upload_at(slot, generation, buffer, pass, lod, false, aabb)
+        self.note_upload_at(slot, generation, buffer, pass, lod, aabb, None)
     }
 
     /// [`Self::note_upload`] for a mesh whose record names a cage.
+    /// `corners` are anchor-relative, cage SSBO order. Face-run culling reads
+    /// them; `aabb` stays the corner box used for the frustum.
     pub fn note_upload_caged(
         &mut self,
         slot: u32,
@@ -311,8 +332,9 @@ impl ArenaDirectory {
         pass: Pass,
         lod: bool,
         aabb: MeshAabb,
+        corners: [[f32; 3]; 8],
     ) -> u32 {
-        self.note_upload_at(slot, generation, buffer, pass, lod, true, aabb)
+        self.note_upload_at(slot, generation, buffer, pass, lod, aabb, Some(corners))
     }
 
     fn note_upload_at(
@@ -322,9 +344,10 @@ impl ArenaDirectory {
         buffer: vk::Buffer,
         pass: Pass,
         lod: bool,
-        caged: bool,
         aabb: MeshAabb,
+        corners: Option<[[f32; 3]; 8]>,
     ) -> u32 {
+        let caged = corners.is_some();
         if let Some(Some((old_arena, old_lane, _))) = self.slots.get(slot as usize).copied() {
             // Re-register without a free: drop the old box out of the union.
             if old_lane.is_some() {
@@ -376,11 +399,15 @@ impl ArenaDirectory {
             self.cull_index_count.resize(n, 0);
             self.cull_vertex_offset.resize(n, 0);
             self.cull_face_quads.resize(n, [0; 3]);
+            self.cull_corners.resize(n, [[0.0; 3]; 8]);
             self.live_bits.resize(n.div_ceil(32), 0);
         }
         self.slots[slot as usize] = Some((arena, lane, generation));
         self.aabbs[slot as usize] = aabb;
         self.write_cull_soa(slot, arena, lane, pass, lod, caged, aabb);
+        if let Some(c) = corners {
+            self.cull_corners[slot as usize] = c;
+        }
         if lane.is_some() {
             self.set_member(arena as usize, slot, true);
             self.grow_union(arena as usize, aabb);
@@ -448,15 +475,31 @@ impl ArenaDirectory {
     /// partition capacities keep matching what the cull shader emits.
     /// Grows the arena union with the new AABB (stale-large until a free).
     pub fn note_record(&mut self, slot: u32, pass: Pass, lod: bool, aabb: MeshAabb) {
-        self.note_record_at(slot, pass, lod, false, aabb);
+        self.note_record_at(slot, pass, lod, aabb, None);
     }
 
     /// [`Self::note_record`] for a mesh whose record names a cage.
-    pub fn note_record_caged(&mut self, slot: u32, pass: Pass, lod: bool, aabb: MeshAabb) {
-        self.note_record_at(slot, pass, lod, true, aabb);
+    /// `corners` replace the slot's anchor-relative cage corners.
+    pub fn note_record_caged(
+        &mut self,
+        slot: u32,
+        pass: Pass,
+        lod: bool,
+        aabb: MeshAabb,
+        corners: [[f32; 3]; 8],
+    ) {
+        self.note_record_at(slot, pass, lod, aabb, Some(corners));
     }
 
-    fn note_record_at(&mut self, slot: u32, pass: Pass, lod: bool, caged: bool, aabb: MeshAabb) {
+    fn note_record_at(
+        &mut self,
+        slot: u32,
+        pass: Pass,
+        lod: bool,
+        aabb: MeshAabb,
+        corners: Option<[[f32; 3]; 8]>,
+    ) {
+        let caged = corners.is_some();
         let Some(Some((arena, lane, _))) = self.slots.get(slot as usize).copied() else {
             return;
         };
@@ -482,6 +525,12 @@ impl ArenaDirectory {
         }
         self.aabbs[slot as usize] = aabb;
         self.write_cull_soa(slot, arena, new_lane, pass, lod, caged, aabb);
+        if let Some(c) = corners {
+            let i = slot as usize;
+            if i < self.cull_corners.len() {
+                self.cull_corners[i] = c;
+            }
+        }
         if new_lane.is_some() {
             self.grow_union(arena as usize, aabb);
         }
@@ -569,6 +618,11 @@ impl ArenaDirectory {
         &self.cull_face_quads
     }
 
+    /// Anchor-relative cage corners, parallel to [`Self::cull_aabbs`].
+    pub(crate) fn cull_corners(&self) -> &[[[f32; 3]; 8]] {
+        &self.cull_corners
+    }
+
     /// Camera-group live bitset, maintained on register/free.
     pub(crate) fn live_bits(&self) -> &[u32] {
         &self.live_bits
@@ -626,6 +680,9 @@ impl ArenaDirectory {
         let i = slot as usize;
         if i < self.cull_bits.len() {
             self.cull_bits[i] = 0;
+        }
+        if i < self.cull_corners.len() {
+            self.cull_corners[i] = [[0.0; 3]; 8];
         }
         self.set_live_bit(slot, false);
     }
@@ -1199,9 +1256,9 @@ mod tests {
     fn caged_full_res_adds_its_lane_and_shadow_capacity() {
         let mut dir = ArenaDirectory::new();
         dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL, UNIT);
-        dir.note_upload_caged(1, G1, buf(1), Pass::Opaque, FULL, UNIT);
-        dir.note_upload_caged(2, G1, buf(1), Pass::Cutout, FULL, UNIT);
-        dir.note_upload_caged(3, G1, buf(1), Pass::Opaque, LOD, UNIT);
+        dir.note_upload_caged(1, G1, buf(1), Pass::Opaque, FULL, UNIT, UNIT.box_corners());
+        dir.note_upload_caged(2, G1, buf(1), Pass::Cutout, FULL, UNIT, UNIT.box_corners());
+        dir.note_upload_caged(3, G1, buf(1), Pass::Opaque, LOD, UNIT, UNIT.box_corners());
         let (parts, _) = dir.partitions();
         assert_eq!(
             parts[camera_part(Group::Opaque as usize, 0, 0, 1)].capacity,
@@ -1217,7 +1274,7 @@ mod tests {
             1
         );
         assert_eq!(parts[shadow_part(0, 0, 1)].capacity, 3);
-        dir.note_record_caged(1, Pass::Opaque, LOD, UNIT);
+        dir.note_record_caged(1, Pass::Opaque, LOD, UNIT, UNIT.box_corners());
         let (parts, _) = dir.partitions();
         assert_eq!(
             parts[camera_part(Group::Caged as usize, 0, 0, 1)].capacity,
@@ -1330,7 +1387,15 @@ mod tests {
             let buf_id = buf(arena as u64 + 1);
             dir.note_upload(arena as u32 * 3, G1, buf_id, Pass::Opaque, FULL, aabb);
             dir.note_upload(arena as u32 * 3 + 1, G1, buf_id, Pass::Opaque, LOD, aabb);
-            dir.note_upload_caged(arena as u32 * 3 + 2, G1, buf_id, Pass::Opaque, LOD, aabb);
+            dir.note_upload_caged(
+                arena as u32 * 3 + 2,
+                G1,
+                buf_id,
+                Pass::Opaque,
+                LOD,
+                aabb,
+                aabb.box_corners(),
+            );
         }
         let (parts, _) = partitions_at(&mut dir, origin_eye());
         let n = places.len();
