@@ -984,10 +984,14 @@ impl Renderer {
         }
     }
 
-    /// Install one datum and, when `albedo_size > 0`, a cube. The previous
-    /// cube is retired on the next flush. No GPU wait. The caller already
-    /// validated the description. A failed cube allocation is logged once
-    /// and the map is installed with `albedo_size` 0 (flat per-face colours);
+    /// Install one datum and, when `albedo_size > 0`, a cube. The datum is
+    /// published on the next flush. When the slot's cube already has all six
+    /// faces landed, the new cube is pending and the sampled view stays until
+    /// those uploads have signaled the graphics timeline; otherwise the
+    /// previous cube is retired on the next flush. No GPU wait. The caller
+    /// already validated the description. A failed cube allocation is logged
+    /// once. With no complete cube the map is installed with `albedo_size` 0
+    /// (flat per-face colours); with one, that cube stays on screen.
     /// [`crate::FarMapError::OutOfMemory`] is not returned.
     pub fn set_far_map(
         &mut self,
@@ -1011,12 +1015,15 @@ impl Renderer {
         )
     }
 
-    /// Queue one albedo face. Recorded into the next frame's command buffer.
+    /// Queue one albedo face for the pending cube, or the sampled cube when
+    /// no replacement is in progress. Recorded into the next frame's command
+    /// buffer.
     pub fn set_far_map_face(&mut self, id: u8, face: u32, bytes: Box<[u8]>) {
         self.far_maps.queue_face(id, face, bytes);
     }
 
-    /// Drop a map. The cube is retired on the next flush.
+    /// Drop a map, including a pending replacement. Cubes are retired on the
+    /// next flush.
     pub fn clear_far_map(&mut self, id: u8) {
         self.far_maps.clear(id);
     }

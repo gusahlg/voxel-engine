@@ -77,9 +77,11 @@ pub enum FarMapError {
     /// The albedo cube could not be allocated.
     ///
     /// [`Engine::set_far_map`](crate::Engine::set_far_map) does not return this.
-    /// The render thread logs that failure once for the map id and keeps the
-    /// datum with flat per-face colours, as if `albedo_size` were 0, until a
-    /// later `set_far_map`. The variant stays so existing matches still compile.
+    /// The render thread logs that failure once for the map id. With no
+    /// complete cube it keeps the datum with flat per-face colours, as if
+    /// `albedo_size` were 0. With a complete cube already on screen, that
+    /// cube stays until a later `set_far_map`. The variant stays so existing
+    /// matches still compile.
     OutOfMemory,
 }
 

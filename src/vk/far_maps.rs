@@ -2,14 +2,22 @@
 //!
 //! One device-local buffer holds eight headers plus every datum. Cube images
 //! are created on `set_map`. If that allocation fails, the failure is logged
-//! once for the map id and the slot keeps its datum with `albedo_size` 0, so
-//! the shader uses the flat per-face colours. [`crate::FarMapError::OutOfMemory`]
-//! is not returned to the caller. Face bytes and mip blits are recorded into
-//! the frame command buffer, which is the queue that can blit; a face whose
-//! cube is missing is dropped. The datum copy follows the block-texture /
-//! material transfer lane (timeline wait, queue-family ownership when the
-//! families differ, staging retired on that timeline). Nothing here waits on
-//! the GPU.
+//! once for the map id. With no complete cube on screen the slot keeps its
+//! datum with `albedo_size` 0, so the shader uses the flat per-face colours;
+//! a complete cube stays up. [`crate::FarMapError::OutOfMemory`] is not
+//! returned to the caller. Face bytes and mip blits are recorded into the
+//! frame command buffer, which is the queue that can blit; a face whose cube
+//! is missing is dropped. The datum copy follows the block-texture / material
+//! transfer lane (timeline wait, queue-family ownership when the families
+//! differ, staging retired on that timeline). Nothing here waits on the GPU.
+//!
+//! A second `set_map` on a slot whose sampled cube already has all six faces
+//! landed keeps that cube on the descriptor and in the header. The new cube
+//! is pending: uploads fill it, and it becomes the sampled cube only once
+//! every new face and its mips have signaled the graphics timeline. The old
+//! cube is then retired at the swap frame's timeline value. The datum is
+//! written on the call, not at the swap. `albedo_size` 0 drops both cubes
+//! on that call.
 
 use ash::vk;
 
@@ -30,6 +38,8 @@ const MAX_G: usize = 65;
 const SLOT_FLOATS: usize = 6 * MAX_G * MAX_G;
 const HEADER_UINTS: usize = MAX_FAR_MAPS * 8;
 const BUFFER_UINTS: usize = HEADER_UINTS + MAX_FAR_MAPS * SLOT_FLOATS;
+/// Six cube faces, bit `f` for face `f`.
+const FACE_MASK: u32 = 0b11_1111;
 
 struct GpuCube {
     image: vk::Image,
@@ -52,14 +62,206 @@ impl GpuCube {
     }
 }
 
+/// Where [`SlotCubes::install`] puts a new cube.
+enum CubeInstall {
+    /// `albedo_size` 0. Both cubes are dropped and the shader uses flat colours.
+    Flat,
+    /// No complete cube is on screen. The new cube is sampled as faces land.
+    Immediate,
+    /// A complete cube is on screen. The new cube stays off-screen until its
+    /// six faces have landed.
+    Pending,
+}
+
+fn cube_install(active_landed: Option<u32>, albedo_size: u32) -> CubeInstall {
+    if albedo_size == 0 {
+        CubeInstall::Flat
+    } else if active_landed.is_some_and(|bits| bits & FACE_MASK == FACE_MASK) {
+        CubeInstall::Pending
+    } else {
+        CubeInstall::Immediate
+    }
+}
+
+/// Cubes [`SlotCubes::install`] or [`SlotCubes::clear`] removed. The caller
+/// retires them after the frames that might still sample them.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Retired<A> {
+    active: Option<A>,
+    pending: Option<A>,
+}
+
+impl<A> Retired<A> {
+    fn drain(self, mut f: impl FnMut(A)) {
+        if let Some(cube) = self.active {
+            f(cube);
+        }
+        if let Some(cube) = self.pending {
+            f(cube);
+        }
+    }
+}
+
+struct Tracked<A> {
+    size: u32,
+    /// Faces whose uploads are visible to later draws. Bit `f` is face `f`.
+    landed: u32,
+    /// `set_map` generation that owns this cube. A face stamped with another
+    /// generation is not for this image.
+    generation: u32,
+    cube: A,
+}
+
+/// Sampled cube plus an optional replacement. `A` is the device image;
+/// tests pass an id. No Vulkan types.
+///
+/// `land_face` means that face's upload, mips included, is visible to later
+/// draws. The device code calls it in the recording frame for the sampled
+/// cube (that frame's barriers cover the texels) and, for a pending cube,
+/// only after the frame that recorded the upload has signaled the graphics
+/// timeline.
+struct SlotCubes<A> {
+    active: Option<Tracked<A>>,
+    pending: Option<Tracked<A>>,
+}
+
+impl<A> SlotCubes<A> {
+    fn new() -> Self {
+        Self {
+            active: None,
+            pending: None,
+        }
+    }
+
+    /// `cube` is `None` when `size` is 0 or the image could not be allocated.
+    /// A failed allocation of a pending cube drops any cube already pending
+    /// and leaves the sampled one in place.
+    #[must_use]
+    fn install(&mut self, size: u32, cube: Option<A>, generation: u32) -> Retired<A> {
+        let kind = cube_install(self.active.as_ref().map(|c| c.landed), size);
+        match kind {
+            CubeInstall::Flat => {
+                debug_assert!(cube.is_none(), "albedo size 0 allocates no cube");
+                self.take_both()
+            }
+            CubeInstall::Immediate => {
+                let retired = self.take_both();
+                if let Some(cube) = cube {
+                    self.active = Some(Tracked {
+                        size,
+                        landed: 0,
+                        generation,
+                        cube,
+                    });
+                }
+                retired
+            }
+            CubeInstall::Pending => {
+                let pending = self.pending.take().map(|c| c.cube);
+                if let Some(cube) = cube {
+                    self.pending = Some(Tracked {
+                        size,
+                        landed: 0,
+                        generation,
+                        cube,
+                    });
+                }
+                Retired {
+                    active: None,
+                    pending,
+                }
+            }
+        }
+    }
+
+    #[must_use]
+    fn clear(&mut self) -> Retired<A> {
+        self.take_both()
+    }
+
+    fn take_both(&mut self) -> Retired<A> {
+        Retired {
+            active: self.active.take().map(|c| c.cube),
+            pending: self.pending.take().map(|c| c.cube),
+        }
+    }
+
+    /// Landed mask published to the shader. The pending cube's bits are not
+    /// included.
+    fn sampled_landed(&self) -> u32 {
+        self.active
+            .as_ref()
+            .map(|c| c.landed & FACE_MASK)
+            .unwrap_or(0)
+    }
+
+    /// Edge of the sampled cube, or 0 when the shader should use flat colours.
+    fn sampled_size(&self) -> u32 {
+        self.active.as_ref().map(|c| c.size).unwrap_or(0)
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn active_cube(&self) -> Option<&A> {
+        self.active.as_ref().map(|c| &c.cube)
+    }
+
+    /// Cube that receives uploads: the pending replacement when one exists.
+    fn upload(&self) -> Option<&Tracked<A>> {
+        if let Some(pending) = self.pending.as_ref() {
+            Some(pending)
+        } else {
+            self.active.as_ref()
+        }
+    }
+
+    fn upload_mut(&mut self) -> Option<&mut Tracked<A>> {
+        if let Some(pending) = self.pending.as_mut() {
+            Some(pending)
+        } else {
+            self.active.as_mut()
+        }
+    }
+
+    fn accepts(&self, generation: u32) -> bool {
+        self.upload()
+            .is_some_and(|cube| cube.generation == generation)
+    }
+
+    /// Set `face`'s bit on the upload target. When that completes a pending
+    /// cube, it becomes the sampled cube and the previous one is returned.
+    fn land_face(&mut self, face: u32) -> Option<A> {
+        if face >= 6 {
+            return None;
+        }
+        {
+            let Some(target) = self.upload_mut() else {
+                return None;
+            };
+            target.landed |= 1 << face;
+        }
+        let complete = self
+            .pending
+            .as_ref()
+            .is_some_and(|cube| cube.landed & FACE_MASK == FACE_MASK);
+        if !complete {
+            return None;
+        }
+        let next = self.pending.take().expect("pending cube completed");
+        self.active.replace(next).map(|cube| cube.cube)
+    }
+}
+
 struct Slot {
     g: u32,
     min_off: f32,
     max_off: f32,
-    albedo_size: u32,
-    landed: u32,
+    /// Bumped on every `set_map` and `clear`. Queued faces stamp it; a face
+    /// whose generation no longer matches is dropped.
     generation: u32,
-    cube: Option<GpuCube>,
+    cubes: SlotCubes<GpuCube>,
 }
 
 struct PendingFace {
@@ -67,6 +269,15 @@ struct PendingFace {
     face: u32,
     generation: u32,
     bytes: Box<[u8]>,
+}
+
+/// A pending-cube face recorded into the frame that signals `done_at`.
+/// Mips are in that same command buffer, so the signal covers them.
+struct InflightFace {
+    id: u8,
+    face: u32,
+    generation: u32,
+    done_at: TimelineValue,
 }
 
 pub(crate) struct FarMaps {
@@ -83,6 +294,9 @@ pub(crate) struct FarMaps {
     dummy: GpuCube,
     slots: [Slot; MAX_FAR_MAPS],
     pending_faces: Vec<PendingFace>,
+    /// Pending-cube faces whose blits are in a frame that has not signaled
+    /// yet. Applied by [`Self::promote_landed`].
+    inflight_faces: Vec<InflightFace>,
     pending_retire: Vec<GpuCube>,
     image_retire: RetireQueue<GpuCube>,
     staging_retire: RetireQueue<(vk::Buffer, vk::DeviceMemory)>,
@@ -146,10 +360,8 @@ impl FarMaps {
             g: 0,
             min_off: 0.0,
             max_off: 0.0,
-            albedo_size: 0,
-            landed: 0,
             generation: 1,
-            cube: None,
+            cubes: SlotCubes::new(),
         };
         Self {
             buffer,
@@ -161,6 +373,7 @@ impl FarMaps {
             dummy,
             slots: std::array::from_fn(|_| slot()),
             pending_faces: Vec::new(),
+            inflight_faces: Vec::new(),
             pending_retire: Vec::new(),
             image_retire: RetireQueue::new(),
             staging_retire: RetireQueue::new(),
@@ -179,11 +392,12 @@ impl FarMaps {
         self.sampler
     }
 
-    /// Cube view for `id`, or the 1×1 dummy when that slot has no albedo.
+    /// Sampled cube view for `id`, or the 1×1 dummy when that slot has no
+    /// albedo on screen. A pending replacement is not returned here.
     pub(crate) fn view(&self, id: usize) -> vk::ImageView {
         self.slots
             .get(id)
-            .and_then(|s| s.cube.as_ref())
+            .and_then(|s| s.cubes.active_cube())
             .map(|c| c.view)
             .unwrap_or(self.dummy.view)
     }
@@ -207,30 +421,68 @@ impl FarMaps {
             || !self.release_cmds.is_empty()
     }
 
-    /// A datum overwrite of a buffer graphics has already read, or a face
-    /// blit onto a cube a previous frame may still be sampling. The frame
-    /// loop submits pending batches first so `last_render_value` covers them.
+    /// A datum overwrite of a buffer graphics has already read, a face blit
+    /// onto a cube a previous frame may still be sampling, or a finished
+    /// replacement that will republish the shared header. The frame loop
+    /// submits pending batches first so `last_render_value` covers them.
     pub(crate) fn has_overwrite_pending(&self) -> bool {
         if self.buffer_dirty && self.buffer_on_graphics {
+            return true;
+        }
+        // The swap writes the header. Previous frames, including an
+        // unsubmitted batch, may still be reading the old words.
+        if self.buffer_on_graphics && self.pending_swap_is_recorded() {
             return true;
         }
         self.pending_faces.iter().any(|face| {
             self.slots.get(face.id as usize).is_some_and(|slot| {
                 slot.generation == face.generation
-                    && slot.cube.as_ref().is_some_and(|cube| cube.cleared)
+                    && !slot.cubes.has_pending()
+                    && slot
+                        .cubes
+                        .active
+                        .as_ref()
+                        .is_some_and(|cube| cube.generation == face.generation && cube.cube.cleared)
             })
         })
     }
 
-    /// Install `datum` and, when `albedo_size > 0`, a fresh cube. The previous
-    /// cube is retired at the next flush. Landed bits start clear, so faces
-    /// must be uploaded again. No GPU wait.
+    /// All six faces of some pending cube are recorded, so a later promote
+    /// may swap and rewrite the header.
+    fn pending_swap_is_recorded(&self) -> bool {
+        self.slots.iter().enumerate().any(|(id, slot)| {
+            let Some(pending) = slot.cubes.pending.as_ref() else {
+                return false;
+            };
+            let mut mask = pending.landed;
+            for face in &self.inflight_faces {
+                if face.id as usize == id && face.generation == pending.generation && face.face < 6
+                {
+                    mask |= 1 << face.face;
+                }
+            }
+            mask & FACE_MASK == FACE_MASK
+        })
+    }
+
+    /// Install `datum` and, when `albedo_size > 0`, a cube. The datum (and
+    /// its min/max) is written on this call, including while the new cube is
+    /// only pending. The header's landed mask and albedo edge stay on the
+    /// sampled cube until a pending cube swaps in.
+    ///
+    /// A slot with a sampled cube whose six faces have landed keeps that cube
+    /// on screen. The new cube is pending; [`Self::queue_face`] fills it, and
+    /// [`Self::promote_landed`] swaps once those uploads have signaled the
+    /// graphics timeline. A second call replaces the pending cube. A slot
+    /// with no cube, or a cube still missing a face, is replaced immediately
+    /// and the previous images are retired at the next flush. `albedo_size`
+    /// 0 drops both cubes. No GPU wait.
     ///
     /// A failed cube allocation is logged once per map id (until a later call
-    /// installs a cube or requests `albedo_size` 0) and the datum is kept
-    /// with `albedo_size` 0. [`FarMapError::OutOfMemory`] is not returned.
-    /// [`Self::queue_face`] then drops faces for this generation because the
-    /// cube is absent.
+    /// installs a cube or requests `albedo_size` 0). With no complete cube
+    /// the datum is kept with `albedo_size` 0. With one, that cube stays.
+    /// [`FarMapError::OutOfMemory`] is not returned. [`Self::queue_face`]
+    /// then drops faces for this generation because no cube owns it.
     pub(crate) fn set_map(
         &mut self,
         device: &ash::Device,
@@ -245,36 +497,50 @@ impl FarMaps {
         }
         let slot_i = id as usize;
         let bit = 1u8 << id;
-        let (cube, albedo_size) = if albedo_size == 0 {
+        let active_landed = self.slots[slot_i]
+            .cubes
+            .active
+            .as_ref()
+            .map(|cube| cube.landed);
+        let kind = cube_install(active_landed, albedo_size);
+        let cube = if albedo_size == 0 {
             self.oom_logged &= !bit;
-            (None, 0)
+            None
         } else {
             match unsafe { create_cube(device, memory_props, albedo_size) } {
                 Ok(cube) => {
                     self.oom_logged &= !bit;
-                    (Some(cube), albedo_size)
+                    Some(cube)
                 }
                 Err(FarMapError::OutOfMemory) => {
                     if self.oom_logged & bit == 0 {
                         self.oom_logged |= bit;
-                        log::warn!(
-                            "far map {id}: albedo cube allocation failed; drawing flat per-face colours until the next set_far_map"
-                        );
+                        if matches!(kind, CubeInstall::Pending) {
+                            log::warn!(
+                                "far map {id}: albedo cube allocation failed; keeping the cube on screen until the next set_far_map"
+                            );
+                        } else {
+                            log::warn!(
+                                "far map {id}: albedo cube allocation failed; drawing flat per-face colours until the next set_far_map"
+                            );
+                        }
                     }
-                    (None, 0)
+                    None
                 }
                 Err(err) => return Err(err),
             }
         };
+        let generation = {
+            let slot = &mut self.slots[slot_i];
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.generation
+        };
+        let retired = self.slots[slot_i]
+            .cubes
+            .install(albedo_size, cube, generation);
+        retired.drain(|old| self.pending_retire.push(old));
         let slot = &mut self.slots[slot_i];
-        if let Some(old) = slot.cube.take() {
-            self.pending_retire.push(old);
-        }
-        slot.generation = slot.generation.wrapping_add(1);
-        slot.albedo_size = albedo_size;
-        slot.landed = 0;
         slot.g = g;
-        slot.cube = cube;
         let base = HEADER_UINTS + slot_i * SLOT_FLOATS;
         for w in &mut self.words[base..base + SLOT_FLOATS] {
             *w = 0;
@@ -299,8 +565,10 @@ impl FarMaps {
         Ok(())
     }
 
-    /// Queue one face. Dropped at flush if `generation` is stale or the cube
-    /// is gone. Does not wait.
+    /// Queue one face for the cube currently accepting uploads (the pending
+    /// replacement when one exists, otherwise the sampled cube). Dropped at
+    /// flush if `generation` is stale, the cube is gone, or the byte length
+    /// does not match that cube. Does not wait.
     pub(crate) fn queue_face(&mut self, id: u8, face: u32, bytes: Box<[u8]>) {
         let Some(slot) = self.slots.get(id as usize) else {
             return;
@@ -313,24 +581,22 @@ impl FarMaps {
         });
     }
 
-    /// Drop the slot. The cube is retired at the next flush; the header
-    /// reports an empty map (`g == 0`) so the shader's datum read is zero.
+    /// Drop the slot, sampled cube and pending cube. Both images are retired
+    /// at the next flush. The header reports an empty map (`g == 0`) so the
+    /// shader's datum read is zero.
     pub(crate) fn clear(&mut self, id: u8) {
         if id as usize >= MAX_FAR_MAPS {
             return;
         }
         // The next failed allocation of this id should log again.
         self.oom_logged &= !(1u8 << id);
+        let retired = self.slots[id as usize].cubes.clear();
+        retired.drain(|old| self.pending_retire.push(old));
         let slot = &mut self.slots[id as usize];
-        if let Some(old) = slot.cube.take() {
-            self.pending_retire.push(old);
-        }
         slot.generation = slot.generation.wrapping_add(1);
         slot.g = 0;
         slot.min_off = 0.0;
         slot.max_off = 0.0;
-        slot.albedo_size = 0;
-        slot.landed = 0;
         let base = HEADER_UINTS + id as usize * SLOT_FLOATS;
         for w in &mut self.words[base..base + SLOT_FLOATS] {
             *w = 0;
@@ -346,8 +612,8 @@ impl FarMaps {
         self.words[b + 1] = (id * SLOT_FLOATS) as u32;
         self.words[b + 2] = slot.min_off.to_bits();
         self.words[b + 3] = slot.max_off.to_bits();
-        self.words[b + 4] = slot.landed;
-        self.words[b + 5] = slot.albedo_size;
+        self.words[b + 4] = slot.cubes.sampled_landed();
+        self.words[b + 5] = slot.cubes.sampled_size();
         self.words[b + 6] = 0;
         self.words[b + 7] = 0;
     }
@@ -370,19 +636,23 @@ impl FarMaps {
         done_at: TimelineValue,
     ) -> Option<TimelineValue> {
         unsafe {
+            if !self.inflight_faces.is_empty() {
+                let current = graphics_timeline.counter(device);
+                self.promote_landed(current);
+            }
             if !self.dummy.cleared {
                 clear_cube(device, graphics_cmd, &self.dummy);
                 self.dummy.cleared = true;
             }
             for slot in &mut self.slots {
-                if let Some(cube) = slot.cube.as_mut() {
-                    if !cube.cleared {
-                        clear_cube(device, graphics_cmd, cube);
-                        cube.cleared = true;
-                    }
+                if let Some(cube) = slot.cubes.active.as_mut() {
+                    prepare_cube(device, graphics_cmd, &mut cube.cube);
+                }
+                if let Some(cube) = slot.cubes.pending.as_mut() {
+                    prepare_cube(device, graphics_cmd, &mut cube.cube);
                 }
             }
-            let face_staging = self.record_faces(instance, device, physical, graphics_cmd);
+            let face_staging = self.record_faces(instance, device, physical, graphics_cmd, done_at);
             if let Some((buffer, memory)) = face_staging {
                 self.staging_retire.push(done_at, (buffer, memory));
             }
@@ -409,16 +679,57 @@ impl FarMaps {
         }
     }
 
+    /// Move pending-cube faces whose recording frame has signaled onto the
+    /// slot. The sixth such face swaps that cube onto the descriptor and the
+    /// header; the old cube is retired with this frame.
+    fn promote_landed(&mut self, current: TimelineValue) {
+        let mut i = 0;
+        while i < self.inflight_faces.len() {
+            if self.inflight_faces[i].done_at > current {
+                i += 1;
+                continue;
+            }
+            let face = self.inflight_faces.swap_remove(i);
+            self.promote_face(face);
+        }
+    }
+
+    fn promote_face(&mut self, face: InflightFace) {
+        let id = face.id as usize;
+        let (retired, publish) = {
+            let Some(slot) = self.slots.get_mut(id) else {
+                return;
+            };
+            if slot.generation != face.generation || !slot.cubes.accepts(face.generation) {
+                return;
+            }
+            let targets_pending = slot.cubes.has_pending();
+            let retired = slot.cubes.land_face(face.face);
+            let publish = !targets_pending || !slot.cubes.has_pending();
+            (retired, publish)
+        };
+        if let Some(old) = retired {
+            self.pending_retire.push(old);
+        }
+        if publish {
+            self.write_header(id);
+            self.buffer_dirty = true;
+        }
+    }
+
     /// Copy each current face into mip 0 and blit the chain, on `cmd` (the
-    /// graphics buffer: a transfer-only queue cannot blit). Sets the landed
-    /// bit only for a face whose commands were recorded. Returns the staging
-    /// buffer, retired by the caller at `done_at`.
+    /// graphics buffer: a transfer-only queue cannot blit). A face on the
+    /// sampled cube sets its landed bit now, so this frame's shader sees it.
+    /// A face on a pending cube waits in [`Self::inflight_faces`] until
+    /// `done_at` has signaled, mips included. Returns the staging buffer,
+    /// retired by the caller at `done_at`.
     unsafe fn record_faces(
         &mut self,
         instance: &ash::Instance,
         device: &ash::Device,
         physical: vk::PhysicalDevice,
         cmd: vk::CommandBuffer,
+        done_at: TimelineValue,
     ) -> Option<(vk::Buffer, vk::DeviceMemory)> {
         let faces = std::mem::take(&mut self.pending_faces);
         if faces.is_empty() {
@@ -439,13 +750,13 @@ impl FarMaps {
             if slot.generation != face.generation || face.face >= 6 {
                 continue;
             }
-            let Some(cube) = slot.cube.as_ref() else {
+            let Some(tracked) = slot.cubes.upload() else {
                 continue;
             };
-            if !cube.cleared {
+            if tracked.generation != face.generation || !tracked.cube.cleared {
                 continue;
             }
-            let expect = cube.size as usize * cube.size as usize * 4;
+            let expect = tracked.cube.size as usize * tracked.cube.size as usize * 4;
             if face.bytes.len() != expect {
                 continue;
             }
@@ -464,10 +775,11 @@ impl FarMaps {
         let (staging, staging_mem) = unsafe { fill_staging(device, &memory_props, &packed) };
         for job in &jobs {
             let (image, mips, size) = {
-                let cube = self.slots[job.id]
-                    .cube
-                    .as_ref()
-                    .expect("face job has a cube");
+                let cube = &self.slots[job.id]
+                    .cubes
+                    .upload()
+                    .expect("face job has a cube")
+                    .cube;
                 (cube.image, cube.mips, cube.size)
             };
             unsafe {
@@ -475,9 +787,24 @@ impl FarMaps {
                     device, cmd, image, mips, size, job.face, staging, job.offset,
                 )
             };
-            self.slots[job.id].landed |= 1 << job.face;
-            self.write_header(job.id);
-            self.buffer_dirty = true;
+            let id = job.id;
+            if self.slots[id].cubes.has_pending() {
+                // The pending image is not sampled yet. Land the bit only
+                // once this frame, mips included, has signaled.
+                self.inflight_faces.push(InflightFace {
+                    id: id as u8,
+                    face: job.face,
+                    generation: self.slots[id].generation,
+                    done_at,
+                });
+            } else {
+                let retired = self.slots[id].cubes.land_face(job.face);
+                if let Some(old) = retired {
+                    self.pending_retire.push(old);
+                }
+                self.write_header(id);
+                self.buffer_dirty = true;
+            }
         }
         Some((staging, staging_mem))
     }
@@ -706,7 +1033,11 @@ impl FarMaps {
             });
             self.dummy.destroy(device);
             for slot in &mut self.slots {
-                if let Some(cube) = slot.cube.take() {
+                let retired = slot.cubes.clear();
+                if let Some(cube) = retired.active {
+                    cube.destroy(device);
+                }
+                if let Some(cube) = retired.pending {
                     cube.destroy(device);
                 }
             }
@@ -834,6 +1165,15 @@ unsafe fn create_cube(
         size,
         cleared: false,
     })
+}
+
+/// First use of a cube: `UNDEFINED` → cleared black → `SHADER_READ`.
+unsafe fn prepare_cube(device: &ash::Device, cmd: vk::CommandBuffer, cube: &mut GpuCube) {
+    if cube.cleared {
+        return;
+    }
+    unsafe { clear_cube(device, cmd, cube) };
+    cube.cleared = true;
 }
 
 /// Every mip of every face: `UNDEFINED` → cleared black → `SHADER_READ`.
@@ -1063,5 +1403,190 @@ unsafe fn destroy_staging(device: &ash::Device, buffer: vk::Buffer, memory: vk::
     unsafe {
         device.destroy_buffer(buffer, None);
         device.free_memory(memory, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FACE_MASK, Retired, SlotCubes};
+
+    fn complete(id: u32, size: u32, generation: u32) -> SlotCubes<u32> {
+        let mut cubes = SlotCubes::new();
+        assert_eq!(
+            cubes.install(size, Some(id), generation),
+            Retired::default()
+        );
+        for face in 0..6 {
+            assert_eq!(cubes.land_face(face), None);
+        }
+        assert_eq!(cubes.sampled_landed(), FACE_MASK);
+        assert!(!cubes.has_pending());
+        cubes
+    }
+
+    #[test]
+    fn first_install_shows_each_face_as_it_lands() {
+        let mut cubes = SlotCubes::new();
+        assert_eq!(cubes.install(64, Some(7), 1), Retired::default());
+        assert_eq!(cubes.sampled_size(), 64);
+        assert_eq!(cubes.sampled_landed(), 0);
+        let mut mask = 0;
+        for face in 0..6 {
+            assert_eq!(cubes.land_face(face), None);
+            mask |= 1 << face;
+            assert_eq!(cubes.sampled_landed(), mask);
+            assert_eq!(cubes.sampled_size(), 64);
+            assert!(!cubes.has_pending());
+        }
+        assert_eq!(cubes.sampled_landed(), FACE_MASK);
+    }
+
+    #[test]
+    fn replacement_keeps_the_old_mask_until_six_new_faces_land() {
+        let mut cubes = complete(1, 256, 1);
+        assert_eq!(cubes.install(1024, Some(2), 2), Retired::default());
+        assert!(cubes.has_pending());
+        assert_eq!(cubes.sampled_size(), 256);
+        assert_eq!(cubes.sampled_landed(), FACE_MASK);
+        assert_eq!(cubes.upload().map(|c| c.size), Some(1024));
+        for face in 0..5 {
+            assert_eq!(cubes.land_face(face), None);
+            assert_eq!(cubes.sampled_size(), 256);
+            assert_eq!(cubes.sampled_landed(), FACE_MASK);
+            assert!(cubes.has_pending());
+        }
+        assert_eq!(cubes.land_face(5), Some(1));
+        assert!(!cubes.has_pending());
+        assert_eq!(cubes.sampled_size(), 1024);
+        assert_eq!(cubes.sampled_landed(), FACE_MASK);
+        assert_eq!(cubes.active_cube().copied(), Some(2));
+        // A repeat of the last face stays on the cube now on screen.
+        assert_eq!(cubes.land_face(5), None);
+        assert_eq!(cubes.sampled_size(), 1024);
+    }
+
+    #[test]
+    fn replacement_of_an_incomplete_cube_is_immediate() {
+        let mut cubes = SlotCubes::new();
+        assert_eq!(cubes.install(256, Some(1), 1), Retired::default());
+        assert_eq!(cubes.land_face(0), None);
+        assert_eq!(cubes.land_face(3), None);
+        assert_eq!(cubes.sampled_landed(), (1 << 0) | (1 << 3));
+        assert_eq!(
+            cubes.install(1024, Some(2), 2),
+            Retired {
+                active: Some(1),
+                pending: None,
+            }
+        );
+        assert!(!cubes.has_pending());
+        assert_eq!(cubes.sampled_size(), 1024);
+        assert_eq!(cubes.sampled_landed(), 0);
+        assert_eq!(cubes.land_face(2), None);
+        assert_eq!(cubes.sampled_landed(), 1 << 2);
+        assert_eq!(cubes.sampled_size(), 1024);
+    }
+
+    #[test]
+    fn clear_drops_the_sampled_cube_and_the_pending_cube() {
+        let mut cubes = complete(1, 256, 1);
+        assert_eq!(cubes.install(1024, Some(2), 2), Retired::default());
+        assert_eq!(cubes.land_face(0), None);
+        assert_eq!(
+            cubes.clear(),
+            Retired {
+                active: Some(1),
+                pending: Some(2),
+            }
+        );
+        assert_eq!(cubes.sampled_size(), 0);
+        assert_eq!(cubes.sampled_landed(), 0);
+        assert!(!cubes.has_pending());
+        assert!(cubes.upload().is_none());
+        assert_eq!(cubes.land_face(0), None);
+    }
+
+    #[test]
+    fn albedo_size_zero_drops_both_cubes_immediately() {
+        let mut cubes = complete(1, 256, 1);
+        assert_eq!(cubes.install(1024, Some(2), 2), Retired::default());
+        assert_eq!(cubes.land_face(4), None);
+        assert_eq!(cubes.sampled_landed(), FACE_MASK);
+        assert_eq!(
+            cubes.install(0, None, 3),
+            Retired {
+                active: Some(1),
+                pending: Some(2),
+            }
+        );
+        assert_eq!(cubes.sampled_size(), 0);
+        assert_eq!(cubes.sampled_landed(), 0);
+        assert!(!cubes.has_pending());
+        assert!(cubes.upload().is_none());
+    }
+
+    #[test]
+    fn a_second_replacement_discards_the_pending_cube() {
+        let mut cubes = complete(1, 256, 1);
+        assert_eq!(cubes.install(512, Some(2), 2), Retired::default());
+        assert_eq!(cubes.land_face(0), None);
+        assert_eq!(cubes.land_face(1), None);
+        assert_eq!(
+            cubes.install(1024, Some(3), 3),
+            Retired {
+                active: None,
+                pending: Some(2),
+            }
+        );
+        assert_eq!(cubes.sampled_size(), 256);
+        assert_eq!(cubes.sampled_landed(), FACE_MASK);
+        assert!(cubes.accepts(3));
+        assert!(!cubes.accepts(2));
+        for face in 0..5 {
+            assert_eq!(cubes.land_face(face), None);
+            assert_eq!(cubes.sampled_size(), 256);
+        }
+        assert_eq!(cubes.land_face(5), Some(1));
+        assert_eq!(cubes.sampled_size(), 1024);
+        assert_eq!(cubes.active_cube().copied(), Some(3));
+    }
+
+    #[test]
+    fn failed_allocation_keeps_a_complete_cube() {
+        let mut cubes = complete(1, 256, 1);
+        assert_eq!(cubes.install(512, Some(2), 2), Retired::default());
+        assert_eq!(
+            cubes.install(1024, None, 3),
+            Retired {
+                active: None,
+                pending: Some(2),
+            }
+        );
+        assert!(!cubes.has_pending());
+        assert_eq!(cubes.sampled_size(), 256);
+        assert_eq!(cubes.sampled_landed(), FACE_MASK);
+        assert_eq!(cubes.active_cube().copied(), Some(1));
+        assert!(cubes.accepts(1));
+        assert!(!cubes.accepts(3));
+        // Faces for the failed generation must not move the sampled mask.
+        assert_eq!(cubes.sampled_landed(), FACE_MASK);
+    }
+
+    #[test]
+    fn failed_allocation_of_an_incomplete_cube_drops_to_flat() {
+        let mut cubes = SlotCubes::new();
+        assert_eq!(cubes.install(256, Some(1), 1), Retired::default());
+        assert_eq!(cubes.land_face(0), None);
+        assert_eq!(
+            cubes.install(1024, None, 2),
+            Retired {
+                active: Some(1),
+                pending: None,
+            }
+        );
+        assert_eq!(cubes.sampled_size(), 0);
+        assert_eq!(cubes.sampled_landed(), 0);
+        assert!(cubes.upload().is_none());
+        assert!(!cubes.accepts(2));
     }
 }
