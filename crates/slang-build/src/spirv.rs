@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: 2026 voxel-engine contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::toolchain::spirv_val_available;
 
@@ -80,13 +85,14 @@ pub fn validate_spirv_with_env(bytes: &[u8], target_env: &str) -> Result<(), Str
     if !spirv_val_available() {
         return Ok(());
     }
-    let dir = std::env::temp_dir().join("voxel_slang_build_spirv_val");
-    fs::create_dir_all(&dir).map_err(|e| format!("create {dir:?}: {e}"))?;
-    let path = dir.join(format!("mod-{:x}.spv", fnv1a_quick(bytes)));
+    // One directory per call. The shader_validation tests run in parallel and
+    // validate the same modules; a shared scratch path lets one call delete or
+    // overwrite the file the other is passing to spirv-val.
+    let scratch = unique_scratch_dir();
+    fs::create_dir_all(&scratch.path).map_err(|e| format!("create {:?}: {e}", scratch.path))?;
+    let path = scratch.path.join("mod.spv");
     fs::write(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-    let result = run_spirv_val(&path, target_env);
-    let _ = fs::remove_file(&path);
-    result
+    run_spirv_val(&path, target_env)
 }
 
 /// Run `spirv-val --target-env <target_env>` on a file on disk.
@@ -104,13 +110,26 @@ pub fn run_spirv_val(path: &Path, target_env: &str) -> Result<(), String> {
     }
 }
 
-fn fnv1a_quick(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// Process id plus a per-call counter. Removed on drop, including on error.
+struct ScratchDir {
+    path: PathBuf,
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
     }
-    hash
+}
+
+fn unique_scratch_dir() -> ScratchDir {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    ScratchDir {
+        path: std::env::temp_dir().join(format!(
+            "voxel_slang_build_spirv_val-{}-{n}",
+            std::process::id()
+        )),
+    }
 }
 
 #[cfg(test)]
