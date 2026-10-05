@@ -204,8 +204,20 @@ impl Renderer {
         // Far-body table (sky set 0 binding 2). Same slot fence as the UBO.
         // A sky with no bodies still uploads a zero count so the binding is live.
         if self.flags.sky && lists.sky.is_some() {
+            let view = lists.scene.as_ref().map(|scene| {
+                super::far_bodies::far_view(
+                    scene.fovy_tan_half,
+                    scene.view_proj,
+                    self.render_extent.width,
+                    self.render_extent.height,
+                )
+            });
             self.far_ring
-                .write(FrameSlot::new(slot), lists.far_slice());
+                .write(FrameSlot::new(slot), lists.far_slice(), view);
+        } else {
+            crate::profile::gauge(crate::profile::Gauge::FarBodies, 0);
+            crate::profile::gauge(crate::profile::Gauge::FarDrawn, 0);
+            crate::profile::gauge(crate::profile::Gauge::FarTiles, 0);
         }
         let warp_map = lists
             .scene

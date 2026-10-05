@@ -2,7 +2,8 @@
 // Outside, the body is at distance 1 along dir and radius is radius/distance.
 // An inner sphere uses that space with radius/distance > 1 (the viewer is
 // inside); the hit is the far root and the normal points at the centre.
-// Included from sky.frag after the frame uniform is declared.
+// The table leads with a 16-byte cone per body so a pixel can reject the
+// record before loading it. Included from sky.frag after the frame uniform.
 
 #ifndef VOXEL_FAR_BODY_SLANG
 #define VOXEL_FAR_BODY_SLANG
@@ -25,8 +26,13 @@ struct FarGpu
 
 struct FarTable
 {
-    uint4 header; // x = count
+    // x = count, y = tile size in pixels, z = tiles_x, w = tiles_y.
+    // yzw are 0 when the host has no view; the shader then walks every body.
+    uint4 header;
+    float4 cone[32]; // xyz = dir, w = sine bound (-1 = never reject)
     FarGpu body[32];
+    // Bit k is kept body k. One word per tile, row-major. Host cap is 8192.
+    uint tile_mask[8192];
 };
 
 // Set 0, binding 2: the host far-body table.
@@ -349,25 +355,28 @@ bool far_ray_rounded(float3 ray, float3 center, float rho, float4 rot, float exp
     return false;
 }
 
-float3 far_face(FarGpu b, uint face)
+float3 far_face(uint i, uint face)
 {
-    if (face == 0u) return b.albedo0.rgb;
-    if (face == 1u) return b.albedo1.rgb;
-    if (face == 2u) return b.albedo2.rgb;
-    if (face == 3u) return b.albedo3.rgb;
-    if (face == 4u) return b.albedo4.rgb;
-    return b.albedo5.rgb;
+    if (face == 0u) return farTable[0].body[i].albedo0.rgb;
+    if (face == 1u) return farTable[0].body[i].albedo1.rgb;
+    if (face == 2u) return farTable[0].body[i].albedo2.rgb;
+    if (face == 3u) return farTable[0].body[i].albedo3.rgb;
+    if (face == 4u) return farTable[0].body[i].albedo4.rgb;
+    return farTable[0].body[i].albedo5.rgb;
 }
 
-float3 far_albedo(FarGpu b, float3 bodyP, uint face, bool sphere, float rho)
+float3 far_albedo(uint i, float3 bodyP, uint face, bool sphere, float rho)
 {
-    uint seed = b.seed.x;
+    uint seed = farTable[0].body[i].seed.x;
     if (sphere)
     {
         float h = far_fbm((bodyP / rho) * 3.0, seed);
-        return lerp(b.albedo0.rgb, b.albedo1.rgb, smoothstep(0.38, 0.62, h));
+        return lerp(
+            farTable[0].body[i].albedo0.rgb,
+            farTable[0].body[i].albedo1.rgb,
+            smoothstep(0.38, 0.62, h));
     }
-    float3 alb = far_face(b, face);
+    float3 alb = far_face(i, face);
     float3 q = bodyP / rho;
     float2 uv = face < 2u ? q.yz : (face < 4u ? q.xz : q.xy);
     float region = far_u01(int(floor(uv.x * 4.0)), int(floor(uv.y * 4.0)), int(face), seed);
@@ -413,21 +422,57 @@ float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air, float rho, bool c
 }
 
 // `px` is the pixel angle, from fwidth in the entry point (uniform flow).
+// `pix` is SV_Position.xy (framebuffer pixels, origin top-left).
 // `inscatter` is the viewer's sky radiance along `ray` (no sun disc, moon or stars).
-float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
+float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix)
 {
     uint n = min(farTable[0].header.x, 32u);
     if (n == 0u)
         return col;
 
+    // One mask for the whole tile. Bits are kept-index order, so walking the
+    // lowest set bit keeps the original composite order.
+    uint live = n == 32u ? 0xffffffffu : ((1u << n) - 1u);
+    uint tilePx = farTable[0].header.y;
+    uint tilesX = farTable[0].header.z;
+    uint tilesY = farTable[0].header.w;
+    uint mask;
+    if (tilePx == 0u || tilesX == 0u || tilesY == 0u)
+        mask = live;
+    else
+    {
+        // Helpers at the quad edge can sit just outside the framebuffer.
+        float2 p = max(pix, float2(0.0, 0.0));
+        uint tx = min(uint(p.x) / tilePx, tilesX - 1u);
+        uint ty = min(uint(p.y) / tilePx, tilesY - 1u);
+        mask = farTable[0].tile_mask[ty * tilesX + tx] & live;
+    }
+    if (mask == 0u)
+        return col;
+
     float flip = frame.light.w * 2.0 - 1.0;
     float bestT = 1e30;
     [loop]
-    for (uint i = 0u; i < n; i++)
+    while (mask != 0u)
     {
-        FarGpu b = farTable[0].body[i];
-        float rho = b.dir_rho.w;
-        float shape = b.atmosphere.w;
+        uint i = firstbitlow(mask);
+        mask &= mask - 1u;
+        // Reject before touching the 160-byte record. `f <= 0` also drops the
+        // rounded air rim's ghost ring at the antipode (that rim has no facing test).
+        float4 c = farTable[0].cone[i];
+        if (c.w >= 0.0)
+        {
+            float f = dot(ray, c.xyz);
+            float3 x = cross(ray, c.xyz);
+            float lim = c.w + 3.0 * px; // 3 px covers the 1.25 px rim, the 0.5 px AA edge and the blob tail
+            if (f <= 0.0 || dot(x, x) > lim * lim)
+                continue;
+        }
+
+        float4 dirRho = farTable[0].body[i].dir_rho;
+        float4 atmo = farTable[0].body[i].atmosphere;
+        float rho = dirRho.w;
+        float shape = atmo.w;
         bool inner = shape > 1.5 && shape < 2.5;
         bool rounded = shape > 2.5 && shape < 3.5;
         if (inner)
@@ -437,7 +482,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
         }
         else if (!(rho > 0.0 && rho < 1.0))
             continue;
-        float3 center = b.dir_rho.xyz;
+        float3 center = dirRho.xyz;
         float facing = dot(ray, center);
         // Inside the sphere every direction hits the far wall, including away from the centre.
         // A rounded body can contain the camera in its enclosing sphere while the camera is
@@ -445,7 +490,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
         if (!inner && !rounded && facing <= 0.0)
             continue;
 
-        float3 air = b.atmosphere.rgb;
+        float3 air = atmo.rgb;
         bool hasAir = dot(air, air) > 0.0;
         if (inner)
         {
@@ -454,8 +499,9 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
             if (far_ray_inner(ray, center, rho, facing, t, nrm) && t < bestT)
             {
                 bestT = t;
-                float3 bodyP = far_inv_rotate(b.rot, ray * t - center);
-                float3 alb = far_albedo(b, bodyP, 0u, true, rho);
+                float4 rot = farTable[0].body[i].rot;
+                float3 bodyP = far_inv_rotate(rot, ray * t - center);
+                float3 alb = far_albedo(i, bodyP, 0u, true, rho);
                 col = far_lit(alb, nrm, ray, air, rho, true);
             }
             continue;
@@ -472,8 +518,9 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
                 float blob = exp(-4.0 * (s * s) / (px * px));
                 float phase = saturate(0.5 - 0.5 * dot(center, frame.sun_dir_elev.xyz) * flip);
                 float gain = max(phase, 0.15);
-                float tw = 0.75 + 0.25 * (float(b.seed.x & 255u) * (1.0 / 255.0));
-                col += b.albedo0.rgb * (frame.light.rgb * gain + frame.ambient_glow.rgb) * (blob * tw);
+                uint seed = farTable[0].body[i].seed.x;
+                float tw = 0.75 + 0.25 * (float(seed & 255u) * (1.0 / 255.0));
+                col += farTable[0].body[i].albedo0.rgb * (frame.light.rgb * gain + frame.ambient_glow.rgb) * (blob * tw);
             }
             continue;
         }
@@ -491,8 +538,9 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
                 if (hit && t < bestT)
                 {
                     bestT = t;
-                    float3 bodyP = far_inv_rotate(b.rot, ray * t - center);
-                    float3 alb = far_albedo(b, bodyP, 0u, true, rho);
+                    float4 rot = farTable[0].body[i].rot;
+                    float3 bodyP = far_inv_rotate(rot, ray * t - center);
+                    float3 alb = far_albedo(i, bodyP, 0u, true, rho);
                     float cov = saturate(0.5 + (rho - s) / px);
                     col = lerp(col, far_through_air(far_lit(alb, nrm, ray, air, rho, false), inscatter, rho), cov);
                 }
@@ -510,13 +558,14 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
         }
         else if (rounded)
         {
-            float pExp = asfloat(b.seed.y);
-            hit = far_ray_rounded(ray, center, rho, b.rot, pExp, facing, t, nrm, face);
+            float pExp = asfloat(farTable[0].body[i].seed.y);
+            float4 rot = farTable[0].body[i].rot;
+            hit = far_ray_rounded(ray, center, rho, rot, pExp, facing, t, nrm, face);
             if (hit && t < bestT)
             {
                 bestT = t;
-                float3 bodyP = far_inv_rotate(b.rot, ray * t - center);
-                float3 alb = far_albedo(b, bodyP, face, false, rho);
+                float3 bodyP = far_inv_rotate(rot, ray * t - center);
+                float3 alb = far_albedo(i, bodyP, face, false, rho);
                 col = far_through_air(far_lit(alb, nrm, ray, air, rho, false), inscatter, rho);
             }
             else if (!hit && hasAir)
@@ -535,12 +584,13 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
         }
         else
         {
-            hit = far_ray_cube(ray, center, rho, b.rot, t, nrm, face);
+            float4 rot = farTable[0].body[i].rot;
+            hit = far_ray_cube(ray, center, rho, rot, t, nrm, face);
             if (hit && t < bestT)
             {
                 bestT = t;
-                float3 bodyP = far_inv_rotate(b.rot, ray * t - center);
-                float3 alb = far_albedo(b, bodyP, face, false, rho);
+                float3 bodyP = far_inv_rotate(rot, ray * t - center);
+                float3 alb = far_albedo(i, bodyP, face, false, rho);
                 col = far_through_air(far_lit(alb, nrm, ray, air, rho, false), inscatter, rho);
             }
             else if (!hit && hasAir)
@@ -549,7 +599,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px)
                 float tRim;
                 float3 nRim;
                 uint faceRim;
-                if (rhoRim < 1.0 && far_ray_cube(ray, center, rhoRim, b.rot, tRim, nRim, faceRim) && tRim < bestT)
+                if (rhoRim < 1.0 && far_ray_cube(ray, center, rhoRim, rot, tRim, nRim, faceRim) && tRim < bestT)
                 {
                     float fres = 1.0 - saturate(dot(nRim, -ray));
                     fres = fres * fres * fres;

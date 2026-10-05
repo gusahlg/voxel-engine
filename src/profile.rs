@@ -359,10 +359,16 @@ pub enum Gauge {
     PoolArrivalFrames,
     /// Staged uploads that had to scan the region because no AABB was recorded.
     PoolAabbFallback,
+    /// Far bodies submitted for this frame, before the view cull.
+    FarBodies,
+    /// Far bodies kept after the frustum cull and written into the sky table.
+    FarDrawn,
+    /// Screen tiles whose far-body mask is non-zero.
+    FarTiles,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 30] = [
+    const ALL: [Gauge; 33] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
@@ -393,6 +399,9 @@ impl Gauge {
         Gauge::PoolCopies,
         Gauge::PoolArrivalFrames,
         Gauge::PoolAabbFallback,
+        Gauge::FarBodies,
+        Gauge::FarDrawn,
+        Gauge::FarTiles,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -428,6 +437,9 @@ impl Gauge {
             Gauge::PoolCopies => "pool.copies",
             Gauge::PoolArrivalFrames => "pool.arrive",
             Gauge::PoolAabbFallback => "pool.aabb",
+            Gauge::FarBodies => "far.bodies",
+            Gauge::FarDrawn => "far.drawn",
+            Gauge::FarTiles => "far.tiles",
         }
     }
 }

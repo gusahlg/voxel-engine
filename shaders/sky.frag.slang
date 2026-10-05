@@ -110,10 +110,11 @@ float4 fragmentMain(FragmentInput input) : SV_Target
 
     // Far bodies occlude stars, the sun disc and the moon behind them, and are
     // seen through the viewer's own air (`inscatter`, ~0 in space).
-    // fwidth stays in this entry point, ahead of the body-count early-out,
-    // so a uniform count of zero cannot flatten the derivative.
+    // fwidth stays in this entry point, ahead of the body-count early-out and
+    // the per-tile mask branch, so a uniform count of zero cannot flatten the
+    // derivative.
     float px = max(length(fwidth(ray)), 1e-6);
-    col = far_bodies(ray, col, inscatter, px);
+    col = far_bodies(ray, col, inscatter, px, input.frag_pos.xy);
 
     // Slab clouds composite LAST so opaque cloud occludes the sun/moon/stars it
     // covers. The octahedral map is the local upper hemisphere; skip the tap
