@@ -1,9 +1,11 @@
 //! Host ring of far-body records for the sky pass (set 0, binding 2).
 //! One coherent buffer per frame-in-flight, written before the sky draw.
-//! The record matches `FarGpu` in `shaders/far_body.slang` (160 bytes, std430).
+//! The record matches `FarGpu` in `shaders/far_table.slang` (160 bytes, std430).
 //! A 16-byte cone sits in front of each record so a pixel can reject the body
 //! before loading it. A tile mask follows the records: one bit per kept body,
 //! one word per screen tile, so a sky pixel skips bodies that miss its tile.
+//! After the mask, two compact tile-index lists (mask == 0, then mask != 0)
+//! feed the instanced tile-quad vertex shader.
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
@@ -63,6 +65,10 @@ const TILE_COARSE_PX: u32 = 128;
 /// `tile_mask[ty * tiles_x + tx]` bit `k` is set when kept body `k` may cover
 /// that tile. Only the `tiles_x * tiles_y` prefix is live.
 ///
+/// `list_header` is `(n_base, n_full, width, height)`. `tile_index` holds the
+/// base tiles (mask == 0) in ascending index order, then the full tiles.
+/// The sky vertex shader reads this tail; `far_bodies` does not.
+///
 /// `Pod` is implemented by hand: bytemuck's derive only covers arrays up to a
 /// few dozen elements, and the mask is 8192 words. The layout is plain
 /// `repr(C)` floats and uints with no padding.
@@ -73,6 +79,8 @@ pub(crate) struct FarTableGpu {
     pub cone: [[f32; 4]; MAX_FAR_BODIES],
     pub body: [FarBodyGpu; MAX_FAR_BODIES],
     pub tile_mask: [u32; MAX_FAR_TILES],
+    pub list_header: [u32; 4],
+    pub tile_index: [u32; MAX_FAR_TILES],
 }
 
 // SAFETY: every field is plain `f32`/`u32` bits, `repr(C)`, and the size is a
@@ -84,12 +92,25 @@ unsafe impl Pod for FarTableGpu {}
 const _: () = assert!(std::mem::size_of::<FarBodyGpu>() == 160);
 const _: () = assert!(
     std::mem::size_of::<FarTableGpu>()
-        == 16 + 16 * MAX_FAR_BODIES + 160 * MAX_FAR_BODIES + 4 * MAX_FAR_TILES
+        == 16
+            + 16 * MAX_FAR_BODIES
+            + 160 * MAX_FAR_BODIES
+            + 4 * MAX_FAR_TILES
+            + 16
+            + 4 * MAX_FAR_TILES
 );
 const _: () = assert!(std::mem::offset_of!(FarTableGpu, cone) == 16);
 const _: () = assert!(std::mem::offset_of!(FarTableGpu, body) == 16 + 16 * MAX_FAR_BODIES);
 const _: () = assert!(
     std::mem::offset_of!(FarTableGpu, tile_mask) == 16 + 16 * MAX_FAR_BODIES + 160 * MAX_FAR_BODIES
+);
+const _: () = assert!(
+    std::mem::offset_of!(FarTableGpu, list_header)
+        == 16 + 16 * MAX_FAR_BODIES + 160 * MAX_FAR_BODIES + 4 * MAX_FAR_TILES
+);
+const _: () = assert!(
+    std::mem::offset_of!(FarTableGpu, tile_index)
+        == std::mem::offset_of!(FarTableGpu, list_header) + 16
 );
 
 /// Sine of the angular radius the shader can draw (`s = ‖ray × center‖`), or
@@ -742,6 +763,7 @@ fn stamp_tiles(table: &mut FarTableGpu, view: Option<&FarView>, cached: Option<&
             *mask |= blanket;
         }
     }
+    fill_tile_lists(table, view.width, view.height);
 }
 
 /// Set bit `k` on each tile whose view-space cone meets the body's.
@@ -809,12 +831,131 @@ fn used_tiles(table: &FarTableGpu) -> usize {
     n.min(MAX_FAR_TILES as u64) as usize
 }
 
+/// Screen rect of tile `index` (`ty * tiles_x + tx`), in pixels, clamped to
+/// the render extent. The right and bottom tiles are shorter when `width` or
+/// `height` is not a multiple of `tile_px`. Matches `sky_tile.vert`.
+#[cfg(test)]
+fn tile_rect(index: u32, tile_px: u32, tiles_x: u32, width: u32, height: u32) -> [u32; 4] {
+    debug_assert!(tiles_x > 0);
+    let tx = index % tiles_x;
+    let ty = index / tiles_x;
+    let x0 = tx.saturating_mul(tile_px);
+    let y0 = ty.saturating_mul(tile_px);
+    let x1 = x0.saturating_add(tile_px).min(width);
+    let y1 = y0.saturating_add(tile_px).min(height);
+    [x0, y0, x1, y1]
+}
+
+/// Inverse of the scene pass's negative-height viewport. NDC y is up,
+/// framebuffer y is down. Matches `sky_tile.vert` and the fullscreen
+/// triangle's clip xy at the same sample.
+#[cfg(test)]
+fn framebuffer_ndc(xf: f32, yf: f32, width: u32, height: u32) -> [f32; 2] {
+    let w = width.max(1) as f32;
+    let h = height.max(1) as f32;
+    [(xf / w) * 2.0 - 1.0, 1.0 - (yf / h) * 2.0]
+}
+
+/// Partition the live tiles into mask == 0 then mask != 0, each run ascending.
+/// `list_header` is `(n_base, n_full, width, height)`.
+fn fill_tile_lists(table: &mut FarTableGpu, width: u32, height: u32) {
+    let n = used_tiles(table);
+    let mut n_base = 0u32;
+    let mut n_full = 0u32;
+    for mask in &table.tile_mask[..n] {
+        if *mask == 0 {
+            n_base += 1;
+        } else {
+            n_full += 1;
+        }
+    }
+    let mut base_i = 0u32;
+    let mut full_i = n_base;
+    for (i, mask) in table.tile_mask[..n].iter().copied().enumerate() {
+        if mask == 0 {
+            table.tile_index[base_i as usize] = i as u32;
+            base_i += 1;
+        } else {
+            table.tile_index[full_i as usize] = i as u32;
+            full_i += 1;
+        }
+    }
+    table.list_header = [n_base, n_full, width, height];
+}
+
+/// How `record_sky` draws this frame. Tile quads only when the mask is a real
+/// per-tile classification: a view, culling on, a non-zero tile size, and at
+/// least one kept body. Otherwise one fullscreen triangle. No kept bodies use
+/// the body-free pipeline; that result matches the full shader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SkyDraw {
+    pub quads: bool,
+    /// Fullscreen triangle uses the body-free pipeline.
+    pub base: bool,
+    pub n_base: u32,
+    pub n_full: u32,
+    /// `firstInstance` of the full-pipeline draw. Base tiles occupy `0..n_base`.
+    /// The vertex shader reads Vulkan's instance index, which includes this.
+    pub first_full: u32,
+}
+
+impl Default for SkyDraw {
+    fn default() -> Self {
+        Self {
+            quads: false,
+            base: false,
+            n_base: 0,
+            n_full: 0,
+            first_full: 0,
+        }
+    }
+}
+
+impl SkyDraw {
+    fn from_table(table: &FarTableGpu, cull: bool) -> Self {
+        let bodies = table.header[0];
+        let tile_px = table.header[1];
+        let tiles_x = table.header[2];
+        let tiles_y = table.header[3];
+        let n_base = table.list_header[0];
+        let n_full = table.list_header[1];
+        let tiled = cull && tile_px != 0 && tiles_x != 0 && tiles_y != 0 && bodies != 0;
+        if tiled {
+            Self {
+                quads: true,
+                base: false,
+                n_base,
+                n_full,
+                first_full: n_base,
+            }
+        } else {
+            Self {
+                quads: false,
+                base: bodies == 0,
+                n_base: 0,
+                n_full: 0,
+                first_full: 0,
+            }
+        }
+    }
+}
+
 /// Bytes the GPU reads this frame: the body table plus one mask per live tile.
 /// The unused mask tail is not part of the match and is not rewritten.
 fn table_bytes(table: &FarTableGpu) -> &[u8] {
     let len = std::mem::offset_of!(FarTableGpu, tile_mask)
         + used_tiles(table) * std::mem::size_of::<u32>();
     &bytemuck::bytes_of(table)[..len]
+}
+
+/// `list_header` plus the live index prefix (`n_base + n_full` words).
+fn list_bytes(table: &FarTableGpu) -> &[u8] {
+    let start = std::mem::offset_of!(FarTableGpu, list_header);
+    let n = (table.list_header[0] as usize)
+        .saturating_add(table.list_header[1] as usize)
+        .min(MAX_FAR_TILES);
+    let len = std::mem::size_of::<[u32; 4]>() + n * std::mem::size_of::<u32>();
+    &bytemuck::bytes_of(table)[start..start + len]
 }
 
 fn nonzero_tiles(table: &FarTableGpu) -> u64 {
@@ -837,7 +978,20 @@ pub(crate) fn pack_table(
     view: Option<FarView>,
     map_max: &[f32; MAX_FAR_MAPS],
 ) -> FarTableGpu {
-    pack_table_cached(bodies, view.as_ref(), None, map_max)
+    *pack_table_cached(bodies, view.as_ref(), None, map_max)
+}
+
+/// The table is 71 KB. `Box::new(FarTableGpu::zeroed())` would build that on
+/// the stack, and the render thread already holds `Renderer` there.
+fn zeroed_table() -> Box<FarTableGpu> {
+    let layout = std::alloc::Layout::new::<FarTableGpu>();
+    // SAFETY: `FarTableGpu` is `Zeroable`, so the zeroed allocation is a valid
+    // value. The pointer is the exact layout `Box` will free.
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<FarTableGpu>();
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    unsafe { Box::from_raw(ptr) }
 }
 
 fn pack_table_cached(
@@ -845,8 +999,8 @@ fn pack_table_cached(
     view: Option<&FarView>,
     frames: Option<&TileFrames>,
     map_max: &[f32; MAX_FAR_MAPS],
-) -> FarTableGpu {
-    let mut table = FarTableGpu::zeroed();
+) -> Box<FarTableGpu> {
+    let mut table = zeroed_table();
     let n = bodies.len().min(MAX_FAR_BODIES);
     let cull = far_cull_enabled();
     let mut kept = 0usize;
@@ -874,8 +1028,11 @@ fn pack_table_cached(
 /// render extent, or the tile size changes and reused across camera turns.
 pub(crate) struct FarBodyRing {
     bufs: PerSlot<HostBuffer>,
-    last: PerSlot<Option<FarTableGpu>>,
+    /// Previous upload. Boxed: three inline tables would add ~210 KB to
+    /// `Renderer`, which lives on the render thread's default stack.
+    last: PerSlot<Option<Box<FarTableGpu>>>,
     tiles: TileFrames,
+    draw: PerSlot<SkyDraw>,
 }
 
 impl FarBodyRing {
@@ -894,7 +1051,13 @@ impl FarBodyRing {
             bufs: PerSlot::new(std::array::from_fn(|_| make())),
             last: PerSlot::new(std::array::from_fn(|_| None)),
             tiles: TileFrames::empty(),
+            draw: PerSlot::new(std::array::from_fn(|_| SkyDraw::default())),
         }
+    }
+
+    /// Draw the sky recorded for `slot` after [`Self::write`].
+    pub(crate) fn sky_draw(&self, slot: FrameSlot) -> SkyDraw {
+        self.draw[slot]
     }
 
     pub(crate) fn write(
@@ -911,15 +1074,25 @@ impl FarBodyRing {
         let offered = bodies.len().min(MAX_FAR_BODIES) as u64;
         crate::profile::gauge(crate::profile::Gauge::FarBodies, offered);
         crate::profile::gauge(crate::profile::Gauge::FarDrawn, u64::from(table.header[0]));
-        crate::profile::gauge(crate::profile::Gauge::FarTiles, nonzero_tiles(&table));
+        // `far.tiles` is the full-pipeline tile count (mask != 0).
+        debug_assert_eq!(u64::from(table.list_header[1]), nonzero_tiles(&table));
+        crate::profile::gauge(
+            crate::profile::Gauge::FarTiles,
+            u64::from(table.list_header[1]),
+        );
+        self.draw[slot] = SkyDraw::from_table(&table, far_cull_enabled());
         let bytes = table_bytes(&table);
+        let lists = list_bytes(&table);
         if self.last[slot]
             .as_ref()
-            .is_some_and(|prev| table_bytes(prev) == bytes)
+            .is_some_and(|prev| table_bytes(prev) == bytes && list_bytes(prev) == lists)
         {
             return;
         }
-        unsafe { self.bufs[slot].write(0, bytes) };
+        unsafe {
+            self.bufs[slot].write(0, bytes);
+            self.bufs[slot].write(std::mem::offset_of!(FarTableGpu, list_header) as u64, lists);
+        }
         self.last[slot] = Some(table);
     }
 
@@ -1666,12 +1839,145 @@ mod tests {
 
     #[test]
     fn shader_tile_mask_length_matches_the_host_cap() {
-        let src = include_str!("../../shaders/far_body.slang");
-        let needle = format!("uint tile_mask[{MAX_FAR_TILES}]");
+        let src = include_str!("../../shaders/far_table.slang");
+        let mask = format!("uint tile_mask[{MAX_FAR_TILES}]");
+        let index = format!("uint tile_index[{MAX_FAR_TILES}]");
         assert!(
-            src.contains(&needle),
+            src.contains(&mask),
             "shader tile_mask length drifted from {MAX_FAR_TILES}"
         );
+        assert!(
+            src.contains(&index),
+            "shader tile_index length drifted from {MAX_FAR_TILES}"
+        );
+        assert!(src.contains("uint4 list_header"));
+        let vert = include_str!("../../shaders/sky_tile.vert.slang");
+        assert!(
+            vert.contains("(xf / float(width)) * 2.0 - 1.0"),
+            "tile ndc x drifted from framebuffer_ndc"
+        );
+        assert!(
+            vert.contains("1.0 - (yf / float(height)) * 2.0"),
+            "tile ndc y drifted from framebuffer_ndc"
+        );
+        assert!(vert.contains("min(x0 + tilePx, width)"));
+    }
+
+    #[test]
+    fn tile_lists_partition_in_order_and_clamp_partial_edges() {
+        let mut table = FarTableGpu::zeroed();
+        // 100×70 is not a multiple of 64: 2×2 tiles, the right column is 36 px
+        // and the bottom row is 6 px.
+        let width = 100u32;
+        let height = 70u32;
+        let tile_px = 64u32;
+        let tiles_x = width.div_ceil(tile_px);
+        let tiles_y = height.div_ceil(tile_px);
+        assert_eq!((tiles_x, tiles_y), (2, 2));
+        table.header = [1, tile_px, tiles_x, tiles_y];
+        table.tile_mask[0] = 0;
+        table.tile_mask[1] = 0b001;
+        table.tile_mask[2] = 0;
+        table.tile_mask[3] = 0b100;
+        fill_tile_lists(&mut table, width, height);
+
+        assert_eq!(table.list_header, [2, 2, width, height]);
+        assert_eq!(&table.tile_index[..2], &[0, 2]);
+        assert_eq!(&table.tile_index[2..4], &[1, 3]);
+        let n = used_tiles(&table);
+        let n_base = table.list_header[0] as usize;
+        let n_full = table.list_header[1] as usize;
+        assert_eq!(n_base + n_full, n);
+        let base = &table.tile_index[..n_base];
+        let full = &table.tile_index[n_base..n];
+        assert!(base.windows(2).all(|w| w[0] < w[1]));
+        assert!(full.windows(2).all(|w| w[0] < w[1]));
+        for &i in base {
+            assert_eq!(table.tile_mask[i as usize], 0, "base tile {i}");
+        }
+        for &i in full {
+            assert_ne!(table.tile_mask[i as usize], 0, "full tile {i}");
+        }
+
+        assert_eq!(
+            tile_rect(0, tile_px, tiles_x, width, height),
+            [0, 0, 64, 64]
+        );
+        assert_eq!(
+            tile_rect(1, tile_px, tiles_x, width, height),
+            [64, 0, 100, 64]
+        );
+        assert_eq!(
+            tile_rect(2, tile_px, tiles_x, width, height),
+            [0, 64, 64, 70]
+        );
+        assert_eq!(
+            tile_rect(3, tile_px, tiles_x, width, height),
+            [64, 64, 100, 70]
+        );
+        // The clamped corner sits on the same NDC edge as the fullscreen triangle.
+        let [x0, y0, x1, y1] = tile_rect(3, tile_px, tiles_x, width, height);
+        let _ = (x0, y0);
+        let edge = framebuffer_ndc(x1 as f32, y1 as f32, width, height);
+        assert_eq!(edge[0].to_bits(), 1.0f32.to_bits());
+        assert_eq!(edge[1].to_bits(), (-1.0f32).to_bits());
+        let origin = framebuffer_ndc(0.0, 0.0, width, height);
+        assert_eq!(origin[0].to_bits(), (-1.0f32).to_bits());
+        assert_eq!(origin[1].to_bits(), 1.0f32.to_bits());
+
+        let draw = SkyDraw::from_table(&table, true);
+        assert!(draw.quads);
+        assert_eq!((draw.n_base, draw.n_full, draw.first_full), (2, 2, 2));
+
+        // No kept bodies: one body-free fullscreen triangle, even with a grid.
+        table.header[0] = 0;
+        let empty = SkyDraw::from_table(&table, true);
+        assert!(!empty.quads);
+        assert!(empty.base);
+
+        // Culling off, or no tile grid: the fullscreen triangle, full pipeline
+        // when any body was kept.
+        table.header[0] = 1;
+        let unculled = SkyDraw::from_table(&table, false);
+        assert!(!unculled.quads && !unculled.base);
+        table.header[1] = 0;
+        let no_grid = SkyDraw::from_table(&table, true);
+        assert!(!no_grid.quads && !no_grid.base);
+    }
+
+    #[test]
+    fn packed_view_lists_match_the_masks() {
+        let width = 100u32;
+        let height = 70u32;
+        let view = view_along_neg_z(60.0, width, height);
+        let body = placed(-Vec3::Z, 0.05, FarShape::Sphere, 1);
+        let table = pack_table(std::slice::from_ref(&body), Some(view));
+        assert_eq!(table.header[1], 64);
+        let n = used_tiles(&table);
+        assert!(n > 1);
+        let n_base = table.list_header[0] as usize;
+        let n_full = table.list_header[1] as usize;
+        assert_eq!(n_base + n_full, n);
+        assert_eq!(table.list_header[2], width);
+        assert_eq!(table.list_header[3], height);
+        assert_eq!(n_full as u64, nonzero_tiles(&table));
+        let mut seen = vec![false; n];
+        for (slot, &index) in table.tile_index[..n].iter().enumerate() {
+            let index = index as usize;
+            assert!(index < n && !seen[index], "index {index} repeated");
+            seen[index] = true;
+            let base = slot < n_base;
+            assert_eq!(table.tile_mask[index] == 0, base);
+            if slot > 0 && slot != n_base {
+                assert!(table.tile_index[slot - 1] < table.tile_index[slot]);
+            }
+        }
+        assert!(seen.iter().all(|s| *s));
+        let corner = (n as u32) - 1;
+        let rect = tile_rect(corner, table.header[1], table.header[2], width, height);
+        assert_eq!(rect[2], width);
+        assert_eq!(rect[3], height);
+        assert!(rect[2] - rect[0] < 64 || rect[3] - rect[1] < 64);
     }
 
     #[test]

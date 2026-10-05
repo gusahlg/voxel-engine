@@ -193,7 +193,9 @@ const TRIS2D_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tris2d.vert
 const TRIS2D_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tris2d.frag.spv"));
 const TRIS2D_TEX_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tris2d_tex.frag.spv"));
 const SKY_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.vert.spv"));
+const SKY_TILE_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_tile.vert.spv"));
 const SKY_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv"));
+const SKY_BASE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_base.frag.spv"));
 const TONEMAP_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.vert.spv"));
 const TONEMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
 const TONEMAP_TAA_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap_taa.frag.spv"));
@@ -252,12 +254,19 @@ pub struct Pipelines {
     /// Unused in rectilinear mode (the overlay stays in the offscreen scene pass).
     pub tris2d_present: vk::Pipeline,
     pub tris2d_tex_present: vk::Pipeline,
-    /// Vertex-less fullscreen background pass: geometry push constant + set 0
-    /// binding 0 (cloud LUT), binding 1 (the shared per-frame `FrameUniforms`),
-    /// binding 2 (far-body storage buffer), binding 3 (datum storage) and
-    /// binding 4 (eight albedo cubes). Depth-tests (read-only) at the
-    /// reversed-Z far plane so it shades only pixels the terrain left uncovered.
+    /// Fullscreen background pass: fragment push constant + set 0 binding 0
+    /// (cloud LUT), binding 1 (the shared per-frame `FrameUniforms`), binding 2
+    /// (far-body storage buffer), binding 3 (datum storage) and binding 4
+    /// (eight albedo cubes). Depth-tests (read-only) at the reversed-Z far
+    /// plane so it shades only pixels the terrain left uncovered.
+    /// `sky` is the full fragment on one triangle. `sky_base` is the same
+    /// triangle with the far-body call compiled out. `sky_tile` / `sky_tile_base`
+    /// are the instanced tile quads for the two fragment variants. All four
+    /// share `layout_sky`.
     pub sky: vk::Pipeline,
+    pub sky_base: vk::Pipeline,
+    pub sky_tile: vk::Pipeline,
+    pub sky_tile_base: vk::Pipeline,
     pub layout_sky: vk::PipelineLayout,
     pub sky_set_layout: vk::DescriptorSetLayout,
     /// Linear-clamp sampler pushed with the octahedral cloud LUT.
@@ -360,7 +369,7 @@ impl Pipelines {
                 .binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(3)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -480,7 +489,9 @@ impl Pipelines {
         let tri2d_frag = pass::shader_module(device, TRIS2D_FRAG, "2d fragment");
         let tri2d_tex_frag = pass::shader_module(device, TRIS2D_TEX_FRAG, "textured 2d fragment");
         let sky_vert = pass::shader_module(device, SKY_VERT, "sky vertex");
+        let sky_tile_vert = pass::shader_module(device, SKY_TILE_VERT, "sky tile vertex");
         let sky_frag = pass::shader_module(device, SKY_FRAG, "sky fragment");
+        let sky_base_frag = pass::shader_module(device, SKY_BASE_FRAG, "sky base fragment");
 
         let builder = PipelineBuilder {
             device,
@@ -752,21 +763,42 @@ impl Pipelines {
         // Sky: no vertex input (verts synthesised from SV_VertexID), depth
         // read-only at the far plane, opaque, no cull. Same GREATER_OR_EQUAL
         // compare as the scene, so it passes only where depth is still cleared.
-        let sky = builder.build(
+        // The four pipelines share that state and `layout_sky`.
+        let sky_cfg = || PipelineConfig {
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            depth: DepthMode::ReadOnly,
+            cull: vk::CullModeFlags::NONE,
+            blend: false,
+            vrs: true,
+            depth_bias: None,
+        };
+        let sky = builder.build(sky_vert, sky_frag, &[], &[], layout_sky, "sky", sky_cfg());
+        let sky_base = builder.build(
             sky_vert,
+            sky_base_frag,
+            &[],
+            &[],
+            layout_sky,
+            "sky_base",
+            sky_cfg(),
+        );
+        let sky_tile = builder.build(
+            sky_tile_vert,
             sky_frag,
             &[],
             &[],
             layout_sky,
-            "sky",
-            PipelineConfig {
-                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                depth: DepthMode::ReadOnly,
-                cull: vk::CullModeFlags::NONE,
-                blend: false,
-                vrs: true,
-                depth_bias: None,
-            },
+            "sky_tile",
+            sky_cfg(),
+        );
+        let sky_tile_base = builder.build(
+            sky_tile_vert,
+            sky_base_frag,
+            &[],
+            &[],
+            layout_sky,
+            "sky_tile_base",
+            sky_cfg(),
         );
 
         // Tonemap: its own builder — writes the present format at single-sample
@@ -916,7 +948,9 @@ impl Pipelines {
             device.destroy_shader_module(tri2d_frag, None);
             device.destroy_shader_module(tri2d_tex_frag, None);
             device.destroy_shader_module(sky_vert, None);
+            device.destroy_shader_module(sky_tile_vert, None);
             device.destroy_shader_module(sky_frag, None);
+            device.destroy_shader_module(sky_base_frag, None);
         }
 
         let vrs_compute = fsr.map(|_| create_vrs_compute(device, cache, stats));
@@ -946,6 +980,9 @@ impl Pipelines {
             tris2d_present,
             tris2d_tex_present,
             sky,
+            sky_base,
+            sky_tile,
+            sky_tile_base,
             layout_sky,
             sky_set_layout,
             sky_lut_sampler,
@@ -1048,6 +1085,9 @@ impl Pipelines {
                 device.destroy_pipeline(p, None);
             }
             device.destroy_pipeline(self.sky, None);
+            device.destroy_pipeline(self.sky_base, None);
+            device.destroy_pipeline(self.sky_tile, None);
+            device.destroy_pipeline(self.sky_tile_base, None);
             device.destroy_pipeline(self.tonemap, None);
             device.destroy_pipeline(self.tonemap_taa, None);
             device.destroy_pipeline_layout(self.layout_3d, None);

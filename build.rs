@@ -49,6 +49,12 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             "sky.vert.spv",
         ),
         job(
+            "shaders/sky_tile.vert.slang",
+            Stage::Vertex,
+            "vertexMain",
+            "sky_tile.vert.spv",
+        ),
+        job(
             "shaders/sky.frag.slang",
             Stage::Fragment,
             "fragmentMain",
@@ -237,7 +243,11 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
         )
     });
     jobs.push(ShaderJob {
-        defines: &[("CAGED", None), ("MESH3D_OPAQUE", None), ("MESH3D_LOD", None)],
+        defines: &[
+            ("CAGED", None),
+            ("MESH3D_OPAQUE", None),
+            ("MESH3D_LOD", None),
+        ],
         ..job(
             "shaders/mesh3d.frag.slang",
             Stage::Fragment,
@@ -246,7 +256,11 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
         )
     });
     jobs.push(ShaderJob {
-        defines: &[("CAGED", None), ("MESH3D_OPAQUE", None), ("MESH3D_LEAN", None)],
+        defines: &[
+            ("CAGED", None),
+            ("MESH3D_OPAQUE", None),
+            ("MESH3D_LEAN", None),
+        ],
         ..job(
             "shaders/mesh3d.frag.slang",
             Stage::Fragment,
@@ -266,6 +280,16 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             Stage::Fragment,
             "fragmentMain",
             "mesh3d_caged_lod_lean.frag.spv",
+        )
+    });
+    // Body-free sky: the far-body call is compiled out. Same layout as `sky.frag`.
+    jobs.push(ShaderJob {
+        defines: &[("SKY_BASE", None)],
+        ..job(
+            "shaders/sky.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "sky_base.frag.spv",
         )
     });
     // Present-time TAA tonemap fragment (`-DTAA_FUSED`).

@@ -4,6 +4,11 @@
 
 #include "sky_common.slang"
 
+// SKY_BASE compiles the far-body call out. `far_bodies` returns `col`
+// unchanged when the tile mask is 0, and `fwidth` only feeds that call, so
+// the shared radiance / disc / moon / stars / cloud sequence is the whole
+// result for a body-free pixel.
+
 struct FragmentInput
 {
     [[vk::location(0)]]
@@ -31,7 +36,9 @@ Sampler2D cloudLut;
 [[vk::binding(1, 0)]]
 ConstantBuffer<FrameUniforms> frame;
 
+#ifndef SKY_BASE
 #include "far_body.slang"
+#endif
 
 // Hash-grid stars on a world-space cube map: dominant axis picks the face
 // (ties X, then Y, then Z), then a 2D cell on that face. Fixed in the universe
@@ -112,9 +119,12 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // seen through the viewer's own air (`inscatter`, ~0 in space).
     // fwidth stays in this entry point, ahead of the body-count early-out and
     // the per-tile mask branch, so a uniform count of zero cannot flatten the
-    // derivative.
+    // derivative. It does not write `col`: a mask of 0 returns `col` as it
+    // stands. SKY_BASE leaves both out.
+#ifndef SKY_BASE
     float px = max(length(fwidth(ray)), 1e-6);
     col = far_bodies(ray, col, inscatter, px, input.frag_pos.xy);
+#endif
 
     // Slab clouds composite LAST so opaque cloud occludes the sun/moon/stars it
     // covers. The octahedral map is the local upper hemisphere; skip the tap

@@ -825,10 +825,14 @@ impl<'a> RenderPass<'a> {
     /// The procedural sky background pass (sky pipeline: fragment push constant,
     /// FrameUniforms at set 0 binding 1, cloud LUT at binding 0, far-body table
     /// at binding 2, datum buffer at binding 3, albedo cubes at binding 4, no
-    /// vertex buffer). A single fullscreen triangle at the
-    /// reversed-Z far plane; the read-only depth test rejects it wherever
-    /// terrain wrote closer depth, so it shades only background pixels. Skipped
-    /// unless the frame set a sky palette.
+    /// vertex buffer). Depth is the reversed-Z far plane; the read-only test
+    /// rejects it wherever terrain wrote closer depth, so it shades only
+    /// background pixels. Skipped unless the frame set a sky palette.
+    ///
+    /// With a real per-tile mask, body-free tiles draw as instanced quads on
+    /// the `SKY_BASE` pipeline and the rest on the full pipeline. No tile
+    /// classification (no view, culling off, no tile size, or no bodies) keeps
+    /// one fullscreen triangle; no bodies use the base pipeline.
     pub(super) unsafe fn record_sky(&self) {
         let Some(desc) = self.lists.sky_for_pass() else {
             return;
@@ -840,8 +844,25 @@ impl<'a> RenderPass<'a> {
         // frame (sky vs terrain silhouettes) and history reprojection is stable.
         let jittered = self.scene_state.expect("a sky pass implies a 3D scene").0;
         let params = pipeline::SkyParams::compose(jittered.inverse(), &desc);
+        let draw = self.r.far_ring.sky_draw(FrameSlot::new(self.slot));
+        let quads = draw.quads && (draw.n_base > 0 || draw.n_full > 0);
+        let sky_full = self.r.pipelines.sky;
+        let sky_base = self.r.pipelines.sky_base;
+        let sky_tile = self.r.pipelines.sky_tile;
+        let sky_tile_base = self.r.pipelines.sky_tile_base;
+        let first = if quads {
+            if draw.n_base > 0 {
+                sky_tile_base
+            } else {
+                sky_tile
+            }
+        } else if draw.base {
+            sky_base
+        } else {
+            sky_full
+        };
         unsafe {
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.r.pipelines.sky);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, first);
             self.invalidate_mesh_desc();
             device.cmd_push_constants(
                 cmd,
@@ -916,7 +937,22 @@ impl<'a> RenderPass<'a> {
                 0,
                 &writes,
             );
-            device.cmd_draw(cmd, 3, 1, 0, 0);
+            if quads {
+                // Base tiles occupy instance ids `0..n_base`. The full draw's
+                // firstInstance is `first_full`; the vertex shader reads Vulkan's
+                // instance index, which includes it, and indexes the combined list.
+                if draw.n_base > 0 {
+                    device.cmd_draw(cmd, 6, draw.n_base, 0, 0);
+                }
+                if draw.n_full > 0 {
+                    if draw.n_base > 0 {
+                        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, sky_tile);
+                    }
+                    device.cmd_draw(cmd, 6, draw.n_full, 0, draw.first_full);
+                }
+            } else {
+                device.cmd_draw(cmd, 3, 1, 0, 0);
+            }
         }
     }
 
