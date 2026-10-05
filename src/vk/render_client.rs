@@ -140,6 +140,25 @@ pub(crate) enum RenderCmd {
         desc: ComputeDescOwned,
         reply: Sender<Result<ComputeKind, EngineError>>,
     },
+    /// Install a datum and (when `albedo_size > 0`) allocate its cube.
+    /// `reply` carries [`crate::FarMapError::OutOfMemory`].
+    SetFarMap {
+        id: crate::FarMapId,
+        g: u32,
+        datum: Box<[f32]>,
+        albedo_size: u32,
+        reply: Sender<Result<(), crate::FarMapError>>,
+    },
+    /// One albedo face, RGBA8 sRGB. Recorded on the next frame; no reply.
+    SetFarMapFace {
+        id: crate::FarMapId,
+        face: u32,
+        bytes: Box<[u8]>,
+    },
+    /// Drop a map. The cube retires with the frames that may still sample it.
+    ClearFarMap {
+        id: crate::FarMapId,
+    },
     ComputeFlush {
         reply: Sender<()>,
     },
@@ -294,6 +313,10 @@ pub(crate) struct RenderClient {
     frames_rendered: Arc<AtomicU64>,
     /// Frames dropped by render-loop coalescing (monotonic).
     frames_coalesced: Arc<AtomicU64>,
+    /// Albedo edge of each installed map, or `None` when the slot is empty.
+    /// Updated only after `set_far_map` replies `Ok`, so a face upload cannot
+    /// race the cube it addresses. `Some(0)` is a datum with no cube.
+    far_map_albedo: [Option<u32>; crate::MAX_FAR_MAPS],
 }
 
 impl RenderClient {
@@ -423,6 +446,7 @@ impl RenderClient {
             join: Some(join),
             frames_rendered,
             frames_coalesced,
+            far_map_albedo: [None; crate::MAX_FAR_MAPS],
         };
         Ok((window, client))
     }
@@ -467,6 +491,62 @@ impl RenderClient {
 
     pub(crate) fn compute_pending(&self) -> usize {
         self.compute.pending()
+    }
+
+    /// Install `desc` on the render thread and wait for the cube allocation.
+    /// The wait is the reply, not a GPU fence: the caller can stall while the
+    /// render thread is inside its frame wait, the same as [`Self::register_compute`].
+    pub(crate) fn set_far_map(
+        &mut self,
+        id: crate::FarMapId,
+        desc: &crate::FarMapDesc<'_>,
+    ) -> Result<(), crate::FarMapError> {
+        crate::far_body::validate_far_map(id, desc)?;
+        let (tx, rx) = channel();
+        let _ = self.tx.send(RenderCmd::SetFarMap {
+            id,
+            g: desc.datum_res,
+            datum: desc.datum.to_vec().into_boxed_slice(),
+            albedo_size: desc.albedo_size,
+            reply: tx,
+        });
+        match rx.recv() {
+            Ok(Ok(())) => {
+                if let Some(slot) = self.far_map_albedo.get_mut(id.0 as usize) {
+                    *slot = Some(desc.albedo_size);
+                }
+                Ok(())
+            }
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(crate::FarMapError::OutOfMemory),
+        }
+    }
+
+    /// Queue one face. `Err` when the slot has no map, the face is out of
+    /// range, or the byte length is not `albedo_size² * 4`. Does not wait.
+    pub(crate) fn set_far_map_face(
+        &mut self,
+        id: crate::FarMapId,
+        face: usize,
+        rgba8_srgb: &[u8],
+    ) -> Result<(), crate::FarMapError> {
+        let slot = self.far_map_albedo.get(id.0 as usize).copied().flatten();
+        crate::far_body::validate_far_map_face(id, face, rgba8_srgb.len(), slot)?;
+        let _ = self.tx.send(RenderCmd::SetFarMapFace {
+            id,
+            face: face as u32,
+            bytes: rgba8_srgb.to_vec().into_boxed_slice(),
+        });
+        Ok(())
+    }
+
+    /// Drop `id`. An id outside `0..MAX_FAR_MAPS` is a no-op. Does not wait.
+    pub(crate) fn clear_far_map(&mut self, id: crate::FarMapId) {
+        let Some(slot) = self.far_map_albedo.get_mut(id.0 as usize) else {
+            return;
+        };
+        *slot = None;
+        let _ = self.tx.send(RenderCmd::ClearFarMap { id });
     }
 
     pub(crate) fn register_compute(
@@ -1137,6 +1217,19 @@ fn render_loop(
                 RenderCmd::RegisterCompute { desc, reply } => {
                     let _ = reply.send(renderer.register_compute(desc));
                 }
+                RenderCmd::SetFarMap {
+                    id,
+                    g,
+                    datum,
+                    albedo_size,
+                    reply,
+                } => {
+                    let _ = reply.send(renderer.set_far_map(id.0, g, &datum, albedo_size));
+                }
+                RenderCmd::SetFarMapFace { id, face, bytes } => {
+                    renderer.set_far_map_face(id.0, face, bytes);
+                }
+                RenderCmd::ClearFarMap { id } => renderer.clear_far_map(id.0),
                 RenderCmd::ComputeFlush { reply } => {
                     renderer.flush_compute_blocking();
                     let _ = reply.send(());

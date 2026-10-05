@@ -19,6 +19,7 @@ pub(crate) mod device;
 pub(crate) mod draw_prep;
 pub(crate) mod exposure;
 pub(crate) mod far_bodies;
+pub(crate) mod far_maps;
 pub(crate) mod frame_loop;
 pub(crate) mod gpu_timer;
 pub(crate) mod handles;
@@ -189,6 +190,8 @@ pub(crate) struct Renderer {
     ubo_ring: uniforms::UboRing,
     /// Far-body table for the sky pass.
     far_ring: far_bodies::FarBodyRing,
+    /// Datum buffer and albedo cubes for [`crate::FarShape::Mapped`].
+    far_maps: far_maps::FarMaps,
     /// Shadow pass.
     shadow: shadow::ShadowPass,
     /// Exposure metering.
@@ -535,6 +538,12 @@ impl Renderer {
         let ubo_ring = uniforms::UboRing::new(&instance.instance, &device.device, device.physical);
         let far_ring =
             far_bodies::FarBodyRing::new(&instance.instance, &device.device, device.physical);
+        let far_maps = far_maps::FarMaps::new(
+            &instance.instance,
+            &device.device,
+            device.physical,
+            device.command_pool,
+        );
 
         let shadow = shadow::ShadowPass::new(
             &instance.instance,
@@ -690,6 +699,7 @@ impl Renderer {
             mesh3d_set_layout,
             ubo_ring,
             far_ring,
+            far_maps,
             shadow,
             exposure,
             bloom,
@@ -973,6 +983,41 @@ impl Renderer {
         }
     }
 
+    /// Install one datum and, when `albedo_size > 0`, a cube. The previous
+    /// cube is retired on the next flush. No GPU wait; [`FarMapError::OutOfMemory`]
+    /// is the only failure (the caller already validated the description).
+    pub fn set_far_map(
+        &mut self,
+        id: u8,
+        g: u32,
+        datum: &[f32],
+        albedo_size: u32,
+    ) -> Result<(), crate::FarMapError> {
+        let memory_props = unsafe {
+            self.instance
+                .instance
+                .get_physical_device_memory_properties(self.device.physical)
+        };
+        self.far_maps.set_map(
+            &self.device.device,
+            &memory_props,
+            id,
+            g,
+            datum,
+            albedo_size,
+        )
+    }
+
+    /// Queue one albedo face. Recorded into the next frame's command buffer.
+    pub fn set_far_map_face(&mut self, id: u8, face: u32, bytes: Box<[u8]>) {
+        self.far_maps.queue_face(id, face, bytes);
+    }
+
+    /// Drop a map. The cube is retired on the next flush.
+    pub fn clear_far_map(&mut self, id: u8) {
+        self.far_maps.clear(id);
+    }
+
     /// Replace block texture array. Same texel size within capacity uploads
     /// only new/changed layers on the transfer lane (no idle wait). Size
     /// change or capacity overflow reallocates and retires the old image.
@@ -1092,6 +1137,7 @@ impl Renderer {
             device.destroy_descriptor_set_layout(self.mesh3d_set_layout, None);
             self.ubo_ring.destroy(device);
             self.far_ring.destroy(device);
+            self.far_maps.destroy(device);
             self.shadow.destroy(device);
             self.exposure.destroy(device);
             self.bloom.destroy(device);

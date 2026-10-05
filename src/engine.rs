@@ -12,13 +12,13 @@ use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
 
+use crate::CageHandle;
 use crate::camera::{self, Camera3D};
 use crate::color::LinearRgb;
 use crate::font;
 use crate::frame::{DrawLists, Frame};
 use crate::input::{InputState, Key, MouseButton};
 use crate::mesh::{MeshData, MeshHandle, MeshPlacement, Pass};
-use crate::CageHandle;
 use crate::vk::compute::{
     ComputeDesc, ComputeJob, ComputeKind, ComputeQueue, ComputeStager, EngineError, JobId,
 };
@@ -668,6 +668,45 @@ impl Engine {
     }
 
     // ---- textures ----
+
+    /// Install the datum (and, when `desc.albedo_size > 0`, an albedo cube)
+    /// for one [`FarShape::Mapped`](crate::FarShape::Mapped) body.
+    ///
+    /// The cube is allocated on the render thread; this waits for that reply
+    /// and not for the GPU. [`FarMapError::OutOfMemory`](crate::FarMapError::OutOfMemory)
+    /// is the allocation failure. A replaced cube is freed after the frames
+    /// that may still sample it. Faces uploaded earlier are dropped: call
+    /// [`Self::set_far_map_face`] again.
+    pub fn set_far_map(
+        &mut self,
+        id: crate::FarMapId,
+        desc: &crate::FarMapDesc<'_>,
+    ) -> Result<(), crate::FarMapError> {
+        self.client.set_far_map(id, desc)
+    }
+
+    /// Upload one albedo face of an installed map, RGBA8 in sRGB.
+    ///
+    /// `face` is `0..6` in the order +X, −X, +Y, −Y, +Z, −Z. The bytes are
+    /// `albedo_size * albedo_size * 4`. Recorded into a later frame's command
+    /// buffer (mips included); this never waits on the GPU. Until the upload
+    /// has landed, that face draws its [`crate::FarBody::albedo`] fallback.
+    /// [`FarMapError::BadId`](crate::FarMapError::BadId) when `id` has no map.
+    pub fn set_far_map_face(
+        &mut self,
+        id: crate::FarMapId,
+        face: usize,
+        rgba8_srgb: &[u8],
+    ) -> Result<(), crate::FarMapError> {
+        self.client.set_far_map_face(id, face, rgba8_srgb)
+    }
+
+    /// Drop the datum and the albedo cube of `id`. An id outside
+    /// `0..`[`crate::MAX_FAR_MAPS`] does nothing. The cube is freed after the
+    /// frames that may still sample it. Does not wait on the GPU.
+    pub fn clear_far_map(&mut self, id: crate::FarMapId) {
+        self.client.clear_far_map(id);
+    }
 
     /// Replaces the block texture array sampled by all 3D geometry
     /// ([`MeshVertex`](crate::MeshVertex)'s `layer` field selects the layer).

@@ -265,6 +265,7 @@ impl Renderer {
                 && !self.quad_ibo.has_garbage()
                 && !self.block_textures.has_garbage()
                 && !self.materials.has_garbage()
+                && !self.far_maps.has_garbage()
             {
                 return;
             }
@@ -279,6 +280,7 @@ impl Renderer {
                 .collect(current, |mut tex| tex.destroy(device));
             self.block_textures.collect(device, current);
             self.materials.collect(device, current);
+            self.far_maps.collect(device, current);
             // Superseded quad IBO buffers are render-owned raw buffers (not
             // allocator suballocations), so destroy them here rather than shipping
             // them back to main's freelist.
@@ -295,6 +297,7 @@ impl Renderer {
                 self.block_textures
                     .collect_transfer(device, transfer_current);
                 self.materials.collect_transfer(device, transfer_current);
+                self.far_maps.collect_transfer(device, transfer_current);
             }
         }
     }

@@ -38,7 +38,10 @@ pub use color::{Color, LinearRgb};
 pub use engine::{
     Config, Engine, GpuCaps, GpuLoad, MeshStats, RenderFlags, RenderTargetConfig, run,
 };
-pub use far_body::{FarBody, FarShape, MAX_FAR_BODIES};
+pub use far_body::{
+    FarBody, FarMapDesc, FarMapError, FarMapId, FarShape, MAX_FAR_BODIES, MAX_FAR_MAPS,
+    far_cube_texel_dir, far_map_basis,
+};
 pub use frame::{
     CoverageVolume, FadeStyle, Frame, Frame3D, Lighting, LodMorph, SkyDesc, SunOverride,
 };
@@ -53,12 +56,12 @@ pub use mesh::{
 };
 pub use rev::Rev;
 pub use vk::RENDER_SCALE_RANGE;
-pub use vk::uniforms::local_sky_basis;
 pub use vk::compute::{
     ComputeDesc, ComputeInput, ComputeJob, ComputeKind, ComputeQueue, ComputeStager,
     EXAMPLE_COMPUTE_SPIRV, EngineError, JobId,
 };
 pub use vk::mesh_staging::{MeshStager, MeshStaging, MeshVertexWriter};
+pub use vk::uniforms::local_sky_basis;
 
 /// Text metrics for the embedded font, usable without an [`Engine`].
 pub use font::measure_text;

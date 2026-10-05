@@ -10,8 +10,15 @@ use crate::color::LinearRgb;
 /// Bodies kept from one [`crate::Frame3D::set_far_bodies`] call. Extra entries are dropped.
 pub const MAX_FAR_BODIES: usize = 32;
 
-/// Sphere, a cube whose `radius` is the half-size, the inside of a sphere, or a
-/// rounded cube.
+/// Datum-mapped planets the sky pass can hold at once.
+pub const MAX_FAR_MAPS: usize = 8;
+
+/// Slot of one datum and its albedo cube. Valid ids are `0..`[`MAX_FAR_MAPS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FarMapId(pub u8);
+
+/// Sphere, a cube whose `radius` is the half-size, the inside of a sphere, a
+/// rounded cube, or a datum-mapped planet.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum FarShape {
     Cube,
@@ -22,7 +29,51 @@ pub enum FarShape {
     /// `|x|^p + |y|^p + |z|^p = radius^p` in body space. `exponent` is p ≥ 2
     /// (2 is the sphere; large p approaches the cube). Face centres sit at
     /// `radius`; a unit direction `d` meets the surface at `radius / ‖d‖_p`.
-    Rounded { exponent: f32 },
+    Rounded {
+        exponent: f32,
+    },
+    /// Radius along body-space direction `d` is [`FarBody::radius`] plus the
+    /// datum offset of `map`. Albedo comes from that map's cube faces.
+    ///
+    /// `horizon` is the sine of the highest elevation of any surface point
+    /// seen from the eye, above the plane whose normal is `-dir`. The shader
+    /// skips rays with `dot(ray, -dir) > horizon`. `1.0` disables the cull.
+    /// `air` is the air-shell thickness in the same unit as `radius` (`0`
+    /// draws no limb).
+    Mapped {
+        map: FarMapId,
+        horizon: f32,
+        air: f32,
+    },
+}
+
+/// Host description of one datum-mapped planet.
+///
+/// Installed with [`crate::Engine::set_far_map`]. The datum is equiangular on
+/// the charts of [`far_map_basis`]: a body-space unit direction `d` on face
+/// `f` has `xi = (4/π) atan(dot(d, tu) / dot(d, n))` and eta likewise with `tv`.
+#[derive(Clone, Copy)]
+pub struct FarMapDesc<'a> {
+    /// Samples per face edge, edges included. `g` is in `2..=65`.
+    pub datum_res: u32,
+    /// `6 * g * g` offsets, in the same unit as [`FarBody::radius`]. Face order
+    /// is +X, −X, +Y, −Y, +Z, −Z. Index `f * g * g + j * g + i`, with `i` along
+    /// xi and `j` along eta.
+    pub datum: &'a [f32],
+    /// Cube-face edge in texels. A power of two in `1..=2048`, or `0` to keep
+    /// the flat [`FarBody::albedo`] colours and upload no cube.
+    pub albedo_size: u32,
+}
+
+/// Why [`crate::Engine::set_far_map`] or [`crate::Engine::set_far_map_face`] rejected a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FarMapError {
+    /// The id is outside `0..`[`MAX_FAR_MAPS`], or the slot has no map yet.
+    BadId,
+    /// Datum resolution, datum length, face index, or albedo size is not valid.
+    BadSize,
+    /// The albedo cube could not be allocated.
+    OutOfMemory,
 }
 
 /// One body drawn in the sky pass.
@@ -34,7 +85,11 @@ pub enum FarShape {
 /// the opposite: `distance < radius`, and the far wall is the sky. `albedo` is
 /// the six cube faces (+X, −X, +Y, −Y, +Z, −Z); a sphere uses `[0]` for land and
 /// `[1]` for the second tone. A rounded body shades the face of its body-space
-/// normal and uses the sphere's rim. A black `atmosphere` draws no rim.
+/// normal and uses the sphere's rim. A [`FarShape::Mapped`] body uses `radius`
+/// as the reference radius; `albedo` is the flat fallback for a cube face whose
+/// upload has not landed (or whose map has `albedo_size` 0), chosen by the
+/// dominant body-space axis of the hit direction. `atmosphere` tints that
+/// body's air limb, and `seed` is unused. A black `atmosphere` draws no rim.
 /// `rotation` takes body space into world space (identity for an axis-aligned
 /// cube or rounded body).
 #[derive(Clone, Copy, Debug)]
@@ -274,7 +329,14 @@ fn lp_grad(q: Vec3, p: f32) -> (f32, Vec3) {
 
 /// Hit at `t_hit` when that sample is outside the solid. Normal from the gradient.
 #[cfg(test)]
-fn rounded_at(ray_o: Vec3, ray_d: Vec3, rotation: Quat, t_hit: f32, p: f32, rho: f32) -> Option<FarHit> {
+fn rounded_at(
+    ray_o: Vec3,
+    ray_d: Vec3,
+    rotation: Quat,
+    t_hit: f32,
+    p: f32,
+    rho: f32,
+) -> Option<FarHit> {
     if !(t_hit > 0.0) {
         return None;
     }
@@ -300,7 +362,13 @@ fn rounded_at(ray_o: Vec3, ray_d: Vec3, rotation: Quat, t_hit: f32, p: f32, rho:
 /// A miss that merely grazes that sphere, where the sphere lies on the body,
 /// reports the sphere point rather than a hole.
 #[cfg(test)]
-pub(crate) fn ray_rounded(ray: Vec3, dir: Vec3, rho: f32, rotation: Quat, exponent: f32) -> Option<FarHit> {
+pub(crate) fn ray_rounded(
+    ray: Vec3,
+    dir: Vec3,
+    rho: f32,
+    rotation: Quat,
+    exponent: f32,
+) -> Option<FarHit> {
     if !(rho > 0.0 && rho < 1.0)
         || !(exponent >= 2.0)
         || !exponent.is_finite()
@@ -416,11 +484,100 @@ fn finite_rgb(c: LinearRgb) -> bool {
     c.0[0].is_finite() && c.0[1].is_finite() && c.0[2].is_finite()
 }
 
+/// Face basis `(tu, n, tv)` of the datum charts. Face order is +X, −X, +Y, −Y,
+/// +Z, −Z. An index outside `0..6` returns the +Y basis.
+pub fn far_map_basis(face: usize) -> (Vec3, Vec3, Vec3) {
+    match face {
+        0 => (Vec3::NEG_Y, Vec3::X, Vec3::Z),
+        1 => (Vec3::Y, Vec3::NEG_X, Vec3::Z),
+        2 => (Vec3::X, Vec3::Y, Vec3::Z),
+        3 => (Vec3::X, Vec3::NEG_Y, Vec3::NEG_Z),
+        4 => (Vec3::X, Vec3::Z, Vec3::NEG_Y),
+        5 => (Vec3::X, Vec3::NEG_Z, Vec3::Y),
+        _ => (Vec3::X, Vec3::Y, Vec3::Z),
+    }
+}
+
+/// Body-space unit direction of the centre of texel `(x, y)` on albedo cube
+/// face `face` of edge `size`. The orientation is Vulkan's cube-map face
+/// table, so a caller never has to know it. `size` of 0 is treated as 1.
+pub fn far_cube_texel_dir(face: usize, size: u32, x: u32, y: u32) -> Vec3 {
+    let size = size.max(1) as f32;
+    let s = (x as f32 + 0.5) / size;
+    let t = (y as f32 + 0.5) / size;
+    let uc = 2.0 * s - 1.0;
+    let vc = 2.0 * t - 1.0;
+    let d = match face {
+        0 => Vec3::new(1.0, -vc, -uc),
+        1 => Vec3::new(-1.0, -vc, uc),
+        2 => Vec3::new(uc, 1.0, vc),
+        3 => Vec3::new(uc, -1.0, -vc),
+        4 => Vec3::new(uc, -vc, 1.0),
+        _ => Vec3::new(-uc, -vc, -1.0),
+    };
+    d.normalize_or_zero()
+}
+
+/// `Ok` when `id` and `desc` can be installed. Does not touch the GPU.
+pub(crate) fn validate_far_map(id: FarMapId, desc: &FarMapDesc<'_>) -> Result<(), FarMapError> {
+    if id.0 as usize >= MAX_FAR_MAPS {
+        return Err(FarMapError::BadId);
+    }
+    let g = desc.datum_res;
+    if !(2..=65).contains(&g) {
+        return Err(FarMapError::BadSize);
+    }
+    let n = 6usize * g as usize * g as usize;
+    if desc.datum.len() != n {
+        return Err(FarMapError::BadSize);
+    }
+    if desc.albedo_size != 0 && (desc.albedo_size > 2048 || !desc.albedo_size.is_power_of_two()) {
+        return Err(FarMapError::BadSize);
+    }
+    Ok(())
+}
+
+/// `slot` is the installed albedo edge, or `None` when the id has no map.
+/// `bytes` is the length of the RGBA8 upload.
+pub(crate) fn validate_far_map_face(
+    id: FarMapId,
+    face: usize,
+    bytes: usize,
+    slot: Option<u32>,
+) -> Result<(), FarMapError> {
+    if id.0 as usize >= MAX_FAR_MAPS {
+        return Err(FarMapError::BadId);
+    }
+    let Some(albedo_size) = slot else {
+        return Err(FarMapError::BadId);
+    };
+    if face >= 6 || albedo_size == 0 {
+        return Err(FarMapError::BadSize);
+    }
+    let expect = albedo_size as usize * albedo_size as usize * 4;
+    if bytes != expect {
+        return Err(FarMapError::BadSize);
+    }
+    Ok(())
+}
+
 fn keep(body: &FarBody) -> Option<FarBody> {
-    if let FarShape::Rounded { exponent } = body.shape {
-        if !(exponent >= 2.0) || !exponent.is_finite() {
-            return None;
+    match body.shape {
+        FarShape::Rounded { exponent } => {
+            if !(exponent >= 2.0) || !exponent.is_finite() {
+                return None;
+            }
         }
+        FarShape::Mapped { map, horizon, air } => {
+            if map.0 as usize >= MAX_FAR_MAPS
+                || !horizon.is_finite()
+                || !air.is_finite()
+                || air < 0.0
+            {
+                return None;
+            }
+        }
+        FarShape::Cube | FarShape::Sphere | FarShape::InnerSphere => {}
     }
     let inside = matches!(body.shape, FarShape::InnerSphere);
     // Outside shapes reject a viewer inside the solid. The inner sphere is the
@@ -481,6 +638,228 @@ pub(crate) fn store(bodies: &[FarBody], out: &mut [FarBody; MAX_FAR_BODIES]) -> 
         )
     });
     n as u32
+}
+
+/// Manual bilinear of the equiangular datum. `g < 2` or a short slice is a flat
+/// zero offset. Four loads, matching the shader (no hardware filtering).
+#[cfg(test)]
+fn sample_datum(g: u32, datum: &[f32], d: Vec3) -> f32 {
+    if g < 2 {
+        return 0.0;
+    }
+    let gg = g as usize;
+    let need = 6 * gg * gg;
+    if datum.len() < need {
+        return 0.0;
+    }
+    let face = dom_face(d) as usize;
+    let (tu, n, tv) = far_map_basis(face);
+    let den = d.dot(n);
+    if den.abs() < 1e-8 {
+        return 0.0;
+    }
+    let xi = (4.0 / std::f32::consts::PI) * (d.dot(tu) / den).atan();
+    let eta = (4.0 / std::f32::consts::PI) * (d.dot(tv) / den).atan();
+    let scale = 0.5 * (g - 1) as f32;
+    let u = ((xi + 1.0) * scale).clamp(0.0, (g - 1) as f32);
+    let v = ((eta + 1.0) * scale).clamp(0.0, (g - 1) as f32);
+    let i0 = (u.floor() as u32).min(g - 1);
+    let j0 = (v.floor() as u32).min(g - 1);
+    let i1 = (i0 + 1).min(g - 1);
+    let j1 = (j0 + 1).min(g - 1);
+    let fu = u - i0 as f32;
+    let fv = v - j0 as f32;
+    let at = |j: u32, i: u32| datum[face * gg * gg + j as usize * gg + i as usize];
+    let v00 = at(j0, i0);
+    let v10 = at(j0, i1);
+    let v01 = at(j1, i0);
+    let v11 = at(j1, i1);
+    let a = v00 + (v10 - v00) * fu;
+    let b = v01 + (v11 - v01) * fu;
+    a + (b - a) * fv
+}
+
+/// Near and far roots of a sphere of radius `rho` centred on the unit `dir`.
+#[cfg(test)]
+fn sphere_roots(facing: f32, rho: f32) -> Option<(f32, f32)> {
+    if !(rho > 0.0) || !rho.is_finite() {
+        return None;
+    }
+    let disc = facing * facing - (1.0 - rho * rho);
+    if disc < 0.0 || !disc.is_finite() {
+        return None;
+    }
+    let sd = disc.sqrt();
+    Some((facing - sd, facing + sd))
+}
+
+/// Outward normal of `r(direction)` from two one-sided steps of half a datum
+/// cell. A flat datum is exactly radial.
+#[cfg(test)]
+fn mapped_normal(
+    rotation: Quat,
+    u_world: Vec3,
+    rho: f32,
+    distance: f32,
+    g: u32,
+    datum: &[f32],
+) -> Vec3 {
+    let u = rotate(conjugate(rotation), u_world);
+    let r_of = |dir: Vec3| rho + sample_datum(g, datum, dir) / distance;
+    let cells = (g.max(2) - 1) as f32;
+    let eps = std::f32::consts::PI / (4.0 * cells);
+    let axis = if u.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+    let t1 = u.cross(axis).normalize_or_zero();
+    let t2 = u.cross(t1);
+    let r0 = r_of(u);
+    let r1 = r_of((u + t1 * eps).normalize_or_zero());
+    let r2 = r_of((u + t2 * eps).normalize_or_zero());
+    let dr1 = (r1 - r0) / eps;
+    let dr2 = (r2 - r0) / eps;
+    let n_body = (u * r0 - t1 * dr1 - t2 * dr2).normalize_or_zero();
+    rotate(rotation, n_body)
+}
+
+/// Ray from the origin against a datum-mapped body. `dir` is the unit centre.
+/// `rho` is `radius/distance`. Offsets are in the radius's unit. The search
+/// matches `far_ray_mapped` in `shaders/far_body.slang`: a lo-sphere bracket
+/// refined by 6 regula-falsi steps, otherwise 12 even steps across the hi
+/// chord and 5 regula-falsi steps. `horizon` skips `dot(ray, -dir) > horizon`.
+#[cfg(test)]
+pub(crate) fn ray_mapped(
+    ray: Vec3,
+    dir: Vec3,
+    rho: f32,
+    distance: f32,
+    rotation: Quat,
+    horizon: f32,
+    g: u32,
+    datum: &[f32],
+    min_off: f32,
+    max_off: f32,
+) -> Option<FarHit> {
+    if !(rho > 0.0)
+        || !(distance > 0.0)
+        || !ray.is_finite()
+        || !dir.is_finite()
+        || !distance.is_finite()
+    {
+        return None;
+    }
+    if ray.dot(-dir) > horizon {
+        return None;
+    }
+    let rho_lo = rho + min_off / distance;
+    let rho_hi = rho + max_off / distance;
+    let facing = ray.dot(dir);
+    let (t_hi_in, t_hi_out) = sphere_roots(facing, rho_hi)?;
+    if !(t_hi_out > 0.0) {
+        return None;
+    }
+    let t_start = t_hi_in.max(0.0);
+    let f_at = |t: f32| -> f32 {
+        let p = ray * t - dir;
+        let rad = p.length();
+        if rad < 1e-8 {
+            return -rho;
+        }
+        let body = rotate(conjugate(rotation), p / rad);
+        rad - (rho + sample_datum(g, datum, body) / distance)
+    };
+    let finish = |t: f32| -> Option<FarHit> {
+        if !(t > 0.0) || !t.is_finite() {
+            return None;
+        }
+        let p = ray * t - dir;
+        let rad = p.length();
+        if rad < 1e-8 {
+            return None;
+        }
+        let u_world = p / rad;
+        let body = rotate(conjugate(rotation), u_world);
+        Some(FarHit {
+            t,
+            normal: mapped_normal(rotation, u_world, rho, distance, g, datum),
+            face: dom_face(body),
+        })
+    };
+    let lo_enter = sphere_roots(facing, rho_lo).and_then(|(t_lo, _)| (t_lo > 0.0).then_some(t_lo));
+    if let Some(t_lo) = lo_enter {
+        let b = t_lo.max(t_start);
+        if b - t_start < 1e-5 {
+            return finish(if t_lo > 0.0 { t_lo } else { t_start });
+        }
+        let mut a = t_start;
+        let mut b = b;
+        let mut fa = f_at(a);
+        let mut fb = f_at(b);
+        if fa.abs() <= 1e-5 {
+            return finish(a);
+        }
+        if fa < 0.0 {
+            return None;
+        }
+        for _ in 0..6 {
+            let den = fb - fa;
+            if den.abs() < 1e-20 || (b - a).abs() < 1e-7 {
+                break;
+            }
+            let t = b - fb * (b - a) / den;
+            if !(t > a.min(b) && t < a.max(b)) {
+                break;
+            }
+            let ft = f_at(t);
+            if fa * ft <= 0.0 {
+                b = t;
+                fb = ft;
+            } else {
+                a = t;
+                fa = ft;
+            }
+        }
+        return finish(if fa.abs() <= fb.abs() { a } else { b });
+    }
+    let mut prev_t = t_start;
+    let mut prev_f = f_at(prev_t);
+    if prev_f < -1e-5 {
+        return None;
+    }
+    if prev_f.abs() <= 1e-5 {
+        return finish(prev_t);
+    }
+    let mut bracket = None;
+    for i in 1..=12 {
+        let t = t_start + (t_hi_out - t_start) * (i as f32 / 12.0);
+        let ft = f_at(t);
+        if prev_f * ft <= 0.0 {
+            bracket = Some((prev_t, t, prev_f, ft));
+            break;
+        }
+        prev_t = t;
+        prev_f = ft;
+    }
+    let Some((mut a, mut b, mut fa, mut fb)) = bracket else {
+        return None;
+    };
+    for _ in 0..5 {
+        let den = fb - fa;
+        if den.abs() < 1e-20 || (b - a).abs() < 1e-7 {
+            break;
+        }
+        let t = b - fb * (b - a) / den;
+        if !(t > a.min(b) && t < a.max(b)) {
+            break;
+        }
+        let ft = f_at(t);
+        if fa * ft <= 0.0 {
+            b = t;
+            fb = ft;
+        } else {
+            a = t;
+            fa = ft;
+        }
+    }
+    finish(if fa.abs() <= fb.abs() { a } else { b })
 }
 
 #[cfg(test)]
@@ -572,19 +951,25 @@ mod tests {
     fn billion_block_distance_is_exact_in_normalised_space() {
         let rho = normalised_radius(1.0e9, 2.5e8);
         assert_eq!(rho.to_bits(), 0.25f32.to_bits());
-        assert_eq!(
-            normalised_radius(1.0e9, 5.0e8).to_bits(),
-            0.5f32.to_bits()
-        );
+        assert_eq!(normalised_radius(1.0e9, 5.0e8).to_bits(), 0.5f32.to_bits());
         let dir = Vec3::new(-0.2, 0.3, 0.8).normalize();
         // A small offset from the centre ray: still inside a rho of 0.25, for both shapes.
         let ray = (dir + Vec3::new(0.05, -0.02, 0.01)).normalize();
         let sphere_far = ray_sphere(ray, dir, rho).expect("sphere hit");
         let sphere_near = ray_sphere(ray, dir, 0.25).unwrap();
         assert_eq!(sphere_far.t.to_bits(), sphere_near.t.to_bits());
-        assert_eq!(sphere_far.normal.x.to_bits(), sphere_near.normal.x.to_bits());
-        assert_eq!(sphere_far.normal.y.to_bits(), sphere_near.normal.y.to_bits());
-        assert_eq!(sphere_far.normal.z.to_bits(), sphere_near.normal.z.to_bits());
+        assert_eq!(
+            sphere_far.normal.x.to_bits(),
+            sphere_near.normal.x.to_bits()
+        );
+        assert_eq!(
+            sphere_far.normal.y.to_bits(),
+            sphere_near.normal.y.to_bits()
+        );
+        assert_eq!(
+            sphere_far.normal.z.to_bits(),
+            sphere_near.normal.z.to_bits()
+        );
         let cube_far = ray_cube(ray, dir, rho, Quat::IDENTITY).unwrap();
         let cube_near = ray_cube(ray, dir, 0.25, Quat::IDENTITY).unwrap();
         assert_eq!(cube_far.t.to_bits(), cube_near.t.to_bits());
@@ -607,7 +992,11 @@ mod tests {
         assert_eq!(n, 32);
         assert_eq!(out[0].distance, 131.0);
         assert_eq!(out[31].distance, 100.0);
-        assert!(out.iter().take(n as usize).all(|b| (0..32).contains(&b.seed)));
+        assert!(
+            out.iter()
+                .take(n as usize)
+                .all(|b| (0..32).contains(&b.seed))
+        );
         assert!((out[0].dir - Vec3::Z).length() < 1e-6);
 
         let mut nan = vec![
@@ -763,7 +1152,10 @@ mod tests {
                         .unwrap_or_else(|| panic!("p {p} dir {u:?} missed"));
                     let got = ray * hit.t;
                     let err = (got - point).length();
-                    assert!(err < 2e-4, "p {p} dir {u:?} off by {err} (got {got}, want {point})");
+                    assert!(
+                        err < 2e-4,
+                        "p {p} dir {u:?} off by {err} (got {got}, want {point})"
+                    );
                     assert!(
                         hit.normal.dot(outward) > 0.999,
                         "p {p} normal {:?} not along {outward:?}",
@@ -783,7 +1175,12 @@ mod tests {
                 let ray = Vec3::new(0.12, -0.05, 1.0).normalize();
                 let sphere = ray_sphere(ray, centre, 0.4).unwrap();
                 let rounded = ray_rounded(ray, centre, 0.4, Quat::IDENTITY, p).unwrap();
-                assert!((sphere.t - rounded.t).abs() < 2e-4, "{} vs {}", sphere.t, rounded.t);
+                assert!(
+                    (sphere.t - rounded.t).abs() < 2e-4,
+                    "{} vs {}",
+                    sphere.t,
+                    rounded.t
+                );
                 assert!(sphere.normal.dot(rounded.normal) > 0.999);
             }
         }
@@ -844,7 +1241,336 @@ mod tests {
         assert_eq!(store(std::slice::from_ref(&body), &mut out), 0);
         body.shape = FarShape::Rounded { exponent: f32::NAN };
         assert_eq!(store(std::slice::from_ref(&body), &mut out), 0);
-        body.shape = FarShape::Rounded { exponent: f32::INFINITY };
+        body.shape = FarShape::Rounded {
+            exponent: f32::INFINITY,
+        };
         assert_eq!(store(std::slice::from_ref(&body), &mut out), 0);
+    }
+
+    #[test]
+    fn far_map_basis_matches_the_chart_table() {
+        let (x, y, z) = (Vec3::X, Vec3::Y, Vec3::Z);
+        assert_eq!(far_map_basis(0), (-y, x, z));
+        assert_eq!(far_map_basis(1), (y, -x, z));
+        assert_eq!(far_map_basis(2), (x, y, z));
+        assert_eq!(far_map_basis(3), (x, -y, -z));
+        assert_eq!(far_map_basis(4), (x, z, -y));
+        assert_eq!(far_map_basis(5), (x, -z, y));
+    }
+
+    #[test]
+    fn far_cube_texel_dir_follows_the_vulkan_cube() {
+        let normals = [
+            Vec3::X,
+            Vec3::NEG_X,
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::Z,
+            Vec3::NEG_Z,
+        ];
+        let size = 8u32;
+        for (face, n) in normals.iter().copied().enumerate() {
+            for y in 0..size {
+                for x in 0..size {
+                    let d = far_cube_texel_dir(face, size, x, y);
+                    assert!((d.length() - 1.0).abs() < 1e-5, "{d:?}");
+                    let a = d.abs();
+                    let axis = if a.x >= a.y && a.x >= a.z {
+                        0
+                    } else if a.y >= a.z {
+                        1
+                    } else {
+                        2
+                    };
+                    assert_eq!(axis, face / 2, "face {face} texel {x},{y} dir {d}");
+                    assert!(d.dot(n) > 0.0, "face {face} points away");
+                    let mirror = far_cube_texel_dir(face, size, size - 1 - x, size - 1 - y);
+                    let sum = d + mirror;
+                    assert!(
+                        sum.cross(n).length() < 1e-4,
+                        "face {face} texel {x},{y} not symmetric: {sum}"
+                    );
+                }
+            }
+        }
+        // Image origin of +X is the corner toward +Y and +Z.
+        let corner = far_cube_texel_dir(0, 4096, 0, 0);
+        let expect = Vec3::new(1.0, 1.0, 1.0).normalize();
+        assert!((corner - expect).length() < 1e-3, "{corner} vs {expect}");
+    }
+
+    #[test]
+    fn far_map_desc_rejects_a_bad_id_or_size() {
+        let ok_datum = [0.0f32; 6 * 2 * 2];
+        let ok = FarMapDesc {
+            datum_res: 2,
+            datum: &ok_datum,
+            albedo_size: 4,
+        };
+        assert_eq!(validate_far_map(FarMapId(8), &ok), Err(FarMapError::BadId));
+        assert_eq!(
+            validate_far_map(FarMapId(255), &ok),
+            Err(FarMapError::BadId)
+        );
+        assert!(validate_far_map(FarMapId(7), &ok).is_ok());
+
+        let mut bad_g = ok;
+        bad_g.datum_res = 1;
+        assert_eq!(
+            validate_far_map(FarMapId(0), &bad_g),
+            Err(FarMapError::BadSize)
+        );
+        bad_g.datum_res = 66;
+        assert_eq!(
+            validate_far_map(FarMapId(0), &bad_g),
+            Err(FarMapError::BadSize)
+        );
+
+        let short = FarMapDesc {
+            datum_res: 2,
+            datum: &[0.0f32; 6],
+            albedo_size: 0,
+        };
+        assert_eq!(
+            validate_far_map(FarMapId(0), &short),
+            Err(FarMapError::BadSize)
+        );
+
+        let mut bad_albedo = ok;
+        bad_albedo.albedo_size = 3;
+        assert_eq!(
+            validate_far_map(FarMapId(0), &bad_albedo),
+            Err(FarMapError::BadSize)
+        );
+        bad_albedo.albedo_size = 4096;
+        assert_eq!(
+            validate_far_map(FarMapId(0), &bad_albedo),
+            Err(FarMapError::BadSize)
+        );
+        bad_albedo.albedo_size = 0;
+        assert!(validate_far_map(FarMapId(0), &bad_albedo).is_ok());
+        bad_albedo.albedo_size = 2048;
+        assert!(validate_far_map(FarMapId(0), &bad_albedo).is_ok());
+
+        assert_eq!(
+            validate_far_map_face(FarMapId(8), 0, 64, Some(4)),
+            Err(FarMapError::BadId)
+        );
+        assert_eq!(
+            validate_far_map_face(FarMapId(0), 0, 64, None),
+            Err(FarMapError::BadId)
+        );
+        assert_eq!(
+            validate_far_map_face(FarMapId(0), 6, 64, Some(4)),
+            Err(FarMapError::BadSize)
+        );
+        assert_eq!(
+            validate_far_map_face(FarMapId(0), 0, 16, Some(4)),
+            Err(FarMapError::BadSize)
+        );
+        assert_eq!(
+            validate_far_map_face(FarMapId(0), 0, 64, Some(0)),
+            Err(FarMapError::BadSize)
+        );
+        assert!(validate_far_map_face(FarMapId(0), 5, 64, Some(4)).is_ok());
+    }
+
+    #[test]
+    fn mapped_is_kept_only_with_a_real_horizon_and_air() {
+        let mut body = sphere_at(Vec3::Z, 4.0, 1.0, 1);
+        body.shape = FarShape::Mapped {
+            map: FarMapId(3),
+            horizon: 1.0,
+            air: 0.0,
+        };
+        let mut out = [FarBody::default(); MAX_FAR_BODIES];
+        assert_eq!(store(std::slice::from_ref(&body), &mut out), 1);
+        body.shape = FarShape::Mapped {
+            map: FarMapId(8),
+            horizon: 1.0,
+            air: 0.0,
+        };
+        assert_eq!(store(std::slice::from_ref(&body), &mut out), 0);
+        body.shape = FarShape::Mapped {
+            map: FarMapId(0),
+            horizon: f32::NAN,
+            air: 0.0,
+        };
+        assert_eq!(store(std::slice::from_ref(&body), &mut out), 0);
+        body.shape = FarShape::Mapped {
+            map: FarMapId(0),
+            horizon: 0.0,
+            air: -0.01,
+        };
+        assert_eq!(store(std::slice::from_ref(&body), &mut out), 0);
+        // Still an outside shape: the viewer must be beyond the reference radius.
+        body.shape = FarShape::Mapped {
+            map: FarMapId(0),
+            horizon: 1.0,
+            air: 0.2,
+        };
+        body.distance = 1.0;
+        body.radius = 1.0;
+        assert_eq!(store(std::slice::from_ref(&body), &mut out), 0);
+    }
+
+    #[test]
+    fn flat_datum_matches_the_sphere() {
+        let dir = Vec3::new(-0.2, 0.4, 0.8).normalize();
+        let rho = 0.35f32;
+        let distance = 8.0f32;
+        let g = 4u32;
+        let datum = vec![0.0f32; 6 * 16];
+        let mut rays = vec![dir];
+        for k in 0..12 {
+            let ang = (k as f32) * 0.07;
+            let ray = (dir + Vec3::new(ang.sin(), ang * 0.3, 0.0)).normalize();
+            rays.push(ray);
+        }
+        rays.push(Vec3::X);
+        rays.push(-dir);
+        for ray in rays {
+            let sphere = ray_sphere(ray, dir, rho);
+            let mapped = ray_mapped(
+                ray,
+                dir,
+                rho,
+                distance,
+                Quat::IDENTITY,
+                1.0,
+                g,
+                &datum,
+                0.0,
+                0.0,
+            );
+            match (sphere, mapped) {
+                (None, None) => {}
+                (Some(a), Some(b)) => {
+                    assert!((a.t - b.t).abs() < 1e-5, "{ray:?} t {} vs {}", a.t, b.t);
+                    assert!(
+                        (a.normal - b.normal).length() < 1e-5,
+                        "{ray:?} n {:?} vs {:?}",
+                        a.normal,
+                        b.normal
+                    );
+                }
+                other => panic!("{ray:?} disagreed: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_datum_bump_moves_the_hit_closer() {
+        let g = 5u32;
+        let mut datum = vec![0.0f32; 6 * 25];
+        // Centre of the −Z face (the face the +Z centre ray meets).
+        let face = 5usize;
+        let i = 2usize;
+        let j = 2usize;
+        datum[face * 25 + j * 5 + i] = 0.2;
+        let rho = 0.25f32;
+        let distance = 4.0f32;
+        let sphere = ray_sphere(Vec3::Z, Vec3::Z, rho).unwrap();
+        let hit = ray_mapped(
+            Vec3::Z,
+            Vec3::Z,
+            rho,
+            distance,
+            Quat::IDENTITY,
+            1.0,
+            g,
+            &datum,
+            0.0,
+            0.2,
+        )
+        .expect("bump hits");
+        assert!(
+            hit.t < sphere.t - 1e-3,
+            "bump t {} should be closer than sphere {}",
+            hit.t,
+            sphere.t
+        );
+    }
+
+    #[test]
+    fn a_limb_ray_that_misses_the_surface_is_a_miss() {
+        // max offset 0, the rest sunk, so the hi sphere is the reference and
+        // the surface sits inside it. Impact parameter between the two.
+        let g = 2u32;
+        let mut datum = vec![-0.4f32; 6 * 4];
+        datum[2 * 4] = 0.0; // one +Y sample keeps max at 0
+        let rho = 0.5f32;
+        let distance = 2.0f32;
+        let s = 0.45f32;
+        let ray = Vec3::new(s, 0.0, (1.0 - s * s).sqrt());
+        assert!(ray_sphere(ray, Vec3::Z, rho).is_some());
+        assert!(
+            ray_mapped(
+                ray,
+                Vec3::Z,
+                rho,
+                distance,
+                Quat::IDENTITY,
+                1.0,
+                g,
+                &datum,
+                -0.4,
+                0.0,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn horizon_cull_skips_rays_above_it() {
+        let rho = 0.95f32;
+        let datum = [0.0f32; 6 * 4];
+        let centre = ray_mapped(
+            Vec3::Z,
+            Vec3::Z,
+            rho,
+            1.0,
+            Quat::IDENTITY,
+            -0.8,
+            2,
+            &datum,
+            0.0,
+            0.0,
+        );
+        assert!(centre.is_some());
+        let s = (1.0f32 - 0.25).sqrt();
+        let raised = Vec3::new(s, 0.0, 0.5);
+        assert!(raised.dot(-Vec3::Z) > -0.8);
+        assert!(ray_sphere(raised, Vec3::Z, rho).is_some());
+        assert!(
+            ray_mapped(
+                raised,
+                Vec3::Z,
+                rho,
+                1.0,
+                Quat::IDENTITY,
+                -0.8,
+                2,
+                &datum,
+                0.0,
+                0.0,
+            )
+            .is_none()
+        );
+        assert!(
+            ray_mapped(
+                raised,
+                Vec3::Z,
+                rho,
+                1.0,
+                Quat::IDENTITY,
+                1.0,
+                2,
+                &datum,
+                0.0,
+                0.0,
+            )
+            .is_some()
+        );
     }
 }

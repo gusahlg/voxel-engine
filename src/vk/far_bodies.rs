@@ -8,7 +8,7 @@
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 
-use crate::far_body::{FarBody, FarShape, MAX_FAR_BODIES};
+use crate::far_body::{FarBody, FarShape, MAX_FAR_BODIES, MAX_FAR_MAPS};
 use crate::rev::{FrameSlot, PerSlot};
 use crate::vk::buffers::HostBuffer;
 
@@ -32,9 +32,16 @@ pub(crate) struct FarBodyGpu {
     pub albedo3: [f32; 4],
     pub albedo4: [f32; 4],
     pub albedo5: [f32; 4],
-    /// rgb rim tint, a = shape (0 cube, 1 sphere, 2 inner sphere, 3 rounded).
+    /// rgb rim / air tint. w = shape: 0 cube, 1 sphere, 2 inner sphere,
+    /// 3 rounded, 4 mapped.
     pub atmosphere: [f32; 4],
-    /// x = noise seed. y = rounded exponent as f32 bits (0 for other shapes).
+    /// x = noise seed (unused for mapped). y = rounded exponent as f32 bits
+    /// (0 otherwise). z = map id + 1 (0 = not mapped). w = 0.
+    ///
+    /// Mapped spare lanes on the albedo vectors: `albedo0.w` = horizon,
+    /// `albedo1.w` = air thickness in radius units, `albedo2.w` = distance
+    /// in world units. The other `.w` lanes stay 0. `dir_rho.w` stays the
+    /// reference `radius/distance`, not the datum hi radius.
     pub seed: [u32; 4],
 }
 
@@ -86,8 +93,10 @@ const _: () = assert!(
 /// Sine of the angular radius the shader can draw (`s = ‖ray × center‖`), or
 /// `-1` when a ray facing away can still hit. Matches `far_bodies()`: the
 /// sphere and rounded rims reach `1.05` times the body, the cube's corners
-/// sit at `√3` times the enlarged half-extent, and an inner sphere is the sky.
-fn cone_bound(body: &FarBody) -> f32 {
+/// sit at `√3` times the enlarged half-extent, a mapped body uses the hi
+/// radius `(radius + max datum offset) / distance`, and an inner sphere is
+/// the sky. `map_max[i]` is that map's maximum datum offset (0 if unset).
+fn cone_bound(body: &FarBody, map_max: &[f32; MAX_FAR_MAPS]) -> f32 {
     if !far_cull_enabled() {
         return -1.0;
     }
@@ -100,6 +109,14 @@ fn cone_bound(body: &FarBody) -> f32 {
             let p = exponent.clamp(2.0, 32.0);
             let rho_b = rho * 3.0f32.powf(0.5 - 1.0 / p) * (1.0 + 2.0e-4);
             1.05 * rho_b
+        }
+        FarShape::Mapped { map, .. } => {
+            let max_off = if (map.0 as usize) < MAX_FAR_MAPS {
+                map_max[map.0 as usize]
+            } else {
+                0.0
+            };
+            ((body.radius + max_off) / body.distance).max(0.0)
         }
     };
     // The camera is inside, or nearly inside, the bounding sphere: a ray
@@ -228,18 +245,25 @@ fn rgb4(c: crate::color::LinearRgb) -> [f32; 4] {
 fn pack_one(body: &FarBody) -> FarBodyGpu {
     let dir = body.dir;
     let q = body.rotation;
-    let (shape, exponent) = match body.shape {
-        FarShape::Cube => (0.0, 0.0),
-        FarShape::Sphere => (1.0, 0.0),
-        FarShape::InnerSphere => (2.0, 0.0),
-        FarShape::Rounded { exponent } => (3.0, exponent),
+    let (shape, exponent, map_plus, horizon, air) = match body.shape {
+        FarShape::Cube => (0.0, 0.0, 0, 0.0, 0.0),
+        FarShape::Sphere => (1.0, 0.0, 0, 0.0, 0.0),
+        FarShape::InnerSphere => (2.0, 0.0, 0, 0.0, 0.0),
+        FarShape::Rounded { exponent } => (3.0, exponent, 0, 0.0, 0.0),
+        FarShape::Mapped { map, horizon, air } => (4.0, 0.0, u32::from(map.0) + 1, horizon, air),
     };
+    let mut albedo0 = rgb4(body.albedo[0]);
+    let mut albedo1 = rgb4(body.albedo[1]);
+    let mut albedo2 = rgb4(body.albedo[2]);
+    albedo0[3] = horizon;
+    albedo1[3] = air;
+    albedo2[3] = if map_plus == 0 { 0.0 } else { body.distance };
     FarBodyGpu {
         dir_rho: [dir.x, dir.y, dir.z, body.radius / body.distance],
         rot: [q.x, q.y, q.z, q.w],
-        albedo0: rgb4(body.albedo[0]),
-        albedo1: rgb4(body.albedo[1]),
-        albedo2: rgb4(body.albedo[2]),
+        albedo0,
+        albedo1,
+        albedo2,
         albedo3: rgb4(body.albedo[3]),
         albedo4: rgb4(body.albedo[4]),
         albedo5: rgb4(body.albedo[5]),
@@ -249,7 +273,7 @@ fn pack_one(body: &FarBody) -> FarBodyGpu {
             body.atmosphere.0[2],
             shape,
         ],
-        seed: [body.seed, exponent.to_bits(), 0, 0],
+        seed: [body.seed, exponent.to_bits(), map_plus, 0],
     }
 }
 
@@ -424,13 +448,20 @@ fn nonzero_tiles(table: &FarTableGpu) -> u64 {
 /// meet the frustum are dropped; the rest stay in their original relative order
 /// (the sky composite is order-dependent). `None` keeps every body. Each kept
 /// body then sets its bit in the screen tiles its drawable cone can reach.
-pub(crate) fn pack_table(bodies: &[FarBody], view: Option<FarView>) -> FarTableGpu {
+/// `map_max[i]` is map `i`'s maximum datum offset, used for a mapped body's
+/// hi-radius cone (`-1` when that sphere contains the camera, which paints
+/// every tile).
+pub(crate) fn pack_table(
+    bodies: &[FarBody],
+    view: Option<FarView>,
+    map_max: &[f32; MAX_FAR_MAPS],
+) -> FarTableGpu {
     let mut table = FarTableGpu::zeroed();
     let n = bodies.len().min(MAX_FAR_BODIES);
     let cull = far_cull_enabled();
     let mut kept = 0usize;
     for body in bodies.iter().take(n) {
-        let bound = cone_bound(body);
+        let bound = cone_bound(body, map_max);
         if cull {
             if let Some(view) = view.as_ref() {
                 if !cone_in_view(body.dir, bound, view) {
@@ -472,8 +503,14 @@ impl FarBodyRing {
         }
     }
 
-    pub(crate) fn write(&mut self, slot: FrameSlot, bodies: &[FarBody], view: Option<FarView>) {
-        let table = pack_table(bodies, view);
+    pub(crate) fn write(
+        &mut self,
+        slot: FrameSlot,
+        bodies: &[FarBody],
+        view: Option<FarView>,
+        map_max: &[f32; MAX_FAR_MAPS],
+    ) {
+        let table = pack_table(bodies, view, map_max);
         let offered = bodies.len().min(MAX_FAR_BODIES) as u64;
         crate::profile::gauge(crate::profile::Gauge::FarBodies, offered);
         crate::profile::gauge(crate::profile::Gauge::FarDrawn, u64::from(table.header[0]));
@@ -508,8 +545,13 @@ mod tests {
     use crate::camera::{Camera3D, Lens, WarpMap, WarpStrength};
     use crate::color::LinearRgb;
     use crate::far_body::{
-        FarBody, FarShape, ray_cube, ray_inner_sphere, ray_rounded, ray_sphere, store,
+        FarBody, FarMapId, FarShape, ray_cube, ray_inner_sphere, ray_mapped, ray_rounded,
+        ray_sphere, store,
     };
+
+    fn pack_table(bodies: &[FarBody], view: Option<FarView>) -> FarTableGpu {
+        super::pack_table(bodies, view, &[0.0; MAX_FAR_MAPS])
+    }
     use glam::{Quat, Vec3, Vec4};
 
     #[test]
@@ -651,6 +693,34 @@ mod tests {
         let wall = sample(FarShape::InnerSphere, 2.0, 5.0);
         assert_eq!(
             pack_table(std::slice::from_ref(&wall), None).cone[0][3].to_bits(),
+            (-1.0f32).to_bits()
+        );
+
+        let mut map_max = [0.0f32; MAX_FAR_MAPS];
+        map_max[3] = 0.1;
+        let mapped = sample(
+            FarShape::Mapped {
+                map: FarMapId(3),
+                horizon: -0.25,
+                air: 0.4,
+            },
+            4.0,
+            1.0,
+        );
+        let table = super::pack_table(std::slice::from_ref(&mapped), None, &map_max);
+        assert_eq!(table.cone[0][3].to_bits(), ((1.0f32 + 0.1) / 4.0).to_bits());
+        let gpu = &table.body[0];
+        assert_eq!(gpu.atmosphere[3].to_bits(), 4.0f32.to_bits());
+        assert_eq!(gpu.seed[2], 4);
+        assert_eq!(gpu.seed[1], 0);
+        assert_eq!(gpu.seed[3], 0);
+        assert_eq!(gpu.albedo0[3].to_bits(), (-0.25f32).to_bits());
+        assert_eq!(gpu.albedo1[3].to_bits(), 0.4f32.to_bits());
+        assert_eq!(gpu.albedo2[3].to_bits(), 4.0f32.to_bits());
+        assert_eq!(gpu.dir_rho[3].to_bits(), 0.25f32.to_bits());
+        map_max[3] = 10.0;
+        assert_eq!(
+            super::pack_table(std::slice::from_ref(&mapped), None, &map_max).cone[0][3].to_bits(),
             (-1.0f32).to_bits()
         );
 
@@ -906,6 +976,22 @@ mod tests {
             FarShape::InnerSphere => {
                 ray_inner_sphere(ray, dir, body.distance, body.radius).is_some()
             }
+            FarShape::Mapped { horizon, .. } => {
+                let datum = [0.0f32; 24];
+                ray_mapped(
+                    ray,
+                    dir,
+                    rho,
+                    body.distance,
+                    body.rotation,
+                    horizon,
+                    2,
+                    &datum,
+                    0.0,
+                    0.0,
+                )
+                .is_some()
+            }
         }
     }
 
@@ -938,6 +1024,13 @@ mod tests {
                 ray_cube(ray, dir, rho_rim, body.rotation).is_none()
             }
             FarShape::InnerSphere => false,
+            FarShape::Mapped { horizon, air, .. } => {
+                if ray.dot(-dir) > horizon {
+                    return true;
+                }
+                let shell = rho + (air / body.distance).max(px);
+                facing <= 0.0 || s >= shell
+            }
         }
     }
 
@@ -991,7 +1084,7 @@ mod tests {
 
             for body in &bodies {
                 let culled = !kept.contains(&body.seed);
-                let bound = cone_bound(body);
+                let bound = cone_bound(body, &[0.0; MAX_FAR_MAPS]);
                 for ray in &rays {
                     for px in px_values {
                         if !(culled || pixel_rejects(*ray, body.dir, bound, px)) {
