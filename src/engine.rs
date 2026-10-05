@@ -672,11 +672,20 @@ impl Engine {
     /// Install the datum (and, when `desc.albedo_size > 0`, an albedo cube)
     /// for one [`FarShape::Mapped`](crate::FarShape::Mapped) body.
     ///
-    /// The cube is allocated on the render thread; this waits for that reply
-    /// and not for the GPU. [`FarMapError::OutOfMemory`](crate::FarMapError::OutOfMemory)
-    /// is the allocation failure. A replaced cube is freed after the frames
-    /// that may still sample it. Faces uploaded earlier are dropped: call
-    /// [`Self::set_far_map_face`] again.
+    /// [`FarMapError::BadId`](crate::FarMapError::BadId) and
+    /// [`FarMapError::BadSize`](crate::FarMapError::BadSize) are checked on
+    /// this thread. The cube allocation is enqueued and this returns `Ok`
+    /// without waiting for the render thread or the GPU, so a caller on the
+    /// game's main thread cannot stall here.
+    /// [`FarMapError::OutOfMemory`](crate::FarMapError::OutOfMemory) is not
+    /// returned: if the render thread cannot allocate the cube it logs once
+    /// and keeps the datum on the flat per-face
+    /// [`FarBody::albedo`](crate::FarBody::albedo) colours, as if
+    /// `albedo_size` were 0. [`Self::set_far_map_face`] for that map then
+    /// returns `Ok` and the upload is ignored until the next `set_far_map`.
+    /// A replaced cube is freed after the frames that may still sample it.
+    /// Faces uploaded earlier are dropped: call [`Self::set_far_map_face`]
+    /// again.
     pub fn set_far_map(
         &mut self,
         id: crate::FarMapId,
@@ -689,9 +698,13 @@ impl Engine {
     ///
     /// `face` is `0..6` in the order +X, −X, +Y, −Y, +Z, −Z. The bytes are
     /// `albedo_size * albedo_size * 4`. Recorded into a later frame's command
-    /// buffer (mips included); this never waits on the GPU. Until the upload
-    /// has landed, that face draws its [`crate::FarBody::albedo`] fallback.
+    /// buffer (mips included). This does not wait for the render thread or
+    /// the GPU. Until the upload has landed, that face draws its
+    /// [`crate::FarBody::albedo`] fallback.
     /// [`FarMapError::BadId`](crate::FarMapError::BadId) when `id` has no map.
+    /// After a failed cube allocation the render thread ignores the bytes
+    /// until the next [`Self::set_far_map`]; this still returns `Ok` when the
+    /// size matches the request.
     pub fn set_far_map_face(
         &mut self,
         id: crate::FarMapId,
@@ -703,7 +716,8 @@ impl Engine {
 
     /// Drop the datum and the albedo cube of `id`. An id outside
     /// `0..`[`crate::MAX_FAR_MAPS`] does nothing. The cube is freed after the
-    /// frames that may still sample it. Does not wait on the GPU.
+    /// frames that may still sample it. Does not wait for the render thread
+    /// or the GPU.
     pub fn clear_far_map(&mut self, id: crate::FarMapId) {
         self.client.clear_far_map(id);
     }

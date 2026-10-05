@@ -1,12 +1,15 @@
 //! Datum storage and albedo cubes for [`crate::FarShape::Mapped`].
 //!
 //! One device-local buffer holds eight headers plus every datum. Cube images
-//! are created on `set_map` (the [`crate::FarMapError::OutOfMemory`] path) and
-//! filled later: face bytes and mip blits are recorded into the frame command
-//! buffer, which is the queue that can blit. The datum copy follows the
-//! block-texture / material transfer lane (timeline wait, queue-family
-//! ownership when the families differ, staging retired on that timeline).
-//! Nothing here waits on the GPU.
+//! are created on `set_map`. If that allocation fails, the failure is logged
+//! once for the map id and the slot keeps its datum with `albedo_size` 0, so
+//! the shader uses the flat per-face colours. [`crate::FarMapError::OutOfMemory`]
+//! is not returned to the caller. Face bytes and mip blits are recorded into
+//! the frame command buffer, which is the queue that can blit; a face whose
+//! cube is missing is dropped. The datum copy follows the block-texture /
+//! material transfer lane (timeline wait, queue-family ownership when the
+//! families differ, staging retired on that timeline). Nothing here waits on
+//! the GPU.
 
 use ash::vk;
 
@@ -87,6 +90,10 @@ pub(crate) struct FarMaps {
     /// Graphics-pool command buffers used for a dedicated-family release.
     release_cmds: RetireQueue<(Timeline, vk::CommandBuffer)>,
     command_pool: vk::CommandPool,
+    /// Bit i is set after map i's cube allocation has failed and been logged.
+    /// Cleared when a later `set_map` installs a cube or an explicit
+    /// `albedo_size` of 0, so the next failure logs again. Not per frame.
+    oom_logged: u8,
 }
 
 impl FarMaps {
@@ -160,6 +167,7 @@ impl FarMaps {
             transfer_retire: RetireQueue::new(),
             release_cmds: RetireQueue::new(),
             command_pool,
+            oom_logged: 0,
         }
     }
 
@@ -217,6 +225,12 @@ impl FarMaps {
     /// Install `datum` and, when `albedo_size > 0`, a fresh cube. The previous
     /// cube is retired at the next flush. Landed bits start clear, so faces
     /// must be uploaded again. No GPU wait.
+    ///
+    /// A failed cube allocation is logged once per map id (until a later call
+    /// installs a cube or requests `albedo_size` 0) and the datum is kept
+    /// with `albedo_size` 0. [`FarMapError::OutOfMemory`] is not returned.
+    /// [`Self::queue_face`] then drops faces for this generation because the
+    /// cube is absent.
     pub(crate) fn set_map(
         &mut self,
         device: &ash::Device,
@@ -230,10 +244,27 @@ impl FarMaps {
             return Err(FarMapError::BadId);
         }
         let slot_i = id as usize;
-        let cube = if albedo_size == 0 {
-            None
+        let bit = 1u8 << id;
+        let (cube, albedo_size) = if albedo_size == 0 {
+            self.oom_logged &= !bit;
+            (None, 0)
         } else {
-            Some(unsafe { create_cube(device, memory_props, albedo_size)? })
+            match unsafe { create_cube(device, memory_props, albedo_size) } {
+                Ok(cube) => {
+                    self.oom_logged &= !bit;
+                    (Some(cube), albedo_size)
+                }
+                Err(FarMapError::OutOfMemory) => {
+                    if self.oom_logged & bit == 0 {
+                        self.oom_logged |= bit;
+                        log::warn!(
+                            "far map {id}: albedo cube allocation failed; drawing flat per-face colours until the next set_far_map"
+                        );
+                    }
+                    (None, 0)
+                }
+                Err(err) => return Err(err),
+            }
         };
         let slot = &mut self.slots[slot_i];
         if let Some(old) = slot.cube.take() {
@@ -285,9 +316,12 @@ impl FarMaps {
     /// Drop the slot. The cube is retired at the next flush; the header
     /// reports an empty map (`g == 0`) so the shader's datum read is zero.
     pub(crate) fn clear(&mut self, id: u8) {
-        let Some(slot) = self.slots.get_mut(id as usize) else {
+        if id as usize >= MAX_FAR_MAPS {
             return;
-        };
+        }
+        // The next failed allocation of this id should log again.
+        self.oom_logged &= !(1u8 << id);
+        let slot = &mut self.slots[id as usize];
         if let Some(old) = slot.cube.take() {
             self.pending_retire.push(old);
         }

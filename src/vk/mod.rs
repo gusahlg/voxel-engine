@@ -984,8 +984,10 @@ impl Renderer {
     }
 
     /// Install one datum and, when `albedo_size > 0`, a cube. The previous
-    /// cube is retired on the next flush. No GPU wait; [`FarMapError::OutOfMemory`]
-    /// is the only failure (the caller already validated the description).
+    /// cube is retired on the next flush. No GPU wait. The caller already
+    /// validated the description. A failed cube allocation is logged once
+    /// and the map is installed with `albedo_size` 0 (flat per-face colours);
+    /// [`crate::FarMapError::OutOfMemory`] is not returned.
     pub fn set_far_map(
         &mut self,
         id: u8,
