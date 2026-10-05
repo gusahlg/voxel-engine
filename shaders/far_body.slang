@@ -560,198 +560,15 @@ bool far_sphere_roots(float facing, float rho, out float tNear, out float tFar)
     return true;
 }
 
-// Datum samples the march may spend. The analytic normal is one more fetch
-// at the hit, outside this cap. Matches src/far_body.rs.
-static const int FAR_MAP_CAP = 5;
+// Coarse probes along the hi/lo bracket. Matches MAPPED_COARSE_CAP.
+static const int FAR_MAP_COARSE = 16;
+// Secant / bisection steps after a sign change. Matches MAPPED_REFINE_CAP.
+static const int FAR_MAP_REFINE = 24;
+// Early-out on |radius - r(dir)| only once the t bracket is already tight.
+// Matches MAPPED_F_TOL. A graze stays under this across a wide interval.
 static const float FAR_MAP_FTOL = 1e-8;
-
-struct FarMarch
-{
-    float3 ray;
-    float3 center;
-    float rho;
-    float distance;
-    float4 rot;
-    uint map;
-    int evals;
-};
-
-// d/dt (|p| - datum/distance). The chart term uses d(atan)/dx, which tracks
-// the equiangular polynomial closely enough for the Newton correction.
-float far_residual_slope(
-    float3 ray, float3 center, float t, float distance, float4 rot,
-    float3 uWorld, float3 uBody, float drDxi, float drDeta)
-{
-    float3 p = ray * t - center;
-    float rad = length(p);
-    float slopeRad = dot(uWorld, ray);
-    if (rad < 1e-8 || !(distance > 0.0))
-        return slopeRad;
-    uint face = far_dom_face(uBody);
-    float3 tu;
-    float3 n;
-    float3 tv;
-    far_face_basis(face, tu, n, tv);
-    float beta = dot(uBody, n);
-    if (abs(beta) < 1e-6)
-        return slopeRad;
-    float3 duWorld = (ray - uWorld * slopeRad) / rad;
-    float3 du = far_inv_rotate(rot, duWorld);
-    float alpha = dot(uBody, tu);
-    float gamma = dot(uBody, tv);
-    float alphaT = dot(du, tu);
-    float betaT = dot(du, n);
-    float gammaT = dot(du, tv);
-    float beta2 = beta * beta;
-    float x = alpha / beta;
-    float xT = (beta * alphaT - alpha * betaT) / beta2;
-    float y = gamma / beta;
-    float yT = (beta * gammaT - gamma * betaT) / beta2;
-    float scale = 4.0 / 3.14159265358979323846;
-    float dxiDt = scale * (xT / (1.0 + x * x));
-    float detaDt = scale * (yT / (1.0 + y * y));
-    float ddatumDt = drDxi * dxiDt + drDeta * detaDt;
-    return slopeRad - ddatumDt / distance;
-}
-
-// (f, r, df/dt). Slope is filled only when |f| < 0.05: that is the Newton
-// gate, and the chain rule is wasted on a sample that is still far from the
-// surface. A degenerate chart reports the radial slope.
-void far_march_sample(inout FarMarch m, float t, out float f, out float r, out float slope)
-{
-    m.evals += 1;
-    float3 p = m.ray * t - m.center;
-    float rad = length(p);
-    f = -m.rho;
-    r = 0.0;
-    slope = 0.0;
-    if (rad < 1e-8)
-        return;
-    float3 uWorld = p / rad;
-    float3 body = far_inv_rotate(m.rot, uWorld);
-    float value;
-    float drDxi;
-    float drDeta;
-    bool ok = far_datum_d(m.map, body, value, drDxi, drDeta);
-    r = m.rho + value / m.distance;
-    f = rad - r;
-    float slopeRad = dot(uWorld, m.ray);
-    if (!ok || abs(f) >= 0.05)
-    {
-        slope = slopeRad;
-        return;
-    }
-    slope = far_residual_slope(m.ray, m.center, t, m.distance, m.rot, uWorld, body, drDxi, drDeta);
-}
-
-bool far_positive_root(float facing, float radius, out float t)
-{
-    float tNear;
-    float tFar;
-    t = 0.0;
-    if (!far_sphere_roots(facing, radius, tNear, tFar))
-        return false;
-    if (tNear > 0.0)
-    {
-        t = tNear;
-        return true;
-    }
-    if (tFar > 0.0)
-    {
-        t = tFar;
-        return true;
-    }
-    return false;
-}
-
-// Illinois regula falsi. The retained endpoint's weight is halved so a stuck
-// side does not burn the remaining samples. A small residual takes a Newton
-// step from the chart slope; with no sample left, sphere curvature corrects it.
-float far_regula(inout FarMarch m, float a0, float b0, float fa0, float fb0)
-{
-    float a = a0;
-    float b = b0;
-    float fa = fa0;
-    float fb = fb0;
-    float wa = fa;
-    float wb = fb;
-    [loop]
-    while (m.evals < FAR_MAP_CAP)
-    {
-        float den = wb - wa;
-        if (abs(den) < 1e-20 || abs(b - a) < 1e-7)
-            break;
-        float tn = b - wb * (b - a) / den;
-        if (!(tn > min(a, b) && tn < max(a, b)))
-            break;
-        float ft;
-        float rt;
-        float st;
-        far_march_sample(m, tn, ft, rt, st);
-        if (abs(ft) <= FAR_MAP_FTOL)
-            return tn;
-        if (abs(st) > 1e-4 && abs(ft) < 2e-3)
-        {
-            float t2 = tn - ft / st;
-            float lo = min(a, b);
-            float hi = max(a, b);
-            if (t2 > lo && t2 < hi && abs(t2 - tn) < 5e-3)
-            {
-                if (!(m.evals < FAR_MAP_CAP))
-                {
-                    float3 p = m.ray * tn - m.center;
-                    float rad = length(p);
-                    float srad = dot(p / rad, m.ray);
-                    float curve = (1.0 - srad * srad) / rad;
-                    float hden = st - ft * curve / (2.0 * st);
-                    float tH = (abs(hden) > 1e-4 && rad > 1e-8) ? (tn - ft / hden) : t2;
-                    if (abs(tH - tn) < 5e-3)
-                        return tH;
-                    return t2;
-                }
-                float f2;
-                float r2;
-                float s2;
-                far_march_sample(m, t2, f2, r2, s2);
-                if (abs(s2) > 1e-4 && abs(f2) < 1e-3)
-                {
-                    float d2 = abs(t2 - tn) > 1e-6 ? (s2 - st) / (t2 - tn) : 0.0;
-                    float hden = s2 - f2 * d2 / (2.0 * s2);
-                    float t3 = abs(hden) > 1e-4 ? (t2 - f2 / hden) : (t2 - f2 / s2);
-                    if (t3 > 0.0 && abs(t3 - t2) < 1e-3)
-                        return t3;
-                }
-                if (abs(f2) <= abs(ft))
-                    return t2;
-            }
-        }
-        if (fa * ft <= 0.0)
-        {
-            b = tn;
-            fb = ft;
-            wb = ft;
-            wa *= 0.5;
-        }
-        else
-        {
-            a = tn;
-            fa = ft;
-            wa = ft;
-            wb *= 0.5;
-        }
-    }
-    if (!(m.evals < FAR_MAP_CAP))
-    {
-        float den = fb - fa;
-        if (abs(den) > 1e-20)
-        {
-            float tn = b - fb * (b - a) / den;
-            if (tn > min(a, b) && tn < max(a, b))
-                return tn;
-        }
-    }
-    return abs(fa) <= abs(fb) ? a : b;
-}
+// Relative width of the normalised-t bracket. Matches MAPPED_T_TOL.
+static const float FAR_MAP_TTOL = 1e-7;
 
 #if 0
 // Finite-difference normal kept for comparison. Two one-sided steps of half
@@ -840,12 +657,29 @@ bool far_mapped_finish(
     return true;
 }
 
-// Datum surface. Fixed-point pulls from the lo-sphere entrance
-// (t <- ray ∩ sphere(r(dir))), then Illinois regula on the bracket those
-// pulls form. A ray that misses the lo sphere walks in from the hi entrance
-// and finishes a shallow graze with one Newton step. At most FAR_MAP_CAP
-// datum samples, plus the analytic normal at the hit. The caller has already
-// applied the horizon gate.
+// |p| - r without cancelling two quantities near 1. |p|^2 - r^2 is
+// t^2 |ray|^2 - 2 t facing + (|dir|^2 - 1) + (1 - r)(1 + r).
+float far_mapped_f(
+    float3 ray, float3 center, float t, float rho, float distance, float4 rot, uint map,
+    float facing, float ray2, float dir2)
+{
+    float3 p = ray * t - center;
+    float rad = length(p);
+    if (rad < 1e-8)
+        return -rho;
+    float h = far_datum(map, far_inv_rotate(rot, p / rad));
+    float r = rho + h / distance;
+    float oneMinusR = (1.0 - rho) - h / distance;
+    float diffSq = t * t * ray2 - 2.0 * t * facing + (dir2 - 1.0) + oneMinusR * (1.0 + r);
+    return diffSq / (rad + r);
+}
+
+// Datum surface. A bounding-sphere miss has already returned. A sign-change
+// search walks the bracket: one datum cell projected on the ray, capped, and
+// always the closest approach (a thin graze is negative there and positive
+// at both ends). Anderson-Björck then tightens the bracket; a step that
+// fails to halve the width is bisected next. The caller applied the horizon
+// gate. Host mirror: ray_mapped in src/far_body.rs.
 bool far_ray_mapped(
     float3 ray, float3 center, float rho, float distance, float4 rot, uint map,
     out float t, out float3 nrm, out uint face)
@@ -863,257 +697,176 @@ bool far_ray_mapped(
     if (!far_sphere_roots(facing, rhoHi, tHiIn, tHiOut) || !(tHiOut > 0.0))
         return false;
     float tStart = max(tHiIn, 0.0);
-    FarMarch m;
-    m.ray = ray;
-    m.center = center;
-    m.rho = rho;
-    m.distance = distance;
-    m.rot = rot;
-    m.map = map;
-    m.evals = 0;
     float tLo;
     float tLoFar;
     bool loHit = far_sphere_roots(facing, rhoLo, tLo, tLoFar) && tLo > 0.0;
-    if (loHit)
+    float tEnd = loHit ? min(tLo, tHiOut) : tHiOut;
+    float ray2 = dot(ray, ray);
+    float dir2 = dot(center, center);
+    if (!(tEnd > tStart) || tEnd - tStart < 1e-5)
     {
-        float bSpan = max(tLo, tStart);
-        if (bSpan - tStart < 1e-5)
-            return far_mapped_finish(ray, center, tLo > 0.0 ? tLo : tStart, rho, distance, rot, map, t, nrm, face);
-        float f;
-        float r;
-        float slope;
-        far_march_sample(m, tLo, f, r, slope);
-        if (abs(f) <= FAR_MAP_FTOL)
-            return far_mapped_finish(ray, center, tLo, rho, distance, rot, map, t, nrm, face);
-        float curT = tLo;
-        bool hasBracket = false;
-        float ba = 0.0;
-        float bb = 0.0;
-        float bfa = 0.0;
-        float bfb = 0.0;
-        [loop]
-        for (int step = 0; step < 2; step++)
-        {
-            if (!(m.evals < FAR_MAP_CAP))
-                break;
-            float tn;
-            if (!far_positive_root(facing, r, tn))
-                break;
-            if (tn <= tStart || tn >= tHiOut || abs(tn - curT) <= 1e-8)
-                break;
-            if (hasBracket && (tn <= ba || tn >= bb))
-                break;
-            float ft;
-            float rt;
-            float st;
-            far_march_sample(m, tn, ft, rt, st);
-            if (f * ft <= 0.0)
-            {
-                hasBracket = true;
-                if (curT < tn)
-                {
-                    ba = curT;
-                    bb = tn;
-                    bfa = f;
-                    bfb = ft;
-                }
-                else
-                {
-                    ba = tn;
-                    bb = curT;
-                    bfa = ft;
-                    bfb = f;
-                }
-            }
-            if (abs(ft) <= FAR_MAP_FTOL)
-                return far_mapped_finish(ray, center, tn, rho, distance, rot, map, t, nrm, face);
-            curT = tn;
-            f = ft;
-            r = rt;
-        }
-        bool needEntrance = !hasBracket || tStart == 0.0;
-        if (needEntrance)
-        {
-            if (!(m.evals < FAR_MAP_CAP))
-                return far_mapped_finish(ray, center, curT, rho, distance, rot, map, t, nrm, face);
-            float fa;
-            float ra;
-            float sa;
-            far_march_sample(m, tStart, fa, ra, sa);
-            if (abs(fa) <= 1e-5)
-                return far_mapped_finish(ray, center, tStart, rho, distance, rot, map, t, nrm, face);
-            if (fa < 0.0)
-                return false;
-            if (!hasBracket)
-            {
-                if (fa * f <= 0.0)
-                {
-                    hasBracket = true;
-                    if (tStart < curT)
-                    {
-                        ba = tStart;
-                        bb = curT;
-                        bfa = fa;
-                        bfb = f;
-                    }
-                    else
-                    {
-                        ba = curT;
-                        bb = tStart;
-                        bfa = f;
-                        bfb = fa;
-                    }
-                }
-                else
-                {
-                    return far_mapped_finish(ray, center, curT, rho, distance, rot, map, t, nrm, face);
-                }
-            }
-        }
-        if (!hasBracket)
-            return far_mapped_finish(ray, center, curT, rho, distance, rot, map, t, nrm, face);
-        float tHit = far_regula(m, ba, bb, bfa, bfb);
+        float tHit = tEnd > 0.0 ? tEnd : tStart;
         return far_mapped_finish(ray, center, tHit, rho, distance, rot, map, t, nrm, face);
     }
-    float f0;
-    float r0;
-    float slope0;
-    far_march_sample(m, tStart, f0, r0, slope0);
-    if (f0 < -1e-5)
+    float fStart = far_mapped_f(ray, center, tStart, rho, distance, rot, map, facing, ray2, dir2);
+    if (fStart < -1e-5)
         return false;
-    if (abs(f0) <= 1e-5)
+    if (abs(fStart) <= 1e-5)
         return far_mapped_finish(ray, center, tStart, rho, distance, rot, map, t, nrm, face);
-    float fEnter = f0;
-    float curT = tStart;
-    float f = f0;
-    float r = r0;
-    float slope = slope0;
+    uint g = max(farMaps[map * 8u], 2u);
+    float cells = float(g - 1u);
+    float cell = 1.5707963267948966 / cells;
+    float3 p0 = ray * tStart - center;
+    float rad0 = length(p0);
+    if (rad0 < rho)
+        rad0 = rho;
+    float sinPhi = 0.0;
+    if (rad0 > 1e-8)
+        sinPhi = length(cross(ray, p0 / rad0));
+    float sinUse = sinPhi > 0.05 ? sinPhi : 0.05;
+    float dt = cell * rad0 / sinUse;
+    float span = tEnd - tStart;
+    float dtUse = dt > 1e-8 ? dt : 1e-8;
+    int n = int(clamp(ceil(span / dtUse), 1.0, float(FAR_MAP_COARSE)));
+    float tClose = clamp(facing, tStart, tEnd);
+    float prevT = tStart;
+    float prevF = fStart;
     bool hasBracket = false;
     float ba = 0.0;
     float bb = 0.0;
     float bfa = 0.0;
     float bfb = 0.0;
     [loop]
-    while (m.evals + 1 < FAR_MAP_CAP)
+    for (int i = 1; i <= n; i++)
     {
-        float tn;
-        if (!far_positive_root(facing, r, tn) || !(tn > tStart && tn <= tHiOut))
-            break;
-        if (abs(tn - curT) <= 1e-8)
-            break;
-        float ft;
-        float rt;
-        float st;
-        far_march_sample(m, tn, ft, rt, st);
-        if (f * ft <= 0.0)
+        float tn = (i == n) ? tEnd : (tStart + span * (float(i) / float(n)));
+        if (tClose > prevT + 1e-8 && tClose < tn - 1e-8)
         {
-            hasBracket = true;
-            if (curT < tn)
+            float fc = far_mapped_f(ray, center, tClose, rho, distance, rot, map, facing, ray2, dir2);
+            if (prevF * fc <= 0.0)
             {
-                ba = curT;
-                bb = tn;
-                bfa = f;
-                bfb = ft;
+                hasBracket = true;
+                ba = prevT;
+                bb = tClose;
+                bfa = prevF;
+                bfb = fc;
+                break;
             }
-            else
-            {
-                ba = tn;
-                bb = curT;
-                bfa = ft;
-                bfb = f;
-            }
-            break;
+            prevT = tClose;
+            prevF = fc;
         }
-        if (abs(ft) <= FAR_MAP_FTOL)
-            return far_mapped_finish(ray, center, tn, rho, distance, rot, map, t, nrm, face);
-        curT = tn;
-        f = ft;
-        r = rt;
-        slope = st;
-    }
-    if (!hasBracket && abs(slope) > 1e-4 && abs(f) < 0.05)
-    {
-        float ts = curT - f / slope;
-        if (ts > tStart && ts < tHiOut && abs(ts - curT) > 1e-8 && abs(ts - curT) < 0.05)
-        {
-            if (m.evals < FAR_MAP_CAP)
-            {
-                float fs;
-                float rs;
-                float ss;
-                far_march_sample(m, ts, fs, rs, ss);
-                if (abs(fs) <= 1e-5)
-                {
-                    if (abs(ss) > 1e-4)
-                    {
-                        float t2 = ts - fs / ss;
-                        if (t2 > tStart && t2 < tHiOut && abs(t2 - ts) < 2e-3)
-                            return far_mapped_finish(ray, center, t2, rho, distance, rot, map, t, nrm, face);
-                    }
-                    return far_mapped_finish(ray, center, ts, rho, distance, rot, map, t, nrm, face);
-                }
-                if (f * fs <= 0.0)
-                {
-                    hasBracket = true;
-                    if (curT < ts)
-                    {
-                        ba = curT;
-                        bb = ts;
-                        bfa = f;
-                        bfb = fs;
-                    }
-                    else
-                    {
-                        ba = ts;
-                        bb = curT;
-                        bfa = fs;
-                        bfb = f;
-                    }
-                }
-                else if (abs(fs) < 1e-3 && abs(ss) > 1e-4)
-                {
-                    float t2 = ts - fs / ss;
-                    if (t2 > tStart && t2 < tHiOut && abs(t2 - ts) < 2e-3)
-                        return far_mapped_finish(ray, center, t2, rho, distance, rot, map, t, nrm, face);
-                }
-            }
-            else if (abs(f) < 1e-3)
-            {
-                return far_mapped_finish(ray, center, ts, rho, distance, rot, map, t, nrm, face);
-            }
-        }
-    }
-    if (hasBracket)
-    {
-        float tHit = far_regula(m, ba, bb, bfa, bfb);
-        return far_mapped_finish(ray, center, tHit, rho, distance, rot, map, t, nrm, face);
-    }
-    float prevT = tStart;
-    float prevF = fEnter;
-    int left = FAR_MAP_CAP - m.evals;
-    if (left < 0)
-        left = 0;
-    [loop]
-    for (int i = 1; i <= left; i++)
-    {
-        if (!(m.evals < FAR_MAP_CAP))
-            break;
-        float tn = tStart + (tHiOut - tStart) * (float(i) / float(left));
-        float ft;
-        float rt;
-        float st;
-        far_march_sample(m, tn, ft, rt, st);
-        if (abs(ft) <= FAR_MAP_FTOL)
-            return far_mapped_finish(ray, center, tn, rho, distance, rot, map, t, nrm, face);
+        float ft = far_mapped_f(ray, center, tn, rho, distance, rot, map, facing, ray2, dir2);
         if (prevF * ft <= 0.0)
         {
-            float tHit = far_regula(m, prevT, tn, prevF, ft);
-            return far_mapped_finish(ray, center, tHit, rho, distance, rot, map, t, nrm, face);
+            hasBracket = true;
+            ba = prevT;
+            bb = tn;
+            bfa = prevF;
+            bfb = ft;
+            break;
         }
         prevT = tn;
         prevF = ft;
     }
-    return false;
+    if (!hasBracket)
+        return false;
+    float a = ba;
+    float b = bb;
+    float fa = bfa;
+    float fb = bfb;
+    if (a > b)
+    {
+        float swapT = a;
+        a = b;
+        b = swapT;
+        float swapF = fa;
+        fa = fb;
+        fb = swapF;
+    }
+    float wa = fa;
+    float wb = fb;
+    int retained = 0;
+    bool forceBisect = false;
+    [loop]
+    for (int step = 0; step < FAR_MAP_REFINE; step++)
+    {
+        float width = b - a;
+        float scale = min(abs(a), abs(b));
+        if (scale < 1e-4)
+            scale = 1e-4;
+        if (!(width > FAR_MAP_TTOL * scale))
+            break;
+        float den = wb - wa;
+        float secant = (abs(den) > 1e-20) ? (b - wb * width / den) : (0.5 * (a + b));
+        bool secantOk = secant > a && secant < b;
+        bool bisect = forceBisect || !secantOk;
+        float c = bisect ? (0.5 * (a + b)) : secant;
+        forceBisect = false;
+        if (!(c > a && c < b))
+            break;
+        float fc = far_mapped_f(ray, center, c, rho, distance, rot, map, facing, ray2, dir2);
+        float cScale = scale > abs(c) ? scale : abs(c);
+        if (abs(fc) <= FAR_MAP_FTOL && width <= FAR_MAP_TTOL * cScale)
+            return far_mapped_finish(ray, center, c, rho, distance, rot, map, t, nrm, face);
+        float oldWidth = width;
+        if (fa * fc <= 0.0)
+        {
+            float discarded = fb;
+            b = c;
+            fb = fc;
+            wb = fc;
+            if (bisect)
+            {
+                wa = fa;
+                retained = 0;
+            }
+            else if (retained == 1)
+            {
+                float m = 0.5;
+                if (abs(discarded) > 1e-20)
+                    m = 1.0 - fc / discarded;
+                if (!(m > 0.0) || m > 1e8)
+                    m = 0.5;
+                wa *= m;
+            }
+            else
+            {
+                wa = fa;
+                retained = 1;
+            }
+        }
+        else
+        {
+            float discarded = fa;
+            a = c;
+            fa = fc;
+            wa = fc;
+            if (bisect)
+            {
+                wb = fb;
+                retained = 0;
+            }
+            else if (retained == 2)
+            {
+                float m = 0.5;
+                if (abs(discarded) > 1e-20)
+                    m = 1.0 - fc / discarded;
+                if (!(m > 0.0) || m > 1e8)
+                    m = 0.5;
+                wb *= m;
+            }
+            else
+            {
+                wb = fb;
+                retained = 2;
+            }
+        }
+        if (b - a > 0.5 * oldWidth)
+            forceBisect = true;
+    }
+    float mid = 0.5 * (a + b);
+    float tHit = (mid > a && mid < b) ? mid : (abs(fa) <= abs(fb) ? a : b);
+    return far_mapped_finish(ray, center, tHit, rho, distance, rot, map, t, nrm, face);
 }
 
 #ifndef FAR_NO_MAPPED

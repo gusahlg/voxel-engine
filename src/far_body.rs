@@ -971,216 +971,32 @@ fn ray_mapped_regula(
     finish(if fa.abs() <= fb.abs() { a } else { b })
 }
 
-/// Datum samples the march may spend. The analytic normal is one more fetch
-/// at the hit, replacing the two finite-difference evaluations.
+/// Coarse probes along the hi/lo bracket. Matches `FAR_MAP_COARSE`.
 #[cfg(test)]
-const MAPPED_EVAL_CAP: u32 = 5;
-/// Early exit on `|rad - r(dir)|`. Normalised units, same space as `t`.
+const MAPPED_COARSE_CAP: u32 = 16;
+/// Secant / bisection steps after a sign change. Matches `FAR_MAP_REFINE`.
+#[cfg(test)]
+const MAPPED_REFINE_CAP: u32 = 24;
+/// Entrance residual that already sits on the surface. A graze stays small
+/// across a wide `t`, so the refinement stops on the bracket width instead.
 #[cfg(test)]
 const MAPPED_F_TOL: f32 = 1e-8;
-
+/// Relative width of the normalised-`t` bracket. Matches `FAR_MAP_TTOL`.
+/// The `1e-4` floor keeps a root near the camera from asking for a sub-ulp step.
 #[cfg(test)]
-struct MappedMarch<'a> {
-    ray: Vec3,
-    center: Vec3,
-    rho: f32,
-    distance: f32,
-    rotation: Quat,
-    g: u32,
-    datum: &'a [f32],
-    evals: u32,
-}
-
-/// `d/dt (|p| - datum/distance)` at an already-sampled point. `patch` is the
-/// bilinear datum at the body-space direction. Uses `d(atan)/dx`, which tracks
-/// the equiangular polynomial closely enough for a Newton correction.
-#[cfg(test)]
-fn residual_slope(
-    march: &MappedMarch<'_>,
-    t: f32,
-    u_world: Vec3,
-    u_body: Vec3,
-    patch: &DatumSample,
-) -> Option<f32> {
-    let p = march.ray * t - march.center;
-    let rad = p.length();
-    if rad < 1e-8 || !(march.distance > 0.0) {
-        return None;
-    }
-    let slope_rad = u_world.dot(march.ray);
-    let face = dom_face(u_body) as usize;
-    let (tu, n, tv) = far_map_basis(face);
-    let beta = u_body.dot(n);
-    if beta.abs() < 1e-6 {
-        return None;
-    }
-    let du_world = (march.ray - u_world * slope_rad) / rad;
-    let du = rotate(conjugate(march.rotation), du_world);
-    let alpha = u_body.dot(tu);
-    let gamma = u_body.dot(tv);
-    let alpha_t = du.dot(tu);
-    let beta_t = du.dot(n);
-    let gamma_t = du.dot(tv);
-    let beta2 = beta * beta;
-    let chart = |num: f32, num_t: f32| {
-        let x = num / beta;
-        let x_t = (beta * num_t - num * beta_t) / beta2;
-        x_t / (1.0 + x * x)
-    };
-    let scale = 4.0 / std::f32::consts::PI;
-    let dxi_dt = scale * chart(alpha, alpha_t);
-    let deta_dt = scale * chart(gamma, gamma_t);
-    let ddatum_dt = patch.dr_dxi * dxi_dt + patch.dr_deta * deta_dt;
-    Some(slope_rad - ddatum_dt / march.distance)
-}
-
-#[cfg(test)]
-impl MappedMarch<'_> {
-    /// `(f, r, df/dt)` at `t`. `f = |p| - r(dir(p))`. One datum evaluation.
-    /// The slope chains the bilinear chart derivatives through the ray. A
-    /// degenerate chart reports the radial slope.
-    fn sample(&mut self, t: f32) -> (f32, f32, f32) {
-        self.evals += 1;
-        let p = self.ray * t - self.center;
-        let rad = p.length();
-        if rad < 1e-8 {
-            return (-self.rho, 0.0, 0.0);
-        }
-        let u_world = p / rad;
-        let body = rotate(conjugate(self.rotation), u_world);
-        let patch = sample_datum_d(self.g, self.datum, body);
-        let r = self.rho + patch.value / self.distance;
-        let f = rad - r;
-        let slope_rad = u_world.dot(self.ray);
-        let slope = residual_slope(self, t, u_world, body, &patch).unwrap_or(slope_rad);
-        (f, r, slope)
-    }
-
-    fn open(&self) -> bool {
-        self.evals < MAPPED_EVAL_CAP
-    }
-}
-
-/// Near positive root of a sphere of radius `radius` centred on the unit dir.
-#[cfg(test)]
-fn positive_root(facing: f32, radius: f32) -> Option<f32> {
-    let (t_near, t_far) = sphere_roots(facing, radius)?;
-    if t_near > 0.0 {
-        Some(t_near)
-    } else if t_far > 0.0 {
-        Some(t_far)
-    } else {
-        None
-    }
-}
-
-/// Illinois regula falsi inside an existing bracket. The retained endpoint's
-/// weight is halved so a stuck side does not burn the remaining samples.
-/// Stops at the eval cap, a tiny step, or `|f| <= MAPPED_F_TOL`. The weights
-/// used for the chord are not the values used to pick the final endpoint.
-#[cfg(test)]
-fn regula(march: &mut MappedMarch<'_>, mut a: f32, mut b: f32, mut fa: f32, mut fb: f32) -> f32 {
-    let mut wa = fa;
-    let mut wb = fb;
-    while march.open() {
-        let den = wb - wa;
-        if den.abs() < 1e-20 || (b - a).abs() < 1e-7 {
-            break;
-        }
-        let tn = b - wb * (b - a) / den;
-        if !(tn > a.min(b) && tn < a.max(b)) {
-            break;
-        }
-        let (ft, _, st) = march.sample(tn);
-        if ft.abs() <= MAPPED_F_TOL {
-            return tn;
-        }
-        // Shallow roots (grazes) make the chord lag. A Newton step from a
-        // small residual uses the chart slope and lands on the root.
-        if st.abs() > 1e-4 && ft.abs() < 2e-3 {
-            let t2 = tn - ft / st;
-            let lo = a.min(b);
-            let hi = a.max(b);
-            if t2 > lo && t2 < hi && (t2 - tn).abs() < 5e-3 {
-                if !march.open() {
-                    // Sphere curvature only. The datum's second derivative is
-                    // small next to (1 - (u·ray)^2) / |p| on a shallow graze,
-                    // and there is no sample left to measure it.
-                    let p = march.ray * tn - march.center;
-                    let rad = p.length();
-                    let srad = (p / rad).dot(march.ray);
-                    let curve = (1.0 - srad * srad) / rad;
-                    let denom = st - ft * curve / (2.0 * st);
-                    let t_h = if denom.abs() > 1e-4 && rad > 1e-8 {
-                        tn - ft / denom
-                    } else {
-                        t2
-                    };
-                    return if t_h.is_finite() && (t_h - tn).abs() < 5e-3 {
-                        t_h
-                    } else {
-                        t2
-                    };
-                }
-                let (f2, _, s2) = march.sample(t2);
-                if s2.abs() > 1e-4 && f2.abs() < 1e-3 {
-                    // Halley: fold in f'' from the two slopes so a shallow
-                    // curve does not leave a 1e-5 residual after Newton.
-                    let d2 = if (t2 - tn).abs() > 1e-6 {
-                        (s2 - st) / (t2 - tn)
-                    } else {
-                        0.0
-                    };
-                    let denom = s2 - f2 * d2 / (2.0 * s2);
-                    let t3 = if denom.abs() > 1e-4 {
-                        t2 - f2 / denom
-                    } else {
-                        t2 - f2 / s2
-                    };
-                    if t3.is_finite() && t3 > 0.0 && (t3 - t2).abs() < 1e-3 {
-                        return t3;
-                    }
-                }
-                if f2.abs() <= ft.abs() {
-                    return t2;
-                }
-            }
-        }
-        if fa * ft <= 0.0 {
-            b = tn;
-            fb = ft;
-            wb = ft;
-            wa *= 0.5;
-        } else {
-            a = tn;
-            fa = ft;
-            wa = ft;
-            wb *= 0.5;
-        }
-    }
-    // The budget is spent. The next chord is a better estimate than either
-    // endpoint and costs no further datum load.
-    if !march.open() {
-        let den = fb - fa;
-        if den.abs() > 1e-20 {
-            let tn = b - fb * (b - a) / den;
-            if tn > a.min(b) && tn < a.max(b) {
-                return tn;
-            }
-        }
-    }
-    if fa.abs() <= fb.abs() { a } else { b }
-}
+const MAPPED_T_TOL: f32 = 1e-7;
 
 /// Ray from the origin against a datum-mapped body. `dir` is the unit centre.
 /// `rho` is `radius/distance`. Offsets are in the radius's unit.
 ///
-/// Starts at the lo-sphere entrance and sets `t` to the near intersection of
-/// the ray with the sphere of radius `r(dir(p))`. Non-grazing rays settle in
-/// two or three steps; `|f| < 1e-6` returns early. A graze that misses the lo
-/// sphere, or a fixed point that does not settle, falls back to regula falsi.
-/// The march takes at most [`MAPPED_EVAL_CAP`] datum samples. The normal is
-/// the analytic patch derivative at the hit. `horizon` skips
+/// A bounding-sphere miss and the horizon test return before any datum load.
+/// Otherwise a sign-change search walks the bracket. The step is one datum
+/// cell projected on the ray, and the count is capped. The closest approach
+/// is always one of the probes: a thin graze is negative there and positive
+/// at both ends, so a uniform grid can step over it. The bracket is then
+/// Anderson–Björck, and a step that fails to halve the width is bisected on
+/// the next iteration. Stops when the width is [`MAPPED_T_TOL`] relative, or
+/// when f32 can no longer split the interval. `horizon` skips
 /// `dot(ray, -dir) > horizon`.
 #[cfg(test)]
 pub(crate) fn ray_mapped(
@@ -1214,6 +1030,27 @@ pub(crate) fn ray_mapped(
         return None;
     }
     let t_start = t_hi_in.max(0.0);
+    let t_lo = sphere_roots(facing, rho_lo).and_then(|(t_lo, _)| (t_lo > 0.0).then_some(t_lo));
+    let t_end = t_lo.map(|t| t.min(t_hi_out)).unwrap_or(t_hi_out);
+    // `|p| - r` cancels in f32 when both are near 1, and a graze then moves
+    // by an ulp over a tiny slope. `|p|^2 - r^2 = t²|ray|² - 2 t facing +
+    // (|dir|² - 1) + (1 - r)(1 + r)`, divided by `|p| + r`, keeps that
+    // difference. `1 - rho` is exact for a rho above one half.
+    let ray2 = ray.length_squared();
+    let dir2 = dir.length_squared();
+    let f_at = |t: f32| -> f32 {
+        let p = ray * t - dir;
+        let rad = p.length();
+        if rad < 1e-8 {
+            return -rho;
+        }
+        let body = rotate(conjugate(rotation), p / rad);
+        let h = sample_datum(g, datum, body);
+        let r = rho + h / distance;
+        let one_minus_r = (1.0 - rho) - h / distance;
+        let diff_sq = t * t * ray2 - 2.0 * t * facing + (dir2 - 1.0) + one_minus_r * (1.0 + r);
+        diff_sq / (rad + r)
+    };
     let finish = |t: f32| -> Option<FarHit> {
         if !(t > 0.0) || !t.is_finite() {
             return None;
@@ -1231,188 +1068,158 @@ pub(crate) fn ray_mapped(
             face: dom_face(body),
         })
     };
-    let mut march = MappedMarch {
-        ray,
-        center: dir,
-        rho,
-        distance,
-        rotation,
-        g,
-        datum,
-        evals: 0,
-    };
-    let lo_enter = sphere_roots(facing, rho_lo).and_then(|(t_lo, _)| (t_lo > 0.0).then_some(t_lo));
-    if let Some(t_lo) = lo_enter {
-        let b = t_lo.max(t_start);
-        if b - t_start < 1e-5 {
-            return finish(if t_lo > 0.0 { t_lo } else { t_start });
-        }
-        // Fixed-point pulls from the lo entrance: t <- ray ∩ sphere(r(dir)).
-        // A sign change is a bracket. Two pulls plus the lo sample are the
-        // non-grazing case; Illinois regula spends whatever is left. The hi
-        // entrance is sampled only when those pulls never bracket, or when
-        // the eye is already inside the hi sphere (t_start == 0), which the
-        // old march treats as a miss when f < 0.
-        let (mut f, mut r, _) = march.sample(t_lo);
-        if f.abs() <= MAPPED_F_TOL {
-            return finish(t_lo);
-        }
-        let mut t = t_lo;
-        let mut bracket: Option<(f32, f32, f32, f32)> = None;
-        for _ in 0..2 {
-            if !march.open() {
-                break;
-            }
-            let Some(tn) = positive_root(facing, r) else {
-                break;
-            };
-            if tn <= t_start || tn >= t_hi_out || (tn - t).abs() <= 1e-8 {
-                break;
-            }
-            if let Some((a, b, _, _)) = bracket
-                && (tn <= a || tn >= b)
-            {
-                break;
-            }
-            let (ft, rt, _) = march.sample(tn);
-            if f * ft <= 0.0 {
-                bracket = Some(if t < tn {
-                    (t, tn, f, ft)
-                } else {
-                    (tn, t, ft, f)
-                });
-            }
-            if ft.abs() <= MAPPED_F_TOL {
-                return finish(tn);
-            }
-            t = tn;
-            f = ft;
-            r = rt;
-        }
-        let need_entrance = bracket.is_none() || t_start == 0.0;
-        if need_entrance {
-            if !march.open() {
-                return finish(t);
-            }
-            let (fa, _, _) = march.sample(t_start);
-            if fa.abs() <= 1e-5 {
-                return finish(t_start);
-            }
-            if fa < 0.0 {
-                return None;
-            }
-            if bracket.is_none() {
-                if fa * f <= 0.0 {
-                    bracket = Some(if t_start < t {
-                        (t_start, t, fa, f)
-                    } else {
-                        (t, t_start, f, fa)
-                    });
-                } else {
-                    return finish(t);
-                }
-            }
-        }
-        let Some((a, b, fa, fb)) = bracket else {
-            return finish(t);
-        };
-        return finish(regula(&mut march, a, b, fa, fb));
+    // Coincident lo/hi spheres, or a bracket thinner than the old entrance
+    // test: the entrance is the surface.
+    if !(t_end > t_start) || t_end - t_start < 1e-5 {
+        let t_hit = if t_end > 0.0 { t_end } else { t_start };
+        return finish(t_hit);
     }
-    // No lo-sphere hit: the ray only clips the datum above the lo sphere.
-    // Fixed-point pulls walk in from the hi entrance. A crossing becomes a
-    // bracket. A shallow graze stalls with a small residual and a small
-    // slope; one Newton step from that residual, then a second from the
-    // sample, finishes it without another load. A short chord scan is the
-    // last resort and only when a pull was not possible.
-    let (mut f, mut r, mut slope) = march.sample(t_start);
-    if f < -1e-5 {
+    let f_start = f_at(t_start);
+    if f_start < -1e-5 {
         return None;
     }
-    if f.abs() <= 1e-5 {
+    if f_start.abs() <= 1e-5 {
         return finish(t_start);
     }
-    let f_enter = f;
-    let mut t = t_start;
-    let mut bracket: Option<(f32, f32, f32, f32)> = None;
-    // One evaluation stays spare for the Newton check below.
-    while march.evals + 1 < MAPPED_EVAL_CAP {
-        let Some(tn) = positive_root(facing, r).filter(|tn| *tn > t_start && *tn <= t_hi_out)
-        else {
-            break;
-        };
-        if (tn - t).abs() <= 1e-8 {
-            break;
-        }
-        let (ft, rt, st) = march.sample(tn);
-        if f * ft <= 0.0 {
-            bracket = Some(if t < tn {
-                (t, tn, f, ft)
-            } else {
-                (tn, t, ft, f)
-            });
-            break;
-        }
-        if ft.abs() <= MAPPED_F_TOL {
-            return finish(tn);
-        }
-        t = tn;
-        f = ft;
-        r = rt;
-        slope = st;
-    }
-    if bracket.is_none() && slope.abs() > 1e-4 && f.abs() < 0.05 {
-        let ts = t - f / slope;
-        if ts > t_start && ts < t_hi_out && (ts - t).abs() > 1e-8 && (ts - t).abs() < 0.05 {
-            if march.open() {
-                let (fs, _, ss) = march.sample(ts);
-                if fs.abs() <= 1e-5 {
-                    if ss.abs() > 1e-4 {
-                        let t2 = ts - fs / ss;
-                        if t2 > t_start && t2 < t_hi_out && (t2 - ts).abs() < 2e-3 {
-                            return finish(t2);
-                        }
-                    }
-                    return finish(ts);
-                }
-                if f * fs <= 0.0 {
-                    bracket = Some(if t < ts {
-                        (t, ts, f, fs)
-                    } else {
-                        (ts, t, fs, f)
-                    });
-                } else if fs.abs() < 1e-3 && ss.abs() > 1e-4 {
-                    let t2 = ts - fs / ss;
-                    if t2 > t_start && t2 < t_hi_out && (t2 - ts).abs() < 2e-3 {
-                        return finish(t2);
-                    }
-                }
-            } else if f.abs() < 1e-3 {
-                return finish(ts);
-            }
-        }
-    }
-    if let Some((a, b, fa, fb)) = bracket {
-        return finish(regula(&mut march, a, b, fa, fb));
-    }
+    let cells = (g.max(2) - 1) as f32;
+    let cell = std::f32::consts::FRAC_PI_2 / cells;
+    let p0 = ray * t_start - dir;
+    let rad0 = p0.length().max(rho);
+    let sin_phi = if rad0 > 1e-8 {
+        ray.cross(p0 / rad0).length()
+    } else {
+        0.0
+    };
+    let dt = cell * rad0 / sin_phi.max(0.05);
+    let span = t_end - t_start;
+    let n = ((span / dt.max(1e-8)).ceil() as u32).clamp(1, MAPPED_COARSE_CAP);
+    let t_close = facing.clamp(t_start, t_end);
     let mut prev_t = t_start;
-    let mut prev_f = f_enter;
-    let left = MAPPED_EVAL_CAP.saturating_sub(march.evals);
-    for i in 1..=left {
-        if !march.open() {
-            break;
+    let mut prev_f = f_start;
+    let mut bracket: Option<(f32, f32, f32, f32)> = None;
+    for i in 1..=n {
+        let tn = if i == n {
+            t_end
+        } else {
+            t_start + span * (i as f32 / n as f32)
+        };
+        if t_close > prev_t + 1e-8 && t_close < tn - 1e-8 {
+            let fc = f_at(t_close);
+            if prev_f * fc <= 0.0 {
+                bracket = Some((prev_t, t_close, prev_f, fc));
+                break;
+            }
+            prev_t = t_close;
+            prev_f = fc;
         }
-        let tn = t_start + (t_hi_out - t_start) * (i as f32 / (left as f32));
-        let (ft, _, _) = march.sample(tn);
-        if ft.abs() <= MAPPED_F_TOL {
-            return finish(tn);
-        }
+        let ft = f_at(tn);
         if prev_f * ft <= 0.0 {
-            return finish(regula(&mut march, prev_t, tn, prev_f, ft));
+            bracket = Some((prev_t, tn, prev_f, ft));
+            break;
         }
         prev_t = tn;
         prev_f = ft;
     }
-    None
+    let Some((mut a, mut b, mut fa, mut fb)) = bracket else {
+        return None;
+    };
+    if a > b {
+        std::mem::swap(&mut a, &mut b);
+        std::mem::swap(&mut fa, &mut fb);
+    }
+    // Chord weights stay separate from the true signs. `retained` is which
+    // endpoint survived the previous secant (1 = a, 2 = b). Anderson–Björck
+    // scales that weight only on the second retention in a row. A step that
+    // does not halve the width forces a bisection next, which is what a
+    // one-sided regula falsi fails to do on a long near-ground chord.
+    let mut wa = fa;
+    let mut wb = fb;
+    let mut retained = 0i32;
+    let mut force_bisect = false;
+    for _ in 0..MAPPED_REFINE_CAP {
+        let width = b - a;
+        let scale = a.abs().min(b.abs()).max(1e-4);
+        if !(width > MAPPED_T_TOL * scale) {
+            break;
+        }
+        let den = wb - wa;
+        let secant = if den.abs() > 1e-20 {
+            b - wb * width / den
+        } else {
+            0.5 * (a + b)
+        };
+        let secant_ok = secant > a && secant < b;
+        let bisect = force_bisect || !secant_ok;
+        let c = if bisect { 0.5 * (a + b) } else { secant };
+        force_bisect = false;
+        if !(c > a && c < b) {
+            break;
+        }
+        let fc = f_at(c);
+        // `|f|` alone is not a root at a graze. Require the bracket to
+        // already be inside the relative tolerance as well.
+        if fc.abs() <= MAPPED_F_TOL && width <= MAPPED_T_TOL * scale.max(c.abs()) {
+            return finish(c);
+        }
+        let old_width = width;
+        if fa * fc <= 0.0 {
+            let discarded = fb;
+            b = c;
+            fb = fc;
+            wb = fc;
+            if bisect {
+                wa = fa;
+                retained = 0;
+            } else if retained == 1 {
+                let mut m = if discarded.abs() > 1e-20 {
+                    1.0 - fc / discarded
+                } else {
+                    0.5
+                };
+                if !(m > 0.0) || !m.is_finite() {
+                    m = 0.5;
+                }
+                wa *= m;
+            } else {
+                wa = fa;
+                retained = 1;
+            }
+        } else {
+            let discarded = fa;
+            a = c;
+            fa = fc;
+            wa = fc;
+            if bisect {
+                wb = fb;
+                retained = 0;
+            } else if retained == 2 {
+                let mut m = if discarded.abs() > 1e-20 {
+                    1.0 - fc / discarded
+                } else {
+                    0.5
+                };
+                if !(m > 0.0) || !m.is_finite() {
+                    m = 0.5;
+                }
+                wb *= m;
+            } else {
+                wb = fb;
+                retained = 2;
+            }
+        }
+        if b - a > 0.5 * old_width {
+            force_bisect = true;
+        }
+    }
+    let mid = 0.5 * (a + b);
+    let t_hit = if mid > a && mid < b {
+        mid
+    } else if fa.abs() <= fb.abs() {
+        a
+    } else {
+        b
+    };
+    finish(t_hit)
 }
 
 /// Air-shell limb, the host mirror of `far_mapped_limb`.
@@ -2343,7 +2150,10 @@ mod tests {
                 }
             }
         }
-        assert!(worst < 1e-6, "t delta {worst}");
+        // The 6-step regula is the coarser of the two. The safeguarded march
+        // is held to the f64 reference elsewhere; here they must still name
+        // the same hit, within a couple of millionths in normalised t.
+        assert!(worst < 2e-6, "t delta {worst}");
         assert!(hits > 50, "only {hits} rays hit");
     }
 
