@@ -735,9 +735,12 @@ impl Renderer {
         // (and skip `fit()`); the slot UBO is filled from the cached block so
         // sampling matches the resident depth.
         if let Some(scene) = &lists.scene {
-            let cfg = crate::skeleton::ShadowCfg::for_coverage(
-                crate::frame::lod_clip_horizontal_reach(lists.lod_centre, lists.lod_half),
+            let reach = crate::frame::lod_clip_horizontal_reach(
+                lists.lod_centre,
+                lists.lod_half,
+                lists.local_frame().up,
             );
+            let cfg = crate::skeleton::ShadowCfg::for_coverage(reach);
             let caster_verts = lists.cube_verts.len() as u32;
             let render = self.shadow_cache.pending_rebuild();
             if render {

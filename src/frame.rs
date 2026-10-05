@@ -176,12 +176,36 @@ impl LodMorphFrame {
     }
 }
 
-/// Camera distance to the farther X or Z face of a coarse-LOD clip box stored
-/// as centre + half-extent. `centre == 0` is `max(half.x, half.z)`: a
-/// non-positive component is left unchanged and does not extend the reach.
-pub(crate) fn lod_clip_horizontal_reach(centre: Vec3, half: Vec3) -> f32 {
+/// World axis most aligned with `up`. Ties, and a zero or non-finite up, stay
+/// on Y, which is the unset local frame (`set_local_frame` default `+Y`).
+fn dominant_up_axis(up: Vec3) -> usize {
+    let a = [up.x.abs(), up.y.abs(), up.z.abs()];
+    let mut axis = 1usize;
+    if a[0] > a[axis] {
+        axis = 0;
+    }
+    if a[2] > a[axis] {
+        axis = 2;
+    }
+    axis
+}
+
+/// Camera distance to the farther face of a coarse-LOD clip box on the two
+/// world axes perpendicular to the dominant axis of `up`.
+///
+/// `up` is the frame's local up ([`Frame3D::set_local_frame`]; default `+Y`).
+/// `+Y` and `-Y` measure X and Z, so a centred box is `max(half.x, half.z)`.
+/// A non-positive half on a measured axis is left unchanged and does not
+/// extend the reach. The up axis is skipped: a box lopsided along local up
+/// (camera height) must not resize the far shadow cascade.
+pub(crate) fn lod_clip_horizontal_reach(centre: Vec3, half: Vec3, up: Vec3) -> f32 {
     let face = |c: f32, h: f32| if h > 0.0 { c.abs() + h } else { h };
-    face(centre.x, half.x).max(face(centre.z, half.z))
+    let axes: [usize; 2] = match dominant_up_axis(up) {
+        0 => [1, 2],
+        1 => [0, 2],
+        _ => [0, 1],
+    };
+    face(centre[axes[0]], half[axes[0]]).max(face(centre[axes[1]], half[axes[1]]))
 }
 
 /// Per-mesh style for [`Engine::set_mesh_style`](crate::Engine::set_mesh_style) — the
@@ -1298,18 +1322,71 @@ mod tests {
     #[test]
     fn centred_clip_reach_matches_the_horizontal_half() {
         let half = Vec3::new(3.0, 9.0, 5.0);
-        assert_eq!(
-            lod_clip_horizontal_reach(Vec3::ZERO, half),
-            half.x.max(half.z)
-        );
+        for up in [Vec3::Y, Vec3::NEG_Y] {
+            assert_eq!(
+                lod_clip_horizontal_reach(Vec3::ZERO, half, up),
+                half.x.max(half.z)
+            );
+        }
         let closed = Vec3::new(-1.0, 4.0, -2.0);
         assert_eq!(
-            lod_clip_horizontal_reach(Vec3::ZERO, closed),
+            lod_clip_horizontal_reach(Vec3::ZERO, closed, Vec3::Y),
             closed.x.max(closed.z)
         );
         // Farther face of min=(-2, …) max=(10, …) on X and max z = 6.
+        // Y is up, so its extent is ignored. A closed X does not extend it.
         let centre = Vec3::new(4.0, -3.0, 2.0);
         let extent = Vec3::new(6.0, 7.0, 4.0);
-        assert_eq!(lod_clip_horizontal_reach(centre, extent), 10.0);
+        assert_eq!(lod_clip_horizontal_reach(centre, extent, Vec3::Y), 10.0);
+        assert_eq!(lod_clip_horizontal_reach(centre, extent, Vec3::NEG_Y), 10.0);
+        let closed_x = Vec3::new(95.0, 1.0, 1.0);
+        let closed_half = Vec3::new(-5.0, 4.0, 2.0);
+        assert_eq!(
+            lod_clip_horizontal_reach(closed_x, closed_half, Vec3::Y),
+            3.0
+        );
+        assert_eq!(
+            lod_clip_horizontal_reach(closed_x, closed_half, Vec3::NEG_Y),
+            3.0
+        );
+    }
+
+    #[test]
+    fn clip_reach_uses_axes_perpendicular_to_local_up() {
+        // +X up: the box is lopsided along X (camera height). Reach is the
+        // farther Y or Z face, max(|2|+10, |-3|+12) = 15, and moving only X
+        // does not change it.
+        let centre = Vec3::new(40.0, 2.0, -3.0);
+        let half = Vec3::new(80.0, 10.0, 12.0);
+        assert_eq!(lod_clip_horizontal_reach(centre, half, Vec3::X), 15.0);
+        assert_eq!(
+            lod_clip_horizontal_reach(
+                Vec3::new(-120.0, 2.0, -3.0),
+                Vec3::new(200.0, 10.0, 12.0),
+                Vec3::X,
+            ),
+            15.0
+        );
+        assert_eq!(
+            lod_clip_horizontal_reach(centre, Vec3::new(-4.0, 10.0, 12.0), Vec3::X),
+            15.0
+        );
+
+        // -Z up: X and Y only, max(|4|+8, |-6|+3) = 12. Moving only Z is ignored.
+        let centre = Vec3::new(4.0, -6.0, 50.0);
+        let half = Vec3::new(8.0, 3.0, 90.0);
+        assert_eq!(lod_clip_horizontal_reach(centre, half, Vec3::NEG_Z), 12.0);
+        assert_eq!(
+            lod_clip_horizontal_reach(
+                Vec3::new(4.0, -6.0, -7.0),
+                Vec3::new(8.0, 3.0, 1.0),
+                Vec3::NEG_Z,
+            ),
+            12.0
+        );
+        assert_eq!(
+            lod_clip_horizontal_reach(centre, Vec3::new(8.0, 3.0, -20.0), Vec3::NEG_Z),
+            12.0
+        );
     }
 }

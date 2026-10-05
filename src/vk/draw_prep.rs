@@ -298,12 +298,16 @@ impl Renderer {
         // Cull emits shadow casters only when the shared map will actually be
         // rewritten this frame. A cache hit skips cascade `fit()` and sets
         // `shadow_enabled = 0` so invisible slots bail before the AABB load.
-        // Far cascade radius is the farther horizontal face of the clip box.
-        // Centre 0 reduces to `max(half.x, half.z)`. A render-distance change
-        // snaps `ShadowKey` from `cfg.splits` and rebuilds once.
-        let cfg = crate::skeleton::ShadowCfg::for_coverage(
-            crate::frame::lod_clip_horizontal_reach(lists.lod_centre, lists.lod_half),
+        // Far cascade radius is the farther clip-box face on the axes
+        // perpendicular to local up. `+Y` and centre 0 reduce to
+        // `max(half.x, half.z)`. A render-distance change snaps `ShadowKey`
+        // from `cfg.splits` and rebuilds once.
+        let reach = crate::frame::lod_clip_horizontal_reach(
+            lists.lod_centre,
+            lists.lod_half,
+            lists.local_frame().up,
         );
+        let cfg = crate::skeleton::ShadowCfg::for_coverage(reach);
         let shadow_frusta = lists.scene.as_ref().and_then(|scene| {
             let rebuild = if self.flags.shadows {
                 let key = shadow_key(scene.eye, sun, self.records.occluder_rev(), lists, &cfg);
