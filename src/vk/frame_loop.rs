@@ -222,16 +222,40 @@ impl Renderer {
                     self.render_extent.height,
                 )
             });
+            // Coarse tiles read the same sun and the same star gate the sky
+            // shader does. `lit_uniforms` is the pre-debug-flat block: the
+            // debug-flat overwrite of `extras` never reaches a sky draw.
+            let coarse = if self.device.sky_coarse_ok(self.targets.samples) {
+                lists.sky_for_pass().map(|desc| {
+                    let u = lists.lit_uniforms();
+                    let (sun_cos_rim, moon_cos_rim) =
+                        pipeline::SkyParams::disc_rims(desc.sun_angular_radius);
+                    super::far_bodies::SkyCoarseQuery {
+                        sun_dir: desc.sun_dir,
+                        sun_cos_rim,
+                        moon_cos_rim,
+                        stars: super::far_bodies::stars_drawn(
+                            1.0 - u.light[3],
+                            u.exposure_dither[1],
+                            u.extras[0],
+                        ),
+                    }
+                })
+            } else {
+                None
+            };
             self.far_ring.write(
                 FrameSlot::new(slot),
                 lists.far_slice(),
                 view,
                 &self.far_maps.max_offsets(),
+                coarse,
             );
         } else {
             crate::profile::gauge(crate::profile::Gauge::FarBodies, 0);
             crate::profile::gauge(crate::profile::Gauge::FarDrawn, 0);
             crate::profile::gauge(crate::profile::Gauge::FarTiles, 0);
+            crate::profile::gauge(crate::profile::Gauge::SkyCoarse, 0);
         }
         let warp_map = lists
             .scene

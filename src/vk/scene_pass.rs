@@ -830,11 +830,12 @@ impl<'a> RenderPass<'a> {
     /// background pixels. Skipped unless the frame set a sky palette.
     ///
     /// With a real per-tile mask, body-free tiles draw as instanced quads on
-    /// the `SKY_BASE` pipeline. Sphere-only tiles use the sphere variant, and
-    /// tiles that meet a cube, rounded or mapped body use the no-mapped
-    /// variant, or the full variant when the frame kept a mapped body. No
-    /// tile classification keeps one fullscreen triangle on that same choice.
-    /// No bodies use the base pipeline.
+    /// the `SKY_BASE` pipeline. Tiles neither disc can touch, and with stars
+    /// off, are a prefix of that run and use the 2×2 pipeline when it exists.
+    /// Sphere-only tiles use the sphere variant, and tiles that meet a cube,
+    /// rounded or mapped body use the no-mapped variant, or the full variant
+    /// when the frame kept a mapped body. No tile classification keeps one
+    /// fullscreen triangle on that same choice. No bodies use the base pipeline.
     pub(super) unsafe fn record_sky(&self) {
         let Some(desc) = self.lists.sky_for_pass() else {
             return;
@@ -853,6 +854,7 @@ impl<'a> RenderPass<'a> {
         let sky_nomap = self.r.pipelines.sky_nomap;
         let sky_sphere = self.r.pipelines.sky_sphere;
         let sky_tile_base = self.r.pipelines.sky_tile_base;
+        let sky_tile_base_coarse = self.r.pipelines.sky_tile_base_coarse;
         let sky_tile_sphere = self.r.pipelines.sky_tile_sphere;
         let sky_tile_heavy = match draw.body {
             super::far_bodies::SkyBodyPipe::Full => self.r.pipelines.sky_tile,
@@ -868,8 +870,14 @@ impl<'a> RenderPass<'a> {
                 super::far_bodies::SkyBodyPipe::Sphere => sky_sphere,
             }
         };
+        // No coarse pipeline: draw the whole base run at 1×1. The CPU only
+        // reorders that run when the pipeline exists for these samples.
+        let n_coarse = sky_tile_base_coarse.map_or(0, |_| draw.n_coarse.min(draw.n_base));
+        let n_fine = draw.n_base - n_coarse;
         let first = if quads {
-            if draw.n_base > 0 {
+            if n_coarse > 0 {
+                sky_tile_base_coarse.unwrap_or(sky_tile_base)
+            } else if n_fine > 0 {
                 sky_tile_base
             } else if draw.n_sphere > 0 {
                 sky_tile_sphere
@@ -956,10 +964,22 @@ impl<'a> RenderPass<'a> {
                 &writes,
             );
             if quads {
-                // Runs are base, then sphere, then heavy. firstInstance is the
-                // run start; the vertex shader's InstanceIndex includes it.
-                if draw.n_base > 0 {
-                    device.cmd_draw(cmd, 6, draw.n_base, 0, 0);
+                // Runs are coarse base, fine base, sphere, then heavy.
+                // firstInstance is the run start; the vertex shader's
+                // InstanceIndex includes it, so the coarse prefix is the
+                // tiles `split_coarse_base` wrote first.
+                if n_coarse > 0 {
+                    device.cmd_draw(cmd, 6, n_coarse, 0, 0);
+                }
+                if n_fine > 0 {
+                    if n_coarse > 0 {
+                        device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            sky_tile_base,
+                        );
+                    }
+                    device.cmd_draw(cmd, 6, n_fine, 0, n_coarse);
                 }
                 if draw.n_sphere > 0 {
                     if draw.n_base > 0 {
