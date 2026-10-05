@@ -3,6 +3,8 @@
 //! per-(camera-group, arena, distance-bucket) and per-(cascade, arena) for
 //! shadows. Blend uses CPU path; immediates untouched. A small live camera-group
 //! count skips the dispatch and writes the same commands on the host.
+//! [`FaceCull::Auto`] (the default) emits face runs on the GPU path and whole
+//! meshes on that host path.
 //!
 //! Camera groups (bucketed): full-res Opaque, Cutout, coarse-LOD Opaque
 //! (`scale > 1`), full-res caged, coarse-LOD caged. The LOD split exists so
@@ -166,6 +168,74 @@ impl DeviceBuffer {
     }
 }
 
+/// Face-run culling. [`Auto`](Self::Auto) is the default: the GPU cull emits
+/// per-direction runs and the CPU cull path (live slots at or below
+/// [`cpu_cull_max`](super::cull_math::cpu_cull_max)) draws whole meshes.
+/// [`Engine::set_cull_faces`](crate::Engine::set_cull_faces) selects
+/// [`On`](Self::On) or [`Off`](Self::Off) and does not return to Auto.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FaceCull {
+    /// GPU path emits face runs. CPU path draws whole meshes.
+    #[default]
+    Auto,
+    /// Both paths emit face runs.
+    On,
+    /// Both paths draw whole meshes.
+    Off,
+}
+
+/// Path and face-run flag for one cull prepare.
+///
+/// [`CullState::prepare`] branches on `cpu_path`. It passes `face_runs` to
+/// `cpu_cull_into` on the host path and writes it to `CullParamsGpu.flags`
+/// on the GPU path. `runs_per_mesh` sizes the partition table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedFaceCull {
+    /// Host command writer. `false` records the compute dispatch.
+    pub cpu_path: bool,
+    /// Face-run flag for the path in [`cpu_path`](Self::cpu_path).
+    pub face_runs: bool,
+    /// Command slots reserved per mesh (`MAX_FACE_RUNS` or 1).
+    pub runs_per_mesh: u32,
+}
+
+impl FaceCull {
+    /// `Engine::set_cull_faces(true)` is [`On`](Self::On); `false` is [`Off`](Self::Off).
+    pub(crate) fn from_explicit(on: bool) -> Self {
+        if on { Self::On } else { Self::Off }
+    }
+
+    /// [`Engine::cull_faces`](crate::Engine::cull_faces): Auto and On.
+    pub(crate) fn reported(self) -> bool {
+        matches!(self, Self::Auto | Self::On)
+    }
+
+    /// Mode to store after `set_cull_faces(on)`. `None` when that explicit
+    /// mode is already stored, so the render-thread command is not sent.
+    /// Auto is not equal to On: the first `true` still changes the CPU path.
+    pub(crate) fn after_set(self, on: bool) -> Option<Self> {
+        let next = Self::from_explicit(on);
+        (next != self).then_some(next)
+    }
+
+    /// Resolve `camera_live` ([`ArenaDirectory::camera_live`]) into the path
+    /// `prepare` takes and the face-run flag that path receives. The host
+    /// path is `camera_live <= cpu_cull_max()`.
+    pub(crate) fn resolve(self, camera_live: u32) -> ResolvedFaceCull {
+        let cpu_path = camera_live <= cpu_cull_max();
+        let face_runs = match self {
+            Self::On => true,
+            Self::Off => false,
+            Self::Auto => !cpu_path,
+        };
+        ResolvedFaceCull {
+            cpu_path,
+            face_runs,
+            runs_per_mesh: if face_runs { MAX_FACE_RUNS } else { 1 },
+        }
+    }
+}
+
 /// Per-frame cull result (commands, counts, partition table).
 pub(crate) struct CullFrame {
     pub commands: vk::Buffer,
@@ -194,9 +264,8 @@ pub(crate) struct CullState {
     spare_parts: Vec<PartitionGpu>,
     /// CPU-side command/count staging reused across frames (capacity retained).
     cpu_scratch: CpuCullScratch,
-    /// Per-direction face-run culling. On by default; follows
-    /// [`crate::Engine::set_cull_faces`].
-    face_cull: bool,
+    /// Face-run mode. [`FaceCull::Auto`] until [`crate::Engine::set_cull_faces`].
+    mode: FaceCull,
 }
 
 /// Host-visible copy of the per-slot geometry histogram, fence-safe to read
@@ -289,14 +358,15 @@ impl CullState {
             stats: std::array::from_fn(|_| StatsReadback::new(device, memory_props)),
             spare_parts: Vec::new(),
             cpu_scratch: CpuCullScratch::default(),
-            face_cull: true,
+            mode: FaceCull::Auto,
         }
     }
 
-    /// Applied between frames; [`Self::prepare`] snapshots the value so a
-    /// toggle cannot size partitions for one run count and advertise the other.
-    pub fn set_face_cull(&mut self, on: bool) {
-        self.face_cull = on;
+    /// Applied between frames. [`Self::prepare`] snapshots the mode with the
+    /// live count via [`FaceCull::resolve`], so partition capacity and the
+    /// flag the chosen path sees agree for the frame.
+    pub fn set_face_cull(&mut self, mode: FaceCull) {
+        self.mode = mode;
     }
 
     /// Last completed histogram for `slot`: `[draws0, idx0, draws1, idx1, draws2, idx2]`.
@@ -322,7 +392,8 @@ impl CullState {
     ///
     /// When the directory's camera-group live count is at most `CPU_CULL_MAX`
     /// (or `VOXEL_CPU_CULL_MAX`), commands and counts are written to host-visible
-    /// buffers here and no compute work is recorded.
+    /// buffers here and no compute work is recorded. [`FaceCull::Auto`] leaves
+    /// face runs off on that path and on for the compute dispatch.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn prepare(
         &mut self,
@@ -348,16 +419,18 @@ impl CullState {
         if partitions.capacity() == 0 {
             partitions = std::mem::take(&mut self.spare_parts);
         }
-        // One snapshot for both partition capacity and CullParams.flags so a
-        // mid-frame toggle cannot size runs for one value and advertise the other.
-        let face_cull = self.face_cull;
-        let runs_per_mesh = if face_cull { MAX_FACE_RUNS } else { 1 };
-        let total = dir.partitions_into(&mut partitions, runs_per_mesh, Some(eye));
+        // One snapshot for partition capacity, the host writer, and
+        // CullParams.flags. Auto resolves against the same live count that
+        // picks the path, so a frame cannot size runs for one path and emit
+        // with the other.
+        let resolved = self.mode.resolve(dir.camera_live());
+        let face_cull = resolved.face_runs;
+        let total = dir.partitions_into(&mut partitions, resolved.runs_per_mesh, Some(eye));
         if partitions.is_empty() || total == 0 {
             self.spare_parts = partitions;
             return None;
         }
-        if dir.camera_live() <= cpu_cull_max() {
+        if resolved.cpu_path {
             let stats_hist = cpu_cull_into(
                 host_records,
                 dir,
@@ -664,5 +737,62 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CullParamsGpu, _pad_b0), 308);
         assert_eq!(std::mem::offset_of!(CullParamsGpu, _pad_b1), 312);
         assert_eq!(std::mem::offset_of!(CullParamsGpu, _pad_b2), 316);
+    }
+
+    #[test]
+    fn face_cull_mode_maps_onto_the_cpu_and_gpu_paths() {
+        // prepare branches on ResolvedFaceCull::cpu_path, passes face_runs to
+        // cpu_cull_into or CullParamsGpu.flags, and sizes partitions with
+        // runs_per_mesh. The split is camera_live <= cpu_cull_max().
+        let max = super::super::cull_math::cpu_cull_max();
+        for live in [0, 1, max] {
+            let auto = FaceCull::Auto.resolve(live);
+            assert!(auto.cpu_path, "live {live} takes the host path");
+            assert!(!auto.face_runs);
+            assert_eq!(auto.runs_per_mesh, 1);
+
+            let on = FaceCull::On.resolve(live);
+            assert!(on.cpu_path && on.face_runs);
+            assert_eq!(on.runs_per_mesh, MAX_FACE_RUNS);
+
+            let off = FaceCull::Off.resolve(live);
+            assert!(off.cpu_path && !off.face_runs);
+            assert_eq!(off.runs_per_mesh, 1);
+        }
+        let Some(gpu_live) = max.checked_add(1) else {
+            return;
+        };
+        let auto = FaceCull::Auto.resolve(gpu_live);
+        assert!(!auto.cpu_path, "live above CPU_CULL_MAX takes the GPU path");
+        assert!(auto.face_runs);
+        assert_eq!(auto.runs_per_mesh, MAX_FACE_RUNS);
+
+        let on = FaceCull::On.resolve(gpu_live);
+        assert!(!on.cpu_path && on.face_runs);
+        assert_eq!(on.runs_per_mesh, MAX_FACE_RUNS);
+
+        let off = FaceCull::Off.resolve(gpu_live);
+        assert!(!off.cpu_path && !off.face_runs);
+        assert_eq!(off.runs_per_mesh, 1);
+    }
+
+    #[test]
+    fn set_cull_faces_maps_to_on_or_off_and_skips_an_equal_mode() {
+        assert_eq!(FaceCull::default(), FaceCull::Auto);
+        assert!(FaceCull::Auto.reported());
+        assert!(FaceCull::On.reported());
+        assert!(!FaceCull::Off.reported());
+
+        assert_eq!(FaceCull::from_explicit(true), FaceCull::On);
+        assert_eq!(FaceCull::from_explicit(false), FaceCull::Off);
+
+        // Auto already reports on. true is still a change: the CPU path
+        // starts emitting face runs.
+        assert_eq!(FaceCull::Auto.after_set(true), Some(FaceCull::On));
+        assert_eq!(FaceCull::Auto.after_set(false), Some(FaceCull::Off));
+        assert_eq!(FaceCull::On.after_set(true), None);
+        assert_eq!(FaceCull::Off.after_set(false), None);
+        assert_eq!(FaceCull::On.after_set(false), Some(FaceCull::Off));
+        assert_eq!(FaceCull::Off.after_set(true), Some(FaceCull::On));
     }
 }

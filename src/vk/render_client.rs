@@ -36,6 +36,7 @@ use super::compute::{
     ComputeDesc, ComputeDescOwned, ComputeKind, ComputeQueue, ComputeRuntime, ComputeStager,
     EngineError,
 };
+use super::cull::FaceCull;
 use super::device::{Device, MemoryBudget};
 use super::image::{AllocError, render_target_oom_message};
 use super::instance::InstanceBundle;
@@ -130,7 +131,9 @@ pub(crate) enum RenderCmd {
     SetVsync(bool),
     /// Replaces the render thread's feature-flag copy (see [`crate::RenderFlags`]).
     SetFlags(crate::RenderFlags),
-    /// GPU face-run culling; applied at the next cull prepare.
+    /// Explicit face-run mode. `true` is [`FaceCull::On`] (both paths),
+    /// `false` is [`FaceCull::Off`] (neither). The render thread starts at
+    /// [`FaceCull::Auto`] and leaves it only through this command.
     SetCullFaces(bool),
     /// Pre-clamped against device caps.
     SetMsaa(u32),
@@ -303,7 +306,8 @@ pub(crate) struct RenderClient {
     render_scale: Scale,
     vsync: bool,
     msaa: u32,
-    cull_faces: bool,
+    /// Face-run mode. [`FaceCull::Auto`] until an explicit [`Self::set_cull_faces`].
+    cull_faces: FaceCull,
     /// The render thread's published exposure cell, cloned into `Engine`.
     exposure: super::exposure::ExposureShared,
     gpu_load: super::gpu_timer::GpuLoadShared,
@@ -443,7 +447,7 @@ impl RenderClient {
             render_scale: Scale::new(reply.render_scale),
             vsync: config.vsync,
             msaa: reply.msaa,
-            cull_faces: true,
+            cull_faces: FaceCull::Auto,
             exposure: reply.exposure,
             gpu_load: reply.gpu_load,
             mesh_stats: reply.mesh_stats.clone(),
@@ -884,19 +888,22 @@ impl RenderClient {
         }
     }
 
-    /// GPU face-run culling. On by default; `false` is an explicit opt-out.
-    /// Ships [`RenderCmd::SetCullFaces`] so the render thread follows; a change
-    /// takes effect at the next frame boundary.
+    /// Explicit face-run mode. `true` is [`FaceCull::On`] (both paths),
+    /// `false` is [`FaceCull::Off`] (neither). Equal to the mode already
+    /// stored is a no-op — [`FaceCull::Auto`] is not On, so the first `true`
+    /// still ships [`RenderCmd::SetCullFaces`]. A change takes effect at the
+    /// next frame boundary.
     pub(crate) fn set_cull_faces(&mut self, on: bool) {
-        if self.cull_faces == on {
+        let Some(next) = self.cull_faces.after_set(on) else {
             return;
-        }
-        self.cull_faces = on;
+        };
+        self.cull_faces = next;
         let _ = self.tx.send(RenderCmd::SetCullFaces(on));
     }
 
+    /// `true` for [`FaceCull::Auto`] and [`FaceCull::On`].
     pub(crate) fn cull_faces(&self) -> bool {
-        self.cull_faces
+        self.cull_faces.reported()
     }
 
     pub(crate) fn set_flags(&mut self, flags: crate::RenderFlags) {

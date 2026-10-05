@@ -795,10 +795,13 @@ impl Renderer {
         self.flags = flags;
     }
 
-    /// GPU face-run culling. Takes effect at the next cull prepare so partition
-    /// capacity and the cull-params flag always agree for a frame.
+    /// Explicit face-run mode from [`render_client::RenderCmd::SetCullFaces`].
+    /// `true` is [`cull::FaceCull::On`] (both paths), `false` is
+    /// [`cull::FaceCull::Off`]. The cull state starts at [`cull::FaceCull::Auto`].
+    /// Takes effect at the next cull prepare so partition capacity and the
+    /// flag the chosen path sees always agree for a frame.
     pub fn set_cull_faces(&mut self, on: bool) {
-        self.cull.set_face_cull(on);
+        self.cull.set_face_cull(cull::FaceCull::from_explicit(on));
     }
 
     /// Set render scale; returns clamped value.

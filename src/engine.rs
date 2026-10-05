@@ -426,18 +426,25 @@ impl Engine {
         self.client.max_texture_layers()
     }
 
-    /// GPU per-direction face-run culling: the cull shader emits contiguous
-    /// camera-facing quad runs instead of a whole-mesh draw. Caged meshes
-    /// keep the same runs, tested in the cage's affine frame; shadows stay
-    /// whole-mesh.
+    /// Per-direction face-run culling: contiguous camera-facing quad runs are
+    /// drawn instead of a whole mesh. Caged meshes keep the same runs, tested
+    /// in the cage's affine frame; shadows stay whole-mesh.
     ///
-    /// On by default (`Config` has no field). Safe to toggle at runtime — the
-    /// change is sent on the render-thread command stream and lands at the next
-    /// frame boundary. `false` is an explicit opt-out (whole-mesh draws).
+    /// The default is automatic (`Config` has no field). Automatic uses face
+    /// runs on the GPU cull and whole-mesh draws on the CPU cull path (the
+    /// path taken when few meshes are live). `true` forces face runs on both
+    /// paths. `false` forces whole-mesh draws on both. Either call replaces
+    /// the default. [`Self::cull_faces`] is `true` for automatic and for `true`.
+    ///
+    /// Safe to toggle at runtime. The change is sent on the render-thread
+    /// command stream and lands at the next frame boundary. Setting the
+    /// explicit mode already in effect does nothing.
     pub fn set_cull_faces(&mut self, on: bool) {
         self.client.set_cull_faces(on);
     }
 
+    /// `true` for the automatic default and after `set_cull_faces(true)`.
+    /// `false` after `set_cull_faces(false)`.
     pub fn cull_faces(&self) -> bool {
         self.client.cull_faces()
     }
