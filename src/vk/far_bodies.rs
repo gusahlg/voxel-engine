@@ -38,9 +38,11 @@ pub(crate) struct FarBodyGpu {
     /// x = noise seed (unused for mapped). y = rounded exponent as f32 bits
     /// (0 otherwise). z = map id + 1 (0 = not mapped). w = 0.
     ///
-    /// Mapped spare lanes on the albedo vectors: `albedo0.w` = horizon,
-    /// `albedo1.w` = air thickness in radius units, `albedo2.w` = distance
-    /// in world units. The other `.w` lanes stay 0. `dir_rho.w` stays the
+    /// `albedo2.w` is the body's world distance for every shape. The sky
+    /// shader orders hits by `t * distance` and rims and point blobs by
+    /// `facing * distance`, and keeps the normalised `t` for shading.
+    /// Mapped spare lanes: `albedo0.w` = horizon, `albedo1.w` = air thickness
+    /// in radius units. The other `.w` lanes stay 0. `dir_rho.w` stays the
     /// reference `radius/distance`, not the datum hi radius.
     pub seed: [u32; 4],
 }
@@ -257,7 +259,8 @@ fn pack_one(body: &FarBody) -> FarBodyGpu {
     let mut albedo2 = rgb4(body.albedo[2]);
     albedo0[3] = horizon;
     albedo1[3] = air;
-    albedo2[3] = if map_plus == 0 { 0.0 } else { body.distance };
+    // Every shape, not only mapped. The shader's depth compare reads this lane.
+    albedo2[3] = body.distance;
     FarBodyGpu {
         dir_rho: [dir.x, dir.y, dir.z, body.radius / body.distance],
         rot: [q.x, q.y, q.z, q.w],
@@ -642,6 +645,33 @@ mod tests {
             albedo: [LinearRgb([0.2, 0.3, 0.4]); 6],
             atmosphere: LinearRgb([0.0, 0.0, 0.0]),
             seed: 1,
+        }
+    }
+
+    #[test]
+    fn every_shape_packs_world_distance_in_albedo2_w() {
+        let shapes = [
+            (FarShape::Sphere, 12.5, 1.0),
+            (FarShape::Cube, 12.5, 1.0),
+            (FarShape::InnerSphere, 2.0, 8.0),
+            (FarShape::Rounded { exponent: 3.0 }, 12.5, 1.0),
+            (
+                FarShape::Mapped {
+                    map: FarMapId(1),
+                    horizon: 0.1,
+                    air: 0.2,
+                },
+                12.5,
+                1.0,
+            ),
+        ];
+        for (shape, distance, radius) in shapes {
+            let gpu = super::pack_one(&sample(shape, distance, radius));
+            assert_eq!(
+                gpu.albedo2[3].to_bits(),
+                distance.to_bits(),
+                "albedo2.w is the world distance"
+            );
         }
     }
 

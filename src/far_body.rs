@@ -1087,6 +1087,43 @@ mod tests {
         assert_eq!(out[2].seed, 8);
     }
 
+    /// Each body is ray-tested with its centre at distance 1, so normalised
+    /// `t` (and a rim's `facing`) cannot order two bodies. The sky shader
+    /// compares `t * distance` for hits and `facing * distance` for rims and
+    /// point blobs, and keeps the normalised `t` for shading. The inner
+    /// sphere's far wall stays the background: a smaller world depth
+    /// composites over it, and a hit past the shell does not.
+    #[test]
+    fn world_depth_orders_bodies_the_normalised_parameter_cannot() {
+        let near = ray_sphere(Vec3::Z, Vec3::Z, 0.2).unwrap();
+        let far = ray_sphere(Vec3::Z, Vec3::Z, 0.9).unwrap();
+        let near_distance = 40.0;
+        let far_distance = 4_000.0;
+        assert!(near.t > far.t, "normalised t would pick the far body");
+        let near_depth = near.t * near_distance;
+        let far_depth = far.t * far_distance;
+        assert!(near_depth < far_depth);
+        assert!((near_depth - 32.0).abs() < 1e-3, "{near_depth}");
+        assert!((far_depth - 400.0).abs() < 1e-2, "{far_depth}");
+
+        let wall = ray_inner_sphere(Vec3::Z, Vec3::Z, 100.0, 500.0).unwrap();
+        let wall_depth = wall.t * 100.0;
+        assert!(
+            (wall_depth - 600.0).abs() < 1e-2,
+            "far wall world depth {wall_depth}"
+        );
+        assert!(wall.t > near.t && wall.t > far.t);
+        let front = ray_sphere(Vec3::Z, Vec3::Z, 0.5).unwrap();
+        assert!(front.t * 80.0 < wall_depth);
+        assert!(
+            front.t * 2_000.0 > wall_depth,
+            "a body past the shell is behind the wall even though its normalised t is smaller"
+        );
+
+        // On this ray `facing` is 1. The close rim is still in front of the far hit.
+        assert!(1.0 * near_distance < far_depth);
+    }
+
     fn axis_face(u: Vec3) -> Option<u32> {
         let a = u.abs();
         if a.x > 0.9 && a.y < 1e-4 && a.z < 1e-4 {

@@ -13,9 +13,13 @@
 // seed.x is the noise seed (unused for mapped). seed.y is the rounded
 // exponent as float bits (0 otherwise). seed.z is the map id + 1 (0 = not
 // mapped). seed.w is 0.
-// Mapped spare lanes: albedo0.w = horizon, albedo1.w = air thickness in
-// radius units, albedo2.w = distance in world units. The other .w lanes
-// stay 0. dir_rho.w stays the reference radius/distance, not the hi radius.
+// albedo2.w is the body's world distance for every shape. Each body is
+// ray-tested with its centre at distance 1, so a normalised `t` or `facing`
+// is not comparable across bodies; the loop orders hits by `t * distance`
+// and rims and point blobs by `facing * distance`. Mapped spare lanes:
+// albedo0.w = horizon, albedo1.w = air thickness in radius units. The other
+// .w lanes stay 0. dir_rho.w stays the reference radius/distance, not the
+// hi radius.
 struct FarGpu
 {
     float4 dir_rho;
@@ -715,12 +719,14 @@ bool far_ray_mapped(
 // `pix` is SV_Position.xy (framebuffer pixels, origin top-left).
 // `inscatter` is the viewer's sky radiance along `ray` (no sun disc, moon or stars).
 // The loop only searches. Albedo and lighting run once, for the nearest hit, so a
-// pixel a single body covers matches the old per-hit shade. Additive rims and
-// point blobs are stashed with their depth (`facing`) and dropped when that depth
-// is not in front of the final hit: a farther rim a nearer body used to overwrite
-// stays overwritten. The inner sphere's far wall is the background; anything with
-// a smaller depth composites over it. A mapped body is kind 4: one shade, then
-// the terrain fog in place of far_through_air. Its air limb is an additive term.
+// pixel a single body covers matches the old per-hit shade. Hits are ordered by
+// world depth `t * distance` and rims and point blobs by `facing * distance`;
+// the normalised `t` is kept for shading. Additive terms are stashed with that
+// world depth and dropped when it is not in front of the final hit: a farther
+// rim a nearer body used to overwrite stays overwritten. The inner sphere's far
+// wall is the background; anything with a smaller world depth composites over
+// it. A mapped body is kind 4: one shade, then the terrain fog in place of
+// far_through_air. Its air limb is an additive term.
 float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix)
 {
     uint n = min(farTable[0].header.x, 32u);
@@ -748,14 +754,16 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         return col;
 
     float flip = frame.light.w * 2.0 - 1.0;
-    float bestT = 1e30;
+    // World units. `bestT` is the winning hit's normalised parameter.
+    float bestDepth = 1e30;
+    float bestT = 0.0;
     uint bestI = 0u;
     uint bestFace = 0u;
     float3 bestN = float3(0.0, 0.0, 0.0);
     float bestCov = 1.0;
     // 0 none, 1 sphere (coverage lerp), 2 inner wall, 3 opaque replace, 4 mapped.
     uint bestKind = 0u;
-    // rgb = contribution, w = depth (`facing` for rims and point blobs).
+    // rgb = contribution, w = world depth (`facing * distance` for rims and blobs).
     float4 addTerm[32];
     uint nAdd = 0u;
 
@@ -799,6 +807,9 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
             continue;
         float3 center = dirRho.xyz;
         float facing = dot(ray, center);
+        // World distance. Normalised `t` and `facing` live in this body's unit space.
+        float distance = farTable[0].body[i].albedo2.w;
+        float facingDepth = facing * distance;
         // Inside the sphere every direction hits the far wall, including away from the centre.
         // A rounded body can contain the camera in its enclosing sphere while the camera is
         // still outside the solid, so a ray away from the centre may meet the bulge.
@@ -812,8 +823,9 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         {
             float t = 0.0;
             float3 nrm = float3(0.0, 0.0, 0.0);
-            if (far_ray_inner(ray, center, rho, facing, t, nrm) && t < bestT)
+            if (far_ray_inner(ray, center, rho, facing, t, nrm) && t * distance < bestDepth)
             {
+                bestDepth = t * distance;
                 bestT = t;
                 bestI = i;
                 bestFace = 0u;
@@ -830,7 +842,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         if (!mapped && ang < 0.7 && facing > 0.0)
         {
             float tPoint = 1.0 - rho;
-            if (tPoint < bestT && nAdd < 32u)
+            if (tPoint * distance < bestDepth && nAdd < 32u)
             {
                 float s = length(cross(ray, center));
                 float blob = exp(-4.0 * (s * s) / (px * px));
@@ -839,7 +851,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 uint seed = farTable[0].body[i].seed.x;
                 float tw = 0.75 + 0.25 * (float(seed & 255u) * (1.0 / 255.0));
                 float3 blobRgb = farTable[0].body[i].albedo0.rgb * (frame.light.rgb * gain + frame.ambient_glow.rgb) * (blob * tw);
-                addTerm[nAdd] = float4(blobRgb, facing);
+                addTerm[nAdd] = float4(blobRgb, facingDepth);
                 nAdd++;
             }
             continue;
@@ -855,8 +867,9 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
             if (s <= rho)
             {
                 hit = far_ray_sphere(ray, center, rho, facing, t, nrm);
-                if (hit && t < bestT)
+                if (hit && t * distance < bestDepth)
                 {
+                    bestDepth = t * distance;
                     bestT = t;
                     bestI = i;
                     bestFace = 0u;
@@ -868,11 +881,11 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
             else if (hasAir)
             {
                 float width = max(rho * 0.05, px * 1.25);
-                if (s < rho + width && facing < bestT && nAdd < 32u)
+                if (s < rho + width && facingDepth < bestDepth && nAdd < 32u)
                 {
                     float u = saturate((s - rho) / width);
                     float rim = 1.0 - u;
-                    addTerm[nAdd] = float4(air * (rim * rim), facing);
+                    addTerm[nAdd] = float4(air * (rim * rim), facingDepth);
                     nAdd++;
                 }
             }
@@ -882,8 +895,9 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
             float pExp = asfloat(farTable[0].body[i].seed.y);
             float4 rot = farTable[0].body[i].rot;
             hit = far_ray_rounded(ray, center, rho, rot, pExp, facing, t, nrm, face);
-            if (hit && t < bestT)
+            if (hit && t * distance < bestDepth)
             {
+                bestDepth = t * distance;
                 bestT = t;
                 bestI = i;
                 bestFace = face;
@@ -897,11 +911,11 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 float rhoB = rho * pow(3.0, 0.5 - 1.0 / pRim);
                 float s = length(cross(ray, center));
                 float width = max(rhoB * 0.05, px * 1.25);
-                if (s > rhoB && s < rhoB + width && facing < bestT && nAdd < 32u)
+                if (s > rhoB && s < rhoB + width && facingDepth < bestDepth && nAdd < 32u)
                 {
                     float u = saturate((s - rhoB) / width);
                     float rim = 1.0 - u;
-                    addTerm[nAdd] = float4(air * (rim * rim), facing);
+                    addTerm[nAdd] = float4(air * (rim * rim), facingDepth);
                     nAdd++;
                 }
             }
@@ -911,15 +925,15 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
             uint mapPlus = farTable[0].body[i].seed.z;
             float horizon = farTable[0].body[i].albedo0.w;
             float airThick = farTable[0].body[i].albedo1.w;
-            float distance = farTable[0].body[i].albedo2.w;
             // Above the horizon plane before any intersection, including the limb.
             if (mapPlus == 0u || mapPlus > 8u || !(distance > 0.0) || dot(ray, -center) > horizon)
                 continue;
             uint map = mapPlus - 1u;
             float4 rot = farTable[0].body[i].rot;
             hit = far_ray_mapped(ray, center, rho, distance, rot, map, t, nrm, face);
-            if (hit && t < bestT)
+            if (hit && t * distance < bestDepth)
             {
+                bestDepth = t * distance;
                 bestT = t;
                 bestI = i;
                 bestFace = face;
@@ -927,7 +941,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 bestCov = 1.0;
                 bestKind = 4u;
             }
-            else if (!hit && airThick > 0.0 && facing > 0.0 && facing < bestT && nAdd < 32u)
+            else if (!hit && airThick > 0.0 && facing > 0.0 && facingDepth < bestDepth && nAdd < 32u)
             {
                 // Shell on the hi sphere, at least one pixel thick. Chord is in
                 // world units. The denominator stays at least a pixel so the
@@ -947,7 +961,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                     float trans = exp(-4.0 * chord / denom);
                     float3 limbN = normalize(ray * facing - center);
                     float daylight = saturate(dot(limbN, frame.sun_dir_elev.xyz) * flip);
-                    addTerm[nAdd] = float4(air * ((1.0 - trans) * frame.light.rgb * daylight), facing);
+                    addTerm[nAdd] = float4(air * ((1.0 - trans) * frame.light.rgb * daylight), facingDepth);
                     nAdd++;
                 }
             }
@@ -956,8 +970,9 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         {
             float4 rot = farTable[0].body[i].rot;
             hit = far_ray_cube(ray, center, rho, rot, t, nrm, face);
-            if (hit && t < bestT)
+            if (hit && t * distance < bestDepth)
             {
+                bestDepth = t * distance;
                 bestT = t;
                 bestI = i;
                 bestFace = face;
@@ -971,11 +986,11 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 float tRim;
                 float3 nRim;
                 uint faceRim;
-                if (rhoRim < 1.0 && far_ray_cube(ray, center, rhoRim, rot, tRim, nRim, faceRim) && tRim < bestT && nAdd < 32u)
+                if (rhoRim < 1.0 && far_ray_cube(ray, center, rhoRim, rot, tRim, nRim, faceRim) && tRim * distance < bestDepth && nAdd < 32u)
                 {
                     float fres = 1.0 - saturate(dot(nRim, -ray));
                     fres = fres * fres * fres;
-                    addTerm[nAdd] = float4(air * fres, facing);
+                    addTerm[nAdd] = float4(air * fres, facingDepth);
                     nAdd++;
                 }
             }
@@ -986,7 +1001,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
     [loop]
     for (uint k = 0u; k < nAdd; k++)
     {
-        if (addTerm[k].w < bestT)
+        if (addTerm[k].w < bestDepth)
             add += addTerm[k].xyz;
     }
 
