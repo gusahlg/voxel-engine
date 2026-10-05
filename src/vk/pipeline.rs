@@ -167,8 +167,10 @@ const MESH3D_CAGED_OPAQUE_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_caged_opaque.frag.spv"));
 const MESH3D_CAGED_LOD_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_caged_lod.frag.spv"));
-const MESH3D_CAGED_OPAQUE_LEAN_FRAG: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_caged_opaque_lean.frag.spv"));
+const MESH3D_CAGED_OPAQUE_LEAN_FRAG: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/mesh3d_caged_opaque_lean.frag.spv"
+));
 const MESH3D_CAGED_LOD_LEAN_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh3d_caged_lod_lean.frag.spv"));
 const MESH3D_CAGED_WATER_FRAG: &[u8] =
@@ -291,6 +293,7 @@ impl Pipelines {
         mesh3d_set_layout: vk::DescriptorSetLayout,
         fsr: Option<&FragmentShadingRate>,
         independent_blend: bool,
+        stats: Option<&super::shader_stats::Loader>,
     ) -> Self {
         // 3D set 0: binding 0 = offsets SSBO (vertex), binding 1 = texture
         // array (fragment), binding 7 = material-desc SSBO (fragment) — one
@@ -463,6 +466,7 @@ impl Pipelines {
             samples,
             fsr_enabled: fsr.is_some(),
             second_color: None,
+            stats,
         };
 
         // Depth: reversed-Z, so GREATER_OR_EQUAL and clear to 0.0.
@@ -480,6 +484,7 @@ impl Pipelines {
             &bindings_3d,
             attributes_3d,
             layout_3d,
+            "mesh3d_opaque",
             opaque_config(),
         );
         let mesh3d_lod = builder.build(
@@ -488,6 +493,7 @@ impl Pipelines {
             &bindings_3d,
             attributes_3d,
             layout_3d,
+            "mesh3d_lod",
             opaque_config(),
         );
         let mesh3d_lean = builder.build(
@@ -496,6 +502,7 @@ impl Pipelines {
             &bindings_3d,
             attributes_3d,
             layout_3d,
+            "mesh3d_lean",
             opaque_config(),
         );
         let mesh3d_lod_lean = builder.build(
@@ -504,6 +511,7 @@ impl Pipelines {
             &bindings_3d,
             attributes_3d,
             layout_3d,
+            "mesh3d_lod_lean",
             opaque_config(),
         );
         // Blend world geometry: same modules/layout, alpha blend, depth read-only
@@ -517,6 +525,7 @@ impl Pipelines {
             &bindings_3d,
             attributes_3d,
             layout_3d,
+            "mesh3d_transparent",
             PipelineConfig {
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 depth: DepthMode::ReadOnly,
@@ -547,6 +556,7 @@ impl Pipelines {
                 &bindings_3d,
                 attributes_3d,
                 layout_3d,
+                "mesh3d_transparent_absorb",
                 blend_config(),
             )
         });
@@ -577,6 +587,7 @@ impl Pipelines {
             &bindings_3d,
             attributes_3d,
             layout_3d,
+            "mesh3d_caged",
             opaque_config(),
         );
         let mesh3d_caged_lod = builder.build(
@@ -585,6 +596,7 @@ impl Pipelines {
             &bindings_3d,
             attributes_3d,
             layout_3d,
+            "mesh3d_caged_lod",
             opaque_config(),
         );
         let mesh3d_caged_lean = builder.build(
@@ -593,6 +605,7 @@ impl Pipelines {
             &bindings_3d,
             attributes_3d,
             layout_3d,
+            "mesh3d_caged_lean",
             opaque_config(),
         );
         let mesh3d_caged_lod_lean = builder.build(
@@ -601,6 +614,7 @@ impl Pipelines {
             &bindings_3d,
             attributes_3d,
             layout_3d,
+            "mesh3d_caged_lod_lean",
             opaque_config(),
         );
         let mesh3d_caged_transparent = builder.build(
@@ -609,11 +623,11 @@ impl Pipelines {
             &bindings_3d,
             attributes_3d,
             layout_3d,
+            "mesh3d_caged_transparent",
             blend_config(),
         );
-        let mesh_caged_water_frag = absorb_ok.then(|| {
-            pass::shader_module(device, MESH3D_CAGED_WATER_FRAG, "caged water fragment")
-        });
+        let mesh_caged_water_frag = absorb_ok
+            .then(|| pass::shader_module(device, MESH3D_CAGED_WATER_FRAG, "caged water fragment"));
         let mesh3d_caged_transparent_absorb = mesh_caged_water_frag.map(|water_frag| {
             builder.build(
                 mesh_caged_vert,
@@ -621,6 +635,7 @@ impl Pipelines {
                 &bindings_3d,
                 attributes_3d,
                 layout_3d,
+                "mesh3d_caged_transparent_absorb",
                 blend_config(),
             )
         });
@@ -631,6 +646,7 @@ impl Pipelines {
             &bindings_debug,
             attributes_debug,
             layout_debug,
+            "debug_tris",
             PipelineConfig {
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 depth: DepthMode::ReadWrite,
@@ -648,6 +664,7 @@ impl Pipelines {
             &bindings_debug,
             attributes_debug,
             layout_debug,
+            "debug_tris_blend",
             PipelineConfig {
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 depth: DepthMode::ReadOnly,
@@ -663,6 +680,7 @@ impl Pipelines {
             &bindings_debug,
             attributes_debug,
             layout_debug,
+            "debug_lines",
             PipelineConfig {
                 topology: vk::PrimitiveTopology::LINE_LIST,
                 depth: DepthMode::ReadOnly,
@@ -678,6 +696,7 @@ impl Pipelines {
             &bindings_2d,
             attributes_2d,
             layout_2d,
+            "tris2d",
             PipelineConfig {
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 depth: DepthMode::Disabled,
@@ -695,6 +714,7 @@ impl Pipelines {
             &bindings_2d,
             attributes_2d,
             layout_2d,
+            "tris2d_tex",
             PipelineConfig {
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 depth: DepthMode::Disabled,
@@ -714,6 +734,7 @@ impl Pipelines {
             &[],
             &[],
             layout_sky,
+            "sky",
             PipelineConfig {
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 depth: DepthMode::ReadOnly,
@@ -736,6 +757,7 @@ impl Pipelines {
             samples: vk::SampleCountFlags::TYPE_1,
             fsr_enabled: false,
             second_color: None,
+            stats,
         };
         let tonemap = tonemap_builder.build(
             tonemap_vert,
@@ -743,6 +765,7 @@ impl Pipelines {
             &[],
             &[],
             layout_tonemap,
+            "tonemap",
             PipelineConfig {
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 depth: DepthMode::Disabled,
@@ -768,6 +791,7 @@ impl Pipelines {
             &[],
             &[],
             layout_tonemap_taa,
+            "tonemap_taa",
             PipelineConfig {
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 depth: DepthMode::Disabled,
@@ -793,6 +817,7 @@ impl Pipelines {
             &bindings_2d,
             attributes_2d,
             layout_2d,
+            "tris2d_present",
             overlay_2d_config(),
         );
         let tris2d_tex_present = tonemap_builder.build(
@@ -801,6 +826,7 @@ impl Pipelines {
             &bindings_2d,
             attributes_2d,
             layout_2d,
+            "tris2d_tex_present",
             overlay_2d_config(),
         );
         // Distinct blend states (att0 alpha-blend, att1 empty write mask) are
@@ -821,6 +847,7 @@ impl Pipelines {
                     &bindings_2d,
                     attributes_2d,
                     layout_2d,
+                    "tris2d_present_taa",
                     overlay_2d_config(),
                 )),
                 Some(overlay_taa_builder.build(
@@ -829,6 +856,7 @@ impl Pipelines {
                     &bindings_2d,
                     attributes_2d,
                     layout_2d,
+                    "tris2d_tex_present_taa",
                     overlay_2d_config(),
                 )),
             )
@@ -867,7 +895,7 @@ impl Pipelines {
             device.destroy_shader_module(sky_frag, None);
         }
 
-        let vrs_compute = fsr.map(|_| create_vrs_compute(device, cache));
+        let vrs_compute = fsr.map(|_| create_vrs_compute(device, cache, stats));
 
         Self {
             vrs_compute,
@@ -1037,6 +1065,7 @@ struct PipelineBuilder<'a> {
     /// match the 2-attachment rendering without touching history. Overlay
     /// variants with a distinct empty mask require `independentBlend`.
     second_color: Option<(vk::Format, vk::ColorComponentFlags)>,
+    stats: Option<&'a super::shader_stats::Loader>,
 }
 
 /// Per-pipeline knobs for `PipelineBuilder::build`, named at each call site
@@ -1060,6 +1089,7 @@ impl PipelineBuilder<'_> {
         bindings: &[vk::VertexInputBindingDescription],
         attributes: &[vk::VertexInputAttributeDescription],
         layout: vk::PipelineLayout,
+        name: &str,
         cfg: PipelineConfig,
     ) -> vk::Pipeline {
         let PipelineConfig {
@@ -1183,11 +1213,12 @@ impl PipelineBuilder<'_> {
         // Every pipeline drawn in a pass that binds a rate attachment must
         // carry this flag — even the non-VRS ones (debug/2D shade at 1×1). So
         // it's keyed on the builder's `fsr_enabled`, not the per-pipeline `vrs`.
-        let create_flags = if self.fsr_enabled {
-            vk::PipelineCreateFlags::RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_KHR
-        } else {
-            vk::PipelineCreateFlags::empty()
-        };
+        let create_flags = super::shader_stats::capture_flags(self.stats)
+            | if self.fsr_enabled {
+                vk::PipelineCreateFlags::RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_KHR
+            } else {
+                vk::PipelineCreateFlags::empty()
+            };
 
         let mut pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .flags(create_flags)
@@ -1206,16 +1237,22 @@ impl PipelineBuilder<'_> {
             pipeline_info = pipeline_info.push_next(&mut fsr_state);
         }
 
-        unsafe {
+        let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(self.cache, &[pipeline_info], None)
                 .map_err(|(_, err)| err)
                 .expect("Failed to create graphics pipeline")[0]
-        }
+        };
+        super::shader_stats::report_pipeline_stats(self.device, self.stats, pipeline, name);
+        pipeline
     }
 }
 
-fn create_vrs_compute(device: &ash::Device, cache: vk::PipelineCache) -> VrsCompute {
+fn create_vrs_compute(
+    device: &ash::Device,
+    cache: vk::PipelineCache,
+    stats: Option<&super::shader_stats::Loader>,
+) -> VrsCompute {
     let bindings = [
         // Depth, sampled by the classifier.
         vk::DescriptorSetLayoutBinding::default()
@@ -1249,7 +1286,7 @@ fn create_vrs_compute(device: &ash::Device, cache: vk::PipelineCache) -> VrsComp
         size_of::<super::vrs::VrsPush>() as u32,
         "vrs",
     );
-    let pipeline = pass::compute_pipeline(device, cache, layout, VRS_COMP, "vrs");
+    let pipeline = pass::compute_pipeline(device, cache, layout, VRS_COMP, "vrs", stats);
 
     let depth_sampler = pass::nearest_clamp_sampler(device, "VRS depth");
 

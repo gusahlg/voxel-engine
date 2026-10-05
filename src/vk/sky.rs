@@ -65,7 +65,11 @@ pub(crate) struct SkyCloudState {
 }
 
 impl SkyCloudState {
-    pub(crate) fn new(device: &ash::Device, cache: vk::PipelineCache) -> SkyCloudState {
+    pub(crate) fn new(
+        device: &ash::Device,
+        cache: vk::PipelineCache,
+        stats: Option<&super::shader_stats::Loader>,
+    ) -> SkyCloudState {
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -85,7 +89,8 @@ impl SkyCloudState {
             0,
             "sky cloud LUT",
         );
-        let pipeline = pass::compute_pipeline(device, cache, layout, SKY_CLOUD_COMP, "sky cloud");
+        let pipeline =
+            pass::compute_pipeline(device, cache, layout, SKY_CLOUD_COMP, "sky_cloud", stats);
         SkyCloudState {
             pipeline,
             layout,
@@ -243,7 +248,11 @@ mod tests {
         assert_ne!(a, LutKey::of(&y, Vec3::Y));
         assert_ne!(LutKey::of(&y, Vec3::Y).y, LutKey::of(&u, Vec3::Y).y);
 
-        assert_ne!(a, LutKey::of(&u, Vec3::X), "a new up rebuilds the cloud LUT");
+        assert_ne!(
+            a,
+            LutKey::of(&u, Vec3::X),
+            "a new up rebuilds the cloud LUT"
+        );
     }
 
     #[test]

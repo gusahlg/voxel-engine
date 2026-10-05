@@ -222,7 +222,11 @@ struct ExposureCompute {
 }
 
 impl ExposureCompute {
-    fn new(device: &ash::Device, cache: vk::PipelineCache) -> ExposureCompute {
+    fn new(
+        device: &ash::Device,
+        cache: vk::PipelineCache,
+        stats: Option<&super::shader_stats::Loader>,
+    ) -> ExposureCompute {
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -242,8 +246,14 @@ impl ExposureCompute {
             size_of::<ExposurePush>() as u32,
             "exposure",
         );
-        let pipeline =
-            pass::compute_pipeline(device, cache, layout, EXPOSURE_REDUCE_COMP, "exposure");
+        let pipeline = pass::compute_pipeline(
+            device,
+            cache,
+            layout,
+            EXPOSURE_REDUCE_COMP,
+            "exposure",
+            stats,
+        );
         // Linear clamp: tile means smooth a little over the box; edge clamp keeps
         // the border tiles from wrapping.
         let sampler = pass::linear_clamp_sampler(device, "exposure HDR");
@@ -312,6 +322,7 @@ impl ExposureState {
         memory_props: &vk::PhysicalDeviceMemoryProperties,
         render_extent: vk::Extent2D,
         cache: vk::PipelineCache,
+        stats: Option<&super::shader_stats::Loader>,
     ) -> ExposureState {
         let tiles = vk::Extent2D {
             width: render_extent.width.div_ceil(TILE).max(1),
@@ -319,7 +330,7 @@ impl ExposureState {
         };
         let tile_count = (tiles.width * tiles.height) as usize;
         ExposureState {
-            compute: ExposureCompute::new(device, cache),
+            compute: ExposureCompute::new(device, cache, stats),
             ring: ExposureRing::new(device, memory_props, tile_count),
             tiles,
             hdr_dim: render_extent,

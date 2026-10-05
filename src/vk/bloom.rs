@@ -131,6 +131,7 @@ impl BloomState {
         device: &ash::Device,
         memory_props: &vk::PhysicalDeviceMemoryProperties,
         cache: vk::PipelineCache,
+        stats: Option<&super::shader_stats::Loader>,
     ) -> BloomState {
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
@@ -162,14 +163,16 @@ impl BloomState {
             cache,
             layout,
             BLOOM_THRESHOLD_COMP,
-            "bloom threshold",
+            "bloom_threshold",
+            stats,
         );
         let downsample = pass::compute_pipeline(
             device,
             cache,
             layout,
             BLOOM_DOWNSAMPLE_COMP,
-            "bloom downsample",
+            "bloom_downsample",
+            stats,
         );
 
         let sampler = pass::linear_clamp_sampler(device, "bloom HDR");
@@ -213,7 +216,7 @@ impl BloomState {
             size_of::<SpillPush>() as u32,
             "spill",
         );
-        let spill = pass::compute_pipeline(device, cache, spill_layout, SPILL_COMP, "spill");
+        let spill = pass::compute_pipeline(device, cache, spill_layout, SPILL_COMP, "spill", stats);
         let depth_sampler = pass::nearest_clamp_sampler(device, "spill depth");
 
         let black = ImageResource::create(
