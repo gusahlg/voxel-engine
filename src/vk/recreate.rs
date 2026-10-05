@@ -388,6 +388,7 @@ impl Renderer {
                     self.atlas.set_layout,
                     self.mesh3d_set_layout,
                     self.device.fragment_shading_rate.as_ref(),
+                    self.device.sky_coarse_ok(self.targets.samples),
                     self.device.independent_blend,
                     self.device.shader_stats.as_ref(),
                 );

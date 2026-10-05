@@ -6,7 +6,10 @@
 //! one word per screen tile, so a sky pixel skips bodies that miss its tile.
 //! After the mask, compact tile-index lists feed the instanced tile-quad
 //! vertex shader: mask == 0, then sphere-only tiles, then tiles that meet a
-//! cube, rounded or mapped body.
+//! cube, rounded or mapped body. When a coarse-shading query is passed, the
+//! base run is stably split into tiles the sun and moon discs miss, then the
+//! rest. `list_header.x` stays the whole base count; the shader still indexes
+//! by instance id.
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
@@ -67,7 +70,9 @@ const TILE_COARSE_PX: u32 = 128;
 /// that tile. Only the `tiles_x * tiles_y` prefix is live.
 ///
 /// `list_header` is `(n_base, n_full, width, height)`. `tile_index` holds the
-/// base tiles (mask == 0) in ascending index order, then the full tiles.
+/// base tiles (mask == 0), then the full tiles. The base run is ascending
+/// row-major unless a coarse query has stably partitioned it into the
+/// disc-free prefix and the rest. `list_header.x` is still every base tile.
 /// The sky vertex shader reads this tail; `far_bodies` does not.
 ///
 /// `Pod` is implemented by hand: bytemuck's derive only covers arrays up to a
@@ -931,6 +936,119 @@ fn fill_tile_lists(table: &mut FarTableGpu, width: u32, height: u32) {
     table.list_header = [n_base, n_sphere + n_heavy, width, height];
 }
 
+/// Disc and star inputs for [`split_coarse_base`]. The rims are the push
+/// constant's outer cosines (`SkyParams::disc_rims`), not the solid cores.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SkyCoarseQuery {
+    /// World-space sun direction, the same vector the push constant normalises.
+    /// A zero or non-finite direction shades every base tile at 1×1.
+    pub sun_dir: glam::Vec3,
+    pub sun_cos_rim: f32,
+    pub moon_cos_rim: f32,
+    /// `max(night, star_floor) * stars_gain > 0` in `sky.frag`.
+    pub stars: bool,
+}
+
+/// Same gate as `sky.frag`: stars draw when `max(night, star_floor) * gain`
+/// is positive. A non-finite factor counts as stars on, so no tile goes coarse.
+pub(crate) fn stars_drawn(night: f32, star_floor: f32, stars_gain: f32) -> bool {
+    if !(night.is_finite() && star_floor.is_finite() && stars_gain.is_finite()) {
+        return true;
+    }
+    night.max(star_floor) * stars_gain > 0.0
+}
+
+/// Widen a disc-rim cosine by `margin_rad`. `None` when the inputs are not a
+/// finite cone, or the widened angle covers the sphere (every tile is touched).
+fn widened_disc(cos_rim: f32, margin_rad: f32) -> Option<(f32, f32)> {
+    if !(cos_rim.is_finite() && margin_rad.is_finite()) || !(-1.0..=1.0).contains(&cos_rim) {
+        return None;
+    }
+    if margin_rad < 0.0 {
+        return None;
+    }
+    let (sin_w, cos_w) = add_angles(cos_rim, margin_rad.cos());
+    if !(sin_w.is_finite() && cos_w.is_finite()) || sin_w < 0.0 || sin_w > 1.0 {
+        return None;
+    }
+    Some((sin_w, cos_w))
+}
+
+fn unit_dir(v: glam::Vec3) -> Option<glam::Vec3> {
+    let len2 = v.length_squared();
+    if !(len2 > 0.0) || !v.is_finite() {
+        return None;
+    }
+    Some(v / len2.sqrt())
+}
+
+/// Stably partition the base prefix into tiles neither disc can touch, then
+/// the rest. Sphere and heavy runs are left where [`fill_tile_lists`] put
+/// them. Returns the coarse count. Stars, a missing frame, or an unusable
+/// disc leave the prefix unchanged and return 0.
+///
+/// `px_max` is twice the larger-axis pixel angle, so the margin is 2 px on
+/// top of the tile cone (which already reaches 1 px past its corners).
+fn split_coarse_base(
+    table: &mut FarTableGpu,
+    frames: &TileFrames,
+    view: &FarView,
+    query: &SkyCoarseQuery,
+) -> u32 {
+    if query.stars {
+        return 0;
+    }
+    let n_base = table.list_header[0] as usize;
+    if n_base == 0 || !frames.matches(view) {
+        return 0;
+    }
+    let Some(basis) = ViewBasis::from_view_proj(view.view_proj) else {
+        return 0;
+    };
+    let Some(sun) = unit_dir(query.sun_dir) else {
+        return 0;
+    };
+    let Some(sun_view) = unit_dir(basis.to_view(sun)) else {
+        return 0;
+    };
+    let Some(moon_view) = unit_dir(basis.to_view(-sun)) else {
+        return 0;
+    };
+    let Some((sun_sin, sun_cos)) = widened_disc(query.sun_cos_rim, view.px_max) else {
+        return 0;
+    };
+    let Some((moon_sin, moon_cos)) = widened_disc(query.moon_cos_rim, view.px_max) else {
+        return 0;
+    };
+    // Classify before writing, so a bad index leaves the run untouched.
+    let mut touch = Vec::with_capacity(n_base);
+    for slot in 0..n_base {
+        let index = table.tile_index[slot];
+        let Some(tile) = frames.samples.get(index as usize) else {
+            return 0;
+        };
+        touch.push(
+            tile_within(tile, sun_view, sun_sin, sun_cos)
+                || tile_within(tile, moon_view, moon_sin, moon_cos),
+        );
+    }
+    let mut coarse = Vec::with_capacity(n_base);
+    let mut fine = Vec::with_capacity(n_base);
+    for (slot, hit) in touch.into_iter().enumerate() {
+        let index = table.tile_index[slot];
+        if hit {
+            fine.push(index);
+        } else {
+            coarse.push(index);
+        }
+    }
+    let n_coarse = coarse.len();
+    for (slot, index) in coarse.into_iter().chain(fine).enumerate() {
+        table.tile_index[slot] = index;
+    }
+    n_coarse as u32
+}
+
 /// Which body fragment a draw needs. `Full` has every shape. `NoMap` drops the
 /// mapped march. `Sphere` keeps spheres and inner spheres.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -959,6 +1077,9 @@ pub(crate) struct SkyDraw {
     pub n_heavy: u32,
     /// `n_sphere + n_heavy`. `far.tiles`.
     pub n_full: u32,
+    /// Coarse-eligible prefix of the base run. `sky.coarse`. Zero unless a
+    /// query actually split the prefix.
+    pub n_coarse: u32,
 }
 
 impl Default for SkyDraw {
@@ -971,6 +1092,7 @@ impl Default for SkyDraw {
             n_sphere: 0,
             n_heavy: 0,
             n_full: 0,
+            n_coarse: 0,
         }
     }
 }
@@ -1003,6 +1125,7 @@ impl SkyDraw {
                 n_sphere,
                 n_heavy,
                 n_full,
+                n_coarse: 0,
             }
         } else {
             Self {
@@ -1013,6 +1136,7 @@ impl SkyDraw {
                 n_sphere: 0,
                 n_heavy: 0,
                 n_full: 0,
+                n_coarse: 0,
             }
         }
     }
@@ -1144,11 +1268,12 @@ impl FarBodyRing {
         bodies: &[FarBody],
         view: Option<FarView>,
         map_max: &[f32; MAX_FAR_MAPS],
+        coarse: Option<SkyCoarseQuery>,
     ) {
         if let Some(view) = view.as_ref() {
             self.tiles.rebuild_if_changed(view);
         }
-        let table = pack_table_cached(bodies, view.as_ref(), Some(&self.tiles), map_max);
+        let mut table = pack_table_cached(bodies, view.as_ref(), Some(&self.tiles), map_max);
         let offered = bodies.len().min(MAX_FAR_BODIES) as u64;
         crate::profile::gauge(crate::profile::Gauge::FarBodies, offered);
         crate::profile::gauge(crate::profile::Gauge::FarDrawn, u64::from(table.header[0]));
@@ -1158,7 +1283,18 @@ impl FarBodyRing {
             crate::profile::Gauge::FarTiles,
             u64::from(table.list_header[1]),
         );
-        self.draw[slot] = SkyDraw::from_table(&table, far_cull_enabled());
+        let mut draw = SkyDraw::from_table(&table, far_cull_enabled());
+        // Fullscreen sky (no tile grid) stays on the 1×1 triangle. The split
+        // rewrites the uploaded index prefix, so it runs before the byte match.
+        if draw.quads {
+            if let (Some(query), Some(view)) = (coarse.as_ref(), view.as_ref()) {
+                if self.tiles.matches(view) {
+                    draw.n_coarse = split_coarse_base(&mut table, &self.tiles, view, query);
+                }
+            }
+        }
+        crate::profile::gauge(crate::profile::Gauge::SkyCoarse, u64::from(draw.n_coarse));
+        self.draw[slot] = draw;
         let bytes = table_bytes(&table);
         let lists = list_bytes(&table);
         if self.last[slot]
@@ -2089,6 +2225,7 @@ mod tests {
             (draw.n_base, draw.n_sphere, draw.n_heavy, draw.n_full),
             (2, 1, 1, 2)
         );
+        assert_eq!(draw.n_coarse, 0);
         assert_eq!(draw.body, SkyBodyPipe::NoMap);
 
         // No kept bodies: one body-free fullscreen triangle, even with a grid.
@@ -2606,5 +2743,142 @@ mod tests {
             accepts > 100,
             "big-sphere cone test never passed, accepts {accepts}"
         );
+    }
+
+    fn coarse_query(sun: Vec3, stars: bool) -> SkyCoarseQuery {
+        let (sun_cos_rim, moon_cos_rim) = crate::vk::pipeline::SkyParams::disc_rims(0.03);
+        SkyCoarseQuery {
+            sun_dir: sun,
+            sun_cos_rim,
+            moon_cos_rim,
+            stars,
+        }
+    }
+
+    /// 320×180 at 60° is 5×3 tiles of 64 px. The screen centre sits in tile 7.
+    fn coarse_grid() -> (Box<FarTableGpu>, FarView, TileFrames) {
+        let width = 320u32;
+        let height = 180u32;
+        let view = view_along_neg_z(60.0, width, height);
+        let frames = TileFrames::build(&view).expect("view basis");
+        assert!(frames.matches(&view));
+        let (tile_px, tiles_x, tiles_y) = tile_layout(width, height);
+        assert_eq!((tile_px, tiles_x, tiles_y), (64, 5, 3));
+        let mut table = zeroed_table();
+        table.header = [0, tile_px, tiles_x, tiles_y];
+        fill_tile_lists(&mut table, width, height);
+        let n = (tiles_x * tiles_y) as usize;
+        assert_eq!(table.list_header[0] as usize, n);
+        assert!(table.tile_index[..n].windows(2).all(|w| w[0] < w[1]));
+        (table, view, frames)
+    }
+
+    fn assert_disc_split(sun: Vec3, center_coarse: bool) {
+        let (mut table, view, frames) = coarse_grid();
+        let n_base = table.list_header[0];
+        let before = table.tile_index[..n_base as usize].to_vec();
+        let header = table.list_header;
+        let n_coarse = split_coarse_base(&mut table, &frames, &view, &coarse_query(sun, false));
+        assert_eq!(table.list_header, header);
+        assert!(n_coarse > 0 && n_coarse < n_base);
+        let coarse = &table.tile_index[..n_coarse as usize];
+        let fine = &table.tile_index[n_coarse as usize..n_base as usize];
+        assert!(coarse.windows(2).all(|w| w[0] < w[1]));
+        assert!(fine.windows(2).all(|w| w[0] < w[1]));
+        let mut merged = table.tile_index[..n_base as usize].to_vec();
+        merged.sort_unstable();
+        assert_eq!(merged, before);
+        let center = 7u32;
+        assert_eq!(tile_at(160.0, 90.0, 64, 5), center as usize);
+        let center_in_coarse = coarse.contains(&center);
+        assert_eq!(center_in_coarse, center_coarse);
+        assert!(coarse.contains(&0), "corner tile must stay coarse");
+        assert!(!fine.contains(&0));
+    }
+
+    #[test]
+    fn coarse_base_excludes_a_tile_a_disc_touches() {
+        // Sun on the view axis: the centre tile meets the sun disc, the moon
+        // is behind the camera. Corner tile 0 is many degrees off both discs.
+        assert_disc_split(-Vec3::Z, false);
+        // Sun behind the camera puts the moon on the view axis.
+        assert_disc_split(Vec3::Z, false);
+    }
+
+    #[test]
+    fn coarse_base_takes_every_tile_when_both_discs_miss() {
+        // +Y is 90° off a 60° view along −Z. Both discs sit outside the frustum.
+        let (mut table, view, frames) = coarse_grid();
+        let n_base = table.list_header[0];
+        let before = table.tile_index[..n_base as usize].to_vec();
+        let n_coarse = split_coarse_base(&mut table, &frames, &view, &coarse_query(Vec3::Y, false));
+        assert_eq!(n_coarse, n_base);
+        assert_eq!(&table.tile_index[..n_base as usize], before.as_slice());
+    }
+
+    #[test]
+    fn stars_disable_coarse_and_leave_the_base_run() {
+        let (mut table, view, frames) = coarse_grid();
+        let n_base = table.list_header[0] as usize;
+        let before = table.tile_index[..n_base].to_vec();
+        let n_coarse = split_coarse_base(&mut table, &frames, &view, &coarse_query(-Vec3::Z, true));
+        assert_eq!(n_coarse, 0);
+        assert_eq!(&table.tile_index[..n_base], before.as_slice());
+        // Day, no star floor: the product is zero even with the gain left on.
+        assert!(!stars_drawn(0.0, 0.0, 1.0));
+        assert!(stars_drawn(1.0, 0.0, 1.0));
+        assert!(stars_drawn(0.0, 0.4, 1.0));
+        assert!(!stars_drawn(1.0, 1.0, 0.0));
+        assert!(stars_drawn(f32::NAN, 0.0, 1.0));
+        // A non-finite rim shades nothing coarse and does not reorder.
+        let (mut table, view, frames) = coarse_grid();
+        let mut query = coarse_query(-Vec3::Z, false);
+        query.sun_cos_rim = f32::NAN;
+        let n_coarse = split_coarse_base(&mut table, &frames, &view, &query);
+        assert_eq!(n_coarse, 0);
+        assert_eq!(&table.tile_index[..n_base], before.as_slice());
+    }
+
+    #[test]
+    fn coarse_split_keeps_the_three_way_partition() {
+        let (mut table, view, frames) = coarse_grid();
+        table.header[0] = 2;
+        table.body[0].atmosphere[3] = 1.0;
+        table.body[1].atmosphere[3] = 0.0;
+        // Tile 1 is sphere-only, tile 3 meets a cube. The centre (tile 7) stays
+        // base, so the sun on −Z pulls it into the fine suffix and the base
+        // order actually changes.
+        table.tile_mask[1] = 0b001;
+        table.tile_mask[3] = 0b010;
+        fill_tile_lists(&mut table, view.width, view.height);
+        let n_base = table.list_header[0] as usize;
+        let n_full = table.list_header[1] as usize;
+        assert_eq!(n_base + n_full, 15);
+        assert_eq!(n_full, 2);
+        let base_before = table.tile_index[..n_base].to_vec();
+        let full_before = table.tile_index[n_base..n_base + n_full].to_vec();
+        let header = table.list_header;
+        let n_coarse =
+            split_coarse_base(&mut table, &frames, &view, &coarse_query(-Vec3::Z, false));
+        assert!(n_coarse > 0 && (n_coarse as usize) < n_base);
+        assert_eq!(table.list_header, header);
+        assert_eq!(
+            &table.tile_index[n_base..n_base + n_full],
+            full_before.as_slice()
+        );
+        let mut merged = table.tile_index[..n_base].to_vec();
+        merged.sort_unstable();
+        assert_eq!(merged, base_before);
+        let coarse = &table.tile_index[..n_coarse as usize];
+        let fine = &table.tile_index[n_coarse as usize..n_base];
+        assert!(coarse.windows(2).all(|w| w[0] < w[1]));
+        assert!(fine.windows(2).all(|w| w[0] < w[1]));
+        assert!(fine.contains(&7), "the sunlit centre tile stays at 1x1");
+        for &index in coarse {
+            assert_eq!(table.tile_mask[index as usize], 0);
+        }
+        for &index in fine {
+            assert_eq!(table.tile_mask[index as usize], 0);
+        }
     }
 }

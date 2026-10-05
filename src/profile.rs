@@ -365,10 +365,12 @@ pub enum Gauge {
     FarDrawn,
     /// Screen tiles whose far-body mask is non-zero.
     FarTiles,
+    /// Body-free sky tiles drawn at a 2×2 fragment shading rate.
+    SkyCoarse,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 33] = [
+    const ALL: [Gauge; 34] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
@@ -402,6 +404,7 @@ impl Gauge {
         Gauge::FarBodies,
         Gauge::FarDrawn,
         Gauge::FarTiles,
+        Gauge::SkyCoarse,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -440,6 +443,7 @@ impl Gauge {
             Gauge::FarBodies => "far.bodies",
             Gauge::FarDrawn => "far.drawn",
             Gauge::FarTiles => "far.tiles",
+            Gauge::SkyCoarse => "sky.coarse",
         }
     }
 }

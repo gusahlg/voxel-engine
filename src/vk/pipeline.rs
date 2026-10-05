@@ -122,6 +122,17 @@ pub struct SkyParams {
 }
 
 impl SkyParams {
+    /// Outer sun and moon disc cosines (`cos(radius · SUN_DISC_RIM)`). The moon
+    /// radius is `sun_angular_radius * MOON_RADIUS_SCALE`. The coarse-tile test
+    /// uses these, not the solid-core cosines.
+    pub(crate) fn disc_rims(sun_angular_radius: f32) -> (f32, f32) {
+        let moon_r = sun_angular_radius * crate::genconst::MOON_RADIUS_SCALE;
+        (
+            (sun_angular_radius * crate::genconst::SUN_DISC_RIM).cos(),
+            (moon_r * crate::genconst::SUN_DISC_RIM).cos(),
+        )
+    }
+
     pub fn compose(inv_view_proj: Mat4, desc: &SkyDesc) -> Self {
         let s = desc.sun_dir.normalize_or_zero();
         // sun_tint is ALREADY linear (LinearRgb, non-quantising boundary) — no
@@ -129,13 +140,14 @@ impl SkyParams {
         let [tr, tg, tb] = desc.sun_tint.0;
         let r = desc.sun_angular_radius;
         let moon_r = r * crate::genconst::MOON_RADIUS_SCALE;
+        let (sun_rim, moon_rim) = Self::disc_rims(r);
         Self {
             inv_view_proj,
             sun: [s.x, s.y, s.z, (r * crate::genconst::SUN_DISC_CORE).cos()],
-            sun_tint: [tr, tg, tb, (r * crate::genconst::SUN_DISC_RIM).cos()],
+            sun_tint: [tr, tg, tb, sun_rim],
             moon: [
                 (moon_r * crate::genconst::SUN_DISC_CORE).cos(),
-                (moon_r * crate::genconst::SUN_DISC_RIM).cos(),
+                moon_rim,
                 0.0,
                 0.0,
             ],
@@ -271,6 +283,9 @@ pub struct Pipelines {
     pub sky_sphere: vk::Pipeline,
     pub sky_tile: vk::Pipeline,
     pub sky_tile_base: vk::Pipeline,
+    /// `sky_tile_base` at a 2×2 fragment size. `None` when this sample count
+    /// has no pipeline 2×2 rate, or `VOXEL_SKY_COARSE=0`.
+    pub sky_tile_base_coarse: Option<vk::Pipeline>,
     pub sky_tile_nomap: vk::Pipeline,
     pub sky_tile_sphere: vk::Pipeline,
     pub layout_sky: vk::PipelineLayout,
@@ -319,6 +334,7 @@ impl Pipelines {
         atlas_set_layout: vk::DescriptorSetLayout,
         mesh3d_set_layout: vk::DescriptorSetLayout,
         fsr: Option<&FragmentShadingRate>,
+        sky_coarse: bool,
         independent_blend: bool,
         stats: Option<&super::shader_stats::Loader>,
     ) -> Self {
@@ -520,6 +536,7 @@ impl Pipelines {
             blend: false,
             vrs: true,
             depth_bias: None,
+            coarse_2x2: false,
         };
         let mesh3d = builder.build(
             mesh_vert,
@@ -576,6 +593,7 @@ impl Pipelines {
                 blend: true,
                 vrs: true,
                 depth_bias: None,
+                coarse_2x2: false,
             },
         );
         // Water absorption: previous-frame depth sample. Single-sample only
@@ -591,6 +609,7 @@ impl Pipelines {
             blend: true,
             vrs: true,
             depth_bias: None,
+            coarse_2x2: false,
         };
         let mesh3d_transparent_absorb = mesh3d_water_frag.map(|water_frag| {
             builder.build(
@@ -697,6 +716,7 @@ impl Pipelines {
                 blend: false,
                 vrs: false,
                 depth_bias: None,
+                coarse_2x2: false,
             },
         );
         // Translucent debug geometry (contact shadows): alpha blend, depth
@@ -715,6 +735,7 @@ impl Pipelines {
                 blend: true,
                 vrs: false,
                 depth_bias: None,
+                coarse_2x2: false,
             },
         );
         let debug_lines = builder.build(
@@ -731,6 +752,7 @@ impl Pipelines {
                 blend: false,
                 vrs: false,
                 depth_bias: None,
+                coarse_2x2: false,
             },
         );
         let tris2d = builder.build(
@@ -747,6 +769,7 @@ impl Pipelines {
                 blend: true,
                 vrs: false,
                 depth_bias: None,
+                coarse_2x2: false,
             },
         );
 
@@ -765,13 +788,15 @@ impl Pipelines {
                 blend: true,
                 vrs: false,
                 depth_bias: None,
+                coarse_2x2: false,
             },
         );
 
         // Sky: no vertex input (verts synthesised from SV_VertexID), depth
         // read-only at the far plane, opaque, no cull. Same GREATER_OR_EQUAL
         // compare as the scene, so it passes only where depth is still cleared.
-        // The eight pipelines share that state and `layout_sky`.
+        // The eight pipelines share that state and `layout_sky`. The optional
+        // ninth is the same base-tile fragment at a 2×2 pipeline rate.
         let sky_cfg = || PipelineConfig {
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
             depth: DepthMode::ReadOnly,
@@ -779,6 +804,7 @@ impl Pipelines {
             blend: false,
             vrs: true,
             depth_bias: None,
+            coarse_2x2: false,
         };
         let sky = builder.build(sky_vert, sky_frag, &[], &[], layout_sky, "sky", sky_cfg());
         let sky_base = builder.build(
@@ -844,6 +870,29 @@ impl Pipelines {
             "sky_tile_sphere",
             sky_cfg(),
         );
+        // 2×2 only where the device lists that size for this sample count.
+        // `vrs: false` so the 1×1 REPLACE state is not also chained; `coarse_2x2`
+        // pushes KEEP/KEEP instead. The attachment create flag still follows
+        // `fsr_enabled`, so the pipeline stays valid in a VRS rendering.
+        let sky_tile_base_coarse = sky_coarse.then(|| {
+            builder.build(
+                sky_tile_vert,
+                sky_base_frag,
+                &[],
+                &[],
+                layout_sky,
+                "sky_tile_base_coarse",
+                PipelineConfig {
+                    topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                    depth: DepthMode::ReadOnly,
+                    cull: vk::CullModeFlags::NONE,
+                    blend: false,
+                    vrs: false,
+                    depth_bias: None,
+                    coarse_2x2: true,
+                },
+            )
+        });
 
         // Tonemap: its own builder — writes the present format at single-sample
         // with no depth attachment; never VRS.
@@ -873,6 +922,7 @@ impl Pipelines {
                 blend: false,
                 vrs: false,
                 depth_bias: None,
+                coarse_2x2: false,
             },
         );
 
@@ -899,6 +949,7 @@ impl Pipelines {
                 blend: false,
                 vrs: false,
                 depth_bias: None,
+                coarse_2x2: false,
             },
         );
         // Overlay variants at present format / single-sample (same modules, layout,
@@ -910,6 +961,7 @@ impl Pipelines {
             blend: true,
             vrs: false,
             depth_bias: None,
+            coarse_2x2: false,
         };
         let tris2d_present = tonemap_builder.build(
             tri2d_vert,
@@ -1031,6 +1083,7 @@ impl Pipelines {
             sky_sphere,
             sky_tile,
             sky_tile_base,
+            sky_tile_base_coarse,
             sky_tile_nomap,
             sky_tile_sphere,
             layout_sky,
@@ -1140,6 +1193,9 @@ impl Pipelines {
             device.destroy_pipeline(self.sky_sphere, None);
             device.destroy_pipeline(self.sky_tile, None);
             device.destroy_pipeline(self.sky_tile_base, None);
+            if let Some(p) = self.sky_tile_base_coarse {
+                device.destroy_pipeline(p, None);
+            }
             device.destroy_pipeline(self.sky_tile_nomap, None);
             device.destroy_pipeline(self.sky_tile_sphere, None);
             device.destroy_pipeline(self.tonemap, None);
@@ -1196,6 +1252,9 @@ struct PipelineConfig {
     /// Opt this pipeline into attachment VRS (geometry passes only).
     vrs: bool,
     depth_bias: Option<(f32, f32)>,
+    /// Pipeline fragment size 2×2, both combiners KEEP. Drawn only for
+    /// body-free sky tiles. Independent of `vrs`.
+    coarse_2x2: bool,
 }
 
 impl PipelineBuilder<'_> {
@@ -1217,6 +1276,7 @@ impl PipelineBuilder<'_> {
             blend,
             vrs,
             depth_bias,
+            coarse_2x2,
         } = cfg;
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
@@ -1318,15 +1378,28 @@ impl PipelineBuilder<'_> {
             .color_attachment_formats(color_formats)
             .depth_attachment_format(self.depth_format);
 
+        // Default pipelines are 1×1 with the attachment replacing that rate, so
+        // an unbound attachment (implicit 1×1) is a no-op. The coarse sky
+        // pipeline is 2×2 and both combiners are KEEP:
+        // * primitive FSR is not enabled, so combiner 0 must be KEEP;
+        // * with no attachment feature, combiner 1 must be KEEP;
+        // * `fragmentShadingRateNonTrivialCombinerOps` may be false, so MIN is
+        //   not portable;
+        // * an unbound attachment is an implicit 1×1, and MIN or REPLACE would
+        //   collapse 2×2 back to 1×1. KEEP preserves the pipeline rate. When
+        //   the attachment is bound, KEEP ignores it, so it cannot coarsen the
+        //   sky past 2×2.
+        let (rate_w, rate_h, combiner_1) = if coarse_2x2 {
+            (2, 2, vk::FragmentShadingRateCombinerOpKHR::KEEP)
+        } else {
+            (1, 1, vk::FragmentShadingRateCombinerOpKHR::REPLACE)
+        };
         let mut fsr_state = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
             .fragment_size(vk::Extent2D {
-                width: 1,
-                height: 1,
+                width: rate_w,
+                height: rate_h,
             })
-            .combiner_ops([
-                vk::FragmentShadingRateCombinerOpKHR::KEEP,
-                vk::FragmentShadingRateCombinerOpKHR::REPLACE,
-            ]);
+            .combiner_ops([vk::FragmentShadingRateCombinerOpKHR::KEEP, combiner_1]);
 
         // Every pipeline drawn in a pass that binds a rate attachment must
         // carry this flag — even the non-VRS ones (debug/2D shade at 1×1). So
@@ -1351,7 +1424,7 @@ impl PipelineBuilder<'_> {
             .depth_stencil_state(&depth_stencil)
             .layout(layout)
             .push_next(&mut rendering_info);
-        if vrs && self.fsr_enabled {
+        if coarse_2x2 || (vrs && self.fsr_enabled) {
             pipeline_info = pipeline_info.push_next(&mut fsr_state);
         }
 

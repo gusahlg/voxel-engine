@@ -79,6 +79,12 @@ pub struct Device {
     pub memory_budget: Option<MemoryBudget>,
     pub anisotropy: Option<Anisotropy>,
     pub fragment_shading_rate: Option<FragmentShadingRate>,
+    /// `pipelineFragmentShadingRate` is enabled. Independent of the attachment
+    /// VRS lane: a device can shade the sky at a pipeline rate without one.
+    pipeline_fragment_shading_rate: bool,
+    /// Sample counts whose shading-rate table lists a 2×2 fragment size.
+    /// Empty when the pipeline feature is off.
+    sky_coarse_rates: vk::SampleCountFlags,
     pub msaa_caps: vk::SampleCountFlags,
     pub multi_draw_indirect: bool,
     pub draw_indirect_first_instance: bool,
@@ -123,6 +129,8 @@ struct Candidate {
     pipeline_executable_info: bool,
     max_anisotropy: Option<f32>,
     fragment_shading_rate: Option<FragmentShadingRate>,
+    pipeline_fragment_shading_rate: bool,
+    sky_coarse_rates: vk::SampleCountFlags,
     score: u32,
 }
 
@@ -162,7 +170,12 @@ impl Device {
         if best.memory_budget {
             device_extensions.push(ext::memory_budget::NAME.as_ptr());
         }
-        if best.fragment_shading_rate.is_some() {
+        // Attachment VRS and the sky's pipeline rate share one extension.
+        // Primitive rate stays off: its combiner would have to be KEEP, and
+        // nothing in the engine sets a primitive rate.
+        let fsr_device =
+            best.fragment_shading_rate.is_some() || best.pipeline_fragment_shading_rate;
+        if fsr_device {
             device_extensions.push(khr::fragment_shading_rate::NAME.as_ptr());
         }
         if best.pipeline_executable_info {
@@ -283,7 +296,8 @@ impl Device {
         }
 
         let mut fsr_features = vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default()
-            .attachment_fragment_shading_rate(true);
+            .attachment_fragment_shading_rate(best.fragment_shading_rate.is_some())
+            .pipeline_fragment_shading_rate(best.pipeline_fragment_shading_rate);
         let mut exec_features =
             vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
                 .pipeline_executable_info(true);
@@ -294,7 +308,7 @@ impl Device {
             .push_next(&mut vulkan_13_features)
             .push_next(&mut vulkan_12_features)
             .push_next(&mut vulkan_11_features);
-        if best.fragment_shading_rate.is_some() {
+        if fsr_device {
             device_create_info = device_create_info.push_next(&mut fsr_features);
         }
         if best.pipeline_executable_info {
@@ -373,6 +387,16 @@ impl Device {
             ),
             None => log::info!("VRS: fragment shading rate unsupported; shading at 1x1"),
         }
+        let pipeline_fragment_shading_rate = best.pipeline_fragment_shading_rate;
+        let sky_coarse_rates = best.sky_coarse_rates;
+        if pipeline_fragment_shading_rate {
+            log::info!(
+                "sky coarse: pipelineFragmentShadingRate, 2x2 samples {:?}",
+                sky_coarse_rates
+            );
+        } else {
+            log::info!("sky coarse: pipelineFragmentShadingRate unsupported");
+        }
 
         let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
         let mut subgroup_props = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
@@ -425,6 +449,8 @@ impl Device {
             memory_budget,
             anisotropy: best.max_anisotropy.map(Anisotropy),
             fragment_shading_rate,
+            pipeline_fragment_shading_rate,
+            sky_coarse_rates,
             msaa_caps,
             multi_draw_indirect: best.multi_draw_indirect,
             draw_indirect_first_instance: best.draw_indirect_first_instance,
@@ -465,6 +491,15 @@ impl Device {
             })
             .map(|i| (i, memory_props.memory_heaps[i].size))
             .max_by_key(|&(_, size)| size)
+    }
+
+    /// 2×2 pipeline shading for body-free sky tiles at this rasterization
+    /// sample count. `VOXEL_SKY_COARSE=0` turns it off. The env is read once.
+    pub(crate) fn sky_coarse_ok(&self, samples: vk::SampleCountFlags) -> bool {
+        self.pipeline_fragment_shading_rate
+            && !samples.is_empty()
+            && self.sky_coarse_rates.contains(samples)
+            && sky_coarse_enabled()
     }
 
     pub fn max_msaa(&self) -> u32 {
@@ -556,26 +591,36 @@ fn evaluate(
             exec.pipeline_executable_info == vk::TRUE
         };
 
-    // Optional: attachment-based variable-rate shading. Requires both the
-    // extension and the attachment feature; the texel size (tile a rate entry
-    // covers) comes from the properties chain. Largest tile = smallest rate
-    // image, which is what we want for coarse far-field shading.
-    let fragment_shading_rate = has_extension(khr::fragment_shading_rate::NAME)
-        .then(|| {
-            let mut fsr_features = vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default();
-            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut fsr_features);
-            unsafe { instance.get_physical_device_features2(physical, &mut f2) };
-            (fsr_features.attachment_fragment_shading_rate == vk::TRUE).then(|| {
+    // Optional fragment shading rate. The attachment feature feeds the VRS
+    // lane. The pipeline feature feeds 2×2 sky tiles. Either one enables the
+    // extension; each feature bit is set only when the device advertises it.
+    // One rate-table query covers both the 4×4 attachment sizes and the 2×2
+    // pipeline sizes, including the sample counts each size supports.
+    let mut fragment_shading_rate = None;
+    let mut pipeline_fragment_shading_rate = false;
+    let mut sky_coarse_rates = vk::SampleCountFlags::empty();
+    if has_extension(khr::fragment_shading_rate::NAME) {
+        let mut fsr_features = vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default();
+        let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut fsr_features);
+        unsafe { instance.get_physical_device_features2(physical, &mut f2) };
+        let attachment = fsr_features.attachment_fragment_shading_rate == vk::TRUE;
+        pipeline_fragment_shading_rate = fsr_features.pipeline_fragment_shading_rate == vk::TRUE;
+        if attachment || pipeline_fragment_shading_rate {
+            let rates = advertised_shading_rates(entry, instance, physical);
+            if attachment {
                 let mut fsr_props = vk::PhysicalDeviceFragmentShadingRatePropertiesKHR::default();
                 let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut fsr_props);
                 unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
-                FragmentShadingRate {
+                fragment_shading_rate = Some(FragmentShadingRate {
                     texel_size: fsr_props.max_fragment_shading_rate_attachment_texel_size,
-                    four_x_four: advertised_4x4(entry, instance, physical),
-                }
-            })
-        })
-        .flatten();
+                    four_x_four: rates.four_x_four,
+                });
+            }
+            if pipeline_fragment_shading_rate {
+                sky_coarse_rates = rates.two_x_two;
+            }
+        }
+    }
 
     let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
     let mut graphics_family = None;
@@ -649,33 +694,60 @@ fn evaluate(
         pipeline_executable_info,
         max_anisotropy,
         fragment_shading_rate,
+        pipeline_fragment_shading_rate,
+        sky_coarse_rates,
         score,
     })
 }
 
-/// Sample counts for which the device lists a 4×4 fragment shading rate.
-fn advertised_4x4(
+struct AdvertisedRates {
+    four_x_four: vk::SampleCountFlags,
+    two_x_two: vk::SampleCountFlags,
+}
+
+/// Sample counts for which the device lists a 4×4 rate and a 2×2 rate.
+/// One enumeration: the list is not walked twice.
+fn advertised_shading_rates(
     entry: &ash::Entry,
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
-) -> vk::SampleCountFlags {
+) -> AdvertisedRates {
+    let empty = AdvertisedRates {
+        four_x_four: vk::SampleCountFlags::empty(),
+        two_x_two: vk::SampleCountFlags::empty(),
+    };
     let loader = khr::fragment_shading_rate::Instance::new(entry, instance);
     let get = loader.fp().get_physical_device_fragment_shading_rates_khr;
     unsafe {
         let mut count = 0u32;
         if get(physical, &mut count, std::ptr::null_mut()) != vk::Result::SUCCESS || count == 0 {
-            return vk::SampleCountFlags::empty();
+            return empty;
         }
         let mut rates = vec![vk::PhysicalDeviceFragmentShadingRateKHR::default(); count as usize];
         if get(physical, &mut count, rates.as_mut_ptr()) != vk::Result::SUCCESS {
-            return vk::SampleCountFlags::empty();
+            return empty;
         }
         rates.truncate(count as usize);
-        rates
-            .iter()
-            .filter(|r| r.fragment_size.width == 4 && r.fragment_size.height == 4)
-            .fold(vk::SampleCountFlags::empty(), |acc, r| {
-                acc | r.sample_counts
-            })
+        let mut four_x_four = vk::SampleCountFlags::empty();
+        let mut two_x_two = vk::SampleCountFlags::empty();
+        for rate in &rates {
+            let size = rate.fragment_size;
+            if size.width == 4 && size.height == 4 {
+                four_x_four |= rate.sample_counts;
+            } else if size.width == 2 && size.height == 2 {
+                two_x_two |= rate.sample_counts;
+            }
+        }
+        AdvertisedRates {
+            four_x_four,
+            two_x_two,
+        }
     }
+}
+
+/// `VOXEL_SKY_COARSE=0` disables 2×2 sky tiles. Any other value, including
+/// unset, leaves them on when the device can do it. Read once.
+fn sky_coarse_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !std::env::var("VOXEL_SKY_COARSE").is_ok_and(|v| v == "0"))
 }
