@@ -142,7 +142,8 @@ pub(crate) enum RenderCmd {
     },
     /// Install a datum and (when `albedo_size > 0`) allocate its cube.
     /// No reply: the caller must not wait. An allocation failure is logged
-    /// on the render thread and that map stays on flat per-face colours.
+    /// on the render thread. With no complete cube the map stays on flat
+    /// per-face colours; with one, that cube stays on screen.
     SetFarMap {
         id: crate::FarMapId,
         g: u32,
@@ -498,8 +499,10 @@ impl RenderClient {
 
     /// Validate `desc`, enqueue the datum and cube allocation, and return.
     /// Does not wait for the render thread. [`crate::FarMapError::OutOfMemory`]
-    /// is not returned; the render thread logs that failure and keeps the map
-    /// on flat per-face colours.
+    /// is not returned. The render thread logs an allocation failure. With no
+    /// complete cube it keeps flat per-face colours; with one, it keeps
+    /// drawing that cube. Either way the new face bytes are dropped until the
+    /// next call.
     pub(crate) fn set_far_map(
         &mut self,
         id: crate::FarMapId,

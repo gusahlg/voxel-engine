@@ -672,19 +672,35 @@ impl Engine {
     /// Install the datum (and, when `desc.albedo_size > 0`, an albedo cube)
     /// for one [`FarShape::Mapped`](crate::FarShape::Mapped) body.
     ///
+    /// The datum is applied on this call, including while a replacement cube
+    /// is still uploading. The header keeps the sampled cube's edge and
+    /// landed mask until the swap, so the albedo on screen stays consistent.
+    /// When `id` already has a cube with all six faces landed, the new cube
+    /// is pending: [`Self::set_far_map_face`] fills that cube, and the shader
+    /// keeps sampling the old one until every new face and its mips have
+    /// signaled the graphics timeline. The next frame then samples the new
+    /// cube, and the old one is freed after the frames that may still sample
+    /// it. A further call before that swap replaces the pending cube and
+    /// leaves the one on screen in place.
+    ///
+    /// A slot with no cube, or a cube that is still missing a face, is
+    /// replaced immediately, so a first install shows each face as its upload
+    /// lands. `albedo_size` 0 drops every cube on the next frame and the
+    /// shader uses the flat per-face colours.
+    ///
     /// [`FarMapError::BadId`](crate::FarMapError::BadId) and
     /// [`FarMapError::BadSize`](crate::FarMapError::BadSize) are checked on
     /// this thread. The cube allocation is enqueued and this returns `Ok`
     /// without waiting for the render thread or the GPU, so a caller on the
     /// game's main thread cannot stall here.
     /// [`FarMapError::OutOfMemory`](crate::FarMapError::OutOfMemory) is not
-    /// returned: if the render thread cannot allocate the cube it logs once
-    /// and keeps the datum on the flat per-face
-    /// [`FarBody::albedo`](crate::FarBody::albedo) colours, as if
-    /// `albedo_size` were 0. [`Self::set_far_map_face`] for that map then
-    /// returns `Ok` and the upload is ignored until the next `set_far_map`.
-    /// A replaced cube is freed after the frames that may still sample it.
-    /// Faces uploaded earlier are dropped: call [`Self::set_far_map_face`]
+    /// returned: if the render thread cannot allocate the cube it logs once.
+    /// With no complete cube on screen it keeps the datum on the flat
+    /// per-face [`FarBody::albedo`](crate::FarBody::albedo) colours, as if
+    /// `albedo_size` were 0. With a complete cube already on screen it keeps
+    /// drawing that cube. [`Self::set_far_map_face`] then returns `Ok` and
+    /// the upload is ignored until the next `set_far_map`. Faces uploaded
+    /// for the previous cube are dropped: call [`Self::set_far_map_face`]
     /// again.
     pub fn set_far_map(
         &mut self,
@@ -697,10 +713,15 @@ impl Engine {
     /// Upload one albedo face of an installed map, RGBA8 in sRGB.
     ///
     /// `face` is `0..6` in the order +X, −X, +Y, −Y, +Z, −Z. The bytes are
-    /// `albedo_size * albedo_size * 4`. Recorded into a later frame's command
-    /// buffer (mips included). This does not wait for the render thread or
-    /// the GPU. Until the upload has landed, that face draws its
-    /// [`crate::FarBody::albedo`] fallback.
+    /// `albedo_size * albedo_size * 4` for the size passed to the latest
+    /// [`Self::set_far_map`]. Recorded into a later frame's command buffer
+    /// (mips included). This does not wait for the render thread or the GPU.
+    ///
+    /// The bytes fill the pending replacement when one exists, and the cube
+    /// on screen stays as it is until all six pending faces have landed on
+    /// the graphics timeline. Otherwise the face is sampled once that upload
+    /// has been recorded; until then it draws its [`crate::FarBody::albedo`]
+    /// fallback.
     /// [`FarMapError::BadId`](crate::FarMapError::BadId) when `id` has no map.
     /// After a failed cube allocation the render thread ignores the bytes
     /// until the next [`Self::set_far_map`]; this still returns `Ok` when the
@@ -714,10 +735,10 @@ impl Engine {
         self.client.set_far_map_face(id, face, rgba8_srgb)
     }
 
-    /// Drop the datum and the albedo cube of `id`. An id outside
-    /// `0..`[`crate::MAX_FAR_MAPS`] does nothing. The cube is freed after the
-    /// frames that may still sample it. Does not wait for the render thread
-    /// or the GPU.
+    /// Drop the datum and every albedo cube of `id`, including a replacement
+    /// that has not swapped in yet. An id outside `0..`[`crate::MAX_FAR_MAPS`]
+    /// does nothing. Cubes are freed after the frames that may still sample
+    /// them. Does not wait for the render thread or the GPU.
     pub fn clear_far_map(&mut self, id: crate::FarMapId) {
         self.client.clear_far_map(id);
     }
