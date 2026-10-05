@@ -10,8 +10,10 @@
 //! write) while only the LOD partition pays for the box clip. Coarse-LOD
 //! meshes whose camera-relative AABB lies entirely inside that box are not
 //! emitted (every fragment would be discarded). Caged meshes use the corner
-//! AABB and their own groups. Shadow Near/Far stay unbucketed; capacity is
-//! full-res Opaque plus full-res caged.
+//! AABB and their own groups. Coarse-LOD groups bucket on splits scaled by
+//! `VOXEL_LOD_BUCKET_SCALE` (default 32); full-res groups keep 16/64/256.
+//! Shadow Near/Far stay unbucketed; capacity is full-res Opaque plus
+//! full-res caged.
 
 use ash::vk;
 
@@ -19,6 +21,7 @@ use super::alloc::{GpuCpuReadback, find_memory_type};
 use super::buffers::{FRAMES_IN_FLIGHT, HostBuffer, MeshRecord, RecordBuffers};
 use super::cull_math::{
     CpuCullScratch, FLAG_STATS, STATS_BYTES, STATS_COUNT, WORKGROUP, cpu_cull_into, cpu_cull_max,
+    lod_bucket_scale,
 };
 use super::pass;
 use crate::camera::Frustum;
@@ -49,13 +52,18 @@ struct CullParamsGpu {
     half_x: f32,
     half_y: f32,
     half_z: f32,
-    // std140 scalars in the 12-byte tail (292 → 304). A float3 would align
-    // to 16 and grow the block; three floats stay at 304.
+    // std140 scalars. A float3 would align to 16. lod_bucket_scale is the
+    // coarse-LOD split multiplier (full-res groups ignore it). Three pads
+    // round the block to 320 with no implicit padding for bytemuck.
     centre_x: f32,
     centre_y: f32,
     centre_z: f32,
+    lod_bucket_scale: f32,
+    _pad_b0: f32,
+    _pad_b1: f32,
+    _pad_b2: f32,
 }
-const _: () = assert!(size_of::<CullParamsGpu>() == 304);
+const _: () = assert!(size_of::<CullParamsGpu>() == 320);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, cam_planes) == 0);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, shadow_planes) == 80);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, cam_block) == 240);
@@ -70,6 +78,10 @@ const _: () = assert!(std::mem::offset_of!(CullParamsGpu, half_z) == 288);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, centre_x) == 292);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, centre_y) == 296);
 const _: () = assert!(std::mem::offset_of!(CullParamsGpu, centre_z) == 300);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, lod_bucket_scale) == 304);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, _pad_b0) == 308);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, _pad_b1) == 312);
+const _: () = assert!(std::mem::offset_of!(CullParamsGpu, _pad_b2) == 316);
 
 /// Device-local grow-only buffer for GPU scratch.
 struct DeviceBuffer {
@@ -404,6 +416,10 @@ impl CullState {
             centre_x: centre[0],
             centre_y: centre[1],
             centre_z: centre[2],
+            lod_bucket_scale: lod_bucket_scale(),
+            _pad_b0: 0.0,
+            _pad_b1: 0.0,
+            _pad_b2: 0.0,
         };
         if let Some(frusta) = shadow {
             for (c, f) in frusta.iter().enumerate() {
@@ -634,7 +650,7 @@ mod tests {
 
     #[test]
     fn cull_params_std140_tail_is_box_extents() {
-        assert_eq!(size_of::<CullParamsGpu>(), 304);
+        assert_eq!(size_of::<CullParamsGpu>(), 320);
         assert_eq!(std::mem::offset_of!(CullParamsGpu, flags), 276);
         assert_eq!(std::mem::offset_of!(CullParamsGpu, half_x), 280);
         assert_eq!(std::mem::offset_of!(CullParamsGpu, half_y), 284);
@@ -642,5 +658,9 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CullParamsGpu, centre_x), 292);
         assert_eq!(std::mem::offset_of!(CullParamsGpu, centre_y), 296);
         assert_eq!(std::mem::offset_of!(CullParamsGpu, centre_z), 300);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, lod_bucket_scale), 304);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, _pad_b0), 308);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, _pad_b1), 312);
+        assert_eq!(std::mem::offset_of!(CullParamsGpu, _pad_b2), 316);
     }
 }

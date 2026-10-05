@@ -5,7 +5,8 @@ use glam::Vec3;
 
 use super::buffers::{MESH_FLAG_FACE_RUNS, MeshRecord};
 use super::cull_math::{
-    BUCKETS, CULL_BUCKET_SPLITS, Group, LANES, PartitionGpu, SHADOW_GROUPS, partition_count,
+    BUCKETS, Group, LANES, PartitionGpu, SHADOW_GROUPS, bucket_splits, group_bucket_scale,
+    partition_count,
 };
 use super::pipeline::EyeSplit;
 use crate::mesh::Pass;
@@ -144,14 +145,12 @@ fn aabb_center_dist_range(mn: [f32; 3], mx: [f32; 3]) -> (f32, f32) {
 /// True when a centre at some distance in `[dmin, dmax]` can land in `bucket`.
 /// Bucket `b` is `[split_{b-1}, split_b)` with `split_{-1} = 0` and the last
 /// bucket unbounded on the right (`dist >= split` assigns the higher bucket).
-fn bucket_intersects(bucket: usize, dmin: f32, dmax: f32) -> bool {
+/// `splits` are that group's edges: full-res uses the 16/64/256 splits,
+/// coarse-LOD uses those edges times `lod_bucket_scale`.
+fn bucket_intersects(bucket: usize, dmin: f32, dmax: f32, splits: &[f32; 3]) -> bool {
     debug_assert!(bucket < BUCKETS);
-    let lo = if bucket == 0 {
-        0.0
-    } else {
-        CULL_BUCKET_SPLITS[bucket - 1]
-    };
-    match CULL_BUCKET_SPLITS.get(bucket) {
+    let lo = if bucket == 0 { 0.0 } else { splits[bucket - 1] };
+    match splits.get(bucket) {
         Some(&hi) => dmax >= lo && dmin < hi,
         None => dmax >= lo,
     }
@@ -690,24 +689,32 @@ impl ArenaDirectory {
         self.unions[arena] = acc;
     }
 
-    fn bucket_reachable(&self, arena: usize, bucket: usize, eye: EyeSplit) -> bool {
+    fn bucket_reachable(
+        &self,
+        arena: usize,
+        bucket: usize,
+        eye: EyeSplit,
+        splits: &[f32; 3],
+    ) -> bool {
         let u = &self.unions[arena];
         if !u.valid {
             // No tracked union: keep the bucket (never drop a reachable mesh).
             return true;
         }
         let (dmin, dmax) = u.cam_dist_range(eye);
-        bucket_intersects(bucket, dmin, dmax)
+        bucket_intersects(bucket, dmin, dmax, splits)
     }
 
     /// Fills `parts` with the group-major partition table, reusing its
     /// allocation, and returns the total command count.
     ///
-    /// Camera groups (Opaque, Cutout, OpaqueLod) emit K distance buckets per
-    /// arena, each sized to `live * runs_per_mesh` (worst case: every mesh lands
-    /// in one bucket and emits that many face-runs) unless `eye` is set and the
-    /// arena union AABB cannot reach that bucket — then capacity is 0 so the
-    /// draw loop skips the call. Shadow groups (Near, Far) stay ×1 (whole-mesh
+    /// Camera groups (Opaque, Cutout, OpaqueLod, Caged, CagedLod) emit K
+    /// distance buckets per arena, each sized to `live * runs_per_mesh`
+    /// (worst case: every mesh lands in one bucket and emits that many
+    /// face-runs) unless `eye` is set and the arena union AABB cannot reach
+    /// that bucket — then capacity is 0 so the draw loop skips the call.
+    /// Coarse-LOD groups test the scaled splits (`lod_bucket_scale`); full-res
+    /// groups keep 16/64/256. Shadow groups (Near, Far) stay ×1 (whole-mesh
     /// cmd) and reuse the full-res Opaque plus full-res caged live counts — a
     /// caster may land in both cascades. Caged cutout shares the caged lane, so
     /// that capacity is a slight over-estimate.
@@ -723,6 +730,10 @@ impl ArenaDirectory {
         let mut offset = 0u32;
         for group in Group::ALL {
             let lane = group as usize;
+            // LOD groups scale the edges; full-res keeps 16/64/256. Capacity
+            // must use the same edges the cull writes into, or a draw lands
+            // in a zero-capacity bucket and is dropped.
+            let splits = bucket_splits(group_bucket_scale(group as u32));
             for arena in 0..a {
                 let full = self.live[arena][lane] * runs_per_mesh;
                 for bucket in 0..BUCKETS {
@@ -735,7 +746,7 @@ impl ArenaDirectory {
                             if self.unions[arena].dirty {
                                 self.recompute_union(arena);
                             }
-                            if self.bucket_reachable(arena, bucket, e) {
+                            if self.bucket_reachable(arena, bucket, e, &splits) {
                                 full
                             } else {
                                 0
@@ -792,7 +803,7 @@ mod tests {
     use ash::vk::Handle;
 
     use super::super::cull_math::{
-        CAMERA_GROUPS, GROUPS, camera_part, group_indirect_calls, shadow_part,
+        CAMERA_GROUPS, CULL_BUCKET_SPLITS, GROUPS, camera_part, group_indirect_calls, shadow_part,
     };
     use super::*;
 
@@ -1258,21 +1269,92 @@ mod tests {
         let s1 = crate::genconst::CULL_BUCKET_SPLIT_1;
         let s2 = crate::genconst::CULL_BUCKET_SPLIT_2;
         // A point in bucket 0 cannot reach 1..=3.
-        assert!(bucket_intersects(0, 0.0, s0 - 0.01));
-        assert!(!bucket_intersects(1, 0.0, s0 - 0.01));
+        let full = &CULL_BUCKET_SPLITS;
+        assert!(bucket_intersects(0, 0.0, s0 - 0.01, full));
+        assert!(!bucket_intersects(1, 0.0, s0 - 0.01, full));
         // Exactly on a split lands in the higher bucket (shader: dist >= split).
-        assert!(!bucket_intersects(0, s0, s0));
-        assert!(bucket_intersects(1, s0, s0));
-        assert!(!bucket_intersects(2, s0, s0));
+        assert!(!bucket_intersects(0, s0, s0, full));
+        assert!(bucket_intersects(1, s0, s0, full));
+        assert!(!bucket_intersects(2, s0, s0, full));
         // A range that straddles a split keeps both sides.
-        assert!(bucket_intersects(0, s0 - 1.0, s0));
-        assert!(bucket_intersects(1, s0 - 1.0, s0));
-        assert!(bucket_intersects(2, s1, s2));
-        assert!(bucket_intersects(3, s1, s2));
-        assert!(!bucket_intersects(1, s1, s2));
+        assert!(bucket_intersects(0, s0 - 1.0, s0, full));
+        assert!(bucket_intersects(1, s0 - 1.0, s0, full));
+        assert!(bucket_intersects(2, s1, s2, full));
+        assert!(bucket_intersects(3, s1, s2, full));
+        assert!(!bucket_intersects(1, s1, s2, full));
         // Unbounded last bucket.
-        assert!(bucket_intersects(3, s2, 1.0e6));
-        assert!(!bucket_intersects(2, s2, 1.0e6));
+        assert!(bucket_intersects(3, s2, 1.0e6, full));
+        assert!(!bucket_intersects(2, s2, 1.0e6, full));
+        // Default LOD scale 32: 512 / 2048 / 8192. A centre past 256 but
+        // inside 512 stays in bucket 0; the full-res edges put it in bucket 3.
+        let lod = bucket_splits(32.0);
+        assert_eq!(lod, [512.0, 2048.0, 8192.0]);
+        assert!(bucket_intersects(0, 300.0, 300.0, &lod));
+        assert!(!bucket_intersects(3, 300.0, 300.0, &lod));
+        assert!(bucket_intersects(3, 300.0, 300.0, full));
+        assert!(bucket_intersects(1, 1000.0, 1000.0, &lod));
+        assert!(!bucket_intersects(0, 1000.0, 1000.0, &lod));
+        assert!(bucket_intersects(2, 3000.0, 3000.0, &lod));
+        assert!(bucket_intersects(3, 9000.0, 9000.0, &lod));
+        assert!(!bucket_intersects(2, 9000.0, 9000.0, &lod));
+        // Scale 1 is the full-res predicate.
+        let same = bucket_splits(1.0);
+        assert!(bucket_intersects(3, 300.0, 300.0, &same));
+        assert!(!bucket_intersects(0, 300.0, 300.0, &same));
+    }
+
+    fn point_caps(dist: f32, splits: &[f32; 3]) -> [u32; BUCKETS] {
+        std::array::from_fn(|b| u32::from(bucket_intersects(b, dist, dist, splits)))
+    }
+
+    fn group_caps(parts: &[PartitionGpu], group: Group, arena: usize, n: usize) -> [u32; BUCKETS] {
+        std::array::from_fn(|b| parts[camera_part(group as usize, arena, b, n)].capacity)
+    }
+
+    #[test]
+    fn lod_partitions_follow_scaled_splits_full_res_does_not() {
+        let scale = super::super::cull_math::lod_bucket_scale();
+        let lod_splits = bucket_splits(scale);
+        // Point boxes so the union distance is the block Z.
+        let at = |z: i32| MeshAabb {
+            block: [0, 0, z],
+            min: [0.0; 3],
+            max: [0.0; 3],
+        };
+        // 300 is past 256. 3000 is inside the default LOD bucket 2 (2048..8192).
+        // 10000 is past 8192, so both scales keep only the last bucket.
+        let places = [300, 3000, 10_000];
+        let mut dir = ArenaDirectory::new();
+        for (arena, &z) in places.iter().enumerate() {
+            let aabb = at(z);
+            let buf_id = buf(arena as u64 + 1);
+            dir.note_upload(arena as u32 * 3, G1, buf_id, Pass::Opaque, FULL, aabb);
+            dir.note_upload(arena as u32 * 3 + 1, G1, buf_id, Pass::Opaque, LOD, aabb);
+            dir.note_upload_caged(arena as u32 * 3 + 2, G1, buf_id, Pass::Opaque, LOD, aabb);
+        }
+        let (parts, _) = partitions_at(&mut dir, origin_eye());
+        let n = places.len();
+        assert_eq!(dir.arena_count(), n);
+        for (arena, &z) in places.iter().enumerate() {
+            let dist = z as f32;
+            assert_eq!(
+                group_caps(&parts, Group::Opaque, arena, n),
+                point_caps(dist, &CULL_BUCKET_SPLITS),
+                "full-res z={z}"
+            );
+            assert_eq!(
+                group_caps(&parts, Group::OpaqueLod, arena, n),
+                point_caps(dist, &lod_splits),
+                "opaque lod z={z}"
+            );
+            assert_eq!(
+                group_caps(&parts, Group::CagedLod, arena, n),
+                point_caps(dist, &lod_splits),
+                "caged lod z={z}"
+            );
+            assert_eq!(group_caps(&parts, Group::Cutout, arena, n), [0; BUCKETS]);
+            assert_eq!(group_caps(&parts, Group::Caged, arena, n), [0; BUCKETS]);
+        }
     }
 
     #[test]

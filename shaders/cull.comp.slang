@@ -55,11 +55,18 @@ struct CullParams
     float half_x; // full-res box half-extents; a non-positive component covers nothing
     float half_y;
     float half_z;
-    // Centre fills the std140 tail (bytes 292..304). Three scalars, not a
-    // float3: a float3 would align to 16 and grow the block past 304.
+    // Centre is three scalars, not a float3: a float3 would align to 16.
+    // lod_bucket_scale multiplies the distance splits for coarse-LOD groups
+    // only (1 restores the full-res edges). The three pads keep this block
+    // 320 bytes, matching vk::cull::CullParamsGpu; a float3 pad would align
+    // to 16 and grow it.
     float centre_x;
     float centre_y;
     float centre_z;
+    float lod_bucket_scale;
+    float pad_b0;
+    float pad_b1;
+    float pad_b2;
 };
 
 [[vk::binding(0, 0)]]
@@ -108,15 +115,17 @@ bool outside_plane(float4 plane, float3 mn, float3 mx)
     return dot(plane.xyz, corner) + plane.w < 0.0;
 }
 
-// Near-to-far bucket of camera distance of the AABB centre. Splits are genconst.
-uint distance_bucket(float dist)
+// Near-to-far bucket of camera distance of the AABB centre. Full-res groups
+// pass scale 1 (splits 16/64/256). Coarse-LOD groups pass lod_bucket_scale
+// (default 32: 512/2048/8192) so draws past 256 blocks still sort near-to-far.
+uint distance_bucket(float dist, float scale)
 {
     uint b = 0;
-    if (dist >= CULL_BUCKET_SPLIT_0)
+    if (dist >= CULL_BUCKET_SPLIT_0 * scale)
         b = 1;
-    if (dist >= CULL_BUCKET_SPLIT_1)
+    if (dist >= CULL_BUCKET_SPLIT_1 * scale)
         b = 2;
-    if (dist >= CULL_BUCKET_SPLIT_2)
+    if (dist >= CULL_BUCKET_SPLIT_2 * scale)
         b = 3;
     return min(b, CULL_DISTANCE_BUCKETS - 1u);
 }
@@ -233,7 +242,8 @@ void computeMain(uint3 id: SV_DispatchThreadID)
             if (!lod_group || !lod_aabb_inside_box(mn, mx, lod_centre, params.half_x, params.half_y, params.half_z))
             {
                 float dist = length(0.5 * (mn + mx));
-                uint bucket = distance_bucket(dist);
+                float bucket_scale = lod_group ? params.lod_bucket_scale : 1.0;
+                uint bucket = distance_bucket(dist, bucket_scale);
                 uint part = (group * params.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
                 if ((params.flags & 1u) == 0u || (rec.flags & 1u) == 0u)
                 {

@@ -27,11 +27,23 @@ pub(crate) const SHADOW_GROUPS: usize = 2;
 pub(crate) const GROUPS: usize = CAMERA_GROUPS + SHADOW_GROUPS;
 /// Front-to-back buckets on camera groups only (shadows stay unbucketed).
 pub(crate) const BUCKETS: usize = crate::genconst::CULL_DISTANCE_BUCKETS as usize;
-/// Inclusive lower edges of buckets 1..=3 (`cull.comp.slang` `distance_bucket`).
+/// Inclusive lower edges of buckets 1..=3 for full-res groups
+/// (`cull.comp.slang` `distance_bucket` with scale 1). Coarse-LOD groups
+/// multiply these by [`lod_bucket_scale`].
 pub(crate) const CULL_BUCKET_SPLITS: [f32; 3] = [
     crate::genconst::CULL_BUCKET_SPLIT_0,
     crate::genconst::CULL_BUCKET_SPLIT_1,
     crate::genconst::CULL_BUCKET_SPLIT_2,
+];
+/// Default coarse-LOD split multiplier. Edges become 512 / 2048 / 8192.
+/// `VOXEL_LOD_BUCKET_SCALE=1` restores the full-res edges.
+pub(crate) const DEFAULT_LOD_BUCKET_SCALE: f32 = 32.0;
+/// Squared full-res edges. The splits are powers of two, so `d² >= split²`
+/// matches `length >= split` exactly and the hot path skips the sqrt.
+const FULL_BUCKET_EDGE_SQ: [f32; 3] = [
+    crate::genconst::CULL_BUCKET_SPLIT_0 * crate::genconst::CULL_BUCKET_SPLIT_0,
+    crate::genconst::CULL_BUCKET_SPLIT_1 * crate::genconst::CULL_BUCKET_SPLIT_1,
+    crate::genconst::CULL_BUCKET_SPLIT_2 * crate::genconst::CULL_BUCKET_SPLIT_2,
 ];
 /// Max contiguous face-runs the GPU cull emits per camera mesh. Per axis the
 /// camera is in {+, −, both}; upload order +X,+Y,+Z,−X,−Y,−Z keeps same-sign
@@ -97,21 +109,64 @@ fn lod_aabb_inside_box(mn: [f32; 3], mx: [f32; 3], centre: [f32; 3], half: [f32;
     far(0) < half[0] && far(1) < half[1] && far(2) < half[2]
 }
 
-/// Camera-distance bucket of an AABB centre, matching `cull.comp.slang`.
-/// Splits are 16/64/256 (powers of two), so comparing `dist²` against `split²`
-/// is exact and skips the `sqrt`.
+/// `VOXEL_LOD_BUCKET_SCALE` when it parses as a finite positive float,
+/// otherwise [`DEFAULT_LOD_BUCKET_SCALE`]. Read once.
+pub(crate) fn lod_bucket_scale() -> f32 {
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        parse_lod_bucket_scale(std::env::var("VOXEL_LOD_BUCKET_SCALE").ok().as_deref())
+    })
+}
+
+fn parse_lod_bucket_scale(raw: Option<&str>) -> f32 {
+    raw.and_then(|s| s.parse().ok())
+        .filter(|s: &f32| s.is_finite() && *s > 0.0)
+        .unwrap_or(DEFAULT_LOD_BUCKET_SCALE)
+}
+
+/// Linear bucket edges for `scale`. Scale 1 is the full-res splits.
+pub(crate) fn bucket_splits(scale: f32) -> [f32; 3] {
+    CULL_BUCKET_SPLITS.map(|s| s * scale)
+}
+
+/// Split multiplier for one camera group. Coarse-LOD groups use
+/// [`lod_bucket_scale`]; every other group uses 1.
+pub(crate) fn group_bucket_scale(group: u32) -> f32 {
+    if is_lod_group(group) {
+        lod_bucket_scale()
+    } else {
+        1.0
+    }
+}
+
+/// Squared edges for `scale`. Scale 1 returns [`FULL_BUCKET_EDGE_SQ`] so the
+/// full-res compare stays the const power-of-two test. Other power-of-two
+/// products (the default 32) stay exact the same way; a non-dyadic scale
+/// still compares `d²` against `(split * scale)²`, matching the shader's
+/// `length >= split * scale` wherever that product is exact.
+fn bucket_edge_sq(scale: f32) -> [f32; 3] {
+    if scale == 1.0 {
+        return FULL_BUCKET_EDGE_SQ;
+    }
+    bucket_splits(scale).map(|e| e * e)
+}
+
+/// Camera-distance bucket of an AABB centre, matching `cull.comp.slang`
+/// `distance_bucket(length, scale)`.
 #[cfg(test)]
 #[inline(always)]
 fn distance_bucket(dist: f32) -> u32 {
-    distance_bucket_sq(dist * dist)
+    distance_bucket_scaled(dist, 1.0)
+}
+
+#[cfg(test)]
+fn distance_bucket_scaled(dist: f32, scale: f32) -> u32 {
+    distance_bucket_sq(dist * dist, bucket_edge_sq(scale))
 }
 
 #[inline(always)]
-fn distance_bucket_sq(d2: f32) -> u32 {
-    const S0: f32 = crate::genconst::CULL_BUCKET_SPLIT_0;
-    const S1: f32 = crate::genconst::CULL_BUCKET_SPLIT_1;
-    const S2: f32 = crate::genconst::CULL_BUCKET_SPLIT_2;
-    u32::from(d2 >= S0 * S0) + u32::from(d2 >= S1 * S1) + u32::from(d2 >= S2 * S2)
+fn distance_bucket_sq(d2: f32, edge_sq: [f32; 3]) -> u32 {
+    u32::from(d2 >= edge_sq[0]) + u32::from(d2 >= edge_sq[1]) + u32::from(d2 >= edge_sq[2])
 }
 
 pub(crate) fn cpu_cull_max() -> u32 {
@@ -534,6 +589,7 @@ fn cpu_cull_legacy(
         ]
     });
     let arena_count = dir.arena_count() as u32;
+    let lod_sq = bucket_edge_sq(lod_bucket_scale());
 
     for slot in 0..slot_count {
         if !is_arrived(slot) {
@@ -570,8 +626,13 @@ fn cpu_cull_legacy(
                 let cx = 0.5 * (mn[0] + mx[0]);
                 let cy = 0.5 * (mn[1] + mx[1]);
                 let cz = 0.5 * (mn[2] + mx[2]);
-                let dist = (cx * cx + cy * cy + cz * cz).sqrt();
-                let bucket = distance_bucket(dist);
+                // Group 2 is the only LOD group this pre-cage path emits.
+                let edges = if group == 2 {
+                    lod_sq
+                } else {
+                    FULL_BUCKET_EDGE_SQ
+                };
+                let bucket = distance_bucket_sq(cx * cx + cy * cy + cz * cz, edges);
                 let part = ((group * arena_count + arena) * crate::genconst::CULL_DISTANCE_BUCKETS
                     + bucket) as usize;
                 if !face_cull || (rec.flags & MESH_FLAG_FACE_RUNS) == 0 {
@@ -644,6 +705,7 @@ fn cull_fast_solid(
     let vertex_offsets = dir.cull_vertex_offsets();
     let arena_count = dir.arena_count() as u32;
     let buckets = crate::genconst::CULL_DISTANCE_BUCKETS;
+    let lod_sq = bucket_edge_sq(lod_bucket_scale());
 
     for slot in 0..slot_count {
         let w = (slot >> 5) as usize;
@@ -673,7 +735,12 @@ fn cull_fast_solid(
         let cx = 0.5 * (mn[0] + mx[0]);
         let cy = 0.5 * (mn[1] + mx[1]);
         let cz = 0.5 * (mn[2] + mx[2]);
-        let bucket = distance_bucket_sq(cx * cx + cy * cy + cz * cz);
+        let edges = if is_lod_group(group) {
+            lod_sq
+        } else {
+            FULL_BUCKET_EDGE_SQ
+        };
+        let bucket = distance_bucket_sq(cx * cx + cy * cy + cz * cz, edges);
         let arena = super::arena::cull_bits_arena(bits) - 1;
         let part = ((group * arena_count + arena) * buckets + bucket) as usize;
         let cmd = DrawIndexedIndirect {
@@ -718,6 +785,7 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
     let arena_count = dir.arena_count() as u32;
     let buckets = crate::genconst::CULL_DISTANCE_BUCKETS;
     let shadow_base = CAMERA_GROUPS as u32 * arena_count * buckets;
+    let lod_sq = bucket_edge_sq(lod_bucket_scale());
 
     for slot in 0..slot_count {
         let w = (slot >> 5) as usize;
@@ -750,7 +818,12 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
                 let cx = 0.5 * (mn[0] + mx[0]);
                 let cy = 0.5 * (mn[1] + mx[1]);
                 let cz = 0.5 * (mn[2] + mx[2]);
-                let bucket = distance_bucket_sq(cx * cx + cy * cy + cz * cz);
+                let edges = if is_lod_group(group) {
+                    lod_sq
+                } else {
+                    FULL_BUCKET_EDGE_SQ
+                };
+                let bucket = distance_bucket_sq(cx * cx + cy * cy + cz * cz, edges);
                 part = ((group * arena_count + arena) * buckets + bucket) as usize;
                 cam_ok = true;
             }
@@ -1034,6 +1107,65 @@ mod tests {
         assert_eq!(distance_bucket(1.0e6), 3);
     }
 
+    #[test]
+    fn lod_bucket_scale_one_matches_full_res_and_default_is_thirty_two() {
+        assert_eq!(parse_lod_bucket_scale(None), DEFAULT_LOD_BUCKET_SCALE);
+        assert_eq!(parse_lod_bucket_scale(Some("32")), 32.0);
+        assert_eq!(parse_lod_bucket_scale(Some("1")), 1.0);
+        assert_eq!(parse_lod_bucket_scale(Some("1.5")), 1.5);
+        assert_eq!(parse_lod_bucket_scale(Some("0")), DEFAULT_LOD_BUCKET_SCALE);
+        assert_eq!(parse_lod_bucket_scale(Some("-2")), DEFAULT_LOD_BUCKET_SCALE);
+        assert_eq!(
+            parse_lod_bucket_scale(Some("nan")),
+            DEFAULT_LOD_BUCKET_SCALE
+        );
+        assert_eq!(
+            parse_lod_bucket_scale(Some("nope")),
+            DEFAULT_LOD_BUCKET_SCALE
+        );
+        assert_eq!(parse_lod_bucket_scale(Some("")), DEFAULT_LOD_BUCKET_SCALE);
+        assert_eq!(
+            lod_bucket_scale(),
+            parse_lod_bucket_scale(std::env::var("VOXEL_LOD_BUCKET_SCALE").ok().as_deref())
+        );
+        assert_eq!(group_bucket_scale(Group::Opaque as u32), 1.0);
+        assert_eq!(group_bucket_scale(Group::Cutout as u32), 1.0);
+        assert_eq!(group_bucket_scale(Group::Caged as u32), 1.0);
+        assert_eq!(
+            group_bucket_scale(Group::OpaqueLod as u32),
+            lod_bucket_scale()
+        );
+        assert_eq!(
+            group_bucket_scale(Group::CagedLod as u32),
+            lod_bucket_scale()
+        );
+
+        let dists = [
+            0.0, 15.99, 16.0, 63.99, 64.0, 255.99, 256.0, 511.99, 512.0, 2047.99, 2048.0, 8191.99,
+            8192.0, 1.0e6,
+        ];
+        for dist in dists {
+            assert_eq!(
+                distance_bucket_scaled(dist, 1.0),
+                distance_bucket(dist),
+                "scale 1 dist={dist}"
+            );
+        }
+        assert_eq!(bucket_splits(32.0), [512.0, 2048.0, 8192.0]);
+        assert_eq!(bucket_edge_sq(1.0), FULL_BUCKET_EDGE_SQ);
+        assert_eq!(
+            bucket_edge_sq(32.0),
+            [512.0 * 512.0, 2048.0 * 2048.0, 8192.0 * 8192.0]
+        );
+        assert_eq!(distance_bucket_scaled(511.99, 32.0), 0);
+        assert_eq!(distance_bucket_scaled(512.0, 32.0), 1);
+        assert_eq!(distance_bucket_scaled(2047.99, 32.0), 1);
+        assert_eq!(distance_bucket_scaled(2048.0, 32.0), 2);
+        assert_eq!(distance_bucket_scaled(8191.99, 32.0), 2);
+        assert_eq!(distance_bucket_scaled(8192.0, 32.0), 3);
+        assert_eq!(distance_bucket_scaled(1.0e6, 32.0), 3);
+    }
+
     fn look_neg_z() -> Frustum {
         let cam = crate::camera::Camera3D {
             position: glam::Vec3::ZERO,
@@ -1280,15 +1412,30 @@ mod tests {
     #[test]
     fn cpu_and_independent_bucket_run_logic_agree() {
         // Independent: count how many splits a distance has crossed.
-        let bucket_naive = |dist: f32| {
+        let bucket_naive = |dist: f32, scale: f32| {
             CULL_BUCKET_SPLITS
                 .iter()
-                .filter(|&&s| dist >= s)
+                .filter(|&&s| dist >= s * scale)
                 .count()
                 .min(BUCKETS - 1) as u32
         };
-        for dist in [0.0, 15.99, 16.0, 63.99, 64.0, 255.99, 256.0, 1.0e6] {
-            assert_eq!(distance_bucket(dist), bucket_naive(dist), "dist={dist}");
+        let dists = [
+            0.0, 15.99, 16.0, 63.99, 64.0, 255.99, 256.0, 511.99, 512.0, 2047.99, 2048.0, 8191.99,
+            8192.0, 1.0e6,
+        ];
+        for dist in dists {
+            assert_eq!(
+                distance_bucket(dist),
+                bucket_naive(dist, 1.0),
+                "dist={dist}"
+            );
+            for scale in [1.0, 32.0] {
+                assert_eq!(
+                    distance_bucket_scaled(dist, scale),
+                    bucket_naive(dist, scale),
+                    "dist={dist} scale={scale}"
+                );
+            }
         }
         // Independent: walk occupied faces and group consecutive runs.
         let runs_naive = |vis: [bool; 6], bounds: [u32; 7]| {
@@ -1352,6 +1499,108 @@ mod tests {
         let (_, _, counts, stats) = run_cpu(&mut dir, &[rec], &[1], &camera, false, [100.0; 3]);
         assert!(counts.iter().all(|&c| c == 0));
         assert_eq!(stats, [0; STATS_COUNT]);
+    }
+
+    /// Centre on the view axis at `dist` blocks in front of `look_neg_z`.
+    fn front_box(dist: f32) -> ([f32; 3], [f32; 3]) {
+        let z = -dist;
+        ([-0.5, -0.5, z - 0.5], [0.5, 0.5, z + 0.5])
+    }
+
+    fn assert_only_bucket(
+        parts: &[PartitionGpu],
+        cmds: &[DrawIndexedIndirect],
+        counts: &[u32],
+        group: Group,
+        arena: usize,
+        arenas: usize,
+        bucket: u32,
+    ) {
+        for b in 0..BUCKETS {
+            let got = part_cmds(
+                parts,
+                cmds,
+                counts,
+                camera_part(group as usize, arena, b, arenas),
+            );
+            if b == bucket as usize {
+                assert_eq!(got.len(), 1, "{group:?} arena {arena} bucket {b}");
+            } else {
+                assert!(
+                    got.is_empty(),
+                    "{group:?} arena {arena} bucket {b} held {}",
+                    got.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_cull_buckets_lod_groups_with_the_scaled_splits() {
+        let camera = look_neg_z();
+        let scale = lod_bucket_scale();
+        // 300 is past the full-res last edge (256). At the default scale 32 it
+        // is still inside the first LOD edge (512). 3000 sits in LOD bucket 2
+        // (2048..8192) and still in the full-res last bucket.
+        let dists = [300.0, 3000.0];
+        let mut records = Vec::new();
+        let mut dir = ArenaDirectory::new();
+        for (arena, &dist) in dists.iter().enumerate() {
+            let (mn, mx) = front_box(dist);
+            let aabb = MeshAabb {
+                block: [0; 3],
+                min: mn,
+                max: mx,
+            };
+            let full = opaque_rec(mn, mx);
+            let mut lod = opaque_rec(mn, mx);
+            lod.detail_pass = u32::from(crate::mesh::Detail(1).to_gpu_bits());
+            let mut caged = lod;
+            caged.cage = 1;
+            let base = records.len() as u32;
+            dir.note_upload(base, G1, buf(arena as u64 + 1), Pass::Opaque, FULL, aabb);
+            dir.note_upload(base + 1, G1, buf(arena as u64 + 1), Pass::Opaque, LOD, aabb);
+            dir.note_upload_caged(base + 2, G1, buf(arena as u64 + 1), Pass::Opaque, LOD, aabb);
+            records.extend([full, lod, caged]);
+        }
+        let (parts, cmds, counts, stats) =
+            run_cpu(&mut dir, &records, &[0b0011_1111], &camera, false, [0.0; 3]);
+        let arenas = dists.len();
+        assert_eq!(dir.arena_count(), arenas);
+        for (arena, &dist) in dists.iter().enumerate() {
+            let full_b = distance_bucket(dist);
+            let lod_b = distance_bucket_scaled(dist, scale);
+            assert_only_bucket(&parts, &cmds, &counts, Group::Opaque, arena, arenas, full_b);
+            assert_only_bucket(
+                &parts,
+                &cmds,
+                &counts,
+                Group::OpaqueLod,
+                arena,
+                arenas,
+                lod_b,
+            );
+            assert_only_bucket(
+                &parts,
+                &cmds,
+                &counts,
+                Group::CagedLod,
+                arena,
+                arenas,
+                lod_b,
+            );
+            if scale > 1.0 {
+                assert!(
+                    lod_b < full_b,
+                    "dist {dist}: LOD bucket {lod_b} should precede full-res {full_b}"
+                );
+            } else {
+                assert_eq!(lod_b, full_b, "scale 1 keeps one set of edges");
+            }
+        }
+        assert_eq!(stats[Group::Opaque as usize * 2], 2);
+        assert_eq!(stats[Group::OpaqueLod as usize * 2], 2);
+        assert_eq!(stats[Group::CagedLod as usize * 2], 2);
     }
 
     #[test]
