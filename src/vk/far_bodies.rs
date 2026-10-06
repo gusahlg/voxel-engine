@@ -2501,6 +2501,7 @@ fn build_horizon_bins(
 }
 
 /// `true` when `ray` is strictly above `bins`. `ray` need not be unit.
+#[cfg(test)]
 fn ray_above_horizon(
     bins: &[f32; HORIZON_BINS],
     up: glam::Vec3,
