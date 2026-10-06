@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 voxel-engine contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs, path::Path, process::Command};
 
 use crate::toolchain::spirv_val_available;
@@ -14,6 +15,9 @@ pub const SPIRV_1_6: u32 = 0x0001_0600;
 
 const OP_CAPABILITY: u32 = 17;
 const CAPABILITY_DEMOTE_TO_HELPER_INVOCATION: u32 = 5379;
+
+/// Distinguishes concurrent `validate_spirv` calls that share a module hash.
+static SPIRV_VAL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Header and capability facts extracted from a SPIR-V binary.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,7 +86,15 @@ pub fn validate_spirv_with_env(bytes: &[u8], target_env: &str) -> Result<(), Str
     }
     let dir = std::env::temp_dir().join("voxel_slang_build_spirv_val");
     fs::create_dir_all(&dir).map_err(|e| format!("create {dir:?}: {e}"))?;
-    let path = dir.join(format!("mod-{:x}.spv", fnv1a_quick(bytes)));
+    // The tracked fallback and the OUT_DIR copy are the same bytes, and the
+    // two shader tests validate both at once. A shared hash path gets
+    // truncated or unlinked under spirv-val.
+    let n = SPIRV_VAL_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!(
+        "mod-{:x}-{}-{n}.spv",
+        fnv1a_quick(bytes),
+        std::process::id()
+    ));
     fs::write(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
     let result = run_spirv_val(&path, target_env);
     let _ = fs::remove_file(&path);
