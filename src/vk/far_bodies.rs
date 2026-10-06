@@ -203,8 +203,8 @@ const _: () = assert!(
 /// * **Mapped.** No facing gate. The datum bulges out to the hi radius
 ///   `hi = (radius + map_max[map]) / distance` (`map_max[i]` is map `i`'s
 ///   maximum datum offset, or 0 when that map is unset). The air limb reaches
-///   `hi + air/distance`: the shader sits on the local surface, which is at
-///   most the hi sphere, and the shader's extra 3 px does not cover a thick
+///   `hi + air/distance`: the air a ray can cross never extends past the hi
+///   sphere plus air, and the shader's extra 3 px does not cover a thick
 ///   shell. A ray aimed away from the centre can still meet the body once
 ///   that sphere contains the camera. Sentinel when the widened bound is
 ///   `>= 0.99`; otherwise the sine is `hi + air/distance` (a negative radius
@@ -2320,11 +2320,12 @@ impl HorizonAccum<'_> {
 /// `up` is the unit centre→eye direction. A cell's radius is the max of its
 /// four corner offsets (exact for bilinear) plus `radius` plus the shell
 /// `max(air, px * distance)`. `px` is an upper bound on the shader's pixel
-/// angle, because the limb shell is `max(air/distance, px)`. Directions of
-/// the cell lie in a cap of the half-diagonal angle around the chart-midpoint
-/// direction. The cap's highest elevation at that radius is written into
-/// every azimuth bin the cap overlaps; a cap that contains the up axis
-/// covers every bin. An unwritten bin becomes 1 so it cannot reject.
+/// angle. The drawn limb is the air the ray crosses and is not widened by
+/// `px`; the table's extra pixel keeps that limb inside the bins. Directions
+/// of the cell lie in a cap of the half-diagonal angle around the
+/// chart-midpoint direction. The cap's highest elevation at that radius is
+/// written into every azimuth bin the cap overlaps; a cap that contains the
+/// up axis covers every bin. An unwritten bin becomes 1 so it cannot reject.
 ///
 /// A datum cell at g = 33 is ~1.5e6 blocks wide. The cell under the eye can
 /// hold a corner above the camera while the ground underfoot is far below, and
@@ -5934,6 +5935,45 @@ mod tests {
             }
             assert!(hits > 0, "alt {altitude} never hit the datum or the limb");
         }
+    }
+
+    /// At 50 km above a home-datum lowland, the limb top along every azimuth
+    /// stays at or under the horizon table. The table still widens by a pixel;
+    /// the limb is the air the ray crosses.
+    #[test]
+    fn lowland_limb_does_not_rise_through_the_horizon_table() {
+        let g = 33u32;
+        let datum = crate::far_body::tests::home_datum(g);
+        let (up, foot) = crate::far_body::tests::lowland_foot(g, &datum);
+        let radius = 31_017_520.0f32;
+        let air = 20_000.0f32;
+        let altitude = 50_000.0f32;
+        let distance = radius + foot + altitude;
+        let px = std::f32::consts::FRAC_PI_2 / 3440.0;
+        let bins = build_horizon_bins(g, &datum, Quat::IDENTITY, up, radius, distance, air, px);
+        let rho = radius / distance;
+        let max_off = datum.iter().copied().fold(f32::MIN, f32::max);
+        let dir = -up;
+        let (east, north) = horizon_axes(up).expect("axes");
+        let mut limbs = 0u32;
+        for k in 0..96 {
+            let azimuth = k as f32 * std::f32::consts::TAU / 96.0;
+            let Some(top) = crate::far_body::tests::mapped_limb_top_angle(
+                dir, azimuth, rho, distance, g, &datum, max_off, air,
+            ) else {
+                continue;
+            };
+            limbs += 1;
+            let ray = crate::far_body::tests::ray_from_nadir(dir, azimuth, top as f32);
+            let mu = ray.dot(up);
+            let bin = horizon_bin(horizon_azimuth(ray, up, east, north));
+            assert!(
+                mu <= bins[bin] + 1.0e-5,
+                "az {azimuth} limb mu {mu} exceeds bin {} ({bin}), foot {foot}",
+                bins[bin]
+            );
+        }
+        assert!(limbs > 90, "only {limbs} azimuths drew a limb at 50 km");
     }
 
     /// Per-frame cost of the g = 33 table. Release budget is 0.2 ms; debug is

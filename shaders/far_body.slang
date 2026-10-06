@@ -1375,100 +1375,156 @@ bool far_above_horizon(uint bodyIndex, float3 ray, float3 center)
     return mu > farTable[0].horizon_sin[slot * 256u + bin];
 }
 
-// Keep `h` when `h/distance - dist` beats the sample held in `best`.
-// `dist` is |p| along that sample's direction.
-void far_limb_consider(
-    float h, float dist, float distance, inout float best, inout float bestScore)
+// World metres from the closest approach. The ends are the cap chord.
+// Zero is the approach itself. Scalar steps only: a function-scope table
+// is the sky fragment's local memory. Lockstep with `limb_delta_m`.
+float far_limb_delta(int i)
 {
-    float score = h / distance - dist;
-    if (score > bestScore)
-    {
-        bestScore = score;
-        best = h;
-    }
+    if (i <= 0)
+        return -1.0e30;
+    if (i == 1)
+        return -1200000.0;
+    if (i == 2)
+        return -400000.0;
+    if (i == 3)
+        return 0.0;
+    if (i == 4)
+        return 400000.0;
+    if (i == 5)
+        return 1200000.0;
+    if (i == 6)
+        return 2400000.0;
+    return 1.0e30;
 }
 
-// Bilinear height the limb sphere uses. The closest approach, plus a
-// quarter, half and full datum cell ahead of and behind it along `ray`.
-// The sample kept is the one whose sphere comes closest to the ray
-// (`h/distance - |p|`), not the highest sample: a smooth lowland stays on
-// the approach, and a full step does not jump a notch inside the cell.
-// Not the cell max. `ray` is unit and perpendicular to `u`. `approach` is
-// |p| at the closest approach. Scalar steps only: a function-scope table
-// is the sky fragment's local memory.
-float far_limb_offset(float4 rot, uint map, float3 u, float3 ray, float distance, float approach)
+// Fraction of u in [0, 1] where qa u² + qb u + qc <= 0. Same stable
+// quadratic as `limb_inside_fraction`. `sign` is not used: Slang's sign(0)
+// is 0 and the host's signum(0) is 1.
+float far_limb_inside_fraction(float qa, float qb, float qc)
 {
-    float best = far_datum_value(map, far_inv_rotate(rot, u));
-    float bestScore = best / distance - approach;
-    uint g = farMaps[map * 8u];
-    float cells = 1.0;
-    if (g > 2u)
-        cells = float(g - 1u);
-    // One equiangular cell at the face centre is π / (2 (g-1)).
-    float delta = 1.5707963267948966 / cells;
-    [unroll]
-    for (int step = 0; step < 3; step++)
+    if (abs(qa) <= 1e-20)
     {
-        float frac = 0.25;
-        if (step == 1)
-            frac = 0.5;
-        if (step == 2)
-            frac = 1.0;
-        float ang = delta * frac;
-        float cs = cos(ang);
-        float sn = sin(ang);
-        if (cs > 0.05)
-        {
-            float dist = approach / cs;
-            float3 ahead = normalize(u * cs + ray * sn);
-            far_limb_consider(
-                far_datum_value(map, far_inv_rotate(rot, ahead)),
-                dist, distance, best, bestScore);
-            float3 back = normalize(u * cs - ray * sn);
-            far_limb_consider(
-                far_datum_value(map, far_inv_rotate(rot, back)),
-                dist, distance, best, bestScore);
-        }
+        if (abs(qb) <= 1e-20)
+            return qc <= 0.0 ? 1.0 : 0.0;
+        float u = -qc / qb;
+        return qb > 0.0 ? clamp(u, 0.0, 1.0) : clamp(1.0 - u, 0.0, 1.0);
     }
-    return best;
+    float disc = qb * qb - 4.0 * qa * qc;
+    if (!(disc >= 0.0))
+        return qa > 0.0 ? 0.0 : 1.0;
+    float sd = sqrt(disc);
+    float q = qb >= 0.0 ? -0.5 * (qb + sd) : -0.5 * (qb - sd);
+    float u0;
+    float u1;
+    if (abs(q) <= 1e-20)
+    {
+        float inv = 0.5 / qa;
+        u0 = (-qb - sd) * inv;
+        u1 = (-qb + sd) * inv;
+    }
+    else
+    {
+        u0 = q / qa;
+        u1 = qc / q;
+    }
+    float lo = min(u0, u1);
+    float hi = max(u0, u1);
+    if (qa > 0.0)
+    {
+        float a = clamp(lo, 0.0, 1.0);
+        float b = clamp(hi, 0.0, 1.0);
+        return max(b - a, 0.0);
+    }
+    return clamp(lo, 0.0, 1.0) + clamp(1.0 - hi, 0.0, 1.0);
 }
 
-// Air shell for a ray that missed the datum. rSurf is the bilinear datum
-// at closest approach, or at a quarter, half or full datum-cell step along
-// the ray when that sphere comes closer. The hi-sphere chord ends are not
-// sampled. The shell is rSurf + max(air/distance, px), and it stops at the
-// outer air sphere rho + (maxOff + air) / distance. A pixel wider than the
-// air used to stick out past the horizon cone and get cut off in a straight
-// line. A ray the march misses whose closest approach lies inside rSurf
-// still hits this shell. False when the ray misses the shell, including a
-// degenerate approach straight through the centre.
-bool far_mapped_limb(
-    float3 ray, float3 center, float facing, float rho, float distance,
-    float4 rot, uint map, float airThick, float px,
-    out float rSurf, out float outer, out float s)
+// Normalised length of [t0, t1] on which |p| is at or below the air radius
+// linearly interpolated from r0 to r1. The quadratic matches the measured
+// |p| at both ends and the analytic curvature between them, so a segment
+// that ends inside the air is not dropped when the analytic radius misses
+// that end. Below the datum counts.
+float far_limb_segment(float t0, float t1, float rad0, float rad1, float r0, float r1)
 {
-    rSurf = 0.0;
-    outer = 0.0;
-    s = length(cross(ray, center));
-    // Closest approach is behind the camera when facing is not forward.
-    if (!(distance > 0.0) || !(facing > 0.0))
-        return false;
+    float dt = t1 - t0;
+    if (!(dt > 1e-20))
+        return 0.0;
+    float a0 = max(r0, 0.0);
+    float a1 = max(r1, 0.0);
+    float dr = a1 - a0;
+    float qa = dt * dt - dr * dr;
+    float qc = (rad0 - a0) * (rad0 + a0);
+    float g1 = (rad1 - a1) * (rad1 + a1);
+    float qb = g1 - qa - qc;
+    float frac = far_limb_inside_fraction(qa, qb, qc);
+    return frac == frac ? frac * dt : 0.0;
+}
+
+// World length of the air `ray` crosses. 0 when the eye's altitude above
+// the bilinear datum in the eye's direction is below `airThick`, or the
+// cap-sphere chord never enters R + datum + air. The horizon table still
+// widens its shell by a pixel; this chord does not. A miss whose sample
+// dips below the datum counts, so a graze the march missed stays lit.
+float far_mapped_air_chord(
+    float3 ray, float3 center, float rho, float distance, float4 rot, uint map, float airThick)
+{
+    if (!(distance > 0.0) || !(airThick > 0.0))
+        return 0.0;
+    float facing = dot(ray, center);
+    if (!(facing > 0.0))
+        return 0.0;
+    float3 radial = -center;
+    float eyeRad = length(radial);
+    if (!(eyeRad > 1e-8))
+        return 0.0;
+    float hEye = far_datum_value(map, far_inv_rotate(rot, radial / eyeRad));
+    if (distance - rho * distance - hEye < airThick)
+        return 0.0;
     float maxOff = asfloat(farMaps[map * 8u + 3u]);
     float rhoCap = rho + (maxOff + airThick) / distance;
-    // Outside that sphere every local shell is missed. Skip the datum sample.
-    if (!(rhoCap > 0.0) || !(s < rhoCap))
-        return false;
-    float3 p = ray * facing - center;
-    float rad = length(p);
-    if (!(rad > 1e-8))
-        return false;
-    float h = far_limb_offset(rot, map, p / rad, ray, distance, rad);
-    rSurf = rho + h / distance;
-    float shell = max(airThick / distance, px);
-    outer = rSurf + shell;
-    if (outer > rhoCap)
-        outer = rhoCap;
-    return rSurf > 0.0 && s < outer;
+    float disc = facing * facing - (1.0 - rhoCap * rhoCap);
+    if (!(rhoCap > 0.0) || !(disc >= 0.0))
+        return 0.0;
+    float sd = sqrt(disc);
+    float tFar = facing + sd;
+    if (!(tFar > 0.0))
+        return 0.0;
+    float t0 = max(facing - sd, 0.0);
+    if (!(tFar > t0))
+        return 0.0;
+    float ca = clamp(facing, t0, tFar);
+    float sumT = 0.0;
+    float prevT = 0.0;
+    float prevRad = 0.0;
+    float prevR = 0.0;
+    // Eight samples. Lockstep with `LIMB_SAMPLES` in src/far_body.rs.
+    [loop]
+    for (int i = 0; i < 8; i++)
+    {
+        float t = clamp(ca + far_limb_delta(i) / distance, t0, tFar);
+        float3 p = ray * t - center;
+        float rad = length(p);
+        float rAir;
+        if (!(rad > 1e-8))
+        {
+            rad = 0.0;
+            rAir = 1.0;
+        }
+        else
+        {
+            float h = far_datum_value(map, far_inv_rotate(rot, p / rad));
+            rAir = rho + (h + airThick) / distance;
+            if (rAir < 0.0)
+                rAir = 0.0;
+        }
+        if (i > 0)
+            sumT += far_limb_segment(prevT, t, prevRad, rad, prevR, rAir);
+        prevT = t;
+        prevRad = rad;
+        prevR = rAir;
+    }
+    if (!(sumT > 0.0) || !(sumT < 1e20))
+        return 0.0;
+    return sumT * distance;
 }
 #endif
 
@@ -1536,23 +1592,15 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
             return float3(0.0, 0.0, 0.0);
         uint map = mapPlus - 1u;
         float4 rot = farTable[0].body[i].rot;
-        float rSurf;
-        float outer;
-        float s;
-        if (!far_mapped_limb(
-                ray, center, facing, rho, distance, rot, map, airThick, px, rSurf, outer, s))
+        // Air the ray actually crosses, in world units. Not a pixel-widened
+        // sphere: the denominator is the shell thickness. Daylight follows
+        // far_lit.
+        float chord = far_mapped_air_chord(ray, center, rho, distance, rot, map, airThick);
+        if (!(chord > 0.0))
             return float3(0.0, 0.0, 0.0);
-        // Shell on the local surface, at least one pixel thick. Chord is in
-        // world units. The denominator stays at least a pixel so the
-        // widened shell does not go opaque. Daylight follows far_lit.
-        float outerChord = sqrt(max(outer * outer - s * s, 0.0));
-        float chordN = s >= rSurf
-            ? 2.0 * outerChord
-            : 2.0 * (outerChord - sqrt(max(rSurf * rSurf - s * s, 0.0)));
-        float chord = chordN * distance;
-        float denom = max(airThick, px * distance);
-        float trans = exp(-FAR_AIR_K * chord / denom);
-        float3 limbN = normalize(ray * facing - center);
+        float trans = exp(-FAR_AIR_K * chord / airThick);
+        float3 approach = ray * facing - center;
+        float3 limbN = dot(approach, approach) > 1e-16 ? normalize(approach) : -ray;
         float daylight = saturate(dot(limbN, frame.sun_dir_elev.xyz) * flip);
         return air * ((1.0 - trans) * frame.light.rgb * daylight);
     }
@@ -1584,8 +1632,8 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
 // background; anything with a smaller world depth composites over it. A mapped
 // body is kind 4: one shade without the fresnel air rim, then the terrain fog
 // in place of far_through_air, then the air shell along the view chord above
-// the hit. Its miss-ray limb is an additive term on the local surface, not
-// the hi sphere.
+// the hit. Its miss-ray limb is the air that ray crosses, and nothing when
+// the eye is already inside that air. Not the hi sphere.
 //
 // Pass 2 accumulates those additive rims and blobs. This matches the old
 // dynamically indexed `float4 addTerm[32]` (that array spilled to local
@@ -1820,14 +1868,11 @@ float3 far_bodies(float3 ray, float3 col, float px, float2 pix)
             {
                 float airThick = farTable[0].body[i].albedo1.w;
                 // The colour is rebuilt in pass 2. The bit records that the
-                // local shell test passed against the running depth.
-                float rSurf;
-                float outer;
-                float s;
+                // ray crosses air and that crossing is in front of the hit.
                 float3 limbC = far_body_dir(i).xyz;
                 float4 rot = far_body_rot(i);
-                if (airThick > 0.0 && far_mapped_limb(
-                        ray, limbC, facing, rho, distance, rot, map, airThick, px, rSurf, outer, s))
+                if (airThick > 0.0
+                    && far_mapped_air_chord(ray, limbC, rho, distance, rot, map, airThick) > 0.0)
                     addMask |= 1u << i;
             }
         }
@@ -2043,7 +2088,7 @@ float3 far_bodies(float3 ray, float3 col, float px, float2 pix)
 // remap add in sky.frag:
 //   R — a mapped surface hit won and would be shaded (bestKind == 4)
 //   G — mapped miss-ray limbs that passed the depth test summed to a channel
-//       above 1e-6 (the additive shell; stars stay under it)
+//       above 1e-6 (the air the ray crosses; stars stay under it)
 //   B — a mapped ray was skipped by far_above_horizon or by the per-body
 //       gate dot(ray, -center) > albedo0.w, after the same cone and tile mask
 //       as far_bodies
@@ -2218,13 +2263,10 @@ float3 far_sky_debug_rgb(float3 ray, float px, float2 pix)
             else if (!hit && facing > 0.0 && facing * distance < bestDepth)
             {
                 float airThick = farTable[0].body[i].albedo1.w;
-                float rSurf;
-                float outer;
-                float s;
                 float3 limbC = far_body_dir(i).xyz;
                 float4 rot = far_body_rot(i);
-                if (airThick > 0.0 && far_mapped_limb(
-                        ray, limbC, facing, rho, distance, rot, map, airThick, px, rSurf, outer, s))
+                if (airThick > 0.0
+                    && far_mapped_air_chord(ray, limbC, rho, distance, rot, map, airThick) > 0.0)
                     addMask |= 1u << i;
             }
         }
