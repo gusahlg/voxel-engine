@@ -379,6 +379,8 @@ pub struct RenderTargets {
     /// Per-slot single-sample MSAA depth resolve target; `Some` only when
     /// multisampled. The MS `depth` can't feed a `Sampler2D`, so the geometry
     /// pass resolves (SAMPLE_ZERO) into this and VRS/godrays/present TAA sample it.
+    /// Frames whose only depth consumer is VRS skip the resolve: the classifier
+    /// loads sample 0 of the stored MS `depth` (`SceneDepthUse::ClassifyMs`).
     pub(crate) resolved_depth: [Option<ImageResource>; FRAMES_IN_FLIGHT as usize],
     pub depth_format: vk::Format,
     /// `Some` only when multisampled; `None` is single-sampled (no MSAA image).

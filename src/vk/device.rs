@@ -85,6 +85,10 @@ pub struct Device {
     /// Sample counts whose shading-rate table lists a 2×2 fragment size.
     /// Empty when the pipeline feature is off.
     sky_coarse_rates: vk::SampleCountFlags,
+    /// `shaderStorageImageMultisample` is enabled. Slang declares the
+    /// `StorageImageMultisample` capability for every multisampled image type,
+    /// sampled ones included, so `vrs_ms.comp.spv` needs it.
+    storage_image_multisample: bool,
     pub msaa_caps: vk::SampleCountFlags,
     pub multi_draw_indirect: bool,
     pub draw_indirect_first_instance: bool,
@@ -131,6 +135,7 @@ struct Candidate {
     fragment_shading_rate: Option<FragmentShadingRate>,
     pipeline_fragment_shading_rate: bool,
     sky_coarse_rates: vk::SampleCountFlags,
+    storage_image_multisample: bool,
     score: u32,
 }
 
@@ -277,7 +282,8 @@ impl Device {
             .draw_indirect_first_instance(best.draw_indirect_first_instance)
             .sampler_anisotropy(best.max_anisotropy.is_some())
             .independent_blend(best.independent_blend)
-            .pipeline_statistics_query(best.pipeline_statistics_query);
+            .pipeline_statistics_query(best.pipeline_statistics_query)
+            .shader_storage_image_multisample(best.storage_image_multisample);
         if best.independent_blend {
             log::info!(
                 "fused TAA overlay: independentBlend enabled (HUD in fused two-attachment present)"
@@ -451,6 +457,7 @@ impl Device {
             fragment_shading_rate,
             pipeline_fragment_shading_rate,
             sky_coarse_rates,
+            storage_image_multisample: best.storage_image_multisample,
             msaa_caps,
             multi_draw_indirect: best.multi_draw_indirect,
             draw_indirect_first_instance: best.draw_indirect_first_instance,
@@ -502,6 +509,17 @@ impl Device {
             && sky_coarse_enabled()
     }
 
+    /// The VRS classifier may load sample 0 of the multisampled depth
+    /// (`vrs_ms.comp.spv`) at this sample count, so classify-only frames skip
+    /// the depth resolve. Needs attachment VRS, MSAA, and the storage-image
+    /// multisample feature the Slang module declares.
+    pub(crate) fn vrs_depth_ms_ok(&self, samples: vk::SampleCountFlags) -> bool {
+        self.fragment_shading_rate.is_some()
+            && self.storage_image_multisample
+            && !samples.is_empty()
+            && samples != vk::SampleCountFlags::TYPE_1
+    }
+
     pub fn max_msaa(&self) -> u32 {
         for (flag, n) in [
             (vk::SampleCountFlags::TYPE_8, 8),
@@ -549,6 +567,7 @@ fn evaluate(
     let draw_indirect_first_instance = features2.features.draw_indirect_first_instance == vk::TRUE;
     let independent_blend = features2.features.independent_blend == vk::TRUE;
     let pipeline_statistics_query = features2.features.pipeline_statistics_query == vk::TRUE;
+    let storage_image_multisample = features2.features.shader_storage_image_multisample == vk::TRUE;
     let max_anisotropy = (features2.features.sampler_anisotropy == vk::TRUE)
         .then_some(properties.limits.max_sampler_anisotropy);
     // Required for GPU-driven culling; reject devices that lack it.
@@ -696,6 +715,7 @@ fn evaluate(
         fragment_shading_rate,
         pipeline_fragment_shading_rate,
         sky_coarse_rates,
+        storage_image_multisample,
         score,
     })
 }

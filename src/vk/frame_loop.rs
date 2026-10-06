@@ -17,7 +17,7 @@ use super::pipeline;
 use super::present::{HdrReadable, OverlayPresent};
 use super::scene_pass::RenderPass;
 use super::timeline::{RenderSubmit, acquire_next_image};
-use super::{Env, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, sampleable_depth_consumed};
+use super::{Env, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, SceneDepthUse, scene_depth_use};
 
 pub(crate) use super::draw_prep::{DrawEntry, DrawRun, ImmOffsets};
 use super::submit::fold_transfer_wait;
@@ -837,13 +837,24 @@ impl Renderer {
         // Known here because `prepare_blend_draws` already filled `draw_runs`.
         let absorb_this_frame = self.pipelines.mesh3d_transparent_absorb.is_some()
             && self.draw_runs.iter().any(|run| run.pass == Pass::Blend);
-        let sample_depth = sampleable_depth_consumed(
+        // MSAA with the sample-0 classifier: frames where VRS is the only
+        // depth consumer read the stored MS depth and skip the resolve.
+        let classify_ms = self.targets.msaa.is_some()
+            && self
+                .pipelines
+                .vrs_compute
+                .as_ref()
+                .is_some_and(|c| c.pipeline_ms.is_some());
+        let depth_use = scene_depth_use(
+            classify_ms,
             will_present,
             self.flags.taa,
             spill_live,
             classify_vrs,
             absorb_this_frame,
         );
+        // WAR on the MS depth: this slot's previous classify read it.
+        let ms_depth_read = self.slots[FrameSlot::new(slot)].vrs_ms_depth_read;
         // Lean opaque/LOD fragments: compile-time equivalent of every optional
         // lighting lane off and fog off. Chosen once per frame from flags.
         let mesh_lean = super::uniforms::mesh_lean(&self.flags);
@@ -877,10 +888,11 @@ impl Renderer {
                     lists,
                     offsets,
                     do_vrs,
-                    sample_depth,
+                    depth_use,
                     will_present,
                     absorb_this_frame,
                     depth_sampled,
+                    ms_depth_read,
                     mesh_lean,
                 )
             }
@@ -975,7 +987,7 @@ impl Renderer {
             if run_exposure {
                 unsafe { pass.end_deferred(classify_vrs) };
                 stamp(GpuPass::Resolve);
-                self.finish_vrs_classify(cmd, slot, classify_vrs, lists);
+                self.finish_vrs_classify(cmd, slot, classify_vrs, depth_use, lists);
                 // Reduce the (jittered, unresolved) frame HDR to per-tile mean
                 // log2-luma, publish the smoothed exposure, and finalize the HDR
                 // in SHADER_READ. Metering the unresolved image is acceptable:
@@ -997,21 +1009,25 @@ impl Renderer {
                             .mark(&self.device.device, cmd, slot, GpuPass::Resolve)
                     };
                 }
-                self.finish_vrs_classify(cmd, slot, classify_vrs, lists);
+                self.finish_vrs_classify(cmd, slot, classify_vrs, depth_use, lists);
                 readable
             } else {
                 // Unpresented, no later HDR writer: skip the sampled transition;
                 // the next begin discards the offscreen from UNDEFINED. Depth
-                // rests only when this frame samples it (classifier); a later
+                // rests only when this frame samples it (classifier: the MS
+                // depth under MSAA unless absorb needs the resolve); a later
                 // present uses a different slot's depth.
                 unsafe { pass.end_deferred(classify_vrs) };
                 stamp(GpuPass::Resolve);
-                self.finish_vrs_classify(cmd, slot, classify_vrs, lists);
+                self.finish_vrs_classify(cmd, slot, classify_vrs, depth_use, lists);
                 HdrReadable::new(slot)
             }
         };
+        // Water absorption sees only the sampleable depth: a classify-only
+        // MSAA frame stored the MS depth, not the resolve.
         self.prev_depth
-            .finish(slot, sample_depth, self.render_extent);
+            .finish(slot, depth_use.sampleable_stored(), self.render_extent);
+        self.slots[FrameSlot::new(slot)].vrs_ms_depth_read = depth_use == SceneDepthUse::ClassifyMs;
         // Bloom pyramid + quarter-res spill (bloom composite + godrays). The
         // tonemap present-copy takes one bilinear tap of the spill. Present-only
         // — a dropped mailbox frame never samples either image. Forced capture
@@ -1076,7 +1092,8 @@ impl Renderer {
 
     /// End-of-frame classify: this slot's just-written depth, for the next use
     /// of the slot (`FRAMES_IN_FLIGHT` frames later). Depth already rests in
-    /// [`SAMPLEABLE_DEPTH_REST_LAYOUT`]; rate/history → GENERAL joined the
+    /// [`SAMPLEABLE_DEPTH_REST_LAYOUT`] (the MS depth for
+    /// [`SceneDepthUse::ClassifyMs`]); rate/history → GENERAL joined the
     /// post-scene barrier. Sets `vrs_ready` / `vrs_history` so the next scene
     /// pass of this slot can bind the rate image.
     fn finish_vrs_classify(
@@ -1084,6 +1101,7 @@ impl Renderer {
         cmd: vk::CommandBuffer,
         slot: usize,
         classify: bool,
+        depth_use: SceneDepthUse,
         lists: &DrawLists,
     ) {
         if !classify {
@@ -1095,7 +1113,8 @@ impl Renderer {
             .expect("classify_vrs implies a 3D scene");
         let focal_px = 0.5 * self.render_extent.height as f32 / scene.fovy_tan_half.max(1e-4);
         let d_threshold = crate::camera::Z_NEAR / focal_px;
-        unsafe { self.record_vrs_generate(cmd, slot, d_threshold) };
+        let depth_ms = depth_use == SceneDepthUse::ClassifyMs;
+        unsafe { self.record_vrs_generate(cmd, slot, d_threshold, depth_ms) };
         if crate::profile::is_enabled() {
             unsafe {
                 self.gpu_timer.recorded(slot);

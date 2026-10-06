@@ -18,8 +18,20 @@
 // the host does not transition it around this dispatch.
 // Tile/depth extents come from push constants so GetDimensions stays out of
 // the sample loop.
+//
+// VRS_DEPTH_MS (vrs_ms.comp.spv): MSAA frames whose only depth consumer is
+// this classifier skip the depth resolve and bind the stored multisampled
+// attachment instead; sample 0 is what the SAMPLE_ZERO resolve would hold.
+// Binding 0 stays a combined image sampler (same layout as the resolved
+// variant); the sampler is unused. Slang declares StorageImageMultisample for
+// any multisampled image, so the host builds this variant only when
+// shaderStorageImageMultisample is enabled.
 
+#ifdef VRS_DEPTH_MS
+[[vk::binding(0, 0)]] Texture2DMS<float> depthTex;
+#else
 [[vk::binding(0, 0)]] Sampler2D depthTex;
+#endif
 [[vk::image_format("r8ui")]] [[vk::binding(1, 0)]] RWTexture2D<uint> rateOut;
 [[vk::image_format("r8ui")]] [[vk::binding(2, 0)]] RWTexture2D<uint> history;
 [[vk::binding(3, 0)]] RWStructuredBuffer<uint> mixCounts; // [1x1, 2x2, 4x4]
@@ -41,7 +53,14 @@ groupshared float s_dmin[10 * 10];
 groupshared float s_dmax[10 * 10];
 
 float sampleDepth(float2 pixel, float2 depthDim) {
+#ifdef VRS_DEPTH_MS
+    // The texel the nearest/clamp sampler picks at (pixel + 0.5) / depthDim,
+    // clamped to the image like CLAMP_TO_EDGE.
+    int2 texel = clamp(int2(floor(pixel + 0.5)), int2(0, 0), int2(depthDim) - 1);
+    return depthTex.Load(texel, 0);
+#else
     return depthTex.SampleLevel((pixel + 0.5) / depthDim, 0).x;
+#endif
 }
 
 void tileMinMax(int2 tile, float2 depthDim, out float dmin, out float dmax) {
