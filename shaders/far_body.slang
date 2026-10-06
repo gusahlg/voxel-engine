@@ -1528,6 +1528,260 @@ float far_mapped_air_chord(
 }
 #endif
 
+#ifdef FAR_MAPPED_SOLO
+// One mapped body, the lowest set bit of the tile mask. The CPU draws this
+// variant only when that bit is the mask. No body loop and no shape dispatch,
+// so the march does not carry a composite across a datum fetch.
+
+uint far_solo_mask(float2 pix)
+{
+    uint n = min(farTable[0].header.x, 32u);
+    if (n == 0u)
+        return 0u;
+    uint live = n == 32u ? 0xffffffffu : ((1u << n) - 1u);
+    uint tilePx = farTable[0].header.y;
+    uint tilesX = farTable[0].header.z;
+    uint tilesY = farTable[0].header.w;
+    if (tilePx == 0u || tilesX == 0u || tilesY == 0u)
+        return live;
+    float2 p = max(pix, float2(0.0, 0.0));
+    uint tx = min(uint(p.x) / tilePx, tilesX - 1u);
+    uint ty = min(uint(p.y) / tilePx, tilesY - 1u);
+    return farTable[0].tile_mask[ty * tilesX + tx] & live;
+}
+
+// Mapped surface shade. Same sequence as far_bodies' kind-4 arm. Runs after
+// the march, so the chart derivative is not live inside a datum fetch.
+float3 far_shade_mapped(float3 ray, float px, uint i, float t, uint face)
+{
+    float rho = farTable[0].body[i].dir_rho.w;
+    uint mapPlus = farTable[0].body[i].seed.z;
+    float distance = farTable[0].body[i].albedo2.w;
+    float4 rot = farTable[0].body[i].rot;
+    float3 uN;
+    {
+        float3 center = farTable[0].body[i].dir_rho.xyz;
+        float3 bodyP = far_inv_rotate(rot, ray * t - center);
+        float radN = length(bodyP);
+        uN = radN > 1e-8 ? bodyP / radN : float3(0.0, 1.0, 0.0);
+    }
+    uint mapN = (mapPlus >= 1u && mapPlus <= 8u) ? mapPlus - 1u : 0u;
+    float3 bestN = far_mapped_normal(rot, uN, rho, distance, mapN);
+    float3 center = farTable[0].body[i].dir_rho.xyz;
+    float3 bodyP = far_inv_rotate(rot, ray * t - center);
+    float3 air = farTable[0].body[i].atmosphere.rgb;
+    float3 inscatter = sky_radiance(ray, frame);
+    float3 alb = far_face(i, face);
+    if (mapPlus >= 1u && mapPlus <= 8u)
+    {
+        uint map = mapPlus - 1u;
+        uint landed = farMaps[map * 8u + 4u];
+        uint albedoSize = farMaps[map * 8u + 5u];
+        if (albedoSize != 0u && (landed & (1u << face)) != 0u)
+        {
+            float rad = length(bodyP);
+            float3 bodyDir = rad > 1e-8 ? bodyP / rad : float3(0.0, 1.0, 0.0);
+            float ndot = abs(dot(ray, bestN));
+            if (ndot < 0.05)
+                ndot = 0.05;
+            float footprint = px * t * distance / ndot;
+            float texel = (1.5707963267948966 * rho * distance) / float(albedoSize);
+            float lod = 0.0;
+            if (texel > 1e-20)
+                lod = log2(max(footprint / texel, 1e-20));
+            float mipMax = log2(float(albedoSize));
+            alb = far_cube(map, bodyDir, clamp(lod, 0.0, mipMax));
+        }
+    }
+    float3 lit = far_lit(alb, bestN, ray, air, rho, false, false);
+    float3 shaded = lit;
+    if (frame.horizon.w > 0.0)
+    {
+        float fog = 1.0 - exp(-t * distance * frame.horizon.w);
+        shaded = lerp(lit, inscatter, fog);
+    }
+    float airThick = farTable[0].body[i].albedo1.w;
+    float trans = 1.0;
+    float facing = dot(ray, center);
+    if (airThick > 0.0 && distance > 0.0)
+    {
+        float rSurf = length(ray * t - center);
+        float outer = rSurf + airThick / distance;
+        float tEnter;
+        float tExit;
+        if (far_sphere_roots(facing, outer, tEnter, tExit))
+        {
+            float chord = (t - max(tEnter, 0.0)) * distance;
+            if (chord > 0.0)
+                trans = exp(-FAR_AIR_K * chord / airThick);
+        }
+    }
+    float3 col = shaded;
+    if (trans < 1.0)
+    {
+        float flip = frame.light.w * 2.0 - 1.0;
+        float3 approach = ray * facing - center;
+        float3 radial = ray * t - center;
+        float3 limbN = dot(approach, approach) > 1e-16
+            ? normalize(approach)
+            : (dot(radial, radial) > 1e-16 ? normalize(radial) : -ray);
+        float daylight = saturate(dot(limbN, frame.sun_dir_elev.xyz) * flip);
+        col = shaded * trans + air * (1.0 - trans) * daylight;
+    }
+    return col;
+}
+
+// Mapped miss-ray limb. Same formula as the mapped arm of far_add_rgb,
+// including a second chord after the gate chord in the caller.
+float3 far_limb_mapped(float3 ray, uint i)
+{
+    float4 dirRho = farTable[0].body[i].dir_rho;
+    float rho = dirRho.w;
+    float3 center = dirRho.xyz;
+    float3 air = farTable[0].body[i].atmosphere.rgb;
+    float distance = farTable[0].body[i].albedo2.w;
+    float facing = dot(ray, center);
+    uint mapPlus = farTable[0].body[i].seed.z;
+    float airThick = farTable[0].body[i].albedo1.w;
+    if (mapPlus == 0u || mapPlus > 8u || !(distance > 0.0))
+        return float3(0.0, 0.0, 0.0);
+    uint map = mapPlus - 1u;
+    float4 rot = farTable[0].body[i].rot;
+    float chord = far_mapped_air_chord(ray, center, rho, distance, rot, map, airThick);
+    if (!(chord > 0.0))
+        return float3(0.0, 0.0, 0.0);
+    float trans = exp(-FAR_AIR_K * chord / airThick);
+    float3 approach = ray * facing - center;
+    float3 limbN = dot(approach, approach) > 1e-16 ? normalize(approach) : -ray;
+    float flip = frame.light.w * 2.0 - 1.0;
+    float daylight = saturate(dot(limbN, frame.sun_dir_elev.xyz) * flip);
+    return air * ((1.0 - trans) * frame.light.rgb * daylight);
+}
+
+// xyz is the shaded surface, or the limb (zero when the ray misses the air).
+// w is 1 when the surface replaces the background and 0 when the caller adds
+// xyz onto the background it builds after this returns. The background is not
+// an argument: a float3 carried into the march stays live on every fetch.
+float4 far_mapped_solo(float3 ray, float px, float2 pix)
+{
+    uint mask = far_solo_mask(pix);
+    if (mask == 0u)
+        return float4(0.0, 0.0, 0.0, 0.0);
+    uint i = firstbitlow(mask);
+    {
+        float4 c = farTable[0].cone[i];
+        if (c.w >= 0.0)
+        {
+            float f = dot(ray, c.xyz);
+            float3 x = cross(ray, c.xyz);
+            float lim = c.w + 3.0 * px;
+            if (f <= 0.0 || dot(x, x) > lim * lim)
+                return float4(0.0, 0.0, 0.0, 0.0);
+        }
+    }
+
+    float rho;
+    float distance;
+    uint map;
+    {
+        rho = farTable[0].body[i].dir_rho.w;
+        if (!(rho > 0.0))
+            return float4(0.0, 0.0, 0.0, 0.0);
+        distance = farTable[0].body[i].albedo2.w;
+        uint mapPlus = farTable[0].body[i].seed.z;
+        float horizon = farTable[0].body[i].albedo0.w;
+        float3 center = farTable[0].body[i].dir_rho.xyz;
+        if (mapPlus == 0u || mapPlus > 8u || !(distance > 0.0) || dot(ray, -center) > horizon
+            || far_above_horizon(i, ray, center))
+            return float4(0.0, 0.0, 0.0, 0.0);
+        map = mapPlus - 1u;
+    }
+
+    float t = 0.0;
+    uint face = 0u;
+    bool hit = far_ray_mapped(ray, i, rho, distance, map, t, face);
+    // bestDepth starts at 1e30. One body, so the hit replaces the sky when
+    // its world depth wins that sentinel.
+    if (hit && t * distance < 1e30)
+        return float4(far_shade_mapped(ray, px, i, t, face), 1.0);
+    if (!hit)
+    {
+        // Recomputed after the march. A copy from the horizon test would sit
+        // live across every datum sample.
+        float facing = dot(ray, far_body_dir(i).xyz);
+        if (facing > 0.0 && facing * distance < 1e30)
+        {
+            float airThick = farTable[0].body[i].albedo1.w;
+            float3 limbC = far_body_dir(i).xyz;
+            float4 rot = far_body_rot(i);
+            if (airThick > 0.0
+                && far_mapped_air_chord(ray, limbC, rho, distance, rot, map, airThick) > 0.0)
+                return float4(far_limb_mapped(ray, i), 0.0);
+        }
+    }
+    return float4(0.0, 0.0, 0.0, 0.0);
+}
+
+// Source key for one mapped body. Same channels as far_sky_debug_rgb.
+float3 far_sky_debug_rgb(float3 ray, float px, float2 pix)
+{
+    uint mask = far_solo_mask(pix);
+    if (mask == 0u)
+        return float3(0.25, 0.25, 0.25);
+    uint i = firstbitlow(mask);
+    {
+        float4 c = farTable[0].cone[i];
+        if (c.w >= 0.0)
+        {
+            float f = dot(ray, c.xyz);
+            float3 x = cross(ray, c.xyz);
+            float lim = c.w + 3.0 * px;
+            if (f <= 0.0 || dot(x, x) > lim * lim)
+                return float3(0.25, 0.25, 0.25);
+        }
+    }
+    float rho = farTable[0].body[i].dir_rho.w;
+    if (!(rho > 0.0))
+        return float3(0.25, 0.25, 0.25);
+    float distance = farTable[0].body[i].albedo2.w;
+    uint mapPlus = farTable[0].body[i].seed.z;
+    float horizon = farTable[0].body[i].albedo0.w;
+    float3 center = farTable[0].body[i].dir_rho.xyz;
+    if (mapPlus == 0u || mapPlus > 8u || !(distance > 0.0))
+        return float3(0.25, 0.25, 0.25);
+    if (dot(ray, -center) > horizon || far_above_horizon(i, ray, center))
+        return float3(0.25, 0.25, 1.0);
+    uint map = mapPlus - 1u;
+    float t = 0.0;
+    uint face = 0u;
+    bool hit = far_ray_mapped(ray, i, rho, distance, map, t, face);
+    // The key is built after the march, so it is not live on the fetches.
+    float3 dbg = float3(0.25, 0.25, 0.25);
+    if (hit && t * distance < 1e30)
+    {
+        dbg.r = 1.0;
+        return dbg;
+    }
+    if (!hit)
+    {
+        float facing = dot(ray, far_body_dir(i).xyz);
+        if (facing > 0.0 && facing * distance < 1e30)
+        {
+            float airThick = farTable[0].body[i].albedo1.w;
+            float3 limbC = far_body_dir(i).xyz;
+            float4 rot = far_body_rot(i);
+            if (airThick > 0.0
+                && far_mapped_air_chord(ray, limbC, rho, distance, rot, map, airThick) > 0.0)
+            {
+                float3 limb = far_limb_mapped(ray, i);
+                if (max(limb.x, max(limb.y, limb.z)) > 1e-6)
+                    dbg.g = 1.0;
+            }
+        }
+    }
+    return dbg;
+}
+#else
 // Colour of the one additive body `i` emitted. The caller has already decided
 // the term is in front of the final hit. Same formulas as the old array stash.
 float3 far_add_rgb(uint i, float3 ray, float px, float flip)
@@ -2321,4 +2575,5 @@ float3 far_sky_debug_rgb(float3 ray, float px, float2 pix)
 }
 #endif
 
+#endif // FAR_MAPPED_SOLO
 #endif

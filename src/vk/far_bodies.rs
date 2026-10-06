@@ -6,12 +6,15 @@
 //! one word per screen tile, so a sky pixel skips bodies that miss its tile.
 //! After the mask, compact tile-index lists feed the instanced tile-quad
 //! vertex shader: mask == 0, then sphere-only tiles, then tiles that meet a
-//! cube, rounded or mapped body. When a coarse-shading query is passed, the
-//! base run is stably split into tiles the sun and moon discs miss, then the
-//! rest, and the heavy run is split into mapped-interior tiles, then the rest.
-//! A mapped-interior tile lies inside the horizon disc or, with the eye
-//! outside the lo sphere, inside that sphere's disc. That prefix is drawn
-//! at 2×2. The edge band stays at full rate. Both use the fixed-point march.
+//! cube, rounded or mapped body. When mapsolo is on, that heavy run is stably
+//! split into tiles whose mask is exactly one Mapped body, then the rest.
+//! When a coarse-shading query is passed, the base run is stably split into
+//! tiles the sun and moon discs miss, then the rest, and the heavy run is
+//! split into mapped-interior tiles, then the rest. With mapsolo on, that
+//! interior is a prefix of the single-Mapped run and is drawn at 2×2 on the
+//! loop-free fragment. A mapped-interior tile lies inside the horizon disc
+//! or, with the eye outside the lo sphere, inside that sphere's disc. The
+//! edge band stays at full rate. Both use the fixed-point march.
 //! Two azimuthal horizon tables follow the body records. Each is 256 sines
 //! of elevation around the local up of a Mapped body the eye is inside the
 //! hi+air ball of. A tile whose cone sits above its table loses that body's
@@ -32,6 +35,15 @@ use crate::vk::buffers::HostBuffer;
 fn far_cull_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| !std::env::var("VOXEL_FAR_CULL").is_ok_and(|v| v == "0"))
+}
+
+/// `VOXEL_SKY_MAPSOLO=0` draws every heavy tile with the full fragment (or the
+/// no-mapped / sphere variant the frame already chose). Any other value,
+/// including unset, draws a heavy tile whose mask is exactly one Mapped body
+/// with the loop-free fragment. Read once.
+fn sky_mapsolo_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !std::env::var("VOXEL_SKY_MAPSOLO").is_ok_and(|v| v == "0"))
 }
 
 /// One body on the GPU. Ten 16-byte lanes, 160 bytes.
@@ -1486,6 +1498,65 @@ fn split_coarse_far(
     n_coarse as u32
 }
 
+/// One live mask bit, and that kept body is Mapped (shape lane in `(3.5, 4.5)`).
+fn mask_is_mapsolo(table: &FarTableGpu, mask: u32) -> bool {
+    if mask.count_ones() != 1 {
+        return false;
+    }
+    let k = mask.trailing_zeros() as usize;
+    let n = (table.header[0] as usize).min(MAX_FAR_BODIES);
+    if k >= n {
+        return false;
+    }
+    let shape = table.body[k].atmosphere[3];
+    (3.5..4.5).contains(&shape)
+}
+
+/// Live tiles whose mask is exactly one Mapped body. Zero when mapsolo is off.
+/// Counts masks, not the index list: every such tile sits in the heavy run.
+fn count_mapsolo(table: &FarTableGpu) -> u32 {
+    if !sky_mapsolo_enabled() {
+        return 0;
+    }
+    table.tile_mask[..used_tiles(table)]
+        .iter()
+        .filter(|mask| mask_is_mapsolo(table, **mask))
+        .count() as u32
+}
+
+/// Stably partition the heavy run into single-Mapped tiles, then the rest.
+/// Returns that count. Base and sphere runs stay where [`fill_tile_lists`]
+/// put them. Called only while quads are on and mapsolo is enabled, and only
+/// before [`split_coarse_far`], so the interior prefix of this run is the
+/// coarse mapsolo tiles.
+fn partition_mapsolo(table: &mut FarTableGpu) -> u32 {
+    let (n_base, n_sphere, n_heavy) = tile_split(table);
+    if n_heavy == 0 {
+        return 0;
+    }
+    let start = (n_base + n_sphere) as usize;
+    let end = start + n_heavy as usize;
+    if end > table.tile_index.len() {
+        return 0;
+    }
+    let mut solo = Vec::with_capacity(n_heavy as usize);
+    let mut rest = Vec::with_capacity(n_heavy as usize);
+    for slot in start..end {
+        let index = table.tile_index[slot];
+        let mask = table.tile_mask.get(index as usize).copied().unwrap_or(0);
+        if mask_is_mapsolo(table, mask) {
+            solo.push(index);
+        } else {
+            rest.push(index);
+        }
+    }
+    let n = solo.len();
+    for (offset, index) in solo.into_iter().chain(rest).enumerate() {
+        table.tile_index[start + offset] = index;
+    }
+    n as u32
+}
+
 /// Which body fragment a draw needs. `Full` has every shape. `NoMap` drops the
 /// mapped march. `Sphere` keeps spheres and inner spheres.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1518,8 +1589,13 @@ pub(crate) struct SkyDraw {
     /// query actually split the prefix.
     pub n_coarse: u32,
     /// Coarse-eligible prefix of the heavy run. `sky.coarse_far`. Zero unless
-    /// a query actually split that run.
+    /// a query actually split that run. With mapsolo on this prefix is a
+    /// prefix of [`Self::n_mapsolo`].
     pub n_coarse_far: u32,
+    /// Heavy tiles drawn with the loop-free single-Mapped fragment, including
+    /// the 2×2 interior prefix. `sky.mapsolo`. Zero when mapsolo is off or the
+    /// sky is one fullscreen triangle.
+    pub n_mapsolo: u32,
 }
 
 impl Default for SkyDraw {
@@ -1534,6 +1610,7 @@ impl Default for SkyDraw {
             n_full: 0,
             n_coarse: 0,
             n_coarse_far: 0,
+            n_mapsolo: 0,
         }
     }
 }
@@ -1568,6 +1645,7 @@ impl SkyDraw {
                 n_full,
                 n_coarse: 0,
                 n_coarse_far: 0,
+                n_mapsolo: count_mapsolo(table),
             }
         } else {
             Self {
@@ -1580,6 +1658,7 @@ impl SkyDraw {
                 n_full: 0,
                 n_coarse: 0,
                 n_coarse_far: 0,
+                n_mapsolo: 0,
             }
         }
     }
@@ -3100,9 +3179,16 @@ impl FarBodyRing {
             u64::from(table.list_header[1]),
         );
         let mut draw = SkyDraw::from_table(&table, far_cull_enabled());
-        // Fullscreen sky (no tile grid) stays on the 1×1 triangle. The split
-        // rewrites the uploaded index prefix, so it runs before the byte match.
+        // Fullscreen sky (no tile grid) stays on the 1×1 triangle. The splits
+        // rewrite the uploaded index prefix, so they run before the byte match.
+        // Mapsolo comes first: the interior split then pulls its coarse prefix
+        // out of that single-Mapped run, and the full-shader tiles stay after it.
         if draw.quads {
+            if sky_mapsolo_enabled() {
+                let n = partition_mapsolo(&mut table);
+                debug_assert_eq!(n, draw.n_mapsolo);
+                draw.n_mapsolo = n;
+            }
             if let (Some(query), Some(view)) = (coarse.as_ref(), view.as_ref()) {
                 if self.tiles.matches(view) {
                     draw.n_coarse = split_coarse_base(&mut table, &self.tiles, view, query);
@@ -3116,6 +3202,7 @@ impl FarBodyRing {
             crate::profile::Gauge::SkyCoarseFar,
             u64::from(draw.n_coarse_far),
         );
+        crate::profile::gauge(crate::profile::Gauge::SkyMapsolo, u64::from(draw.n_mapsolo));
         self.draw[slot] = draw;
         if super::uniforms::sky_debug_enabled() {
             log_sky_debug(bodies, &table, view.as_ref(), dip, &map_min, sky_up);
@@ -4270,6 +4357,7 @@ mod tests {
         );
         assert_eq!(draw.n_coarse, 0);
         assert_eq!(draw.n_coarse_far, 0);
+        assert_eq!(draw.n_mapsolo, 0);
         assert_eq!(draw.body, SkyBodyPipe::NoMap);
 
         // No kept bodies: one body-free fullscreen triangle, even with a grid.
@@ -4288,13 +4376,81 @@ mod tests {
         table.body[0].atmosphere[3] = 0.0;
         let cube = SkyDraw::from_table(&table, false);
         assert_eq!(cube.body, SkyBodyPipe::NoMap);
+        assert_eq!(cube.n_mapsolo, 0);
         table.body[0].atmosphere[3] = 4.0;
         let mapped = SkyDraw::from_table(&table, false);
         assert_eq!(mapped.body, SkyBodyPipe::Full);
+        assert_eq!(mapped.n_mapsolo, 0);
         table.header[1] = 0;
         let no_grid = SkyDraw::from_table(&table, true);
         assert!(!no_grid.quads && !no_grid.base);
         assert_eq!(no_grid.body, SkyBodyPipe::Full);
+        assert_eq!(no_grid.n_mapsolo, 0);
+    }
+
+    #[test]
+    fn mapsolo_is_the_single_mapped_prefix_of_the_heavy_run() {
+        let mut table = FarTableGpu::zeroed();
+        // 192×128 is 3×2 tiles of 64 px.
+        let width = 192u32;
+        let height = 128u32;
+        let tile_px = 64u32;
+        let tiles_x = width.div_ceil(tile_px);
+        let tiles_y = height.div_ceil(tile_px);
+        assert_eq!((tiles_x, tiles_y), (3, 2));
+        table.header = [3, tile_px, tiles_x, tiles_y];
+        // Kept 0 is a sphere, kept 1 is mapped, kept 2 is a cube.
+        table.body[0].atmosphere[3] = 1.0;
+        table.body[1].atmosphere[3] = 4.0;
+        table.body[2].atmosphere[3] = 0.0;
+        // 0 base, 1 mapped, 2 sphere, 3 mapped+sphere, 4 cube, 5 mapped.
+        table.tile_mask[0] = 0;
+        table.tile_mask[1] = 0b010;
+        table.tile_mask[2] = 0b001;
+        table.tile_mask[3] = 0b011;
+        table.tile_mask[4] = 0b100;
+        table.tile_mask[5] = 0b010;
+        fill_tile_lists(&mut table, width, height);
+
+        let draw = SkyDraw::from_table(&table, true);
+        assert!(draw.quads);
+        assert_eq!(
+            (
+                draw.n_base,
+                draw.n_sphere,
+                draw.n_heavy,
+                draw.n_full,
+                draw.n_mapsolo
+            ),
+            (1, 1, 4, 5, 2)
+        );
+        assert_eq!(
+            draw.n_base + draw.n_sphere + draw.n_heavy,
+            tiles_x * tiles_y
+        );
+        assert!(draw.n_mapsolo <= draw.n_heavy);
+        assert_eq!(draw.body, SkyBodyPipe::Full);
+        // Base, then the single sphere. Heavy is still row-major here.
+        assert_eq!(&table.tile_index[..2], &[0, 2]);
+        assert_eq!(&table.tile_index[2..6], &[1, 3, 4, 5]);
+        let base_sphere = table.tile_index[..2].to_vec();
+        let n = partition_mapsolo(&mut table);
+        assert_eq!(n, draw.n_mapsolo);
+        assert_eq!(&table.tile_index[..2], base_sphere.as_slice());
+        // Mapped tiles stay sorted, then the shared and cube tiles stay sorted.
+        assert_eq!(&table.tile_index[2..6], &[1, 5, 3, 4]);
+        assert!(mask_is_mapsolo(&table, table.tile_mask[1]));
+        assert!(mask_is_mapsolo(&table, table.tile_mask[5]));
+        assert!(
+            !mask_is_mapsolo(&table, table.tile_mask[3]),
+            "mapped+sphere"
+        );
+        assert!(!mask_is_mapsolo(&table, table.tile_mask[2]), "sphere");
+        assert!(!mask_is_mapsolo(&table, table.tile_mask[4]), "cube");
+        assert!(!mask_is_mapsolo(&table, 0));
+        let heavy = &table.tile_index[2..6];
+        assert!(heavy[..n as usize].windows(2).all(|w| w[0] < w[1]));
+        assert!(heavy[n as usize..].windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
@@ -5317,6 +5473,108 @@ mod tests {
             }
         }
         assert!(interiors > 0, "no tile sat below the horizon");
+    }
+
+    #[test]
+    fn mapsolo_interior_is_coarse_and_a_shared_tile_stays_full() {
+        let view = view_pitched(0.0, 90.0, 1280, 720);
+        let frames = TileFrames::build(&view).expect("frames");
+        let map_max = [0.0f32; MAX_FAR_MAPS];
+        let map_min = [0.0f32; MAX_FAR_MAPS];
+        let body = mapped_down(4.0, 1.0, 0.0, 0.0);
+        let mut table = super::pack_table(std::slice::from_ref(&body), Some(view), &map_max);
+        let draw = SkyDraw::from_table(&table, true);
+        assert!(draw.quads);
+        assert!(draw.n_mapsolo > 1, "mapsolo {}", draw.n_mapsolo);
+        assert_eq!(draw.n_mapsolo, draw.n_heavy);
+        assert_eq!(draw.body, SkyBodyPipe::Full);
+        let (start, end) = heavy_run(&table);
+        let head = table.tile_index[..start].to_vec();
+        let heavy = table.tile_index[start..end].to_vec();
+        let n = partition_mapsolo(&mut table);
+        assert_eq!(n, draw.n_mapsolo);
+        // One mapped body: the partition is the identity, and the base run stays.
+        assert_eq!(&table.tile_index[..start], head.as_slice());
+        assert_eq!(&table.tile_index[start..end], heavy.as_slice());
+        let n_coarse = split_coarse_far(
+            &mut table,
+            &frames,
+            &view,
+            &coarse_query(Vec3::Z, false),
+            &map_min,
+        );
+        assert!(
+            n_coarse > 0 && n_coarse <= n,
+            "coarse {n_coarse} of mapsolo {n}"
+        );
+        for &index in &table.tile_index[start..start + n_coarse as usize] {
+            assert!(
+                mask_is_mapsolo(&table, table.tile_mask[index as usize]),
+                "coarse tile {index} is not mapsolo"
+            );
+        }
+
+        // A sphere sharing tiles with the planet leaves those tiles on the full
+        // fragment, after the mapsolo prefix, and out of the coarse run.
+        let companion = placed(Vec3::new(0.0, -1.0, -1.0), 0.15, FarShape::Sphere, 2);
+        let mut both = super::pack_table(&[body, companion], Some(view), &map_max);
+        assert_eq!(both.header[0], 2);
+        let both_draw = SkyDraw::from_table(&both, true);
+        assert_eq!(both_draw.body, SkyBodyPipe::Full);
+        assert!(both_draw.n_mapsolo < both_draw.n_heavy);
+        assert_eq!(
+            both_draw.n_base + both_draw.n_sphere + both_draw.n_heavy,
+            used_tiles(&both) as u32
+        );
+        let (both_start, both_end) = heavy_run(&both);
+        let both_head = both.tile_index[..both_start].to_vec();
+        let n_sphere = both_draw.n_sphere as usize;
+        let n_base = both_draw.n_base as usize;
+        for &index in &both.tile_index[n_base..n_base + n_sphere] {
+            let mask = both.tile_mask[index as usize];
+            assert_ne!(mask, 0);
+            assert!(!mask_is_mapsolo(&both, mask), "sphere tile {index}");
+        }
+        let n_solo = partition_mapsolo(&mut both);
+        assert_eq!(n_solo, both_draw.n_mapsolo);
+        assert_eq!(&both.tile_index[..both_start], both_head.as_slice());
+        let solo = &both.tile_index[both_start..both_start + n_solo as usize];
+        let rest = &both.tile_index[both_start + n_solo as usize..both_end];
+        assert!(solo.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(rest.windows(2).all(|pair| pair[0] < pair[1]));
+        let mut shared = 0u32;
+        for &index in solo {
+            assert!(mask_is_mapsolo(&both, both.tile_mask[index as usize]));
+        }
+        for &index in rest {
+            let mask = both.tile_mask[index as usize];
+            assert!(!mask_is_mapsolo(&both, mask), "tile {index} mask {mask:#x}");
+            if mask.count_ones() != 1 {
+                shared += 1;
+            }
+        }
+        assert!(shared > 0, "the companion shared no heavy tile");
+        let n_both = split_coarse_far(
+            &mut both,
+            &frames,
+            &view,
+            &coarse_query(Vec3::Z, false),
+            &map_min,
+        );
+        assert!(
+            n_both > 0 && n_both <= n_solo,
+            "coarse {n_both} of mapsolo {n_solo}"
+        );
+        let both_coarse = &both.tile_index[both_start..both_start + n_both as usize];
+        for &index in both_coarse {
+            assert!(mask_is_mapsolo(&both, both.tile_mask[index as usize]));
+        }
+        for &index in &both.tile_index[both_start + n_solo as usize..both_end] {
+            assert!(
+                !both_coarse.contains(&index),
+                "full-run tile {index} went coarse"
+            );
+        }
     }
 
     /// Every pixel of a lo-sphere interior tile meets the datum. Altitudes run
