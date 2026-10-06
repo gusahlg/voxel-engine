@@ -569,6 +569,9 @@ static const int FAR_MAP_REFINE = 24;
 static const float FAR_MAP_FTOL = 1e-8;
 // Relative width of the normalised-t bracket. Matches MAPPED_T_TOL.
 static const float FAR_MAP_TTOL = 1e-7;
+// Interior probes of one coarse segment that could hide a root. Matches
+// MAPPED_HUNT. A highland edge is negative only between two positive samples.
+static const int FAR_MAP_HUNT = 4;
 
 #if 0
 // Finite-difference normal kept for comparison. Two one-sided steps of half
@@ -674,12 +677,57 @@ float far_mapped_f(
     return diffSq / (rad + r);
 }
 
+// Look between two positive samples. False when both sit further out than the
+// datum range (no root can hide there) or when the probes stay positive.
+bool far_mapped_hunt(
+    float3 ray, float3 center, float rho, float distance, float4 rot, uint map,
+    float facing, float ray2, float dir2,
+    float lo, float hi, float flo, float fhi, float allowance,
+    out float ba, out float bb, out float bfa, out float bfb)
+{
+    ba = lo;
+    bb = hi;
+    bfa = flo;
+    bfb = fhi;
+    if (!(min(flo, fhi) <= allowance) || !(hi > lo))
+        return false;
+    float pt = lo;
+    float pf = flo;
+    [loop]
+    for (int h = 1; h <= FAR_MAP_HUNT; h++)
+    {
+        float tm = lo + (hi - lo) * (float(h) / float(FAR_MAP_HUNT + 1));
+        float fm = far_mapped_f(ray, center, tm, rho, distance, rot, map, facing, ray2, dir2);
+        if (pf * fm <= 0.0)
+        {
+            ba = pt;
+            bb = tm;
+            bfa = pf;
+            bfb = fm;
+            return true;
+        }
+        pt = tm;
+        pf = fm;
+    }
+    if (pf * fhi <= 0.0)
+    {
+        ba = pt;
+        bb = hi;
+        bfa = pf;
+        bfb = fhi;
+        return true;
+    }
+    return false;
+}
+
 // Datum surface. A bounding-sphere miss has already returned. A sign-change
 // search walks the bracket: one datum cell projected on the ray, capped, and
-// always the closest approach (a thin graze is negative there and positive
-// at both ends). Anderson-Björck then tightens the bracket; a step that
-// fails to halve the width is bisected next. The caller applied the horizon
-// gate. Host mirror: ray_mapped in src/far_body.rs.
+// always the closest approach. A segment still within the datum range of the
+// surface is probed inside (FAR_MAP_HUNT): a highland edge is negative only
+// between those samples, and it is not always the closest segment.
+// Anderson-Björck then tightens the bracket; a step that fails to halve the
+// width is bisected next. The caller applied the horizon gate. Host mirror:
+// ray_mapped in src/far_body.rs.
 bool far_ray_mapped(
     float3 ray, float3 center, float rho, float distance, float4 rot, uint map,
     out float t, out float3 nrm, out uint face)
@@ -736,6 +784,7 @@ bool far_ray_mapped(
     float bb = 0.0;
     float bfa = 0.0;
     float bfb = 0.0;
+    float allowance = abs(maxOff - minOff) / distance;
     [loop]
     for (int i = 1; i <= n; i++)
     {
@@ -752,6 +801,13 @@ bool far_ray_mapped(
                 bfb = fc;
                 break;
             }
+            if (far_mapped_hunt(
+                    ray, center, rho, distance, rot, map, facing, ray2, dir2,
+                    prevT, tClose, prevF, fc, allowance, ba, bb, bfa, bfb))
+            {
+                hasBracket = true;
+                break;
+            }
             prevT = tClose;
             prevF = fc;
         }
@@ -765,11 +821,25 @@ bool far_ray_mapped(
             bfb = ft;
             break;
         }
+        if (far_mapped_hunt(
+                ray, center, rho, distance, rot, map, facing, ray2, dir2,
+                prevT, tn, prevF, ft, allowance, ba, bb, bfa, bfb))
+        {
+            hasBracket = true;
+            break;
+        }
         prevT = tn;
         prevF = ft;
     }
     if (!hasBracket)
+    {
+        // No sign change. Entering the lo sphere with f on zero is a graze
+        // of the minimum surface. The hi-sphere exit is not: f is small
+        // there on a highland far side that the ray never hit.
+        if (loHit && prevF <= 1e-5)
+            return far_mapped_finish(ray, center, prevT, rho, distance, rot, map, t, nrm, face);
         return false;
+    }
     float a = ba;
     float b = bb;
     float fa = bfa;
@@ -899,11 +969,58 @@ bool far_above_horizon(uint bodyIndex, float3 ray, float3 center)
     return mu > farTable[0].horizon_sin[slot * 256u + bin];
 }
 
-// Air shell for a ray that missed the datum. The direction from the centre
-// at the ray's closest approach is the limb's body-space sample: rSurf is
-// the surface radius there, and the shell is
-// [rSurf, rSurf + max(air/distance, px)]. A shell on the hi sphere floats
-// off a lower silhouette. False when the ray misses that shell, including
+// Max of the four corners of the datum cell that contains `d`. The limb
+// uses this so a highland edge keeps the high corner, not the slope.
+float far_datum_cell_max(uint map, float3 d)
+{
+    uint g = farMaps[map * 8u];
+    if (g < 2u)
+        return 0.0;
+    uint face = far_dom_face(d);
+    float3 tu;
+    float3 n;
+    float3 tv;
+    far_face_basis(face, tu, n, tv);
+    float den = dot(d, n);
+    if (abs(den) < 1e-8)
+        return 0.0;
+    float xi = (4.0 / 3.14159265358979323846) * far_atan_approx(dot(d, tu) / den);
+    float eta = (4.0 / 3.14159265358979323846) * far_atan_approx(dot(d, tv) / den);
+    float scale = 0.5 * float(g - 1u);
+    float u = clamp((xi + 1.0) * scale, 0.0, float(g - 1u));
+    float v = clamp((eta + 1.0) * scale, 0.0, float(g - 1u));
+    uint i0 = min(uint(floor(u)), g - 1u);
+    uint j0 = min(uint(floor(v)), g - 1u);
+    uint i1 = min(i0 + 1u, g - 1u);
+    uint j1 = min(j0 + 1u, g - 1u);
+    uint off = farMaps[map * 8u + 1u];
+    uint base = 64u + off + face * g * g;
+    float v00 = asfloat(farMaps[base + j0 * g + i0]);
+    float v10 = asfloat(farMaps[base + j0 * g + i1]);
+    float v01 = asfloat(farMaps[base + j1 * g + i0]);
+    float v11 = asfloat(farMaps[base + j1 * g + i1]);
+    return max(max(v00, v10), max(v01, v11));
+}
+
+// Limb radius at `t`: cell-max datum so a highland edge keeps the high
+// corner. Three calls along the hi-sphere chord, no array.
+float far_mapped_r(
+    float3 ray, float3 center, float t, float rho, float distance, float4 rot, uint map)
+{
+    float3 p = ray * t - center;
+    float rad = length(p);
+    if (rad < 1e-8)
+        return 0.0;
+    return rho + far_datum_cell_max(map, far_inv_rotate(rot, p / rad)) / distance;
+}
+
+// Air shell for a ray that missed the datum. rSurf is the max cell-corner
+// datum at closest approach and at the hi-sphere entry and exit. An edge
+// cell keeps the highland corner so the interpolated slope cannot drop the
+// limb into a notch. The shell is rSurf + max(air/distance, px), and it
+// stops at the outer air sphere rho + (maxOff + air) / distance. A pixel
+// wider than the air used to stick out past the horizon cone and get cut
+// off in a straight line. False when the ray misses that shell, including
 // a degenerate approach straight through the centre.
 bool far_mapped_limb(
     float3 ray, float3 center, float facing, float rho, float distance,
@@ -917,18 +1034,24 @@ bool far_mapped_limb(
     if (!(distance > 0.0) || !(facing > 0.0))
         return false;
     float maxOff = asfloat(farMaps[map * 8u + 3u]);
-    float rhoHi = rho + maxOff / distance;
+    float rhoCap = rho + (maxOff + airThick) / distance;
+    // Outside that sphere every local shell is missed. Skip the datum sample.
+    if (!(rhoCap > 0.0) || !(s < rhoCap))
+        return false;
+    rSurf = far_mapped_r(ray, center, facing, rho, distance, rot, map);
+    float tIn;
+    float tOut;
+    if (far_sphere_roots(facing, rho + maxOff / distance, tIn, tOut))
+    {
+        if (tIn > 0.0)
+            rSurf = max(rSurf, far_mapped_r(ray, center, tIn, rho, distance, rot, map));
+        if (tOut > 0.0)
+            rSurf = max(rSurf, far_mapped_r(ray, center, tOut, rho, distance, rot, map));
+    }
     float shell = max(airThick / distance, px);
-    // The local surface is at most the hi sphere, so a miss of that outer
-    // bound misses every local shell and can skip the datum sample.
-    if (!(rhoHi > 0.0 && s < rhoHi + shell))
-        return false;
-    float3 fromCenter = ray * facing - center;
-    if (!(dot(fromCenter, fromCenter) > 1e-16))
-        return false;
-    float3 bodyDir = far_inv_rotate(rot, normalize(fromCenter));
-    rSurf = rho + far_datum(map, bodyDir) / distance;
     outer = rSurf + shell;
+    if (outer > rhoCap)
+        outer = rhoCap;
     return rSurf > 0.0 && s < outer;
 }
 #endif

@@ -738,6 +738,38 @@ fn sample_datum(g: u32, datum: &[f32], d: Vec3) -> f32 {
     sample_datum_d(g, datum, d).value
 }
 
+/// Max of the four bilinear corners of the datum cell that contains `d`.
+/// Matches `far_datum_cell_max`. The limb uses this so an edge cell keeps the
+/// highland radius instead of the interpolated slope.
+#[cfg(test)]
+fn sample_datum_cell_max(g: u32, datum: &[f32], d: Vec3) -> f32 {
+    if g < 2 {
+        return 0.0;
+    }
+    let gg = g as usize;
+    let need = 6 * gg * gg;
+    if datum.len() < need {
+        return 0.0;
+    }
+    let face = dom_face(d) as usize;
+    let (tu, n, tv) = far_map_basis(face);
+    let den = d.dot(n);
+    if den.abs() < 1e-8 {
+        return 0.0;
+    }
+    let xi = (4.0 / std::f32::consts::PI) * atan_approx(d.dot(tu) / den);
+    let eta = (4.0 / std::f32::consts::PI) * atan_approx(d.dot(tv) / den);
+    let scale = 0.5 * (g - 1) as f32;
+    let u = ((xi + 1.0) * scale).clamp(0.0, (g - 1) as f32);
+    let v = ((eta + 1.0) * scale).clamp(0.0, (g - 1) as f32);
+    let i0 = (u.floor() as u32).min(g - 1);
+    let j0 = (v.floor() as u32).min(g - 1);
+    let i1 = (i0 + 1).min(g - 1);
+    let j1 = (j0 + 1).min(g - 1);
+    let at = |j: u32, i: u32| datum[face * gg * gg + j as usize * gg + i as usize];
+    at(j0, i0).max(at(j0, i1)).max(at(j1, i0)).max(at(j1, i1))
+}
+
 /// Near and far roots of a sphere of radius `rho` centred on the unit `dir`.
 #[cfg(test)]
 fn sphere_roots(facing: f32, rho: f32) -> Option<(f32, f32)> {
@@ -985,6 +1017,11 @@ const MAPPED_F_TOL: f32 = 1e-8;
 /// The `1e-4` floor keeps a root near the camera from asking for a sub-ulp step.
 #[cfg(test)]
 const MAPPED_T_TOL: f32 = 1e-7;
+/// Interior probes of a coarse segment that could still hide a root.
+/// Matches `FAR_MAP_HUNT`. A highland edge is negative only between two
+/// positive samples, and that segment is not always the closest one.
+#[cfg(test)]
+const MAPPED_HUNT: u32 = 4;
 
 /// Ray from the origin against a datum-mapped body. `dir` is the unit centre.
 /// `rho` is `radius/distance`. Offsets are in the radius's unit.
@@ -992,8 +1029,10 @@ const MAPPED_T_TOL: f32 = 1e-7;
 /// A bounding-sphere miss and the horizon test return before any datum load.
 /// Otherwise a sign-change search walks the bracket. The step is one datum
 /// cell projected on the ray, and the count is capped. The closest approach
-/// is always one of the probes: a thin graze is negative there and positive
-/// at both ends, so a uniform grid can step over it. The bracket is then
+/// is always one of the probes. A segment whose samples are still within the
+/// datum range of the surface is probed inside ([`MAPPED_HUNT`]): a highland
+/// edge is negative only between those samples. A lo-sphere end with `f` on
+/// zero is a graze of the minimum surface. The bracket is then
 /// Anderson–Björck, and a step that fails to halve the width is bisected on
 /// the next iteration. Stops when the width is [`MAPPED_T_TOL`] relative, or
 /// when f32 can no longer split the interval. `horizon` skips
@@ -1097,6 +1136,25 @@ pub(crate) fn ray_mapped(
     let mut prev_t = t_start;
     let mut prev_f = f_start;
     let mut bracket: Option<(f32, f32, f32, f32)> = None;
+    // A segment cannot cross zero if both samples are further out than the
+    // whole datum range. Anything closer may hide a highland edge.
+    let allowance = (max_off - min_off).abs() / distance;
+    let hunt = |lo: f32, hi: f32, mut pf: f32, fhi: f32| -> Option<(f32, f32, f32, f32)> {
+        if !(pf.min(fhi) <= allowance) {
+            return None;
+        }
+        let mut pt = lo;
+        for i in 1..=MAPPED_HUNT {
+            let tm = lo + (hi - lo) * (i as f32 / (MAPPED_HUNT as f32 + 1.0));
+            let fm = f_at(tm);
+            if pf * fm <= 0.0 {
+                return Some((pt, tm, pf, fm));
+            }
+            pt = tm;
+            pf = fm;
+        }
+        (pf * fhi <= 0.0).then_some((pt, hi, pf, fhi))
+    };
     for i in 1..=n {
         let tn = if i == n {
             t_end
@@ -1109,6 +1167,10 @@ pub(crate) fn ray_mapped(
                 bracket = Some((prev_t, t_close, prev_f, fc));
                 break;
             }
+            if let Some(found) = hunt(prev_t, t_close, prev_f, fc) {
+                bracket = Some(found);
+                break;
+            }
             prev_t = t_close;
             prev_f = fc;
         }
@@ -1117,11 +1179,23 @@ pub(crate) fn ray_mapped(
             bracket = Some((prev_t, tn, prev_f, ft));
             break;
         }
+        if let Some(found) = hunt(prev_t, tn, prev_f, ft) {
+            bracket = Some(found);
+            break;
+        }
         prev_t = tn;
         prev_f = ft;
     }
     let Some((mut a, mut b, mut fa, mut fb)) = bracket else {
-        return None;
+        // No sign change. Entering the lo sphere with f on zero is a graze
+        // of the minimum surface (a uniform grid of positive samples can
+        // miss that). The hi-sphere exit is not: f is small there on a
+        // highland far side that the ray never hit.
+        return if t_lo.is_some() && prev_f <= 1e-5 {
+            finish(prev_t)
+        } else {
+            None
+        };
     };
     if a > b {
         std::mem::swap(&mut a, &mut b);
@@ -1222,11 +1296,109 @@ pub(crate) fn ray_mapped(
     finish(t_hit)
 }
 
-/// Air-shell limb, the host mirror of `far_mapped_limb`.
+/// Surface radius of the mapped body along `ray` at normalised `t`.
+#[cfg(test)]
+fn mapped_radius_at(
+    ray: Vec3,
+    dir: Vec3,
+    t: f32,
+    rho: f32,
+    distance: f32,
+    rotation: Quat,
+    g: u32,
+    datum: &[f32],
+) -> f32 {
+    let p = ray * t - dir;
+    let rad = p.length();
+    if rad < 1e-8 {
+        return 0.0;
+    }
+    rho + sample_datum(g, datum, rotate(conjugate(rotation), p / rad)) / distance
+}
+
+/// Limb radius along `ray` at `t`: cell-max datum, so a highland edge keeps
+/// the high corner instead of the interpolated slope.
+#[cfg(test)]
+fn mapped_limb_radius_at(
+    ray: Vec3,
+    dir: Vec3,
+    t: f32,
+    rho: f32,
+    distance: f32,
+    rotation: Quat,
+    g: u32,
+    datum: &[f32],
+) -> f32 {
+    let p = ray * t - dir;
+    let rad = p.length();
+    if rad < 1e-8 {
+        return 0.0;
+    }
+    rho + sample_datum_cell_max(g, datum, rotate(conjugate(rotation), p / rad)) / distance
+}
+
+/// Local air shell for a ray that missed the datum. Host mirror of
+/// `far_mapped_limb`.
 ///
-/// `px` is the pixel angle the shader passes (0 for the geometric shell).
-/// A ray aimed away from the centre, or one that misses the shell
-/// `r(approach) + max(air/distance, px)`, is not a limb.
+/// `r_surf` is the max cell-corner datum at closest approach and at the
+/// hi-sphere entry and exit. An edge cell keeps the highland corner so the
+/// interpolated slope cannot drop the limb into a notch. The outer radius
+/// is `r_surf + max(air/distance, px)`, clamped to the air sphere
+/// `rho + (max_off + air) / distance` that the horizon cone bounds. A
+/// pixel-wide shell used to stick out past that sphere and get cut off in a
+/// straight line. `s` is the impact parameter.
+#[cfg(test)]
+struct MappedShell {
+    r_surf: f32,
+    outer: f32,
+    s: f32,
+}
+
+#[cfg(test)]
+fn ray_mapped_shell(
+    ray: Vec3,
+    dir: Vec3,
+    rho: f32,
+    distance: f32,
+    rotation: Quat,
+    g: u32,
+    datum: &[f32],
+    max_off: f32,
+    air: f32,
+    px: f32,
+) -> Option<MappedShell> {
+    if !(distance > 0.0) || !ray.is_finite() || !dir.is_finite() {
+        return None;
+    }
+    let facing = ray.dot(dir);
+    if !(facing > 0.0) {
+        return None;
+    }
+    let s = ray.cross(dir).length();
+    let rho_cap = rho + (max_off + air) / distance;
+    // Outside that sphere every local shell is missed. Skip the datum load.
+    if !(rho_cap > 0.0 && s < rho_cap) {
+        return None;
+    }
+    let r_at = |t: f32| mapped_limb_radius_at(ray, dir, t, rho, distance, rotation, g, datum);
+    let mut r_surf = r_at(facing);
+    if let Some((t_in, t_out)) = sphere_roots(facing, rho + max_off / distance) {
+        if t_in > 0.0 {
+            r_surf = r_surf.max(r_at(t_in));
+        }
+        if t_out > 0.0 {
+            r_surf = r_surf.max(r_at(t_out));
+        }
+    }
+    if !(r_surf > 0.0) {
+        return None;
+    }
+    let shell = (air / distance).max(px);
+    let outer = (r_surf + shell).min(rho_cap);
+    (s < outer).then_some(MappedShell { r_surf, outer, s })
+}
+
+/// `true` when [`ray_mapped_shell`] covers `ray`. `px` is the pixel angle.
 #[cfg(test)]
 pub(crate) fn ray_mapped_limb(
     ray: Vec3,
@@ -1240,26 +1412,10 @@ pub(crate) fn ray_mapped_limb(
     air: f32,
     px: f32,
 ) -> bool {
-    if !(distance > 0.0) || !ray.is_finite() || !dir.is_finite() {
-        return false;
-    }
-    let facing = ray.dot(dir);
-    if !(facing > 0.0) {
-        return false;
-    }
-    let s = ray.cross(dir).length();
-    let rho_hi = rho + max_off / distance;
-    let shell = (air / distance).max(px);
-    if !(rho_hi > 0.0 && s < rho_hi + shell) {
-        return false;
-    }
-    let from = ray * facing - dir;
-    if from.length_squared() <= 1e-16 {
-        return false;
-    }
-    let body_dir = rotate(conjugate(rotation), from.normalize());
-    let r_surf = rho + sample_datum(g, datum, body_dir) / distance;
-    r_surf > 0.0 && s < r_surf + shell
+    ray_mapped_shell(
+        ray, dir, rho, distance, rotation, g, datum, max_off, air, px,
+    )
+    .is_some()
 }
 
 #[cfg(test)]
@@ -2589,5 +2745,206 @@ mod tests {
         let huge = mapped_albedo_lod(1.0, 10.0, distance, radius, 0.05, albedo);
         assert_eq!(tiny, 0.0);
         assert_eq!(huge, (albedo as f32).log2());
+    }
+
+    /// Lowland everywhere, a broad highland in front of +X. The zenith sample
+    /// stays 0 so an eye on +Y is above the ground, not inside the bump.
+    fn horizon_highland(g: u32, beta0: f32, beta1: f32, az_half: f32, height: f32) -> Vec<f32> {
+        let gg = g as usize;
+        let mut datum = vec![0.0f32; 6 * gg * gg];
+        for face in 0..6usize {
+            let (tu, n, tv) = far_map_basis(face);
+            for j in 0..g {
+                for i in 0..g {
+                    let edge = (g - 1) as f32;
+                    let xi = 2.0 * i as f32 / edge - 1.0;
+                    let eta = 2.0 * j as f32 / edge - 1.0;
+                    let quarter = std::f32::consts::FRAC_PI_4;
+                    let d =
+                        (n + tu * (xi * quarter).tan() + tv * (eta * quarter).tan()).normalize();
+                    let beta = d.dot(Vec3::Y).clamp(-1.0, 1.0).acos();
+                    let az = d.z.atan2(d.x);
+                    if (beta0..=beta1).contains(&beta) && az.abs() <= az_half {
+                        datum[face * gg * gg + j as usize * gg + i as usize] = height;
+                    }
+                }
+            }
+        }
+        datum
+    }
+
+    /// Closed-form tangent of the outer air sphere, or `1` when that sphere
+    /// contains the camera (the game then disables the scalar cone).
+    fn outer_horizon_sine(rho_cap: f32) -> f32 {
+        if rho_cap > 0.0 && rho_cap < 1.0 {
+            -(1.0 - rho_cap * rho_cap).max(0.0).sqrt()
+        } else {
+            1.0
+        }
+    }
+
+    fn limb_chord(shell: &MappedShell) -> f32 {
+        let outer_c = (shell.outer * shell.outer - shell.s * shell.s)
+            .max(0.0)
+            .sqrt();
+        if shell.s >= shell.r_surf {
+            2.0 * outer_c
+        } else {
+            let inner = (shell.r_surf * shell.r_surf - shell.s * shell.s)
+                .max(0.0)
+                .sqrt();
+            2.0 * (outer_c - inner)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SilhouetteClass {
+        Hit,
+        Limb,
+        Miss,
+    }
+
+    /// Highland at the horizon: every ray hits, or gets a limb on the surface
+    /// it grazes. No hole between the two, and no limb past the air cap.
+    #[test]
+    fn highland_silhouette_is_continuous() {
+        let g = 33u32;
+        let radius = HOME_RADIUS as f32;
+        let air = 20_000.0f32;
+        let px = 1.5e-3f32;
+        let dir = -Vec3::Y;
+        let datum = horizon_highland(g, 0.03, 0.55, 0.45, 1_000_000.0);
+        let max_off = datum.iter().copied().fold(0.0f32, f32::max);
+        let min_off = 0.0f32;
+        assert_eq!(sample_datum(g, &datum, Vec3::Y), 0.0);
+        let mut inside_empty = 0u32;
+        let mut limb_above = 0u32;
+        let mut holes = 0u32;
+        let mut gaps = 0u32;
+        let mut gap_where = String::new();
+        let mut limb_n = 0u32;
+        let mut chord_jump = 0u32;
+        for altitude in [50_000.0f32, 2_000_000.0] {
+            let distance = radius + altitude;
+            let rho = radius / distance;
+            let rho_cap = rho + (max_off + air) / distance;
+            let horizon = outer_horizon_sine(rho_cap);
+            for azimuth in [0.0f32, 0.35, 0.55, 1.2] {
+                let horizon_ang = reference_horizon_angle(
+                    dir, azimuth, rho, distance, g, &datum, min_off, max_off,
+                );
+                let mut row: Vec<(SilhouetteClass, f32, f32, f32, f32)> = Vec::new();
+                for k in -40..=80 {
+                    let angle = horizon_ang + f64::from(k) * 2.0e-4;
+                    if !(angle > 0.0 && angle < std::f64::consts::PI) {
+                        continue;
+                    }
+                    let ray = ray_from_nadir(dir, azimuth, angle as f32);
+                    let facing = ray.dot(dir);
+                    let above = ray.dot(-dir) > horizon;
+                    let hit = if above {
+                        None
+                    } else {
+                        ray_mapped(
+                            ray,
+                            dir,
+                            rho,
+                            distance,
+                            Quat::IDENTITY,
+                            horizon,
+                            g,
+                            &datum,
+                            min_off,
+                            max_off,
+                        )
+                    };
+                    let shell = if above {
+                        None
+                    } else {
+                        ray_mapped_shell(
+                            ray,
+                            dir,
+                            rho,
+                            distance,
+                            Quat::IDENTITY,
+                            g,
+                            &datum,
+                            max_off,
+                            air,
+                            px,
+                        )
+                    };
+                    let s = ray.cross(dir).length();
+                    let r_local = if facing > 0.0 {
+                        mapped_radius_at(ray, dir, facing, rho, distance, Quat::IDENTITY, g, &datum)
+                    } else {
+                        0.0
+                    };
+                    let class = if hit.is_some() {
+                        SilhouetteClass::Hit
+                    } else if shell.is_some() {
+                        SilhouetteClass::Limb
+                    } else {
+                        SilhouetteClass::Miss
+                    };
+                    if facing > 0.0 && s + 1e-5 < r_local && class == SilhouetteClass::Miss {
+                        inside_empty += 1;
+                    }
+                    if let Some(sh) = &shell {
+                        if class == SilhouetteClass::Limb && sh.s > rho_cap + 1e-5 {
+                            limb_above += 1;
+                        }
+                    }
+                    let chord = shell.as_ref().map(limb_chord).unwrap_or(0.0);
+                    let outer = shell.as_ref().map(|sh| sh.outer).unwrap_or(0.0);
+                    if class == SilhouetteClass::Limb {
+                        limb_n += 1;
+                    }
+                    row.push((class, facing, chord, angle as f32, outer));
+                }
+                for w in row.windows(3) {
+                    let (a, _, _, _, _) = w[0];
+                    let (b, facing, _, ang, outer) = w[1];
+                    let (c, _, _, _, _) = w[2];
+                    if b == SilhouetteClass::Miss
+                        && a != SilhouetteClass::Miss
+                        && c != SilhouetteClass::Miss
+                    {
+                        holes += 1;
+                    }
+                    if a == SilhouetteClass::Hit && b == SilhouetteClass::Miss && facing > 0.0 {
+                        gaps += 1;
+                        if gap_where.is_empty() {
+                            gap_where = format!(
+                                "alt {altitude} az {azimuth} ang {ang} facing {facing} outer {outer} href {horizon_ang} {:?}->{:?}->{:?}",
+                                a, b, c
+                            );
+                        }
+                    }
+                }
+                for w in row.windows(2) {
+                    let (a, _, ca, _, _) = w[0];
+                    let (b, _, cb, _, _) = w[1];
+                    if a == SilhouetteClass::Limb && b == SilhouetteClass::Limb {
+                        let scale = ca.max(cb).max(px);
+                        if (ca - cb).abs() > 8.0 * scale {
+                            chord_jump += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            inside_empty, 0,
+            "rays inside the local surface with no hit and no limb"
+        );
+        assert_eq!(limb_above, 0, "limb rays past the outer air sphere");
+        assert_eq!(
+            gaps, 0,
+            "hit then miss with no limb between the surface and space ({gap_where})"
+        );
+        assert_eq!(holes, 0, "limb band with a miss hole in it");
+        assert_eq!(chord_jump, 0, "limb chord jumped between adjacent rays");
+        assert!(limb_n > 0, "expected some limb rays on the highland");
     }
 }

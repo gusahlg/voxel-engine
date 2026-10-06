@@ -460,6 +460,12 @@ const SLANG_CONST_ALLOWLIST: &[(&str, &str)] = &[
         "relative width of the normalised-t bracket, the same tolerance as \
          MAPPED_T_TOL in src/far_body.rs",
     ),
+    (
+        "FAR_MAP_HUNT",
+        "extra probes in a coarse mapped segment that could hide a highland \
+         edge, the same count as MAPPED_HUNT in src/far_body.rs. A search \
+         limit, not a scene tunable",
+    ),
 ];
 
 /// Lint static consts; allowlist-exempt those referencing generated symbols.
