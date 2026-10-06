@@ -95,6 +95,42 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     float4 far = mul(pc.inv_view_proj, float4(input.ndc, 0.0, 1.0));
     float3 ray = normalize(far.xyz);
 
+#ifdef FAR_MAPPED_SOLO
+    // fwidth before any mask branch, same as the full entry. Pixel position
+    // is consumed before the march (the debug key returns here) so FragCoord
+    // is not live across a datum fetch. The background is built only on a
+    // miss, after the march: a hit replaces it.
+    float px = max(length(fwidth(ray)), 1e-6);
+    float2 pix = input.frag_pos.xy;
+    [branch]
+    if (frame.sky_tangent.w != 0.0)
+    {
+        float3 dbg = far_sky_debug_rgb(ray, px, pix);
+        float yLocal = sky_local(ray, frame).y;
+        float sDip = frame.sky_bitangent.w;
+        if (yLocal >= -sDip && yLocal <= 0.0)
+            dbg += 0.5;
+        return float4(dbg, 1.0);
+    }
+    float4 body = far_mapped_solo(ray, px, pix);
+    float3 col;
+    if (body.w != 0.0)
+        col = body.xyz;
+    else
+    {
+        float3 inscatter = sky_radiance(ray, frame);
+        col = inscatter
+               + sun_disc_cos(ray, pc.sun.xyz, pc.sun_tint.rgb, pc.sun.w, pc.sun_tint.w);
+        float night = 1.0 - frame.light.w;
+        float3 moon_dir = -pc.sun.xyz;
+        float3 moon_tint = float3(MOON_TINT[0], MOON_TINT[1], MOON_TINT[2]);
+        col += sun_disc_cos(ray, moon_dir, moon_tint, pc.moon.x, pc.moon.y) * night;
+        float star_night = max(night, frame.exposure_dither.y);
+        if (star_night * frame.extras.x > 0.0)
+            col += stars(ray, moon_dir, star_night) * frame.extras.x;
+        col += body.xyz;
+    }
+#else
     // Fog IS the sky: the same analytic radiance the terrain fades toward, plus
     // the additive HDR sun disc. glow_pow / sun dir / disc cosines are hoisted.
     float3 inscatter = sky_radiance(ray, frame);
@@ -125,6 +161,7 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     float px = max(length(fwidth(ray)), 1e-6);
     col = far_bodies(ray, col, px, input.frag_pos.xy);
 #endif
+#endif
 
     // Slab clouds composite LAST so opaque cloud occludes the sun/moon/stars it
     // covers. The octahedral map is the local upper hemisphere; skip the tap
@@ -139,12 +176,15 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     }
     col = col * (1.0 - cover) + cloud_lit;
 
+#ifndef FAR_MAPPED_SOLO
     // VOXEL_SKY_DEBUG. sky_tangent.w is 1 for the frame or 0. One uniform
     // branch: when it is 0 the colour above is what the pixel returns, and
     // far_sky_debug_rgb is not called. A non-zero lane replaces the colour
     // with the source key. R/G/B mark a mapped surface, a mapped air limb,
     // and a horizon skip; base sky (no far bodies) stays 0.25 grey. The steep
     // part of sky_radiance's elevation remap, -s <= y_local <= 0, adds 0.5.
+    // The solo variant returns this key before the march so FragCoord is not
+    // live across a datum fetch.
     [branch]
     if (frame.sky_tangent.w != 0.0)
     {
@@ -160,5 +200,6 @@ float4 fragmentMain(FragmentInput input) : SV_Target
             dbg += 0.5;
         return float4(dbg, 1.0);
     }
+#endif
     return float4(col, 1.0);
 }

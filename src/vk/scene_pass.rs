@@ -832,13 +832,16 @@ impl<'a> RenderPass<'a> {
     /// With a real per-tile mask, body-free tiles draw as instanced quads on
     /// the `SKY_BASE` pipeline. Tiles neither disc can touch, and with stars
     /// off, are a prefix of that run and use the 2×2 pipeline when it exists.
-    /// Sphere-only tiles use the sphere variant. Tiles that meet a cube,
-    /// rounded or mapped body use the no-mapped variant, or the full variant
-    /// when the frame kept a mapped body. Mapped-interior tiles are a prefix
-    /// of that heavy run and use the full fragment at 2×2 when it exists.
-    /// Edge tiles stay at full rate. Both rates use the fixed-point mapped
-    /// march. No tile classification keeps one fullscreen triangle on that
-    /// same choice. No bodies use the base pipeline.
+    /// Sphere-only tiles use the sphere variant. A heavy tile whose mask is
+    /// exactly one Mapped body uses the loop-free mapsolo fragment; its
+    /// interior is a prefix of that run and uses the 2×2 mapsolo pipeline
+    /// when it exists. Every other heavy tile uses the no-mapped variant, or
+    /// the full variant when the frame kept a mapped body. With mapsolo off,
+    /// mapped-interior tiles are a prefix of the whole heavy run and use the
+    /// full fragment at 2×2. Edge tiles stay at full rate. Both rates use the
+    /// fixed-point mapped march. No tile classification keeps one fullscreen
+    /// triangle on that same choice. No bodies use the base pipeline. The
+    /// fullscreen triangle never binds mapsolo: it has no per-tile mask.
     pub(super) unsafe fn record_sky(&self) {
         let Some(desc) = self.lists.sky_for_pass() else {
             return;
@@ -859,6 +862,8 @@ impl<'a> RenderPass<'a> {
         let sky_tile_base = self.r.pipelines.sky_tile_base;
         let sky_tile_base_coarse = self.r.pipelines.sky_tile_base_coarse;
         let sky_tile_coarse = self.r.pipelines.sky_tile_coarse;
+        let sky_tile_mapsolo = self.r.pipelines.sky_tile_mapsolo;
+        let sky_tile_mapsolo_coarse = self.r.pipelines.sky_tile_mapsolo_coarse;
         let sky_tile_sphere = self.r.pipelines.sky_tile_sphere;
         let sky_tile_heavy = match draw.body {
             super::far_bodies::SkyBodyPipe::Full => self.r.pipelines.sky_tile,
@@ -875,11 +880,22 @@ impl<'a> RenderPass<'a> {
             }
         };
         // No coarse pipeline: draw that run at 1×1. The CPU only reorders a
-        // run when the pipeline exists for these samples.
+        // run when the pipeline exists for these samples. Mapsolo tiles are a
+        // prefix of the heavy run, and their interior is a prefix of that
+        // prefix. With mapsolo off the prefix is empty and the heavy run is
+        // the old coarse/full split.
         let n_coarse = sky_tile_base_coarse.map_or(0, |_| draw.n_coarse.min(draw.n_base));
         let n_fine = draw.n_base - n_coarse;
-        let n_coarse_far = sky_tile_coarse.map_or(0, |_| draw.n_coarse_far.min(draw.n_heavy));
-        let n_heavy_fine = draw.n_heavy - n_coarse_far;
+        let n_mapsolo = draw.n_mapsolo.min(draw.n_heavy);
+        let n_mapsolo_coarse =
+            sky_tile_mapsolo_coarse.map_or(0, |_| draw.n_coarse_far.min(n_mapsolo));
+        let n_mapsolo_fine = n_mapsolo - n_mapsolo_coarse;
+        let n_full_coarse = sky_tile_coarse.map_or(0, |_| {
+            draw.n_coarse_far
+                .saturating_sub(n_mapsolo)
+                .min(draw.n_heavy - n_mapsolo)
+        });
+        let n_full_fine = draw.n_heavy - n_mapsolo - n_full_coarse;
         let first = if quads {
             if n_coarse > 0 {
                 sky_tile_base_coarse.unwrap_or(sky_tile_base)
@@ -887,7 +903,11 @@ impl<'a> RenderPass<'a> {
                 sky_tile_base
             } else if draw.n_sphere > 0 {
                 sky_tile_sphere
-            } else if n_coarse_far > 0 {
+            } else if n_mapsolo_coarse > 0 {
+                sky_tile_mapsolo_coarse.unwrap_or(sky_tile_mapsolo)
+            } else if n_mapsolo_fine > 0 {
+                sky_tile_mapsolo
+            } else if n_full_coarse > 0 {
                 sky_tile_coarse.unwrap_or(sky_tile_heavy)
             } else {
                 sky_tile_heavy
@@ -972,10 +992,11 @@ impl<'a> RenderPass<'a> {
                 &writes,
             );
             if quads {
-                // Runs are coarse base, fine base, sphere, coarse mapped
-                // interior, then the rest of the heavy run. firstInstance is
-                // the run start; the vertex shader's InstanceIndex includes
-                // it, so each coarse prefix is the tiles the split wrote first.
+                // Runs are coarse base, fine base, sphere, mapsolo coarse,
+                // mapsolo fine, full coarse, then the rest of the heavy run.
+                // firstInstance is the run start; the vertex shader's
+                // InstanceIndex includes it, so each prefix is the tiles the
+                // split wrote first. Each pipeline is bound once.
                 if n_coarse > 0 {
                     device.cmd_draw(cmd, 6, n_coarse, 0, 0);
                 }
@@ -1000,25 +1021,51 @@ impl<'a> RenderPass<'a> {
                     device.cmd_draw(cmd, 6, draw.n_sphere, 0, draw.n_base);
                 }
                 let heavy_start = draw.n_base + draw.n_sphere;
-                if n_coarse_far > 0 {
+                if n_mapsolo_coarse > 0 {
                     if draw.n_base > 0 || draw.n_sphere > 0 {
+                        device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            sky_tile_mapsolo_coarse.unwrap_or(sky_tile_mapsolo),
+                        );
+                    }
+                    device.cmd_draw(cmd, 6, n_mapsolo_coarse, 0, heavy_start);
+                }
+                if n_mapsolo_fine > 0 {
+                    if draw.n_base > 0 || draw.n_sphere > 0 || n_mapsolo_coarse > 0 {
+                        device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            sky_tile_mapsolo,
+                        );
+                    }
+                    device.cmd_draw(cmd, 6, n_mapsolo_fine, 0, heavy_start + n_mapsolo_coarse);
+                }
+                if n_full_coarse > 0 {
+                    if draw.n_base > 0 || draw.n_sphere > 0 || n_mapsolo > 0 {
                         device.cmd_bind_pipeline(
                             cmd,
                             vk::PipelineBindPoint::GRAPHICS,
                             sky_tile_coarse.unwrap_or(sky_tile_heavy),
                         );
                     }
-                    device.cmd_draw(cmd, 6, n_coarse_far, 0, heavy_start);
+                    device.cmd_draw(cmd, 6, n_full_coarse, 0, heavy_start + n_mapsolo);
                 }
-                if n_heavy_fine > 0 {
-                    if draw.n_base > 0 || draw.n_sphere > 0 || n_coarse_far > 0 {
+                if n_full_fine > 0 {
+                    if draw.n_base > 0 || draw.n_sphere > 0 || n_mapsolo > 0 || n_full_coarse > 0 {
                         device.cmd_bind_pipeline(
                             cmd,
                             vk::PipelineBindPoint::GRAPHICS,
                             sky_tile_heavy,
                         );
                     }
-                    device.cmd_draw(cmd, 6, n_heavy_fine, 0, heavy_start + n_coarse_far);
+                    device.cmd_draw(
+                        cmd,
+                        6,
+                        n_full_fine,
+                        0,
+                        heavy_start + n_mapsolo + n_full_coarse,
+                    );
                 }
             } else {
                 device.cmd_draw(cmd, 3, 1, 0, 0);

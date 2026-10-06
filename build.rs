@@ -317,6 +317,16 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             "sky_sphere.frag.spv",
         )
     });
+    // One mapped body: the lowest set bit of the tile mask. No shape loop.
+    jobs.push(ShaderJob {
+        defines: &[("FAR_MAPPED_SOLO", None)],
+        ..job(
+            "shaders/sky.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "sky_mapsolo.frag.spv",
+        )
+    });
     // Present-time TAA tonemap fragment (`-DTAA_FUSED`).
     jobs.push(ShaderJob {
         defines: &[("TAA_FUSED", None)],

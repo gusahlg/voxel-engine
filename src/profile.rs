@@ -369,10 +369,13 @@ pub enum Gauge {
     SkyCoarse,
     /// Mapped-interior sky tiles drawn at a 2×2 fragment shading rate.
     SkyCoarseFar,
+    /// Sky tiles drawn with the loop-free single-Mapped fragment, including
+    /// the 2×2 interior prefix.
+    SkyMapsolo,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 35] = [
+    const ALL: [Gauge; 36] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
@@ -408,6 +411,7 @@ impl Gauge {
         Gauge::FarTiles,
         Gauge::SkyCoarse,
         Gauge::SkyCoarseFar,
+        Gauge::SkyMapsolo,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -448,6 +452,7 @@ impl Gauge {
             Gauge::FarTiles => "far.tiles",
             Gauge::SkyCoarse => "sky.coarse",
             Gauge::SkyCoarseFar => "sky.coarse_far",
+            Gauge::SkyMapsolo => "sky.mapsolo",
         }
     }
 }
