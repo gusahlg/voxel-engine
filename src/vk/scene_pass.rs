@@ -836,8 +836,9 @@ impl<'a> RenderPass<'a> {
     /// rounded or mapped body use the no-mapped variant, or the full variant
     /// when the frame kept a mapped body. Mapped-interior tiles are a prefix
     /// of that heavy run and use the full fragment at 2×2 when it exists.
-    /// No tile classification keeps one fullscreen triangle on that same
-    /// choice. No bodies use the base pipeline.
+    /// Edge tiles stay at full rate. Both rates use the fixed-point mapped
+    /// march. No tile classification keeps one fullscreen triangle on that
+    /// same choice. No bodies use the base pipeline.
     pub(super) unsafe fn record_sky(&self) {
         let Some(desc) = self.lists.sky_for_pass() else {
             return;

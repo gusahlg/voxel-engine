@@ -414,6 +414,47 @@ impl FarMaps {
         out
     }
 
+    /// Minimum datum offset of each map, for the lo-sphere disc. An empty
+    /// slot reports 0, the same flat datum the shader samples.
+    pub(crate) fn min_offsets(&self) -> [f32; MAX_FAR_MAPS] {
+        let mut out = [0.0; MAX_FAR_MAPS];
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot.g >= 2 {
+                out[i] = slot.min_off;
+            }
+        }
+        out
+    }
+
+    /// Grid size and `set_map` generation. `None` when `id` is out of range.
+    /// An empty slot has `g == 0` and still has a generation.
+    pub(crate) fn map_stamp(&self, id: usize) -> Option<(u32, u32)> {
+        let slot = self.slots.get(id)?;
+        Some((slot.g, slot.generation))
+    }
+
+    /// Copy the live datum (`6 * g * g` floats, face-major) into `out`.
+    /// `None` when the slot is empty (`g < 2`); the shader then samples a
+    /// flat zero and no horizon table is published for it.
+    pub(crate) fn copy_datum(&self, id: usize, out: &mut Vec<f32>) -> Option<u32> {
+        let slot = self.slots.get(id)?;
+        if slot.g < 2 {
+            return None;
+        }
+        let g = slot.g;
+        let n = 6 * g as usize * g as usize;
+        let base = HEADER_UINTS + id * SLOT_FLOATS;
+        if base + n > self.words.len() {
+            return None;
+        }
+        out.clear();
+        out.reserve(n);
+        for i in 0..n {
+            out.push(f32::from_bits(self.words[base + i]));
+        }
+        Some(g)
+    }
+
     pub(crate) fn has_garbage(&self) -> bool {
         !self.image_retire.is_empty()
             || !self.staging_retire.is_empty()

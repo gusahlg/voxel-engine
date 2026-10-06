@@ -51,7 +51,11 @@ struct FrameUniforms
     float4 shadow_bounce;
     // Engine-derived local sky basis (not in FrameUniformsGpu). xyz = tangent:
     // the world axis least aligned with up, rejected into the plane (ties X, then Y,
-    // then Z). +Y up yields +X. w unused.
+    // then Z). +Y up yields +X. w = 1 when the process was started with
+    // VOXEL_SKY_DEBUG=1, else 0. The sky fragment treats a non-zero w as a uniform
+    // and replaces its colour with a source key (mapped surface, mapped air limb,
+    // horizon skip, and the steep horizon-dip remap). Every other reader uses xyz
+    // only. 0 leaves the sky colour path unchanged.
     float4 sky_tangent;
     // Engine-derived. xyz = unit local up (default +Y). w = altitude above the
     // local datum from set_local_frame. The cloud slab reads anim.w (the game writes
@@ -60,9 +64,11 @@ struct FrameUniforms
     // Engine-derived. xyz = bitangent = tangent × up, right-handed (+Y up yields +Z).
     // w = horizon-dip sine. While packing far bodies, the ground body is the kept
     // outside body (rho < 1) with the largest rho and dot(dir, -sky_up) > 0.5.
-    // s = sqrt(max(1 - rho^2, 0)) clamped to [0, 0.5], or 0 when there is no such
-    // body. sky_radiance lowers the horizon colour by s. Stars and the cloud
-    // horizon do not read this lane. 0 keeps the old elevation clamp.
+    // rho is radius/distance; a Mapped body uses the lo sphere
+    // (radius + that map's minimum datum offset) / distance, and an unknown or
+    // empty map uses offset 0. s = sqrt(max(1 - rho^2, 0)) clamped to [0, 0.5],
+    // or 0 when there is no such body. sky_radiance lowers the horizon colour by s.
+    // Stars and the cloud horizon do not read this lane. 0 keeps the old elevation clamp.
     float4 sky_bitangent;
     // --- LOD morph (engine-derived; not in FrameUniformsGpu) ---
     // Slot i: levels 2i (xy = start, end) and 2i+1 (zw = start, end),

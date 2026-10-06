@@ -118,6 +118,14 @@ impl Default for LocalFrame {
     }
 }
 
+/// `VOXEL_SKY_DEBUG=1` false-colours the sky by what produced each pixel.
+/// Any other value, including unset, leaves the lane at 0 and the sky path
+/// unchanged. Read once.
+pub(crate) fn sky_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VOXEL_SKY_DEBUG").is_ok_and(|v| v == "1"))
+}
+
 /// Orthonormal sky basis `(tangent, up, bitangent)`.
 ///
 /// `tangent` is the world axis least aligned with `up` (ties break toward X,
@@ -152,7 +160,8 @@ impl FrameUniformsExt {
     /// shadows/blocklight/ambient lane-enable bits in `shadow_bounce.w`,
     /// and the local sky basis. `horizon_dip` is the sine packed from the
     /// ground far body (`sky_bitangent.w`); `0` leaves the sky clamp unchanged.
-    /// Mirrors `common.slang`.
+    /// `sky_tangent.w` stays 0 here. [`UboRing::write_from_gpu`] sets that spare
+    /// lane to 1 when [`sky_debug_enabled`] is set. Mirrors `common.slang`.
     pub(crate) fn derive(
         u: FrameUniformsGpu,
         flags: RenderFlags,
@@ -184,6 +193,8 @@ impl FrameUniformsExt {
             ambient_glow: [ambient.x, ambient.y, ambient.z, glow_pow],
             glow_day: [glow_rgb.x, glow_rgb.y, glow_rgb.z, day],
             shadow_bounce: [bounce.x, bounce.y, bounce.z, lane_enable_bits(&flags)],
+            // w stays 0. The debug flag is stamped in `write_from_gpu` so this
+            // function's bytes do not depend on the process environment.
             sky_tangent: [tangent.x, tangent.y, tangent.z, 0.0],
             sky_up: [up.x, up.y, up.z, local.altitude],
             sky_bitangent: [bitangent.x, bitangent.y, bitangent.z, horizon_dip],
@@ -283,6 +294,11 @@ impl UboRing {
         }
         let mut ext = FrameUniformsExt::derive(u, flags, local, horizon_dip);
         ext.apply_lod_morph(morph);
+        // Spare lane of the basis uniform. Unset stays 0, so the uploaded
+        // block matches `derive`. sky.frag branches once on this lane.
+        if sky_debug_enabled() {
+            ext.sky_tangent[3] = 1.0;
+        }
         self.write(slot, &ext);
         self.last_gpu[slot] = Some((u, flags, local, morph, horizon_dip));
     }

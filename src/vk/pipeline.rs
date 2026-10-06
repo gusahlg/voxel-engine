@@ -273,10 +273,11 @@ pub struct Pipelines {
     /// (far-body storage buffer), binding 3 (datum storage) and binding 4
     /// (eight albedo cubes). Depth-tests (read-only) at the reversed-Z far
     /// plane so it shades only pixels the terrain left uncovered.
-    /// `sky` is the full fragment on one triangle. `sky_base` compiles the
-    /// far-body call out. `sky_nomap` drops the mapped march. `sky_sphere`
-    /// keeps spheres and inner spheres. The `sky_tile_*` pipelines are the
-    /// same fragments on instanced tile quads. All of them share `layout_sky`.
+    /// `sky` is the full fragment on one triangle. Its mapped intersection is
+    /// the five-sample fixed-point march. `sky_base` compiles the far-body
+    /// call out. `sky_nomap` drops the mapped march. `sky_sphere` keeps
+    /// spheres and inner spheres. The `sky_tile_*` pipelines are the same
+    /// fragments on instanced tile quads. All of them share `layout_sky`.
     pub sky: vk::Pipeline,
     pub sky_base: vk::Pipeline,
     pub sky_nomap: vk::Pipeline,
@@ -286,8 +287,9 @@ pub struct Pipelines {
     /// `sky_tile_base` at a 2×2 fragment size. `None` when this sample count
     /// has no pipeline 2×2 rate, or `VOXEL_SKY_COARSE=0`.
     pub sky_tile_base_coarse: Option<vk::Pipeline>,
-    /// Full sky fragment (the mapped march included) at a 2×2 fragment size.
-    /// Same `None` conditions as [`Self::sky_tile_base_coarse`].
+    /// Full sky fragment (the fixed-point mapped march included) at a 2×2
+    /// fragment size. Mapped-interior tiles bind this. `None` under the same
+    /// conditions as [`Self::sky_tile_base_coarse`].
     pub sky_tile_coarse: Option<vk::Pipeline>,
     pub sky_tile_nomap: vk::Pipeline,
     pub sky_tile_sphere: vk::Pipeline,
@@ -798,9 +800,10 @@ impl Pipelines {
         // Sky: no vertex input (verts synthesised from SV_VertexID), depth
         // read-only at the far plane, opaque, no cull. Same GREATER_OR_EQUAL
         // compare as the scene, so it passes only where depth is still cleared.
-        // The eight pipelines share that state and `layout_sky`. Two optional
+        // The sky pipelines share that state and `layout_sky`. Two optional
         // pipelines are 2×2: the base-tile fragment, and the full fragment
-        // (mapped march included) for interior tiles of a mapped body.
+        // for interior tiles of a mapped body. Edge tiles stay at 1×1. Both
+        // rates use the fixed-point mapped march.
         let sky_cfg = || PipelineConfig {
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
             depth: DepthMode::ReadOnly,
