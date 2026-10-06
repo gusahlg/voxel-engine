@@ -123,7 +123,7 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // stands. SKY_BASE leaves both out.
 #ifndef SKY_BASE
     float px = max(length(fwidth(ray)), 1e-6);
-    col = far_bodies(ray, col, inscatter, px, input.frag_pos.xy);
+    col = far_bodies(ray, col, px, input.frag_pos.xy);
 #endif
 
     // Slab clouds composite LAST so opaque cloud occludes the sun/moon/stars it
@@ -139,5 +139,26 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     }
     col = col * (1.0 - cover) + cloud_lit;
 
+    // VOXEL_SKY_DEBUG. sky_tangent.w is 1 for the frame or 0. One uniform
+    // branch: when it is 0 the colour above is what the pixel returns, and
+    // far_sky_debug_rgb is not called. A non-zero lane replaces the colour
+    // with the source key. R/G/B mark a mapped surface, a mapped air limb,
+    // and a horizon skip; base sky (no far bodies) stays 0.25 grey. The steep
+    // part of sky_radiance's elevation remap, -s <= y_local <= 0, adds 0.5.
+    [branch]
+    if (frame.sky_tangent.w != 0.0)
+    {
+        float3 dbg = float3(0.25, 0.25, 0.25);
+#ifndef SKY_BASE
+#ifndef FAR_NO_MAPPED
+        dbg = far_sky_debug_rgb(ray, px, input.frag_pos.xy);
+#endif
+#endif
+        float yLocal = sky_local(ray, frame).y;
+        float sDip = frame.sky_bitangent.w;
+        if (yLocal >= -sDip && yLocal <= 0.0)
+            dbg += 0.5;
+        return float4(dbg, 1.0);
+    }
     return float4(col, 1.0);
 }

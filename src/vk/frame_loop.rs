@@ -213,7 +213,7 @@ impl Renderer {
                 FrameSlot::new(slot),
                 lists.far_slice(),
                 view,
-                &self.far_maps.max_offsets(),
+                &self.far_maps,
                 coarse,
                 lists.local_frame().up,
             )

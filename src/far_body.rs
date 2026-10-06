@@ -39,9 +39,9 @@ pub enum FarShape {
     /// seen from the eye, above the plane whose normal is `-dir`. The shader
     /// skips rays with `dot(ray, -dir) > horizon`. `1.0` disables the cull.
     /// `air` is the air-shell thickness in the same unit as `radius` (`0`
-    /// draws no limb). A miss ray's limb is that shell on the surface radius
-    /// at the ray's closest approach to the centre, not a shell on the
-    /// datum's maximum.
+    /// draws no limb). A miss ray's limb is the air that ray actually
+    /// crosses, between the local datum and that datum plus `air`. No limb
+    /// is drawn when the eye's altitude above the local datum is below `air`.
     Mapped {
         map: FarMapId,
         horizon: f32,
@@ -971,14 +971,315 @@ fn ray_mapped_regula(
     finish(if fa.abs() <= fb.abs() { a } else { b })
 }
 
+/// Coarse probes along the hi/lo bracket. Matches `FAR_MAP_COARSE`.
+#[cfg(test)]
+const MAPPED_COARSE_CAP: u32 = 16;
+/// Secant / bisection steps after a sign change. Matches `FAR_MAP_REFINE`.
+#[cfg(test)]
+const MAPPED_REFINE_CAP: u32 = 24;
+/// Entrance residual that already sits on the surface. A graze stays small
+/// across a wide `t`, so the refinement stops on the bracket width instead.
+#[cfg(test)]
+const MAPPED_F_TOL: f32 = 1e-8;
+/// Relative width of the normalised-`t` bracket. Matches `FAR_MAP_TTOL`.
+/// The `1e-7` floor keeps a root near the camera from asking for a sub-ulp
+/// step. A `1e-4` floor left a hit a few metres out inside a bracket whose
+/// relative width was several times 1e-6.
+#[cfg(test)]
+const MAPPED_T_TOL: f32 = 1e-7;
+/// Interior probes of a coarse segment that could still hide a root.
+/// Matches `FAR_MAP_HUNT`. A highland edge is negative only between two
+/// positive samples, and that segment is not always the closest one.
+#[cfg(test)]
+const MAPPED_HUNT: u32 = 4;
+
+/// Robust bracket march. Test-only reference beside the f64 intersection in
+/// this module's tests. The GPU march is [`ray_mapped_fast`].
+///
+/// Ray from the origin against a datum-mapped body. `dir` is the unit centre.
+/// `rho` is `radius/distance`. Offsets are in the radius's unit.
+///
+/// A bounding-sphere miss and the horizon test return before any datum load.
+/// Otherwise a sign-change search walks the bracket. The step is one datum
+/// cell projected on the ray, and the count is capped. The closest approach
+/// is always one of the probes. A segment whose samples are still within the
+/// datum range of the surface is probed inside ([`MAPPED_HUNT`]): a highland
+/// edge is negative only between those samples. A lo-sphere end with `f` on
+/// zero is a graze of the minimum surface. The bracket is then
+/// Anderson–Björck, and a step that fails to halve the width is bisected on
+/// the next iteration. Stops when the width is [`MAPPED_T_TOL`] relative, or
+/// when f32 can no longer split the interval. `horizon` skips
+/// `dot(ray, -dir) > horizon`.
+#[cfg(test)]
+pub(crate) fn ray_mapped(
+    ray: Vec3,
+    dir: Vec3,
+    rho: f32,
+    distance: f32,
+    rotation: Quat,
+    horizon: f32,
+    g: u32,
+    datum: &[f32],
+    min_off: f32,
+    max_off: f32,
+) -> Option<FarHit> {
+    if !(rho > 0.0)
+        || !(distance > 0.0)
+        || !ray.is_finite()
+        || !dir.is_finite()
+        || !distance.is_finite()
+    {
+        return None;
+    }
+    if ray.dot(-dir) > horizon {
+        return None;
+    }
+    let rho_lo = rho + min_off / distance;
+    let rho_hi = rho + max_off / distance;
+    let facing = ray.dot(dir);
+    let (t_hi_in, t_hi_out) = sphere_roots(facing, rho_hi)?;
+    if !(t_hi_out > 0.0) {
+        return None;
+    }
+    let t_start = t_hi_in.max(0.0);
+    let t_lo = sphere_roots(facing, rho_lo).and_then(|(t_lo, _)| (t_lo > 0.0).then_some(t_lo));
+    let t_end = t_lo.map(|t| t.min(t_hi_out)).unwrap_or(t_hi_out);
+    // `|p| - r` cancels in f32 when both are near 1, and a graze then moves
+    // by an ulp over a tiny slope. `|p|^2 - r^2 = t²|ray|² - 2 t facing +
+    // (|dir|² - 1) + (1 - r)(1 + r)`, divided by `|p| + r`, keeps that
+    // difference. `1 - rho` is exact for a rho above one half.
+    let ray2 = ray.length_squared();
+    let dir2 = dir.length_squared();
+    let f_at = |t: f32| -> f32 {
+        let p = ray * t - dir;
+        let rad = p.length();
+        if rad < 1e-8 {
+            return -rho;
+        }
+        let body = rotate(conjugate(rotation), p / rad);
+        let h = sample_datum(g, datum, body);
+        let r = rho + h / distance;
+        let one_minus_r = (1.0 - rho) - h / distance;
+        let diff_sq = t * t * ray2 - 2.0 * t * facing + (dir2 - 1.0) + one_minus_r * (1.0 + r);
+        diff_sq / (rad + r)
+    };
+    let finish = |t: f32| -> Option<FarHit> {
+        if !(t > 0.0) || !t.is_finite() {
+            return None;
+        }
+        let p = ray * t - dir;
+        let rad = p.length();
+        if rad < 1e-8 {
+            return None;
+        }
+        let u_world = p / rad;
+        let body = rotate(conjugate(rotation), u_world);
+        Some(FarHit {
+            t,
+            normal: mapped_normal_analytic(rotation, u_world, rho, distance, g, datum),
+            face: dom_face(body),
+        })
+    };
+    // Coincident lo/hi spheres, or a bracket thinner than the old entrance
+    // test: the entrance is the surface.
+    if !(t_end > t_start) || t_end - t_start < 1e-5 {
+        let t_hit = if t_end > 0.0 { t_end } else { t_start };
+        return finish(t_hit);
+    }
+    let f_start = f_at(t_start);
+    if f_start < -1e-5 {
+        return None;
+    }
+    // `t_start == 0` is the camera: the eye is inside the hi sphere, so the
+    // entrance was clamped. `|f| <= 1e-5` is then a few hundred metres of
+    // clearance on a planet-sized body, and a positive residual still has
+    // the surface in front. Treating that clamp as the hit drops the ray.
+    if f_start.abs() <= 1e-5 && t_start > 0.0 {
+        return finish(t_start);
+    }
+    if t_start == 0.0 && f_start <= 0.0 {
+        return None;
+    }
+    let cells = (g.max(2) - 1) as f32;
+    let cell = std::f32::consts::FRAC_PI_2 / cells;
+    let p0 = ray * t_start - dir;
+    let rad0 = p0.length().max(rho);
+    let sin_phi = if rad0 > 1e-8 {
+        ray.cross(p0 / rad0).length()
+    } else {
+        0.0
+    };
+    let dt = cell * rad0 / sin_phi.max(0.05);
+    let span = t_end - t_start;
+    let n = ((span / dt.max(1e-8)).ceil() as u32).clamp(1, MAPPED_COARSE_CAP);
+    let t_close = facing.clamp(t_start, t_end);
+    let mut prev_t = t_start;
+    let mut prev_f = f_start;
+    let mut bracket: Option<(f32, f32, f32, f32)> = None;
+    // A segment cannot cross zero if both samples are further out than the
+    // whole datum range. Anything closer may hide a highland edge.
+    let allowance = (max_off - min_off).abs() / distance;
+    let hunt = |lo: f32, hi: f32, mut pf: f32, fhi: f32| -> Option<(f32, f32, f32, f32)> {
+        if !(pf.min(fhi) <= allowance) {
+            return None;
+        }
+        let mut pt = lo;
+        for i in 1..=MAPPED_HUNT {
+            let tm = lo + (hi - lo) * (i as f32 / (MAPPED_HUNT as f32 + 1.0));
+            let fm = f_at(tm);
+            if pf * fm <= 0.0 {
+                return Some((pt, tm, pf, fm));
+            }
+            pt = tm;
+            pf = fm;
+        }
+        (pf * fhi <= 0.0).then_some((pt, hi, pf, fhi))
+    };
+    for i in 1..=n {
+        let tn = if i == n {
+            t_end
+        } else {
+            t_start + span * (i as f32 / n as f32)
+        };
+        if t_close > prev_t + 1e-8 && t_close < tn - 1e-8 {
+            let fc = f_at(t_close);
+            if prev_f * fc <= 0.0 {
+                bracket = Some((prev_t, t_close, prev_f, fc));
+                break;
+            }
+            if let Some(found) = hunt(prev_t, t_close, prev_f, fc) {
+                bracket = Some(found);
+                break;
+            }
+            prev_t = t_close;
+            prev_f = fc;
+        }
+        let ft = f_at(tn);
+        if prev_f * ft <= 0.0 {
+            bracket = Some((prev_t, tn, prev_f, ft));
+            break;
+        }
+        if let Some(found) = hunt(prev_t, tn, prev_f, ft) {
+            bracket = Some(found);
+            break;
+        }
+        prev_t = tn;
+        prev_f = ft;
+    }
+    let Some((mut a, mut b, mut fa, mut fb)) = bracket else {
+        // No sign change. Entering the lo sphere with f on zero is a graze
+        // of the minimum surface (a uniform grid of positive samples can
+        // miss that). The hi-sphere exit is not: f is small there on a
+        // highland far side that the ray never hit.
+        return if t_lo.is_some() && prev_f <= 1e-5 {
+            finish(prev_t)
+        } else {
+            None
+        };
+    };
+    if a > b {
+        std::mem::swap(&mut a, &mut b);
+        std::mem::swap(&mut fa, &mut fb);
+    }
+    // Chord weights stay separate from the true signs. `retained` is which
+    // endpoint survived the previous secant (1 = a, 2 = b). Anderson–Björck
+    // scales that weight only on the second retention in a row. A step that
+    // does not halve the width forces a bisection next, which is what a
+    // one-sided regula falsi fails to do on a long near-ground chord.
+    let mut wa = fa;
+    let mut wb = fb;
+    let mut retained = 0i32;
+    let mut force_bisect = false;
+    for _ in 0..MAPPED_REFINE_CAP {
+        let width = b - a;
+        let scale = a.abs().min(b.abs()).max(1e-7);
+        if !(width > MAPPED_T_TOL * scale) {
+            break;
+        }
+        let den = wb - wa;
+        let secant = if den.abs() > 1e-20 {
+            b - wb * width / den
+        } else {
+            0.5 * (a + b)
+        };
+        let secant_ok = secant > a && secant < b;
+        let bisect = force_bisect || !secant_ok;
+        let c = if bisect { 0.5 * (a + b) } else { secant };
+        force_bisect = false;
+        if !(c > a && c < b) {
+            break;
+        }
+        let fc = f_at(c);
+        // `|f|` alone is not a root at a graze. Require the bracket to
+        // already be inside the relative tolerance as well.
+        if fc.abs() <= MAPPED_F_TOL && width <= MAPPED_T_TOL * scale.max(c.abs()) {
+            return finish(c);
+        }
+        let old_width = width;
+        if fa * fc <= 0.0 {
+            let discarded = fb;
+            b = c;
+            fb = fc;
+            wb = fc;
+            if bisect {
+                wa = fa;
+                retained = 0;
+            } else if retained == 1 {
+                let mut m = if discarded.abs() > 1e-20 {
+                    1.0 - fc / discarded
+                } else {
+                    0.5
+                };
+                if !(m > 0.0) || !m.is_finite() {
+                    m = 0.5;
+                }
+                wa *= m;
+            } else {
+                wa = fa;
+                retained = 1;
+            }
+        } else {
+            let discarded = fa;
+            a = c;
+            fa = fc;
+            wa = fc;
+            if bisect {
+                wb = fb;
+                retained = 0;
+            } else if retained == 2 {
+                let mut m = if discarded.abs() > 1e-20 {
+                    1.0 - fc / discarded
+                } else {
+                    0.5
+                };
+                if !(m > 0.0) || !m.is_finite() {
+                    m = 0.5;
+                }
+                wb *= m;
+            } else {
+                wb = fb;
+                retained = 2;
+            }
+        }
+        if b - a > 0.5 * old_width {
+            force_bisect = true;
+        }
+    }
+    let mid = 0.5 * (a + b);
+    let t_hit = if mid > a && mid < b {
+        mid
+    } else if fa.abs() <= fb.abs() {
+        a
+    } else {
+        b
+    };
+    finish(t_hit)
+}
+
 /// Datum samples the march may spend. The analytic normal is one more fetch
 /// at the hit, replacing the two finite-difference evaluations.
 #[cfg(test)]
 const MAPPED_EVAL_CAP: u32 = 5;
-/// Early exit on `|rad - r(dir)|`. Normalised units, same space as `t`.
-#[cfg(test)]
-const MAPPED_F_TOL: f32 = 1e-8;
-
 #[cfg(test)]
 struct MappedMarch<'a> {
     ray: Vec3,
@@ -991,54 +1292,12 @@ struct MappedMarch<'a> {
     evals: u32,
 }
 
-/// `d/dt (|p| - datum/distance)` at an already-sampled point. `patch` is the
-/// bilinear datum at the body-space direction. Uses `d(atan)/dx`, which tracks
-/// the equiangular polynomial closely enough for a Newton correction.
-#[cfg(test)]
-fn residual_slope(
-    march: &MappedMarch<'_>,
-    t: f32,
-    u_world: Vec3,
-    u_body: Vec3,
-    patch: &DatumSample,
-) -> Option<f32> {
-    let p = march.ray * t - march.center;
-    let rad = p.length();
-    if rad < 1e-8 || !(march.distance > 0.0) {
-        return None;
-    }
-    let slope_rad = u_world.dot(march.ray);
-    let face = dom_face(u_body) as usize;
-    let (tu, n, tv) = far_map_basis(face);
-    let beta = u_body.dot(n);
-    if beta.abs() < 1e-6 {
-        return None;
-    }
-    let du_world = (march.ray - u_world * slope_rad) / rad;
-    let du = rotate(conjugate(march.rotation), du_world);
-    let alpha = u_body.dot(tu);
-    let gamma = u_body.dot(tv);
-    let alpha_t = du.dot(tu);
-    let beta_t = du.dot(n);
-    let gamma_t = du.dot(tv);
-    let beta2 = beta * beta;
-    let chart = |num: f32, num_t: f32| {
-        let x = num / beta;
-        let x_t = (beta * num_t - num * beta_t) / beta2;
-        x_t / (1.0 + x * x)
-    };
-    let scale = 4.0 / std::f32::consts::PI;
-    let dxi_dt = scale * chart(alpha, alpha_t);
-    let deta_dt = scale * chart(gamma, gamma_t);
-    let ddatum_dt = patch.dr_dxi * dxi_dt + patch.dr_deta * deta_dt;
-    Some(slope_rad - ddatum_dt / march.distance)
-}
-
 #[cfg(test)]
 impl MappedMarch<'_> {
-    /// `(f, r, df/dt)` at `t`. `f = |p| - r(dir(p))`. One datum evaluation.
-    /// The slope chains the bilinear chart derivatives through the ray. A
-    /// degenerate chart reports the radial slope.
+    /// `(f, r, df/dt)` at `t`. `f` is the stable `|p| - r(dir(p))`. One datum
+    /// evaluation. The slope is `u·ray`: inside the lo-sphere disc that term
+    /// keeps the hit within 1e-6 relative of [`ray_mapped`], and the chart
+    /// derivative is a live range the fast shader cannot afford.
     fn sample(&mut self, t: f32) -> (f32, f32, f32) {
         self.evals += 1;
         let p = self.ray * t - self.center;
@@ -1048,11 +1307,18 @@ impl MappedMarch<'_> {
         }
         let u_world = p / rad;
         let body = rotate(conjugate(self.rotation), u_world);
-        let patch = sample_datum_d(self.g, self.datum, body);
-        let r = self.rho + patch.value / self.distance;
-        let f = rad - r;
-        let slope_rad = u_world.dot(self.ray);
-        let slope = residual_slope(self, t, u_world, body, &patch).unwrap_or(slope_rad);
+        let value = sample_datum(self.g, self.datum, body);
+        let r = self.rho + value / self.distance;
+        // `|p| - r` cancels in f32 when both are near 1. The same
+        // `|p|^2 - r^2` form as `ray_mapped` keeps a hit a few metres
+        // out, which is the whole lo-disc interior at low altitude.
+        let facing = self.ray.dot(self.center);
+        let one_minus_r = (1.0 - self.rho) - value / self.distance;
+        let diff_sq = t * t * self.ray.length_squared() - 2.0 * t * facing
+            + (self.center.length_squared() - 1.0)
+            + one_minus_r * (1.0 + r);
+        let f = diff_sq / (rad + r);
+        let slope = u_world.dot(self.ray);
         (f, r, slope)
     }
 
@@ -1074,9 +1340,22 @@ fn positive_root(facing: f32, radius: f32) -> Option<f32> {
     }
 }
 
+/// Another Newton step would move `t` by less than 1e-8 relative, inside
+/// the 1e-6 agreement band of the robust march. A shallow
+/// slope falls back to [`MAPPED_F_TOL`]: a graze stays small across a wide
+/// interval, and the step is not a meaningful distance.
+#[cfg(test)]
+fn fast_settled(t: f32, f: f32, slope: f32) -> bool {
+    if slope.abs() > 1e-4 {
+        (f / slope).abs() <= 1e-8 * t.abs().max(1e-12)
+    } else {
+        f.abs() <= MAPPED_F_TOL
+    }
+}
+
 /// Illinois regula falsi inside an existing bracket. The retained endpoint's
 /// weight is halved so a stuck side does not burn the remaining samples.
-/// Stops at the eval cap, a tiny step, or `|f| <= MAPPED_F_TOL`. The weights
+/// Stops at the eval cap, a tiny step, or [`fast_settled`]. The weights
 /// used for the chord are not the values used to pick the final endpoint.
 #[cfg(test)]
 fn regula(march: &mut MappedMarch<'_>, mut a: f32, mut b: f32, mut fa: f32, mut fb: f32) -> f32 {
@@ -1084,7 +1363,10 @@ fn regula(march: &mut MappedMarch<'_>, mut a: f32, mut b: f32, mut fa: f32, mut 
     let mut wb = fb;
     while march.open() {
         let den = wb - wa;
-        if den.abs() < 1e-20 || (b - a).abs() < 1e-7 {
+        // Relative, not absolute: a 1e-7 bracket is a large fraction of a
+        // hit that sits 10 m in front of a planet-sized body.
+        let span = a.abs().max(b.abs()).max(1e-6);
+        if den.abs() < 1e-20 || (b - a).abs() <= 1e-8 * span {
             break;
         }
         let tn = b - wb * (b - a) / den;
@@ -1092,11 +1374,11 @@ fn regula(march: &mut MappedMarch<'_>, mut a: f32, mut b: f32, mut fa: f32, mut 
             break;
         }
         let (ft, _, st) = march.sample(tn);
-        if ft.abs() <= MAPPED_F_TOL {
+        if fast_settled(tn, ft, st) {
             return tn;
         }
         // Shallow roots (grazes) make the chord lag. A Newton step from a
-        // small residual uses the chart slope and lands on the root.
+        // small residual uses the radial slope and lands on the root.
         if st.abs() > 1e-4 && ft.abs() < 2e-3 {
             let t2 = tn - ft / st;
             let lo = a.min(b);
@@ -1123,9 +1405,14 @@ fn regula(march: &mut MappedMarch<'_>, mut a: f32, mut b: f32, mut fa: f32, mut 
                     };
                 }
                 let (f2, _, s2) = march.sample(t2);
+                if fast_settled(t2, f2, s2) {
+                    return t2;
+                }
                 if s2.abs() > 1e-4 && f2.abs() < 1e-3 {
                     // Halley: fold in f'' from the two slopes so a shallow
-                    // curve does not leave a 1e-5 residual after Newton.
+                    // curve does not leave a residual after Newton. Accept
+                    // it only inside the 1e-6 band; a wider step goes back
+                    // into the bracket.
                     let d2 = if (t2 - tn).abs() > 1e-6 {
                         (s2 - st) / (t2 - tn)
                     } else {
@@ -1137,12 +1424,42 @@ fn regula(march: &mut MappedMarch<'_>, mut a: f32, mut b: f32, mut fa: f32, mut 
                     } else {
                         t2 - f2 / s2
                     };
-                    if t3.is_finite() && t3 > 0.0 && (t3 - t2).abs() < 1e-3 {
+                    if t3.is_finite()
+                        && t3 > lo
+                        && t3 < hi
+                        && (f2 / s2).abs() <= 1e-8 * t2.abs().max(1e-12)
+                    {
                         return t3;
                     }
                 }
-                if f2.abs() <= ft.abs() {
-                    return t2;
+                // Not there yet. Shrink the bracket onto the sampled pair.
+                if ft * f2 <= 0.0 {
+                    if tn < t2 {
+                        a = tn;
+                        b = t2;
+                        fa = ft;
+                        fb = f2;
+                    } else {
+                        a = t2;
+                        b = tn;
+                        fa = f2;
+                        fb = ft;
+                    }
+                    wa = fa;
+                    wb = fb;
+                    continue;
+                }
+                if f2.abs() < ft.abs() {
+                    if fa * f2 <= 0.0 {
+                        b = t2;
+                        fb = f2;
+                        wb = f2;
+                    } else {
+                        a = t2;
+                        fa = f2;
+                        wa = f2;
+                    }
+                    continue;
                 }
             }
         }
@@ -1172,18 +1489,25 @@ fn regula(march: &mut MappedMarch<'_>, mut a: f32, mut b: f32, mut fa: f32, mut 
     if fa.abs() <= fb.abs() { a } else { b }
 }
 
-/// Ray from the origin against a datum-mapped body. `dir` is the unit centre.
+/// Cheap fixed-point march. Host mirror of `far_ray_mapped` in
+/// `shaders/far_body.slang`: the two stay sample-for-sample identical, and
+/// the shader is the copy that runs. The Illinois steps are this march's own
+/// graze handler and stay inside [`MAPPED_EVAL_CAP`]; [`ray_mapped`] is not
+/// called. `dir` is the unit centre.
 /// `rho` is `radius/distance`. Offsets are in the radius's unit.
 ///
 /// Starts at the lo-sphere entrance and sets `t` to the near intersection of
 /// the ray with the sphere of radius `r(dir(p))`. Non-grazing rays settle in
-/// two or three steps; `|f| < 1e-6` returns early. A graze that misses the lo
-/// sphere, or a fixed point that does not settle, falls back to regula falsi.
+/// two or three steps; a step smaller than 1e-8 relative returns early. A
+/// graze that misses the lo sphere, or a fixed point that does not settle,
+/// falls back to regula falsi.
 /// The march takes at most [`MAPPED_EVAL_CAP`] datum samples. The normal is
-/// the analytic patch derivative at the hit. `horizon` skips
+/// the analytic patch derivative at the hit. A hi-sphere entrance clamped
+/// to the camera is not a root: `|f| <= 1e-5` there is clearance, and a
+/// positive residual keeps marching. `horizon` skips
 /// `dot(ray, -dir) > horizon`.
 #[cfg(test)]
-pub(crate) fn ray_mapped(
+pub(crate) fn ray_mapped_fast(
     ray: Vec3,
     dir: Vec3,
     rho: f32,
@@ -1253,8 +1577,8 @@ pub(crate) fn ray_mapped(
         // entrance is sampled only when those pulls never bracket, or when
         // the eye is already inside the hi sphere (t_start == 0), which the
         // old march treats as a miss when f < 0.
-        let (mut f, mut r, _) = march.sample(t_lo);
-        if f.abs() <= MAPPED_F_TOL {
+        let (mut f, mut r, mut slope) = march.sample(t_lo);
+        if fast_settled(t_lo, f, slope) {
             return finish(t_lo);
         }
         let mut t = t_lo;
@@ -1263,10 +1587,23 @@ pub(crate) fn ray_mapped(
             if !march.open() {
                 break;
             }
-            let Some(tn) = positive_root(facing, r) else {
-                break;
+            // The far root of a sphere that contains the camera is the back
+            // of the planet. Step with the radial slope instead; that stays
+            // on the near surface. A 1e-8 absolute stop froze hits near the
+            // eye a ulp-scale step short of the root.
+            let tn = match sphere_roots(facing, r) {
+                Some((near, _)) if near > t_start && near < t_hi_out => near,
+                _ if slope.abs() > 1e-4 && f.abs() < 0.05 => {
+                    let ts = t - f / slope;
+                    if ts > t_start && ts < t_hi_out {
+                        ts
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
             };
-            if tn <= t_start || tn >= t_hi_out || (tn - t).abs() <= 1e-8 {
+            if (tn - t).abs() <= 1e-12 {
                 break;
             }
             if let Some((a, b, _, _)) = bracket
@@ -1274,7 +1611,7 @@ pub(crate) fn ray_mapped(
             {
                 break;
             }
-            let (ft, rt, _) = march.sample(tn);
+            let (ft, rt, st) = march.sample(tn);
             if f * ft <= 0.0 {
                 bracket = Some(if t < tn {
                     (t, tn, f, ft)
@@ -1282,23 +1619,38 @@ pub(crate) fn ray_mapped(
                     (tn, t, ft, f)
                 });
             }
-            if ft.abs() <= MAPPED_F_TOL {
+            if fast_settled(tn, ft, st) {
                 return finish(tn);
             }
             t = tn;
             f = ft;
             r = rt;
+            slope = st;
         }
-        let need_entrance = bracket.is_none() || t_start == 0.0;
+        // The camera sample catches an eye inside the body. A bracket whose
+        // near end is already outside does not need it, and the sample is
+        // better spent tightening the root.
+        let need_entrance = match bracket {
+            None => true,
+            Some((ba, bb, bfa, bfb)) => {
+                let near_f = if ba <= bb { bfa } else { bfb };
+                t_start == 0.0 && near_f < 0.0
+            }
+        };
         if need_entrance {
             if !march.open() {
                 return finish(t);
             }
             let (fa, _, _) = march.sample(t_start);
-            if fa.abs() <= 1e-5 {
+            // Same camera clamp as [`ray_mapped`]: `|f| <= 1e-5` at `t == 0`
+            // is clearance, not a root, and `finish(0)` would drop the ray.
+            if t_start == 0.0 && fa.abs() <= 1e-5 {
+                if fa <= 0.0 {
+                    return None;
+                }
+            } else if fa.abs() <= 1e-5 {
                 return finish(t_start);
-            }
-            if fa < 0.0 {
+            } else if fa < 0.0 {
                 return None;
             }
             if bracket.is_none() {
@@ -1328,8 +1680,11 @@ pub(crate) fn ray_mapped(
     if f < -1e-5 {
         return None;
     }
-    if f.abs() <= 1e-5 {
+    if f.abs() <= 1e-5 && t_start > 0.0 {
         return finish(t_start);
+    }
+    if t_start == 0.0 && f <= 0.0 {
+        return None;
     }
     let f_enter = f;
     let mut t = t_start;
@@ -1352,7 +1707,7 @@ pub(crate) fn ray_mapped(
             });
             break;
         }
-        if ft.abs() <= MAPPED_F_TOL {
+        if fast_settled(tn, ft, st) {
             return finish(tn);
         }
         t = tn;
@@ -1402,8 +1757,8 @@ pub(crate) fn ray_mapped(
             break;
         }
         let tn = t_start + (t_hi_out - t_start) * (i as f32 / (left as f32));
-        let (ft, _, _) = march.sample(tn);
-        if ft.abs() <= MAPPED_F_TOL {
+        let (ft, _, st) = march.sample(tn);
+        if fast_settled(tn, ft, st) {
             return finish(tn);
         }
         if prev_f * ft <= 0.0 {
@@ -1415,8 +1770,251 @@ pub(crate) fn ray_mapped(
     None
 }
 
+/// Surface radius of the mapped body along `ray` at normalised `t`.
 #[cfg(test)]
-mod tests {
+fn mapped_radius_at(
+    ray: Vec3,
+    dir: Vec3,
+    t: f32,
+    rho: f32,
+    distance: f32,
+    rotation: Quat,
+    g: u32,
+    datum: &[f32],
+) -> f32 {
+    let p = ray * t - dir;
+    let rad = p.length();
+    if rad < 1e-8 {
+        return 0.0;
+    }
+    rho + sample_datum(g, datum, rotate(conjugate(rotation), p / rad)) / distance
+}
+
+/// Samples on the cap-sphere chord. Fixed at 8, the shader loop bound.
+#[cfg(test)]
+const LIMB_SAMPLES: usize = 8;
+
+/// World metres from the closest approach. The ends are the cap chord.
+/// Zero is the approach itself, so a march miss that dips under the datum
+/// there still counts. The rest pack toward that approach: a uniform step
+/// across the cap chord is coarser than the air. Lockstep with
+/// `far_limb_delta` in `shaders/far_body.slang`.
+#[cfg(test)]
+fn limb_delta_m(i: usize) -> f32 {
+    match i {
+        0 => -1.0e30,
+        1 => -1_200_000.0,
+        2 => -400_000.0,
+        3 => 0.0,
+        4 => 400_000.0,
+        5 => 1_200_000.0,
+        6 => 2_400_000.0,
+        _ => 1.0e30,
+    }
+}
+
+/// `true` when the eye's altitude above the bilinear datum in the eye's
+/// direction is below `air`.
+#[cfg(test)]
+fn eye_inside_mapped_air(
+    dir: Vec3,
+    rho: f32,
+    distance: f32,
+    rotation: Quat,
+    g: u32,
+    datum: &[f32],
+    air: f32,
+) -> bool {
+    let radial = -dir;
+    let rad = radial.length();
+    if !(rad > 1e-8) || !(distance > 0.0) {
+        return true;
+    }
+    let h = sample_datum(g, datum, rotate(conjugate(rotation), radial / rad));
+    let altitude = distance - rho * distance - h;
+    altitude < air
+}
+
+/// Forward chord through the sphere of normalised radius `rho_cap`.
+/// `t` is in units of `distance`. `None` when the ray misses it.
+#[cfg(test)]
+fn cap_chord(facing: f32, rho_cap: f32) -> Option<(f32, f32)> {
+    if !(rho_cap > 0.0) || !rho_cap.is_finite() || !facing.is_finite() {
+        return None;
+    }
+    let disc = facing * facing - (1.0 - rho_cap * rho_cap);
+    if !(disc >= 0.0) || !disc.is_finite() {
+        return None;
+    }
+    let sd = disc.sqrt();
+    let t_far = facing + sd;
+    if !(t_far > 0.0) {
+        return None;
+    }
+    let t0 = (facing - sd).max(0.0);
+    (t_far > t0).then_some((t0, t_far))
+}
+
+/// `(rad, r_air)` at normalised `t`. A sample on the centre is inside.
+#[cfg(test)]
+fn limb_air_at(
+    ray: Vec3,
+    dir: Vec3,
+    t: f32,
+    rho: f32,
+    distance: f32,
+    rotation: Quat,
+    g: u32,
+    datum: &[f32],
+    air: f32,
+) -> (f32, f32) {
+    let p = ray * t - dir;
+    let rad = p.length();
+    if rad < 1e-8 {
+        return (0.0, 1.0);
+    }
+    let h = sample_datum(g, datum, rotate(conjugate(rotation), p / rad));
+    let r_air = rho + (h + air) / distance;
+    (rad, r_air.max(0.0))
+}
+
+/// Fraction of `u` in `[0, 1]` where `qa u² + qb u + qc <= 0`.
+#[cfg(test)]
+fn limb_inside_fraction(qa: f32, qb: f32, qc: f32) -> f32 {
+    if qa.abs() <= 1e-20 {
+        if qb.abs() <= 1e-20 {
+            return if qc <= 0.0 { 1.0 } else { 0.0 };
+        }
+        let u = -qc / qb;
+        return if qb > 0.0 {
+            u.clamp(0.0, 1.0)
+        } else {
+            (1.0 - u).clamp(0.0, 1.0)
+        };
+    }
+    let disc = qb * qb - 4.0 * qa * qc;
+    if !(disc >= 0.0) || !disc.is_finite() {
+        return if qa > 0.0 { 0.0 } else { 1.0 };
+    }
+    let sd = disc.sqrt();
+    let q = if qb >= 0.0 {
+        -0.5 * (qb + sd)
+    } else {
+        -0.5 * (qb - sd)
+    };
+    let (u0, u1) = if q.abs() <= 1e-20 {
+        let inv = 0.5 / qa;
+        ((-qb - sd) * inv, (-qb + sd) * inv)
+    } else {
+        (q / qa, qc / q)
+    };
+    let lo = u0.min(u1);
+    let hi = u0.max(u1);
+    if qa > 0.0 {
+        let a = lo.clamp(0.0, 1.0);
+        let b = hi.clamp(0.0, 1.0);
+        (b - a).max(0.0)
+    } else {
+        lo.clamp(0.0, 1.0) + (1.0 - hi).clamp(0.0, 1.0)
+    }
+}
+
+/// Normalised length of `[t0, t1]` on which `|p|` is at or below the air
+/// radius linearly interpolated from `r0` to `r1`. The quadratic matches the
+/// measured `|p|` at both ends and the analytic curvature between them, so a
+/// segment that ends inside the air is not dropped when the analytic radius
+/// misses that end. Below the datum counts: that
+/// radius already includes the interior, so a graze the march missed still
+/// contributes.
+#[cfg(test)]
+fn limb_segment_t(t0: f32, t1: f32, rad0: f32, rad1: f32, r0: f32, r1: f32) -> f32 {
+    let dt = t1 - t0;
+    if !(dt > 1e-20) {
+        return 0.0;
+    }
+    let r0 = r0.max(0.0);
+    let r1 = r1.max(0.0);
+    let dr = r1 - r0;
+    let qa = dt * dt - dr * dr;
+    let qc = (rad0 - r0) * (rad0 + r0);
+    let g1 = (rad1 - r1) * (rad1 + r1);
+    let qb = g1 - qa - qc;
+    let frac = limb_inside_fraction(qa, qb, qc);
+    if frac.is_finite() { frac * dt } else { 0.0 }
+}
+
+/// World length of the air `ray` crosses. `0` when the eye is inside the
+/// local air, or the cap-sphere chord never enters `R + datum + air`.
+/// Host mirror of `far_mapped_air_chord`. The horizon table still widens
+/// its shell by a pixel; this chord does not.
+#[cfg(test)]
+fn ray_mapped_limb_chord(
+    ray: Vec3,
+    dir: Vec3,
+    rho: f32,
+    distance: f32,
+    rotation: Quat,
+    g: u32,
+    datum: &[f32],
+    max_off: f32,
+    air: f32,
+) -> f32 {
+    if !(distance > 0.0) || !(air > 0.0) || !ray.is_finite() || !dir.is_finite() {
+        return 0.0;
+    }
+    let facing = ray.dot(dir);
+    if !(facing > 0.0) {
+        return 0.0;
+    }
+    if eye_inside_mapped_air(dir, rho, distance, rotation, g, datum, air) {
+        return 0.0;
+    }
+    let rho_cap = rho + (max_off + air) / distance;
+    let Some((t0, t1)) = cap_chord(facing, rho_cap) else {
+        return 0.0;
+    };
+    let ca = facing.clamp(t0, t1);
+    let mut sum_t = 0.0f32;
+    let mut prev_t = 0.0f32;
+    let mut prev_rad = 0.0f32;
+    let mut prev_r = 0.0f32;
+    for i in 0..LIMB_SAMPLES {
+        let t = (ca + limb_delta_m(i) / distance).clamp(t0, t1);
+        let (rad, r_air) = limb_air_at(ray, dir, t, rho, distance, rotation, g, datum, air);
+        if i > 0 {
+            sum_t += limb_segment_t(prev_t, t, prev_rad, rad, prev_r, r_air);
+        }
+        prev_t = t;
+        prev_rad = rad;
+        prev_r = r_air;
+    }
+    if !(sum_t > 0.0) || !sum_t.is_finite() {
+        return 0.0;
+    }
+    sum_t * distance
+}
+
+/// `true` when [`ray_mapped_limb_chord`] is positive. `px` is unused: the
+/// limb is the air the ray crosses, not a pixel-widened sphere.
+#[cfg(test)]
+pub(crate) fn ray_mapped_limb(
+    ray: Vec3,
+    dir: Vec3,
+    rho: f32,
+    distance: f32,
+    rotation: Quat,
+    g: u32,
+    datum: &[f32],
+    max_off: f32,
+    air: f32,
+    px: f32,
+) -> bool {
+    let _ = px;
+    ray_mapped_limb_chord(ray, dir, rho, distance, rotation, g, datum, max_off, air) > 0.0
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
 
     fn sphere_at(dir: Vec3, distance: f32, radius: f32, seed: u32) -> FarBody {
@@ -2303,7 +2901,1090 @@ mod tests {
                 }
             }
         }
-        assert!(worst < 1e-6, "t delta {worst}");
+        // The 6-step regula is the coarser of the two. The safeguarded march
+        // is held to the f64 reference elsewhere; here they must still name
+        // the same hit, within a couple of millionths in normalised t.
+        assert!(worst < 2e-6, "t delta {worst}");
         assert!(hits > 50, "only {hits} rays hit");
+    }
+
+    /// Home-planet radius, in blocks. Datum offsets sit in `[-278_000, 1_040_000]`.
+    const HOME_RADIUS: f64 = 31_017_520.0;
+
+    /// Low-order height, then an affine map onto the home offset range.
+    /// Smooth on the scale of a face: a sum of a few harmonics, not noise.
+    pub(crate) fn home_datum(g: u32) -> Vec<f32> {
+        let gg = g as usize;
+        let mut raw = vec![0.0f64; 6 * gg * gg];
+        for face in 0..6usize {
+            let (tu, n, tv) = far_map_basis(face);
+            let (tu, n, tv) = (tu.as_dvec3(), n.as_dvec3(), tv.as_dvec3());
+            for j in 0..g {
+                for i in 0..g {
+                    let edge = f64::from(g - 1);
+                    let xi = 2.0 * f64::from(i) / edge - 1.0;
+                    let eta = 2.0 * f64::from(j) / edge - 1.0;
+                    let quarter = std::f64::consts::FRAC_PI_4;
+                    let d =
+                        (n + tu * (xi * quarter).tan() + tv * (eta * quarter).tan()).normalize();
+                    let h = 0.55 * d.y
+                        + 0.28 * (d.x * d.x - d.z * d.z)
+                        + 0.22 * (2.0 * d.x * d.z)
+                        + 0.14 * d.y * (1.0 - 3.0 * d.y * d.y);
+                    raw[face * gg * gg + j as usize * gg + i as usize] = h;
+                }
+            }
+        }
+        let lo = raw.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = raw.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let min_t = -278_000.0;
+        let max_t = 1_040_000.0;
+        let scale = (max_t - min_t) / (hi - lo);
+        raw.iter()
+            .map(|v| ((v - lo) * scale + min_t) as f32)
+            .collect()
+    }
+
+    fn sphere_roots_f64(facing: f64, rho: f64) -> Option<(f64, f64)> {
+        if !(rho > 0.0) || !rho.is_finite() {
+            return None;
+        }
+        let disc = facing * facing - (1.0 - rho * rho);
+        if disc < 0.0 || !disc.is_finite() {
+            return None;
+        }
+        let sd = disc.sqrt();
+        Some((facing - sd, facing + sd))
+    }
+
+    /// Residual of the shader's bilinear datum along an f64 ray.
+    /// `t` is refined in f64; the height sample is the same f32 bilinear the
+    /// march uses, including the equiangular polynomial.
+    fn mapped_residual_f64(
+        t: f64,
+        ray: glam::DVec3,
+        center: glam::DVec3,
+        rho: f64,
+        distance: f64,
+        rotation: Quat,
+        g: u32,
+        datum: &[f32],
+    ) -> f64 {
+        let p = ray * t - center;
+        let rad = p.length();
+        if rad < 1e-12 {
+            return -rho;
+        }
+        let u = p / rad;
+        let u32 = Vec3::new(u.x as f32, u.y as f32, u.z as f32);
+        let body = rotate(conjugate(rotation), u32);
+        let height = f64::from(sample_datum(g, datum, body));
+        rad - (rho + height / distance)
+    }
+
+    /// f64 reference intersection. Dense march inside
+    /// `[max(t_hi_in, 0), min(t_lo_in, t_hi_out)]` (or `t_hi_out` when the ray
+    /// misses the lo sphere), with a step well under one datum cell projected
+    /// on the ray, then bisection to `1e-12` in normalised `t`.
+    fn ray_mapped_reference(
+        ray: Vec3,
+        dir: Vec3,
+        rho: f32,
+        distance: f32,
+        rotation: Quat,
+        g: u32,
+        datum: &[f32],
+        min_off: f32,
+        max_off: f32,
+    ) -> Option<f64> {
+        if !(rho > 0.0) || !(distance > 0.0) || !ray.is_finite() || !dir.is_finite() {
+            return None;
+        }
+        let ray_d = ray.as_dvec3().normalize();
+        let dir_d = dir.as_dvec3().normalize();
+        let rho_d = f64::from(rho);
+        let distance_d = f64::from(distance);
+        let rho_lo = rho_d + f64::from(min_off) / distance_d;
+        let rho_hi = rho_d + f64::from(max_off) / distance_d;
+        let facing = ray_d.dot(dir_d);
+        let (t_hi_in, t_hi_out) = sphere_roots_f64(facing, rho_hi)?;
+        if !(t_hi_out > 0.0) {
+            return None;
+        }
+        let t_start = t_hi_in.max(0.0);
+        let t_lo =
+            sphere_roots_f64(facing, rho_lo).and_then(|(t_lo, _)| (t_lo > 0.0).then_some(t_lo));
+        let t_end = t_lo.map(|t| t.min(t_hi_out)).unwrap_or(t_hi_out);
+        let f_at =
+            |t: f64| mapped_residual_f64(t, ray_d, dir_d, rho_d, distance_d, rotation, g, datum);
+        // Lo and hi spheres coincide on a constant datum: the entrance is the hit.
+        if !(t_end > t_start) {
+            let f0 = f_at(t_start);
+            return (t_start > 0.0 && f0.abs() <= 1e-5).then_some(t_start);
+        }
+        let f_start = f_at(t_start);
+        if f_start < -1e-5 {
+            return None;
+        }
+        if f_start.abs() <= 1e-8 {
+            return (t_start > 0.0).then_some(t_start);
+        }
+        // One datum cell is π / (2 (g-1)) radians. Along the ray that is
+        // `cell * rad / sin(phi)`. A tenth of that cannot step over the
+        // bilinear's single sign change inside a cell.
+        let cells = f64::from(g.max(2) - 1);
+        let cell = std::f64::consts::FRAC_PI_2 / cells;
+        let mut t = t_start;
+        let mut prev_f = f_start;
+        let mut bracket: Option<(f64, f64)> = None;
+        let mut guard = 0u32;
+        while t < t_end && guard < 100_000 {
+            guard += 1;
+            let p = ray_d * t - dir_d;
+            let rad = p.length().max(rho_d);
+            let sin_phi = if rad > 1e-8 {
+                ray_d.cross(p / rad).length()
+            } else {
+                0.0
+            };
+            let dt = (cell * rad / sin_phi.max(0.05)) * 0.1;
+            let next = (t + dt.max(1e-8)).min(t_end);
+            let ft = f_at(next);
+            if prev_f * ft <= 0.0 {
+                bracket = Some((t, next));
+                break;
+            }
+            t = next;
+            prev_f = ft;
+        }
+        let (mut a, mut b) = bracket?;
+        for _ in 0..80 {
+            if (b - a).abs() <= 1e-12 {
+                break;
+            }
+            let mid = 0.5 * (a + b);
+            let fm = f_at(mid);
+            let fa = f_at(a);
+            if fa * fm <= 0.0 {
+                b = mid;
+            } else {
+                a = mid;
+            }
+        }
+        let root = 0.5 * (a + b);
+        (root > 0.0 && root.is_finite()).then_some(root)
+    }
+
+    #[test]
+    fn reference_matches_spheres_of_constant_datum() {
+        let g = 33u32;
+        let gg = g as usize;
+        let distance = 4.0f32;
+        for offset in [0.0f32, 0.25] {
+            let datum = vec![offset; 6 * gg * gg];
+            let rho = 0.35f32;
+            // Facing stays above the graze of rho 0.35 (disc needs |ray·dir| ≳ 0.94).
+            for (ray, dir) in [
+                (Vec3::Z, Vec3::Z),
+                (Vec3::new(0.25, -0.1, 1.0).normalize(), Vec3::Z),
+                (
+                    Vec3::new(0.15, 0.05, 1.0).normalize(),
+                    Vec3::new(0.05, -0.08, 1.0).normalize(),
+                ),
+            ] {
+                // Same f64 ray the reference normalises, and the same radius
+                // the residual subtracts (f64 division, not the f32 sphere).
+                let facing = ray.as_dvec3().normalize().dot(dir.as_dvec3().normalize());
+                let radius = f64::from(rho) + f64::from(offset) / f64::from(distance);
+                let (t_near, _) = sphere_roots_f64(facing, radius).unwrap();
+                let got = ray_mapped_reference(
+                    ray,
+                    dir,
+                    rho,
+                    distance,
+                    Quat::IDENTITY,
+                    g,
+                    &datum,
+                    offset,
+                    offset,
+                )
+                .unwrap_or_else(|| panic!("reference missed offset {offset} ray {ray:?}"));
+                assert!(
+                    (got - t_near).abs() < 1e-9,
+                    "offset {offset} reference {got} analytic {t_near}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reference_straight_down_is_the_local_altitude() {
+        let g = 33u32;
+        let datum = home_datum(g);
+        let min_off = datum.iter().copied().fold(f32::MAX, f32::min);
+        let max_off = datum.iter().copied().fold(f32::MIN, f32::max);
+        assert!(min_off > -278_001.0 && max_off < 1_040_001.0);
+        assert!(max_off - min_off > 500_000.0, "harmonics collapsed");
+        let up = Vec3::Y;
+        let local = sample_datum(g, &datum, up);
+        for altitude in [10_000.0f32, 50_000.0, 1.0e5, 1.0e7] {
+            let distance = (HOME_RADIUS + f64::from(local) + f64::from(altitude)) as f32;
+            let rho = (HOME_RADIUS as f32) / distance;
+            let dir = -up;
+            let got = ray_mapped_reference(
+                dir,
+                dir,
+                rho,
+                distance,
+                Quat::IDENTITY,
+                g,
+                &datum,
+                min_off,
+                max_off,
+            )
+            .expect("straight down hits");
+            // f32 radius/distance, not the f64 altitude ratio: R is not an f32 integer.
+            let r = f64::from(rho) + f64::from(local) / f64::from(distance);
+            let expect = 1.0 - r;
+            assert!(
+                (got - expect).abs() < 1e-9,
+                "alt {altitude} reference {got} 1 - r(local) {expect}"
+            );
+        }
+    }
+
+    /// Angle from the centre direction. `0` looks straight down.
+    pub(crate) fn ray_from_nadir(dir: Vec3, azimuth: f32, angle: f32) -> Vec3 {
+        let down = dir.normalize();
+        let up = -down;
+        let reference = if up.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+        let east = reference.cross(up).normalize();
+        let north = up.cross(east);
+        let horiz = east * azimuth.sin() + north * azimuth.cos();
+        (down * angle.cos() + horiz * angle.sin()).normalize()
+    }
+
+    /// Outermost reference hit, sweeping from nadir toward the anti-centre.
+    fn reference_horizon_angle(
+        dir: Vec3,
+        azimuth: f32,
+        rho: f32,
+        distance: f32,
+        g: u32,
+        datum: &[f32],
+        min_off: f32,
+        max_off: f32,
+    ) -> f64 {
+        let hits = |angle: f64| {
+            let ray = ray_from_nadir(dir, azimuth, angle as f32);
+            ray_mapped_reference(
+                ray,
+                dir,
+                rho,
+                distance,
+                Quat::IDENTITY,
+                g,
+                datum,
+                min_off,
+                max_off,
+            )
+            .is_some()
+        };
+        assert!(hits(0.0), "nadir missed");
+        let mut lo = 0.0f64;
+        let mut hi = std::f64::consts::PI;
+        if hits(hi) {
+            return hi;
+        }
+        for _ in 0..50 {
+            let mid = 0.5 * (lo + hi);
+            if hits(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+
+    /// Fixed-point march against the f64 reference, on the same home-datum
+    /// sweep the bracket march passed at `2e-4` relative with no hit/miss
+    /// disagreements.
+    ///
+    /// Measured on this sweep (208 rays: altitudes 10 km, 50 km, 100 km and
+    /// 10,000 km, four azimuths, nadir through the horizon band):
+    /// worst relative `|Δt|/t` = 8.133e-4, at 100 km, azimuth 0, 0.002 rad
+    /// inside the reference horizon. Grazing horizon misses = 11, each the
+    /// sample 2e-4 rad inside that horizon (the reference hits and the
+    /// fixed-point march misses). A disagreement any farther away, or a
+    /// fixed-point hit where the reference misses, fails. Misses that close
+    /// to the horizon are the limb's job.
+    #[test]
+    fn mapped_solver_matches_the_reference_near_the_ground() {
+        // Just above the measured 8.133e-4. The march is deterministic, so
+        // the slack is one digit of the reported figure.
+        const FAST_WORST_REL: f64 = 8.14e-4;
+        /// The sweep's closest interior sample. Every measured miss lands here.
+        const FAST_GRAZE_RAD: f64 = 2.0e-4;
+        const FAST_GRAZING_MISSES: u32 = 11;
+
+        let g = 33u32;
+        let datum = home_datum(g);
+        let min_off = datum.iter().copied().fold(f32::MAX, f32::min);
+        let max_off = datum.iter().copied().fold(f32::MIN, f32::max);
+        let local = sample_datum(g, &datum, Vec3::Y);
+        let radius = HOME_RADIUS as f32;
+        let mut worst = 0.0f64;
+        let mut worst_where = String::new();
+        let mut grazing_misses = 0u32;
+        let mut other_misses = 0u32;
+        let mut compared = 0u32;
+        for altitude in [10_000.0f32, 50_000.0, 1.0e5, 1.0e7] {
+            let distance = radius + local + altitude;
+            let rho = radius / distance;
+            let dir = -Vec3::Y;
+            for azimuth in [0.0f32, 1.3, 2.6, 4.2] {
+                let horizon = reference_horizon_angle(
+                    dir, azimuth, rho, distance, g, &datum, min_off, max_off,
+                );
+                let mut angles = vec![0.0f64, 0.4, 0.8, 1.2217304763960306];
+                for delta in [
+                    -0.2, -0.05, -0.02, -0.01, -0.005, -0.002, -2.0e-4, 2.0e-4, 0.02,
+                ] {
+                    let angle = horizon + delta;
+                    if angle > 0.0 && angle < std::f64::consts::PI {
+                        angles.push(angle);
+                    }
+                }
+                for angle in angles {
+                    let ray = ray_from_nadir(dir, azimuth, angle as f32);
+                    let reference = ray_mapped_reference(
+                        ray,
+                        dir,
+                        rho,
+                        distance,
+                        Quat::IDENTITY,
+                        g,
+                        &datum,
+                        min_off,
+                        max_off,
+                    );
+                    let got = ray_mapped_fast(
+                        ray,
+                        dir,
+                        rho,
+                        distance,
+                        Quat::IDENTITY,
+                        1.0,
+                        g,
+                        &datum,
+                        min_off,
+                        max_off,
+                    );
+                    let from_horizon = (angle - horizon).abs();
+                    compared += 1;
+                    match (reference, got) {
+                        (None, None) => {}
+                        (Some(t_ref), Some(hit)) => {
+                            let rel = (f64::from(hit.t) - t_ref).abs() / t_ref;
+                            if rel > worst {
+                                worst = rel;
+                                worst_where = format!(
+                                    "alt {altitude} az {azimuth} angle {angle} \
+                                     from_horizon {from_horizon} t {t_ref} got {}",
+                                    hit.t
+                                );
+                            }
+                        }
+                        (Some(_), None) if from_horizon <= FAST_GRAZE_RAD => {
+                            grazing_misses += 1;
+                        }
+                        (reference, got) => {
+                            other_misses += 1;
+                            if other_misses <= 8 {
+                                eprintln!(
+                                    "hit/miss alt {altitude} az {azimuth} angle {angle} \
+                                     from_horizon {from_horizon} horizon {horizon} \
+                                     ref {reference:?} got {got:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            other_misses == 0 && grazing_misses <= FAST_GRAZING_MISSES && worst <= FAST_WORST_REL,
+            "fixed-point march disagrees with the f64 reference: {other_misses} \
+             non-grazing hit/miss mismatches over {compared} rays, \
+             {grazing_misses} grazing horizon misses (bound {FAST_GRAZING_MISSES}, \
+             within {FAST_GRAZE_RAD} rad), worst relative |Δt|/t = {worst} \
+             (bound {FAST_WORST_REL}) at {worst_where}"
+        );
+    }
+
+    /// Rays inside the lo-sphere disc hit far from a graze, so the five-sample
+    /// march and the bracket reference name the same surface.
+    #[test]
+    fn fast_march_matches_robust_inside_the_lo_sphere_disc() {
+        let g = 33u32;
+        let datum = home_datum(g);
+        let min_off = datum.iter().copied().fold(f32::MAX, f32::min);
+        let max_off = datum.iter().copied().fold(f32::MIN, f32::max);
+        let radius = HOME_RADIUS as f32;
+        let local = sample_datum(g, &datum, Vec3::Y);
+        let dir = -Vec3::Y;
+        let mut worst = 0.0f64;
+        let mut worst_where = String::new();
+        let mut compared = 0u32;
+        // Eye altitude above the local surface, 10 m through 1e6 m.
+        for altitude in [10.0f32, 100.0, 1_000.0, 10_000.0, 1.0e5, 1.0e6] {
+            let distance = radius + local + altitude;
+            let rho = radius / distance;
+            let rho_lo = rho + min_off / distance;
+            assert!(
+                rho_lo > 0.0 && rho_lo < 1.0,
+                "alt {altitude} rho_lo {rho_lo} is not an exterior lo sphere"
+            );
+            // Half-angle of the lo-sphere disc. A unit ray at angle θ from the
+            // centre hits that sphere when sin θ < rho_lo. Stay strictly inside.
+            let limb = f64::from(rho_lo).asin();
+            for azimuth in [0.0f32, 1.1, 2.4, 3.7, 5.0] {
+                for frac in [0.0f64, 0.2, 0.45, 0.7, 0.9, 0.98] {
+                    let angle = limb * frac;
+                    let ray = ray_from_nadir(dir, azimuth, angle as f32);
+                    let robust = ray_mapped(
+                        ray,
+                        dir,
+                        rho,
+                        distance,
+                        Quat::IDENTITY,
+                        1.0,
+                        g,
+                        &datum,
+                        min_off,
+                        max_off,
+                    );
+                    let fast = ray_mapped_fast(
+                        ray,
+                        dir,
+                        rho,
+                        distance,
+                        Quat::IDENTITY,
+                        1.0,
+                        g,
+                        &datum,
+                        min_off,
+                        max_off,
+                    );
+                    let (Some(robust), Some(fast)) = (robust, fast) else {
+                        panic!(
+                            "interior ray missed alt {altitude} az {azimuth} \
+                             frac {frac} angle {angle} robust {robust:?} fast {fast:?}"
+                        );
+                    };
+                    compared += 1;
+                    let rel =
+                        (f64::from(fast.t) - f64::from(robust.t)).abs() / f64::from(robust.t).abs();
+                    if rel > worst {
+                        worst = rel;
+                        worst_where = format!(
+                            "alt {altitude} az {azimuth} frac {frac} \
+                             robust {} fast {}",
+                            robust.t, fast.t
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            compared > 100 && worst <= 1.0e-6,
+            "fast march disagrees inside the lo disc: {compared} rays, \
+             worst relative |Δt|/t = {worst} at {worst_where}"
+        );
+    }
+
+    /// Cube LOD the shader derives from the pixel footprint. `ndot` is
+    /// `|ray · n|`. The face-centre texel is `(π/2) R / albedo_size`, and the
+    /// result is clamped to the mip range `[0, log2(albedo_size)]`.
+    fn mapped_albedo_lod(
+        px: f32,
+        t: f32,
+        distance: f32,
+        radius: f32,
+        ndot: f32,
+        albedo_size: u32,
+    ) -> f32 {
+        let nd = ndot.abs().max(0.05);
+        let footprint = px * t * distance / nd;
+        let texel = (std::f32::consts::FRAC_PI_2 * radius) / albedo_size as f32;
+        let lod = (footprint / texel).max(1e-20).log2();
+        let mip_max = (albedo_size as f32).log2();
+        lod.clamp(0.0, mip_max)
+    }
+
+    #[test]
+    fn albedo_lod_rises_toward_the_horizon() {
+        let px = 0.01f32;
+        let t = 0.5f32;
+        let distance = 1.0e7f32;
+        let radius = 3.101752e7f32;
+        let albedo = 1024u32;
+        let down = mapped_albedo_lod(px, t, distance, radius, 1.0, albedo);
+        let graze = mapped_albedo_lod(px, t, distance, radius, 0.05, albedo);
+        let flatter = mapped_albedo_lod(px, t, distance, radius, 0.01, albedo);
+        let levels = std::f32::consts::LN_2;
+        let expect = (20.0f32).ln() / levels;
+        assert!(
+            (graze - down - expect).abs() < 1e-4,
+            "nadir {down} graze {graze} expected +{expect}"
+        );
+        assert!((flatter - graze).abs() < 1e-5, "ndot below 0.05 must clamp");
+        assert!(down > 0.0 && graze < (albedo as f32).log2());
+        let tiny = mapped_albedo_lod(1e-6, 1e-4, distance, radius, 1.0, albedo);
+        let huge = mapped_albedo_lod(1.0, 10.0, distance, radius, 0.05, albedo);
+        assert_eq!(tiny, 0.0);
+        assert_eq!(huge, (albedo as f32).log2());
+    }
+
+    /// Lowland everywhere, a broad highland in front of +X. The zenith sample
+    /// stays 0 so an eye on +Y is above the ground, not inside the bump.
+    fn horizon_highland(g: u32, beta0: f32, beta1: f32, az_half: f32, height: f32) -> Vec<f32> {
+        let gg = g as usize;
+        let mut datum = vec![0.0f32; 6 * gg * gg];
+        for face in 0..6usize {
+            let (tu, n, tv) = far_map_basis(face);
+            for j in 0..g {
+                for i in 0..g {
+                    let edge = (g - 1) as f32;
+                    let xi = 2.0 * i as f32 / edge - 1.0;
+                    let eta = 2.0 * j as f32 / edge - 1.0;
+                    let quarter = std::f32::consts::FRAC_PI_4;
+                    let d =
+                        (n + tu * (xi * quarter).tan() + tv * (eta * quarter).tan()).normalize();
+                    let beta = d.dot(Vec3::Y).clamp(-1.0, 1.0).acos();
+                    let az = d.z.atan2(d.x);
+                    if (beta0..=beta1).contains(&beta) && az.abs() <= az_half {
+                        datum[face * gg * gg + j as usize * gg + i as usize] = height;
+                    }
+                }
+            }
+        }
+        datum
+    }
+
+    /// Closed-form tangent of the outer air sphere, or `1` when that sphere
+    /// contains the camera (the game then disables the scalar cone).
+    fn outer_horizon_sine(rho_cap: f32) -> f32 {
+        if rho_cap > 0.0 && rho_cap < 1.0 {
+            -(1.0 - rho_cap * rho_cap).max(0.0).sqrt()
+        } else {
+            1.0
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SilhouetteClass {
+        Hit,
+        Limb,
+        Miss,
+    }
+
+    /// Highland at the horizon: every fixed-point ray hits, or the air chord
+    /// covers the graze the march missed. A miss next to the silhouette is a
+    /// hole. No limb past the air cap.
+    #[test]
+    fn highland_silhouette_is_continuous() {
+        let g = 33u32;
+        let radius = HOME_RADIUS as f32;
+        let air = 20_000.0f32;
+        let px = 1.5e-3f32;
+        let dir = -Vec3::Y;
+        let datum = horizon_highland(g, 0.03, 0.55, 0.45, 1_000_000.0);
+        let max_off = datum.iter().copied().fold(0.0f32, f32::max);
+        let min_off = 0.0f32;
+        assert_eq!(sample_datum(g, &datum, Vec3::Y), 0.0);
+        let mut inside_empty = 0u32;
+        let mut limb_above = 0u32;
+        let mut holes = 0u32;
+        let mut hole_where = String::new();
+        let mut gaps = 0u32;
+        let mut gap_where = String::new();
+        let mut limb_n = 0u32;
+        let mut chord_jump = 0u32;
+        for altitude in [50_000.0f32, 2_000_000.0] {
+            let distance = radius + altitude;
+            let rho = radius / distance;
+            let rho_cap = rho + (max_off + air) / distance;
+            let horizon = outer_horizon_sine(rho_cap);
+            for azimuth in [0.0f32, 0.35, 0.55, 1.2] {
+                let horizon_ang = reference_horizon_angle(
+                    dir, azimuth, rho, distance, g, &datum, min_off, max_off,
+                );
+                let mut row: Vec<(SilhouetteClass, f32, f32, f32, f32)> = Vec::new();
+                for k in -40..=80 {
+                    let angle = horizon_ang + f64::from(k) * 2.0e-4;
+                    if !(angle > 0.0 && angle < std::f64::consts::PI) {
+                        continue;
+                    }
+                    let ray = ray_from_nadir(dir, azimuth, angle as f32);
+                    let facing = ray.dot(dir);
+                    let above = ray.dot(-dir) > horizon;
+                    let hit = if above {
+                        None
+                    } else {
+                        ray_mapped_fast(
+                            ray,
+                            dir,
+                            rho,
+                            distance,
+                            Quat::IDENTITY,
+                            horizon,
+                            g,
+                            &datum,
+                            min_off,
+                            max_off,
+                        )
+                    };
+                    let chord_world = if above {
+                        0.0
+                    } else {
+                        ray_mapped_limb_chord(
+                            ray,
+                            dir,
+                            rho,
+                            distance,
+                            Quat::IDENTITY,
+                            g,
+                            &datum,
+                            max_off,
+                            air,
+                        )
+                    };
+                    // Normalised, so the jump check stays on the same scale as
+                    // `px`. The world chord is what the shader integrates.
+                    let chord = if distance > 0.0 {
+                        chord_world / distance
+                    } else {
+                        0.0
+                    };
+                    let s = ray.cross(dir).length();
+                    let r_local = if facing > 0.0 {
+                        mapped_radius_at(ray, dir, facing, rho, distance, Quat::IDENTITY, g, &datum)
+                    } else {
+                        0.0
+                    };
+                    let class = if hit.is_some() {
+                        SilhouetteClass::Hit
+                    } else if chord_world > 0.0 {
+                        SilhouetteClass::Limb
+                    } else {
+                        SilhouetteClass::Miss
+                    };
+                    if facing > 0.0 && s + 1e-5 < r_local && class == SilhouetteClass::Miss {
+                        inside_empty += 1;
+                    }
+                    if class == SilhouetteClass::Limb && s > rho_cap + 1e-4 {
+                        limb_above += 1;
+                    }
+                    if class == SilhouetteClass::Limb {
+                        limb_n += 1;
+                    }
+                    row.push((class, facing, chord, angle as f32, chord_world));
+                }
+                for w in row.windows(3) {
+                    let (a, _, _, _, _) = w[0];
+                    let (b, facing, _, ang, chord_w) = w[1];
+                    let (c, _, _, _, _) = w[2];
+                    if b == SilhouetteClass::Miss
+                        && a != SilhouetteClass::Miss
+                        && c != SilhouetteClass::Miss
+                    {
+                        holes += 1;
+                        if hole_where.is_empty() {
+                            hole_where = format!(
+                                "alt {altitude} az {azimuth} ang {ang} facing {facing} chord {chord_w} href {horizon_ang} {:?}->{:?}->{:?}",
+                                a, b, c
+                            );
+                        }
+                    }
+                    if a == SilhouetteClass::Hit && b == SilhouetteClass::Miss && facing > 0.0 {
+                        gaps += 1;
+                        if gap_where.is_empty() {
+                            gap_where = format!(
+                                "alt {altitude} az {azimuth} ang {ang} facing {facing} chord {chord_w} href {horizon_ang} {:?}->{:?}->{:?}",
+                                a, b, c
+                            );
+                        }
+                    }
+                }
+                for w in row.windows(2) {
+                    let (a, _, ca, _, _) = w[0];
+                    let (b, _, cb, _, _) = w[1];
+                    if a == SilhouetteClass::Limb && b == SilhouetteClass::Limb {
+                        let scale = ca.max(cb).max(px);
+                        if (ca - cb).abs() > 8.0 * scale {
+                            chord_jump += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            inside_empty, 0,
+            "rays inside the local surface with no hit and no limb"
+        );
+        assert_eq!(limb_above, 0, "limb rays past the outer air sphere");
+        assert_eq!(
+            gaps, 0,
+            "hit then miss with no limb between the surface and space ({gap_where})"
+        );
+        assert_eq!(holes, 0, "limb band with a miss hole in it ({hole_where})");
+        assert_eq!(chord_jump, 0, "limb chord jumped between adjacent rays");
+        assert!(limb_n > 0, "expected some limb rays on the highland");
+    }
+
+    /// Direction of chart sample `(face, i, j)`. Same reconstruction `home_datum`
+    /// uses when it writes that sample.
+    fn chart_sample_dir(g: u32, face: usize, i: u32, j: u32) -> Vec3 {
+        let (tu, n, tv) = far_map_basis(face);
+        let edge = (g - 1) as f32;
+        let xi = 2.0 * i as f32 / edge - 1.0;
+        let eta = 2.0 * j as f32 / edge - 1.0;
+        let quarter = std::f32::consts::FRAC_PI_4;
+        (n + tu * (xi * quarter).tan() + tv * (eta * quarter).tan()).normalize()
+    }
+
+    /// Lowest chart sample. The eye stands on this lowland.
+    fn lowland_up(g: u32, datum: &[f32]) -> Vec3 {
+        let gg = g as usize;
+        let mut best_h = f32::MAX;
+        let mut best = Vec3::Y;
+        for face in 0..6usize {
+            for j in 0..g {
+                for i in 0..g {
+                    let h = datum[face * gg * gg + j as usize * gg + i as usize];
+                    if h < best_h {
+                        best_h = h;
+                        best = chart_sample_dir(g, face, i, j);
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Unit direction of the lowest sample, and the bilinear height there.
+    pub(crate) fn lowland_foot(g: u32, datum: &[f32]) -> (Vec3, f32) {
+        let up = lowland_up(g, datum);
+        (up, sample_datum(g, datum, up))
+    }
+
+    /// `true` when a 25 km march along the cap chord finds air. Same eye and
+    /// facing gates as [`ray_mapped_limb_chord`]. The segment test is the
+    /// analytic ray radius against the linearly interpolated air top, so a
+    /// graze thinner than the step is not missed.
+    fn dense_crosses_air(
+        ray: Vec3,
+        dir: Vec3,
+        rho: f32,
+        distance: f32,
+        g: u32,
+        datum: &[f32],
+        max_off: f32,
+        air: f32,
+    ) -> bool {
+        if !(distance > 0.0) || !(air > 0.0) || !ray.is_finite() || !dir.is_finite() {
+            return false;
+        }
+        let facing = ray.dot(dir);
+        if !(facing > 0.0) {
+            return false;
+        }
+        if eye_inside_mapped_air(dir, rho, distance, Quat::IDENTITY, g, datum, air) {
+            return false;
+        }
+        let rho_cap = rho + (max_off + air) / distance;
+        let Some((t0, t1)) = cap_chord(facing, rho_cap) else {
+            return false;
+        };
+        let step = (25_000.0 / distance).max(1.0e-8);
+        let ca = facing.clamp(t0, t1);
+        let (mut prev_rad, mut prev_r) =
+            limb_air_at(ray, dir, t0, rho, distance, Quat::IDENTITY, g, datum, air);
+        let mut prev_t = t0;
+        for _ in 0..20_000 {
+            let mut next = prev_t + step;
+            if prev_t < ca && next > ca {
+                next = ca;
+            }
+            if next >= t1 {
+                next = t1;
+            }
+            if !(next > prev_t) {
+                break;
+            }
+            let (rad, r_air) =
+                limb_air_at(ray, dir, next, rho, distance, Quat::IDENTITY, g, datum, air);
+            if limb_segment_t(prev_t, next, prev_rad, rad, prev_r, r_air) > 0.0 {
+                return true;
+            }
+            let done = next >= t1;
+            prev_t = next;
+            prev_rad = rad;
+            prev_r = r_air;
+            if done {
+                break;
+            }
+        }
+        false
+    }
+
+    fn limb_boundary_angle(covered: &impl Fn(f64) -> bool) -> Option<f64> {
+        if !covered(1.0e-3) {
+            return None;
+        }
+        let mut lo = 1.0e-3f64;
+        let mut hi = std::f64::consts::PI;
+        if covered(hi) {
+            return Some(hi);
+        }
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            if covered(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Some(0.5 * (lo + hi))
+    }
+
+    /// Angle from nadir of the outermost ray [`ray_mapped_limb`] still covers.
+    /// `None` when a ray just off nadir misses the air.
+    pub(crate) fn mapped_limb_top_angle(
+        dir: Vec3,
+        azimuth: f32,
+        rho: f32,
+        distance: f32,
+        g: u32,
+        datum: &[f32],
+        max_off: f32,
+        air: f32,
+    ) -> Option<f64> {
+        limb_boundary_angle(&|theta| {
+            let ray = ray_from_nadir(dir, azimuth, theta as f32);
+            ray_mapped_limb(
+                ray,
+                dir,
+                rho,
+                distance,
+                Quat::IDENTITY,
+                g,
+                datum,
+                max_off,
+                air,
+                0.0,
+            )
+        })
+    }
+
+    fn dense_air_top_angle(
+        dir: Vec3,
+        azimuth: f32,
+        rho: f32,
+        distance: f32,
+        g: u32,
+        datum: &[f32],
+        max_off: f32,
+        air: f32,
+    ) -> Option<f64> {
+        limb_boundary_angle(&|theta| {
+            let ray = ray_from_nadir(dir, azimuth, theta as f32);
+            dense_crosses_air(ray, dir, rho, distance, g, datum, max_off, air)
+        })
+    }
+
+    /// Constant datum: the crossed-air chord is the outer-sphere chord. A ray
+    /// that dips under the surface still counts the interior, so a graze the
+    /// march missed does not open a gap. The eye inside the shell draws none.
+    #[test]
+    fn constant_datum_limb_chord_matches_the_outer_sphere() {
+        let g = 4u32;
+        let h = 100_000.0f32;
+        let air = 20_000.0f32;
+        let radius = 1_000_000.0f32;
+        let distance = 2_000_000.0f32;
+        let datum = vec![h; 6 * g as usize * g as usize];
+        let rho = radius / distance;
+        let dir = Vec3::Z;
+        let r_air = rho + (h + air) / distance;
+        let r_surf = rho + h / distance;
+        let ray_at = |s: f32| {
+            let facing = (1.0 - s * s).max(0.0).sqrt();
+            (dir * facing + Vec3::X * s).normalize()
+        };
+        let analytic = |ray: Vec3| {
+            let s = ray.cross(dir).length();
+            let facing = ray.dot(dir);
+            let disc = r_air * r_air - s * s;
+            assert!(disc > 0.0, "s {s} r_air {r_air}");
+            let sd = disc.sqrt();
+            assert!(facing - sd > 0.0, "near root is behind the camera");
+            2.0 * sd * distance
+        };
+        // Between the surface and the air top: the shell chord is the outer chord.
+        let between = ray_at(0.5 * (r_surf + r_air));
+        let got = ray_mapped_limb_chord(
+            between,
+            dir,
+            rho,
+            distance,
+            Quat::IDENTITY,
+            g,
+            &datum,
+            h,
+            air,
+        );
+        let expect = analytic(between);
+        assert!(
+            (got - expect).abs() < 1.0,
+            "shell ray chord {got} analytic {expect}"
+        );
+        // Under the surface: the interior counts, so this is the full outer
+        // chord, not the thin shell between r_surf and r_air.
+        let under = ray_at(r_surf * 0.85);
+        let got_under =
+            ray_mapped_limb_chord(under, dir, rho, distance, Quat::IDENTITY, g, &datum, h, air);
+        let expect_under = analytic(under);
+        let s_under = under.cross(dir).length();
+        let shell_only = 2.0
+            * ((r_air * r_air - s_under * s_under).sqrt()
+                - (r_surf * r_surf - s_under * s_under).max(0.0).sqrt())
+            * distance;
+        assert!(
+            (got_under - expect_under).abs() < 1.0,
+            "under-surface chord {got_under} analytic {expect_under}"
+        );
+        assert!(
+            got_under > shell_only + 1_000.0,
+            "under-surface chord {got_under} collapsed to the shell {shell_only}"
+        );
+        // Inside the cap, outside the air.
+        let miss = ray_at(r_air + 0.02);
+        let got_miss = ray_mapped_limb_chord(
+            miss,
+            dir,
+            rho,
+            distance,
+            Quat::IDENTITY,
+            g,
+            &datum,
+            h + 500_000.0,
+            air,
+        );
+        assert_eq!(got_miss, 0.0, "a ray outside the air drew a limb");
+        // Eye 5 km above the datum, air 20 km: no limb on any ray.
+        let distance_in = radius + h + 5_000.0;
+        let rho_in = radius / distance_in;
+        let got_in = ray_mapped_limb_chord(
+            dir,
+            dir,
+            rho_in,
+            distance_in,
+            Quat::IDENTITY,
+            g,
+            &datum,
+            h,
+            air,
+        );
+        assert_eq!(got_in, 0.0, "eye inside the air drew a limb");
+    }
+
+    /// Eye 10 km above a home-datum lowland draws no limb. At 50 km the limb's
+    /// top along every azimuth is the true top of the air the ray crosses,
+    /// within 2 pixels of a 3440-wide 90° view.
+    #[test]
+    fn lowland_limb_matches_the_air_the_ray_crosses() {
+        let g = 33u32;
+        let datum = home_datum(g);
+        let max_off = datum.iter().copied().fold(f32::MIN, f32::max);
+        let min_off = datum.iter().copied().fold(f32::MAX, f32::min);
+        let (up, foot) = lowland_foot(g, &datum);
+        assert!(
+            foot < min_off + 50_000.0,
+            "foot {foot} is not a lowland (datum {min_off}..{max_off})"
+        );
+        let radius = HOME_RADIUS as f32;
+        let air = 20_000.0f32;
+        let dir = -up;
+        let px = f64::from(std::f32::consts::FRAC_PI_2 / 3440.0);
+
+        let distance_in = radius + foot + 10_000.0;
+        let rho_in = radius / distance_in;
+        assert!(eye_inside_mapped_air(
+            dir,
+            rho_in,
+            distance_in,
+            Quat::IDENTITY,
+            g,
+            &datum,
+            air,
+        ));
+        for k in 0..48 {
+            let azimuth = k as f32 * std::f32::consts::TAU / 48.0;
+            for j in 0..48 {
+                let angle = (j as f32 + 0.5) * std::f32::consts::PI / 48.0;
+                let ray = ray_from_nadir(dir, azimuth, angle);
+                let chord = ray_mapped_limb_chord(
+                    ray,
+                    dir,
+                    rho_in,
+                    distance_in,
+                    Quat::IDENTITY,
+                    g,
+                    &datum,
+                    max_off,
+                    air,
+                );
+                assert_eq!(
+                    chord, 0.0,
+                    "alt 10000 az {azimuth} ang {angle} drew a limb of {chord}"
+                );
+            }
+        }
+
+        let distance = radius + foot + 50_000.0;
+        let rho = radius / distance;
+        assert!(!eye_inside_mapped_air(
+            dir,
+            rho,
+            distance,
+            Quat::IDENTITY,
+            g,
+            &datum,
+            air,
+        ));
+        let mut worst = 0.0f64;
+        let mut worst_at = String::new();
+        for k in 0..96 {
+            let azimuth = k as f32 * std::f32::consts::TAU / 96.0;
+            let got = mapped_limb_top_angle(dir, azimuth, rho, distance, g, &datum, max_off, air)
+                .map(|angle| angle - std::f64::consts::FRAC_PI_2);
+            let expect = dense_air_top_angle(dir, azimuth, rho, distance, g, &datum, max_off, air)
+                .map(|angle| angle - std::f64::consts::FRAC_PI_2);
+            let (Some(got), Some(expect)) = (got, expect) else {
+                panic!("az {azimuth} limb {got:?} true air {expect:?}");
+            };
+            let pixels = (got - expect).abs() / px;
+            if pixels > worst {
+                worst = pixels;
+                worst_at = format!("az {azimuth} limb {got} true {expect}");
+            }
+        }
+        assert!(
+            worst <= 2.0,
+            "limb top missed the air the ray crosses by {worst} px at {worst_at}"
+        );
     }
 }

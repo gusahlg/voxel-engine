@@ -441,14 +441,15 @@ const SLANG_CONST_ALLOWLIST: &[(&str, &str)] = &[
          the CPU reads it, and a genconst entry would be a public constant",
     ),
     (
-        "FAR_MAP_CAP",
-        "datum samples one mapped ray may spend, the same cap as \
-         MAPPED_EVAL_CAP in src/far_body.rs. A search limit, not a scene tunable",
+        "FAR_MAP_FTOL",
+        "shallow-slope settle tolerance of the fixed-point mapped march, the \
+         same value as MAPPED_F_TOL in src/far_body.rs. A search limit, not a \
+         scene tunable",
     ),
     (
-        "FAR_MAP_FTOL",
-        "early-out on |radius - r(dir)| during the mapped march, the same \
-         tolerance as MAPPED_F_TOL in src/far_body.rs",
+        "FAR_MAP_CAP",
+        "datum samples of the fixed-point mapped march, the same cap as \
+         MAPPED_EVAL_CAP in src/far_body.rs. A search limit, not a scene tunable",
     ),
 ];
 
@@ -1199,7 +1200,7 @@ fn derived_lane_table() -> Vec<Lane> {
         },
         Lane {
             name: "sky_tangent",
-            doc: "Engine-derived local sky basis (not in FrameUniformsGpu). xyz = tangent:\nthe world axis least aligned with up, rejected into the plane (ties X, then Y,\nthen Z). +Y up yields +X. w unused.",
+            doc: "Engine-derived local sky basis (not in FrameUniformsGpu). xyz = tangent:\nthe world axis least aligned with up, rejected into the plane (ties X, then Y,\nthen Z). +Y up yields +X. w = 1 when the process was started with\nVOXEL_SKY_DEBUG=1, else 0. The sky fragment treats a non-zero w as a uniform\nand replaces its colour with a source key (mapped surface, mapped air limb,\nhorizon skip, and the steep horizon-dip remap). Every other reader uses xyz\nonly. 0 leaves the sky colour path unchanged.",
         },
         Lane {
             name: "sky_up",
@@ -1207,7 +1208,7 @@ fn derived_lane_table() -> Vec<Lane> {
         },
         Lane {
             name: "sky_bitangent",
-            doc: "Engine-derived. xyz = bitangent = tangent × up, right-handed (+Y up yields +Z).\nw = horizon-dip sine. While packing far bodies, the ground body is the kept\noutside body (rho < 1) with the largest rho and dot(dir, -sky_up) > 0.5.\ns = sqrt(max(1 - rho^2, 0)) clamped to [0, 0.5], or 0 when there is no such\nbody. sky_radiance lowers the horizon colour by s. Stars and the cloud\nhorizon do not read this lane. 0 keeps the old elevation clamp.",
+            doc: "Engine-derived. xyz = bitangent = tangent × up, right-handed (+Y up yields +Z).\nw = horizon-dip sine. While packing far bodies, the ground body is the kept\noutside body (rho < 1) with the largest rho and dot(dir, -sky_up) > 0.5.\nrho is radius/distance; a Mapped body uses the lo sphere\n(radius + that map's minimum datum offset) / distance, and an unknown or\nempty map uses offset 0. s = sqrt(max(1 - rho^2, 0)) clamped to [0, 0.5],\nor 0 when there is no such body. sky_radiance lowers the horizon colour by s.\nStars and the cloud horizon do not read this lane. 0 keeps the old elevation clamp.",
         },
     ]
 }
