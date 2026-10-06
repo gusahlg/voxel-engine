@@ -506,8 +506,8 @@ float3 far_through_air(float3 lit, float3 inscatter, float rho)
 
 // Optical depth per air thickness. The mapped limb and the mapped surface
 // chord share this. A vertical path equal to the shell thickness keeps
-// exp(-0.35) of the surface; the old limb coefficient of 4 did not.
-static const float FAR_AIR_K = 0.35;
+// exp(-0.2) of the surface (~82% transmittance).
+static const float FAR_AIR_K = 0.2;
 
 float3 far_lit(float3 alb, float3 nrm, float3 ray, float3 air, float rho, bool core, bool rim)
 {
