@@ -1621,7 +1621,17 @@ pub(crate) fn pack_table(
     view: Option<FarView>,
     map_max: &[f32; MAX_FAR_MAPS],
 ) -> FarTableGpu {
-    *pack_table_cached(bodies, view.as_ref(), None, map_max, glam::Vec3::Y).0
+    // The table bytes do not depend on the dip. Callers that need the sine
+    // go through [`pack_table_cached`] with the real minimum offsets.
+    *pack_table_cached(
+        bodies,
+        view.as_ref(),
+        None,
+        map_max,
+        &[0.0; MAX_FAR_MAPS],
+        glam::Vec3::Y,
+    )
+    .0
 }
 
 /// The table is 72 KB. `Box::new(FarTableGpu::zeroed())` would build that on
@@ -1639,21 +1649,31 @@ fn zeroed_table() -> Box<FarTableGpu> {
 
 /// Sine of the geometric horizon dip below the local horizontal.
 ///
-/// The ground body is the outside body (`rho = radius/distance < 1`) with the
-/// largest rho whose centre lies under the viewer: `dot(dir, -sky_up) > 0.5`.
-/// `sky_up` is the same local up [`super::uniforms::local_sky_basis`] uses, so
-/// a zero or non-unit up matches the sky frame. No such body yields `0`.
-/// Otherwise `s = sqrt(max(1 - rho², 0))`, clamped to `[0, 0.5]`.
+/// The ground body is the outside body (`0 < rho < 1`) with the largest rho
+/// whose centre lies under the viewer: `dot(dir, -sky_up) > 0.5`. `rho` is
+/// `radius/distance`. A [`FarShape::Mapped`] body uses the lo sphere instead,
+/// `(radius + map_min[map]) / distance`: the deepest geometric horizon, so
+/// the sky line stays under the drawn silhouette. An id past the table, or a
+/// non-finite offset, uses offset 0 (the reference radius). An empty slot is
+/// already 0. `sky_up` is the same local up [`super::uniforms::local_sky_basis`]
+/// uses, so a zero or non-unit up matches the sky frame. No such body yields
+/// `0`. Otherwise `s = sqrt(max(1 - rho², 0))`, clamped to `[0, 0.5]`.
 ///
 /// Called from packing on the bodies that pack keeps (the list past `keep`,
 /// not the frustum survivors). Fog and water evaluate `sky_radiance` too, so
 /// the dip must not pop when the ground body leaves the sky frustum.
-pub(crate) fn horizon_dip(bodies: &[FarBody], sky_up: glam::Vec3) -> f32 {
+/// `map_min[i]` is map `i`'s minimum datum offset, the same table as the
+/// lo-sphere disc.
+pub(crate) fn horizon_dip(
+    bodies: &[FarBody],
+    sky_up: glam::Vec3,
+    map_min: &[f32; MAX_FAR_MAPS],
+) -> f32 {
     let (_, up, _) = super::uniforms::local_sky_basis(sky_up);
     let down = -up;
     let mut best = -1.0f32;
     for body in bodies.iter().take(MAX_FAR_BODIES) {
-        let rho = body.radius / body.distance;
+        let rho = horizon_rho(body, map_min);
         if !(rho.is_finite() && rho > 0.0 && rho < 1.0) {
             continue;
         }
@@ -1670,6 +1690,22 @@ pub(crate) fn horizon_dip(bodies: &[FarBody], sky_up: glam::Vec3) -> f32 {
         return 0.0;
     }
     (1.0 - best * best).max(0.0).sqrt().clamp(0.0, 0.5)
+}
+
+/// `radius/distance`. A mapped body adds the map's minimum datum offset first
+/// (the lo sphere). A missing or non-finite offset leaves the reference radius.
+fn horizon_rho(body: &FarBody, map_min: &[f32; MAX_FAR_MAPS]) -> f32 {
+    let mut radius = body.radius;
+    if let FarShape::Mapped { map, .. } = body.shape {
+        let slot = map.0 as usize;
+        if slot < MAX_FAR_MAPS {
+            let min_off = map_min[slot];
+            if min_off.is_finite() {
+                radius += min_off;
+            }
+        }
+    }
+    radius / body.distance
 }
 
 /// `(east, north)` for `up`. `ref` is +Y when `|up.y| < 0.9`, else +X.
@@ -2690,13 +2726,14 @@ fn pack_table_cached(
     view: Option<&FarView>,
     frames: Option<&TileFrames>,
     map_max: &[f32; MAX_FAR_MAPS],
+    map_min: &[f32; MAX_FAR_MAPS],
     sky_up: glam::Vec3,
 ) -> (Box<FarTableGpu>, f32) {
     let mut table = zeroed_table();
     prime_horizon(&mut table);
     let n = bodies.len().min(MAX_FAR_BODIES);
     // Before the cull: see [`horizon_dip`].
-    let dip = horizon_dip(&bodies[..n], sky_up);
+    let dip = horizon_dip(&bodies[..n], sky_up, map_min);
     let cull = far_cull_enabled();
     let mut kept = 0usize;
     for body in bodies.iter().take(n) {
@@ -2921,8 +2958,14 @@ impl FarBodyRing {
         }
         let map_max = maps.max_offsets();
         let map_min = maps.min_offsets();
-        let (mut table, dip) =
-            pack_table_cached(bodies, view.as_ref(), Some(&self.tiles), &map_max, sky_up);
+        let (mut table, dip) = pack_table_cached(
+            bodies,
+            view.as_ref(),
+            Some(&self.tiles),
+            &map_max,
+            &map_min,
+            sky_up,
+        );
         self.publish_horizons(&mut table, view.as_ref(), maps, &map_max, &map_min);
         let offered = bodies.len().min(MAX_FAR_BODIES) as u64;
         crate::profile::gauge(crate::profile::Gauge::FarBodies, offered);
@@ -2992,6 +3035,12 @@ mod tests {
 
     fn pack_table(bodies: &[FarBody], view: Option<FarView>) -> FarTableGpu {
         super::pack_table(bodies, view, &[0.0; MAX_FAR_MAPS])
+    }
+
+    /// Reference-radius dip. A zero minimum-offset table leaves every shape,
+    /// including Mapped, on `radius/distance`.
+    fn horizon_dip(bodies: &[FarBody], sky_up: Vec3) -> f32 {
+        super::horizon_dip(bodies, sky_up, &[0.0; MAX_FAR_MAPS])
     }
     use glam::{Quat, Vec3, Vec4};
 
@@ -3455,10 +3504,98 @@ mod tests {
             placed(Vec3::Y, 0.4, FarShape::Sphere, 1),
             placed(-Vec3::Y, 0.96, FarShape::Sphere, 2),
         ];
-        let (table, dip) = pack_table_cached(&bodies, None, None, &[0.0; MAX_FAR_MAPS], Vec3::Y);
+        let map_min = [0.0; MAX_FAR_MAPS];
+        let (table, dip) =
+            pack_table_cached(&bodies, None, None, &[0.0; MAX_FAR_MAPS], &map_min, Vec3::Y);
         assert_eq!(table.header[0], 2);
         assert_eq!(dip.to_bits(), horizon_dip(&bodies, Vec3::Y).to_bits());
         assert!(dip > 0.0 && dip < 0.5);
+    }
+
+    /// Lowlands sit inside the reference sphere, so the sky dip has to follow
+    /// the lo sphere or the gradient edge draws above the silhouette.
+    #[test]
+    fn horizon_dip_of_a_mapped_ground_body_uses_the_lo_sphere() {
+        let radius = 31_000_000.0f32;
+        let distance = radius + 50_000.0;
+        let min_off = -278_000.0f32;
+        let mut map_min = [0.0f32; MAX_FAR_MAPS];
+        map_min[3] = min_off;
+        let mapped = |map: u8| FarBody {
+            dir: -Vec3::Y,
+            distance,
+            radius,
+            shape: FarShape::Mapped {
+                map: FarMapId(map),
+                horizon: 0.2,
+                air: 12.0,
+            },
+            rotation: Quat::IDENTITY,
+            albedo: [LinearRgb([0.2, 0.2, 0.2]); 6],
+            atmosphere: LinearRgb([0.1, 0.0, 0.0]),
+            seed: 7,
+        };
+        let reference = FarBody {
+            shape: FarShape::Sphere,
+            ..mapped(3)
+        };
+        let lo_sphere = FarBody {
+            radius: radius + min_off,
+            shape: FarShape::Sphere,
+            ..mapped(3)
+        };
+
+        let dip_mapped = super::horizon_dip(std::slice::from_ref(&mapped(3)), Vec3::Y, &map_min);
+        let dip_ref = super::horizon_dip(std::slice::from_ref(&reference), Vec3::Y, &map_min);
+        let dip_lo = super::horizon_dip(std::slice::from_ref(&lo_sphere), Vec3::Y, &map_min);
+        assert!(
+            dip_mapped > dip_ref,
+            "lo sphere {dip_mapped} should dip past the reference sphere {dip_ref}"
+        );
+        assert_eq!(dip_mapped.to_bits(), dip_lo.to_bits());
+        let rho = radius / distance;
+        let exact = (1.0 - rho * rho).max(0.0).sqrt();
+        assert_eq!(dip_ref.to_bits(), exact.to_bits());
+
+        // A sphere does not read the offset table.
+        let mut noisy = [123_456.0f32; MAX_FAR_MAPS];
+        noisy[3] = min_off;
+        assert_eq!(
+            super::horizon_dip(std::slice::from_ref(&reference), Vec3::Y, &noisy).to_bits(),
+            dip_ref.to_bits()
+        );
+
+        // Unknown id, and a cleared slot whose minimum is still 0.
+        assert_eq!(
+            super::horizon_dip(
+                std::slice::from_ref(&mapped(MAX_FAR_MAPS as u8)),
+                Vec3::Y,
+                &map_min
+            )
+            .to_bits(),
+            dip_ref.to_bits()
+        );
+        assert_eq!(
+            super::horizon_dip(std::slice::from_ref(&mapped(0)), Vec3::Y, &map_min).to_bits(),
+            dip_ref.to_bits()
+        );
+        // A non-finite offset is not a datum; stay on the reference radius.
+        map_min[3] = f32::NAN;
+        assert_eq!(
+            super::horizon_dip(std::slice::from_ref(&mapped(3)), Vec3::Y, &map_min).to_bits(),
+            dip_ref.to_bits()
+        );
+
+        map_min[3] = min_off;
+        let (_table, packed) = pack_table_cached(
+            std::slice::from_ref(&mapped(3)),
+            None,
+            None,
+            &[0.0; MAX_FAR_MAPS],
+            &map_min,
+            Vec3::Y,
+        );
+        assert_eq!(packed.to_bits(), dip_mapped.to_bits());
     }
 
     #[test]
@@ -4408,6 +4545,7 @@ mod tests {
             std::slice::from_ref(&planet),
             Some(&up),
             Some(&cache),
+            &[0.0; MAX_FAR_MAPS],
             &[0.0; MAX_FAR_MAPS],
             Vec3::Y,
         );
