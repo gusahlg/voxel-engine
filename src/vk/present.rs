@@ -607,9 +607,10 @@ impl Renderer {
                         self.recreate_if_stale();
                     }
                 }
-                // OUT_OF_DATE/SURFACE_LOST: recreate next frame. Other errors: fatal.
+                // OUT_OF_DATE/SURFACE_LOST: recreate the swapchain next frame.
+                // Other errors: fatal.
                 Err(err) => match Env::classify(err) {
-                    Some(Env::OutOfDate | Env::SurfaceLost) => self.needs_recreate = true,
+                    Some(Env::OutOfDate | Env::SurfaceLost) => self.mark_swapchain_stale(),
                     _ => panic!("queue_present failed: {err:?}"),
                 },
             }
