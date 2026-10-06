@@ -738,38 +738,6 @@ fn sample_datum(g: u32, datum: &[f32], d: Vec3) -> f32 {
     sample_datum_d(g, datum, d).value
 }
 
-/// Max of the four bilinear corners of the datum cell that contains `d`.
-/// Matches `far_datum_cell_max`. The limb uses this so an edge cell keeps the
-/// highland radius instead of the interpolated slope.
-#[cfg(test)]
-fn sample_datum_cell_max(g: u32, datum: &[f32], d: Vec3) -> f32 {
-    if g < 2 {
-        return 0.0;
-    }
-    let gg = g as usize;
-    let need = 6 * gg * gg;
-    if datum.len() < need {
-        return 0.0;
-    }
-    let face = dom_face(d) as usize;
-    let (tu, n, tv) = far_map_basis(face);
-    let den = d.dot(n);
-    if den.abs() < 1e-8 {
-        return 0.0;
-    }
-    let xi = (4.0 / std::f32::consts::PI) * atan_approx(d.dot(tu) / den);
-    let eta = (4.0 / std::f32::consts::PI) * atan_approx(d.dot(tv) / den);
-    let scale = 0.5 * (g - 1) as f32;
-    let u = ((xi + 1.0) * scale).clamp(0.0, (g - 1) as f32);
-    let v = ((eta + 1.0) * scale).clamp(0.0, (g - 1) as f32);
-    let i0 = (u.floor() as u32).min(g - 1);
-    let j0 = (v.floor() as u32).min(g - 1);
-    let i1 = (i0 + 1).min(g - 1);
-    let j1 = (j0 + 1).min(g - 1);
-    let at = |j: u32, i: u32| datum[face * gg * gg + j as usize * gg + i as usize];
-    at(j0, i0).max(at(j0, i1)).max(at(j1, i0)).max(at(j1, i1))
-}
-
 /// Near and far roots of a sphere of radius `rho` centred on the unit `dir`.
 #[cfg(test)]
 fn sphere_roots(facing: f32, rho: f32) -> Option<(f32, f32)> {
@@ -1822,34 +1790,62 @@ fn mapped_radius_at(
     rho + sample_datum(g, datum, rotate(conjugate(rotation), p / rad)) / distance
 }
 
-/// Limb radius along `ray` at `t`: cell-max datum, so a highland edge keeps
-/// the high corner instead of the interpolated slope.
+/// Bilinear height the limb sphere uses. The closest approach, plus one
+/// datum cell ahead and behind along `ray`, at the quarter, half and full
+/// step. The sample kept is the one whose sphere comes closest to the ray
+/// (`h/distance - |p|`), not the highest sample: a smooth lowland stays on
+/// the approach, and a full step does not jump a notch inside the cell.
+/// Not the cell max. `None` when the approach has no direction.
 #[cfg(test)]
-fn mapped_limb_radius_at(
+fn limb_datum_offset(
     ray: Vec3,
     dir: Vec3,
-    t: f32,
-    rho: f32,
-    distance: f32,
     rotation: Quat,
+    distance: f32,
     g: u32,
     datum: &[f32],
-) -> f32 {
-    let p = ray * t - dir;
-    let rad = p.length();
-    if rad < 1e-8 {
-        return 0.0;
+) -> Option<f32> {
+    let facing = ray.dot(dir);
+    let p = ray * facing - dir;
+    let approach = p.length();
+    if approach < 1e-8 || !(distance > 0.0) {
+        return None;
     }
-    rho + sample_datum_cell_max(g, datum, rotate(conjugate(rotation), p / rad)) / distance
+    let u = p / approach;
+    let to_body = |w: Vec3| rotate(conjugate(rotation), w);
+    let mut best_h = sample_datum(g, datum, to_body(u));
+    let mut best_score = best_h / distance - approach;
+    let cells = (g.max(2) - 1) as f32;
+    // One equiangular cell at the face centre is π / (2 (g-1)).
+    let delta = std::f32::consts::FRAC_PI_2 / cells;
+    for frac in [0.25f32, 0.5, 1.0] {
+        let (sn, cs) = (delta * frac).sin_cos();
+        if cs <= 0.05 {
+            continue;
+        }
+        let dist = approach / cs;
+        for sign in [1.0f32, -1.0] {
+            let stepped = (u * cs + ray * (sn * sign)).normalize_or_zero();
+            let h = sample_datum(g, datum, to_body(stepped));
+            let score = h / distance - dist;
+            if score > best_score {
+                best_score = score;
+                best_h = h;
+            }
+        }
+    }
+    Some(best_h)
 }
 
 /// Local air shell for a ray that missed the datum. Host mirror of
 /// `far_mapped_limb`.
 ///
-/// `r_surf` is the max cell-corner datum at closest approach and at the
-/// hi-sphere entry and exit. An edge cell keeps the highland corner so the
-/// interpolated slope cannot drop the limb into a notch. The outer radius
-/// is `r_surf + max(air/distance, px)`, clamped to the air sphere
+/// `r_surf` is the bilinear datum at closest approach, or at a quarter, half
+/// or full datum-cell step along the ray when that sphere comes closer to
+/// the ray than the approach does. The hi-sphere chord ends are not sampled,
+/// and the cell max is not used. A ray the march misses whose closest
+/// approach lies inside `r_surf` still hits the shell. The outer radius is
+/// `r_surf + max(air/distance, px)`, clamped to the air sphere
 /// `rho + (max_off + air) / distance` that the horizon cone bounds. A
 /// pixel-wide shell used to stick out past that sphere and get cut off in a
 /// straight line. `s` is the impact parameter.
@@ -1886,16 +1882,8 @@ fn ray_mapped_shell(
     if !(rho_cap > 0.0 && s < rho_cap) {
         return None;
     }
-    let r_at = |t: f32| mapped_limb_radius_at(ray, dir, t, rho, distance, rotation, g, datum);
-    let mut r_surf = r_at(facing);
-    if let Some((t_in, t_out)) = sphere_roots(facing, rho + max_off / distance) {
-        if t_in > 0.0 {
-            r_surf = r_surf.max(r_at(t_in));
-        }
-        if t_out > 0.0 {
-            r_surf = r_surf.max(r_at(t_out));
-        }
-    }
+    let h = limb_datum_offset(ray, dir, rotation, distance, g, datum)?;
+    let r_surf = rho + h / distance;
     if !(r_surf > 0.0) {
         return None;
     }
@@ -3558,5 +3546,173 @@ mod tests {
         assert_eq!(holes, 0, "limb band with a miss hole in it");
         assert_eq!(chord_jump, 0, "limb chord jumped between adjacent rays");
         assert!(limb_n > 0, "expected some limb rays on the highland");
+    }
+
+    /// Direction of chart sample `(face, i, j)`. Same reconstruction `home_datum`
+    /// uses when it writes that sample.
+    fn chart_sample_dir(g: u32, face: usize, i: u32, j: u32) -> Vec3 {
+        let (tu, n, tv) = far_map_basis(face);
+        let edge = (g - 1) as f32;
+        let xi = 2.0 * i as f32 / edge - 1.0;
+        let eta = 2.0 * j as f32 / edge - 1.0;
+        let quarter = std::f32::consts::FRAC_PI_4;
+        (n + tu * (xi * quarter).tan() + tv * (eta * quarter).tan()).normalize()
+    }
+
+    /// Lowest chart sample. The eye stands on this lowland.
+    fn lowland_up(g: u32, datum: &[f32]) -> Vec3 {
+        let gg = g as usize;
+        let mut best_h = f32::MAX;
+        let mut best = Vec3::Y;
+        for face in 0..6usize {
+            for j in 0..g {
+                for i in 0..g {
+                    let h = datum[face * gg * gg + j as usize * gg + i as usize];
+                    if h < best_h {
+                        best_h = h;
+                        best = chart_sample_dir(g, face, i, j);
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Elevation of the tangent to the air top built from the bilinear datum
+    /// at that ray's closest approach. The direction and the radius are solved
+    /// together. A shell that contains the eye has no below-horizontal tangent;
+    /// the limb stops at the local horizontal, where the approach passes
+    /// behind the camera. Elevation is radians above the local horizontal.
+    fn local_air_top_elevation(
+        dir: Vec3,
+        azimuth: f32,
+        rho: f32,
+        distance: f32,
+        g: u32,
+        datum: &[f32],
+        air: f32,
+    ) -> f64 {
+        let radius_at = |theta: f64| -> f64 {
+            let ray = ray_from_nadir(dir, azimuth, theta as f32);
+            let facing = ray.dot(dir);
+            if facing <= 0.0 {
+                return f64::MAX;
+            }
+            let p = ray * facing - dir;
+            let rad = p.length();
+            if rad < 1e-6 {
+                return f64::from(rho + air / distance);
+            }
+            let h = sample_datum(g, datum, p / rad);
+            f64::from(rho + (h + air) / distance)
+        };
+        let mut lo = 0.0f64;
+        let mut hi = std::f64::consts::FRAC_PI_2;
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            let r = radius_at(mid);
+            if r >= 1.0 || mid.sin() < r {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi) - std::f64::consts::FRAC_PI_2
+    }
+
+    /// Elevation of the outermost forward ray [`ray_mapped_limb`] still covers.
+    fn limb_top_elevation(
+        dir: Vec3,
+        azimuth: f32,
+        rho: f32,
+        distance: f32,
+        g: u32,
+        datum: &[f32],
+        max_off: f32,
+        air: f32,
+        px: f32,
+    ) -> f64 {
+        let covered = |theta: f64| {
+            let ray = ray_from_nadir(dir, azimuth, theta as f32);
+            ray_mapped_limb(
+                ray,
+                dir,
+                rho,
+                distance,
+                Quat::IDENTITY,
+                g,
+                datum,
+                max_off,
+                air,
+                px,
+            )
+        };
+        assert!(
+            covered(0.2),
+            "a ray 0.2 rad from nadir missed the limb shell"
+        );
+        let mut lo = 0.2f64;
+        let mut hi = std::f64::consts::PI - 0.05;
+        assert!(
+            !covered(hi),
+            "the limb covered a ray above the anti-horizon"
+        );
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            if covered(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi) - std::f64::consts::FRAC_PI_2
+    }
+
+    /// Eye 10 km and 50 km above a home-datum lowland. Along the forward
+    /// azimuth the limb's top edge is the air-top tangent of the bilinear
+    /// datum at closest approach, within 2 pixels of a 3440-wide 90° view.
+    #[test]
+    fn lowland_limb_top_matches_the_local_air_tangent() {
+        let g = 33u32;
+        let datum = home_datum(g);
+        let max_off = datum.iter().copied().fold(f32::MIN, f32::max);
+        let min_off = datum.iter().copied().fold(f32::MAX, f32::min);
+        let up = lowland_up(g, &datum);
+        let foot = sample_datum(g, &datum, up);
+        assert!(
+            foot < min_off + 50_000.0,
+            "foot {foot} is not a lowland (datum {min_off}..{max_off})"
+        );
+        let radius = HOME_RADIUS as f32;
+        let air = 20_000.0f32;
+        let dir = -up;
+        // Azimuth 0 of `ray_from_nadir`: forward, the local north.
+        let azimuth = 0.0f32;
+        // One pixel of a 90° view, 3440 pixels across.
+        let px = std::f32::consts::FRAC_PI_2 / 3440.0;
+        let px_rad = f64::from(px);
+        for altitude in [10_000.0f32, 50_000.0] {
+            let distance = radius + foot + altitude;
+            let rho = radius / distance;
+            assert!(
+                air / distance > px,
+                "alt {altitude} air shell is thinner than a pixel"
+            );
+            let expect = local_air_top_elevation(dir, azimuth, rho, distance, g, &datum, air);
+            let got = limb_top_elevation(dir, azimuth, rho, distance, g, &datum, max_off, air, px);
+            let pixels = (got - expect).abs() / px_rad;
+            assert!(
+                pixels <= 2.0,
+                "alt {altitude} limb top {got} rad vs local air tangent {expect} rad \
+                 ({pixels} px, foot {foot}, rho {rho})"
+            );
+            if altitude >= 50_000.0 {
+                assert!(
+                    expect < -1.0_f64.to_radians(),
+                    "alt {altitude} air tangent {expect} rad is not below the horizontal \
+                     (foot {foot})"
+                );
+            }
+        }
     }
 }

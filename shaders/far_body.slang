@@ -1375,59 +1375,73 @@ bool far_above_horizon(uint bodyIndex, float3 ray, float3 center)
     return mu > farTable[0].horizon_sin[slot * 256u + bin];
 }
 
-// Max of the four corners of the datum cell that contains `d`. The limb
-// uses this so a highland edge keeps the high corner, not the slope.
-float far_datum_cell_max(uint map, float3 d)
+// Keep `h` when `h/distance - dist` beats the sample held in `best`.
+// `dist` is |p| along that sample's direction.
+void far_limb_consider(
+    float h, float dist, float distance, inout float best, inout float bestScore)
 {
+    float score = h / distance - dist;
+    if (score > bestScore)
+    {
+        bestScore = score;
+        best = h;
+    }
+}
+
+// Bilinear height the limb sphere uses. The closest approach, plus a
+// quarter, half and full datum cell ahead of and behind it along `ray`.
+// The sample kept is the one whose sphere comes closest to the ray
+// (`h/distance - |p|`), not the highest sample: a smooth lowland stays on
+// the approach, and a full step does not jump a notch inside the cell.
+// Not the cell max. `ray` is unit and perpendicular to `u`. `approach` is
+// |p| at the closest approach. Scalar steps only: a function-scope table
+// is the sky fragment's local memory.
+float far_limb_offset(float4 rot, uint map, float3 u, float3 ray, float distance, float approach)
+{
+    float best = far_datum_value(map, far_inv_rotate(rot, u));
+    float bestScore = best / distance - approach;
     uint g = farMaps[map * 8u];
-    if (g < 2u)
-        return 0.0;
-    uint face = far_dom_face(d);
-    float3 tu;
-    float3 n;
-    float3 tv;
-    far_face_basis(face, tu, n, tv);
-    float den = dot(d, n);
-    if (abs(den) < 1e-8)
-        return 0.0;
-    float xi = (4.0 / 3.14159265358979323846) * far_atan_approx(dot(d, tu) / den);
-    float eta = (4.0 / 3.14159265358979323846) * far_atan_approx(dot(d, tv) / den);
-    float scale = 0.5 * float(g - 1u);
-    float u = clamp((xi + 1.0) * scale, 0.0, float(g - 1u));
-    float v = clamp((eta + 1.0) * scale, 0.0, float(g - 1u));
-    uint i0 = min(uint(floor(u)), g - 1u);
-    uint j0 = min(uint(floor(v)), g - 1u);
-    uint i1 = min(i0 + 1u, g - 1u);
-    uint j1 = min(j0 + 1u, g - 1u);
-    uint off = farMaps[map * 8u + 1u];
-    uint base = 64u + off + face * g * g;
-    float v00 = asfloat(farMaps[base + j0 * g + i0]);
-    float v10 = asfloat(farMaps[base + j0 * g + i1]);
-    float v01 = asfloat(farMaps[base + j1 * g + i0]);
-    float v11 = asfloat(farMaps[base + j1 * g + i1]);
-    return max(max(v00, v10), max(v01, v11));
+    float cells = 1.0;
+    if (g > 2u)
+        cells = float(g - 1u);
+    // One equiangular cell at the face centre is π / (2 (g-1)).
+    float delta = 1.5707963267948966 / cells;
+    [unroll]
+    for (int step = 0; step < 3; step++)
+    {
+        float frac = 0.25;
+        if (step == 1)
+            frac = 0.5;
+        if (step == 2)
+            frac = 1.0;
+        float ang = delta * frac;
+        float cs = cos(ang);
+        float sn = sin(ang);
+        if (cs > 0.05)
+        {
+            float dist = approach / cs;
+            float3 ahead = normalize(u * cs + ray * sn);
+            far_limb_consider(
+                far_datum_value(map, far_inv_rotate(rot, ahead)),
+                dist, distance, best, bestScore);
+            float3 back = normalize(u * cs - ray * sn);
+            far_limb_consider(
+                far_datum_value(map, far_inv_rotate(rot, back)),
+                dist, distance, best, bestScore);
+        }
+    }
+    return best;
 }
 
-// Limb radius at `t`: cell-max datum so a highland edge keeps the high
-// corner. Three calls along the hi-sphere chord, no array.
-float far_mapped_r(
-    float3 ray, float3 center, float t, float rho, float distance, float4 rot, uint map)
-{
-    float3 p = ray * t - center;
-    float rad = length(p);
-    if (rad < 1e-8)
-        return 0.0;
-    return rho + far_datum_cell_max(map, far_inv_rotate(rot, p / rad)) / distance;
-}
-
-// Air shell for a ray that missed the datum. rSurf is the max cell-corner
-// datum at closest approach and at the hi-sphere entry and exit. An edge
-// cell keeps the highland corner so the interpolated slope cannot drop the
-// limb into a notch. The shell is rSurf + max(air/distance, px), and it
-// stops at the outer air sphere rho + (maxOff + air) / distance. A pixel
-// wider than the air used to stick out past the horizon cone and get cut
-// off in a straight line. False when the ray misses that shell, including
-// a degenerate approach straight through the centre.
+// Air shell for a ray that missed the datum. rSurf is the bilinear datum
+// at closest approach, or at a quarter, half or full datum-cell step along
+// the ray when that sphere comes closer. The hi-sphere chord ends are not
+// sampled. The shell is rSurf + max(air/distance, px), and it stops at the
+// outer air sphere rho + (maxOff + air) / distance. A pixel wider than the
+// air used to stick out past the horizon cone and get cut off in a straight
+// line. A ray the march misses whose closest approach lies inside rSurf
+// still hits this shell. False when the ray misses the shell, including a
+// degenerate approach straight through the centre.
 bool far_mapped_limb(
     float3 ray, float3 center, float facing, float rho, float distance,
     float4 rot, uint map, float airThick, float px,
@@ -1444,16 +1458,12 @@ bool far_mapped_limb(
     // Outside that sphere every local shell is missed. Skip the datum sample.
     if (!(rhoCap > 0.0) || !(s < rhoCap))
         return false;
-    rSurf = far_mapped_r(ray, center, facing, rho, distance, rot, map);
-    float tIn;
-    float tOut;
-    if (far_sphere_roots(facing, rho + maxOff / distance, tIn, tOut))
-    {
-        if (tIn > 0.0)
-            rSurf = max(rSurf, far_mapped_r(ray, center, tIn, rho, distance, rot, map));
-        if (tOut > 0.0)
-            rSurf = max(rSurf, far_mapped_r(ray, center, tOut, rho, distance, rot, map));
-    }
+    float3 p = ray * facing - center;
+    float rad = length(p);
+    if (!(rad > 1e-8))
+        return false;
+    float h = far_limb_offset(rot, map, p / rad, ray, distance, rad);
+    rSurf = rho + h / distance;
     float shell = max(airThick / distance, px);
     outer = rSurf + shell;
     if (outer > rhoCap)
