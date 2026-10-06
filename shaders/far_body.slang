@@ -275,8 +275,27 @@ bool far_ray_cube(float3 ray, float3 center, float rho, float4 rot, out float t,
     if (tMin <= 0.0)
         return false;
     t = tMin;
-    nrm = far_rotate(rot, FACE_NORMAL[face]);
+    // A switch, not FACE_NORMAL[face]. A dynamic index of that array is a
+    // function-scope copy, and that copy is the sky fragment's local memory.
+    nrm = far_rotate(rot, far_face_normal(face));
     return true;
+}
+
+// Cube-face unit normal. Same order as FACE_NORMAL. Inlined as a branch so
+// the fragment does not copy a 6-vector table into local memory.
+float3 far_face_normal(uint face)
+{
+    if (face == 0u)
+        return float3(1.0, 0.0, 0.0);
+    if (face == 1u)
+        return float3(-1.0, 0.0, 0.0);
+    if (face == 2u)
+        return float3(0.0, 1.0, 0.0);
+    if (face == 3u)
+        return float3(0.0, -1.0, 0.0);
+    if (face == 4u)
+        return float3(0.0, 0.0, 1.0);
+    return float3(0.0, 0.0, -1.0);
 }
 
 // Dominant axis of a body-space normal. Ties break toward X, then Y, then Z.
@@ -312,11 +331,12 @@ void far_lp(float3 q, float p, out float s, out float3 g)
     if (a.z > 0.0) g.z = pz / sum * s / a.z * sign(q.z);
 }
 
-// Sample at tHit when it is outside the solid. Normal from the gradient.
-bool far_round_at(float4 rot, float3 o, float3 d, float tHit, float p, float rho, out float t, out float3 nrm, out uint face)
+// Sample at tHit when it is outside the solid. The face is the gradient's
+// dominant axis. Shade rebuilds the world normal with one far_lp at the hit,
+// so this march does not carry a float3 out.
+bool far_round_at(float3 o, float3 d, float tHit, float p, float rho, out float t, out uint face)
 {
     t = 0.0;
-    nrm = float3(0.0, 0.0, 0.0);
     face = 0u;
     if (!(tHit > 0.0))
         return false;
@@ -329,7 +349,6 @@ bool far_round_at(float4 rot, float3 o, float3 d, float tHit, float p, float rho
     if (!(glen > 1e-8))
         return false;
     t = tHit;
-    nrm = far_rotate(rot, g / glen);
     face = far_dom_face(g);
     return true;
 }
@@ -337,10 +356,11 @@ bool far_round_at(float4 rot, float3 o, float3 d, float tHit, float p, float rho
 // Superellipsoid of face radius rho. Bound is rho * 3^(1/2 - 1/p), padded a hair
 // so the entry stays outside the solid. A graze of that sphere, where it meets
 // the body, falls back to the sphere point rather than opening a hole.
-bool far_ray_rounded(float3 ray, float3 center, float rho, float4 rot, float exponent, float facing, out float t, out float3 nrm, out uint face)
+// No world normal: a carried float3 across this loop spilled. Shade rebuilds
+// the gradient, or the enclosing-sphere radial when face bit 3 is set.
+bool far_ray_rounded(float3 ray, float3 center, float rho, float4 rot, float exponent, float facing, out float t, out uint face)
 {
     t = 0.0;
-    nrm = float3(0.0, 0.0, 0.0);
     face = 0u;
     float p = clamp(exponent, 2.0, 32.0);
     float rhoB = rho * pow(3.0, 0.5 - 1.0 / p) * (1.0 + 2.0e-4);
@@ -356,30 +376,27 @@ bool far_ray_rounded(float3 ray, float3 center, float rho, float4 rot, float exp
     float3 o = far_inv_rotate(rot, -center);
     float3 d = far_inv_rotate(rot, ray);
     float t0 = max(tNear, 0.0);
-    float s0;
-    float3 g0;
-    far_lp(o, p, s0, g0);
-    if (t0 == 0.0 && s0 <= rho)
+    float s;
+    float3 g;
+    far_lp(o, p, s, g);
+    if (t0 == 0.0 && s <= rho)
         return false;
 
     float tC = clamp(facing, t0, tFar);
-    float sC;
-    float3 gC;
-    far_lp(o + d * tC, p, sC, gC);
-    if (sC > rho)
+    far_lp(o + d * tC, p, s, g);
+    if (s > rho)
     {
-        if (sC <= rho * 1.001 && tC > 0.0 && far_round_at(rot, o, d, tC, p, rho, t, nrm, face))
+        if (s <= rho * 1.001 && tC > 0.0 && far_round_at(o, d, tC, p, rho, t, face))
             return true;
         if (tNear > 0.0 && sd <= rhoB * 0.02)
         {
-            float sB;
-            float3 gB;
-            far_lp(o + d * tNear, p, sB, gB);
-            if (sB >= rho && sB <= rho * 1.01)
+            far_lp(o + d * tNear, p, s, g);
+            if (s >= rho && s <= rho * 1.01)
             {
                 t = tNear;
-                nrm = (ray * tNear - center) / rhoB;
-                face = far_dom_face(far_inv_rotate(rot, nrm));
+                // far_dom_face(inv_rotate(rot, (ray*t-center)/rhoB)). A positive
+                // scale does not change the dominant axis.
+                face = far_dom_face(o + d * tNear) | 8u;
                 return true;
             }
         }
@@ -392,13 +409,12 @@ bool far_ray_rounded(float3 ray, float3 center, float rho, float4 rot, float exp
     for (uint step = 0u; step < 6u; step++)
     {
         float sL;
-        float3 gL;
-        far_lp(o + d * lo, p, sL, gL);
+        far_lp(o + d * lo, p, sL, g);
         if (sL >= rho && sL <= rho * (1.0 + 2.0e-5))
             break;
         if (hi - lo < 1e-6)
             break;
-        float slope = dot(gL, d);
+        float slope = dot(g, d);
         bool moved = false;
         if (slope < -1e-8)
         {
@@ -406,8 +422,7 @@ bool far_ray_rounded(float3 ray, float3 center, float rho, float4 rot, float exp
             if (tN > lo && tN < hi)
             {
                 float sN;
-                float3 gN;
-                far_lp(o + d * tN, p, sN, gN);
+                far_lp(o + d * tN, p, sN, g);
                 if (sN >= rho)
                 {
                     lo = tN;
@@ -420,8 +435,7 @@ bool far_ray_rounded(float3 ray, float3 center, float rho, float4 rot, float exp
         if (!moved)
         {
             float sH;
-            float3 gH;
-            far_lp(o + d * hi, p, sH, gH);
+            far_lp(o + d * hi, p, sH, g);
             float tF = 0.5 * (lo + hi);
             float span = sL - sH;
             if (abs(span) > 1e-12)
@@ -431,26 +445,22 @@ bool far_ray_rounded(float3 ray, float3 center, float rho, float4 rot, float exp
                     tF = guess;
             }
             float sF;
-            float3 gF;
-            far_lp(o + d * tF, p, sF, gF);
+            far_lp(o + d * tF, p, sF, g);
             if (sF >= rho)
                 lo = tF;
             else
                 hi = tF;
         }
     }
-    if (far_round_at(rot, o, d, lo, p, rho, t, nrm, face))
+    if (far_round_at(o, d, lo, p, rho, t, face))
         return true;
     if (tNear > 0.0)
     {
-        float sB;
-        float3 gB;
-        far_lp(o + d * tNear, p, sB, gB);
-        if (sB >= rho)
+        far_lp(o + d * tNear, p, s, g);
+        if (s >= rho)
         {
             t = tNear;
-            nrm = (ray * tNear - center) / rhoB;
-            face = far_dom_face(far_inv_rotate(rot, nrm));
+            face = far_dom_face(o + d * tNear) | 8u;
             return true;
         }
     }
@@ -560,18 +570,321 @@ bool far_sphere_roots(float facing, float rho, out float tNear, out float tFar)
     return true;
 }
 
-// Coarse probes along the hi/lo bracket. Matches MAPPED_COARSE_CAP.
-static const int FAR_MAP_COARSE = 16;
-// Secant / bisection steps after a sign change. Matches MAPPED_REFINE_CAP.
-static const int FAR_MAP_REFINE = 24;
-// Early-out on |radius - r(dir)| only once the t bracket is already tight.
-// Matches MAPPED_F_TOL. A graze stays under this across a wide interval.
+// Five-sample fixed-point march. The only mapped intersection a GPU module
+// compiles. The bracket march stays a CPU test reference (`ray_mapped`);
+// the host mirror of this function is `ray_mapped_fast`, and the two stay
+// sample-for-sample identical. No fallback.
+// Datum samples the march may spend. The analytic normal is one more fetch
+// after the march, outside this cap. Matches src/far_body.rs.
+static const int FAR_MAP_CAP = 5;
 static const float FAR_MAP_FTOL = 1e-8;
-// Relative width of the normalised-t bracket. Matches MAPPED_T_TOL.
-static const float FAR_MAP_TTOL = 1e-7;
-// Interior probes of one coarse segment that could hide a root. Matches
-// MAPPED_HUNT. A highland edge is negative only between two positive samples.
-static const int FAR_MAP_HUNT = 4;
+
+// Value only. Derivatives stay in far_datum_d for the analytic normal.
+// Components, not the three basis vectors: those nine floats are live
+// across the bilinear loads, which is the regula sample's hottest point.
+float far_datum_value(uint map, float3 d)
+{
+    uint g = farMaps[map * 8u];
+    if (g < 2u)
+        return 0.0;
+    uint face = far_dom_face(d);
+    // Same dots as far_face_basis. d is dead once the three components exist.
+    float den;
+    float du;
+    float dv;
+    if (face == 0u)
+    {
+        den = d.x;
+        du = -d.y;
+        dv = d.z;
+    }
+    else if (face == 1u)
+    {
+        den = -d.x;
+        du = d.y;
+        dv = d.z;
+    }
+    else if (face == 2u)
+    {
+        den = d.y;
+        du = d.x;
+        dv = d.z;
+    }
+    else if (face == 3u)
+    {
+        den = -d.y;
+        du = d.x;
+        dv = -d.z;
+    }
+    else if (face == 4u)
+    {
+        den = d.z;
+        du = d.x;
+        dv = -d.y;
+    }
+    else
+    {
+        den = -d.z;
+        du = d.x;
+        dv = d.y;
+    }
+    if (abs(den) < 1e-8)
+        return 0.0;
+    float xi = (4.0 / 3.14159265358979323846) * far_atan_approx(du / den);
+    float eta = (4.0 / 3.14159265358979323846) * far_atan_approx(dv / den);
+    float scale = 0.5 * float(g - 1u);
+    float u = clamp((xi + 1.0) * scale, 0.0, float(g - 1u));
+    float v = clamp((eta + 1.0) * scale, 0.0, float(g - 1u));
+    uint i0 = min(uint(floor(u)), g - 1u);
+    uint j0 = min(uint(floor(v)), g - 1u);
+    uint i1 = min(i0 + 1u, g - 1u);
+    uint j1 = min(j0 + 1u, g - 1u);
+    float fu = u - float(i0);
+    float fv = v - float(j0);
+    uint off = farMaps[map * 8u + 1u];
+    uint base = 64u + off + face * g * g;
+    // Two loads, then the lerp, so the four samples are not live together.
+    float a = asfloat(farMaps[base + j0 * g + i0]);
+    a = a + (asfloat(farMaps[base + j0 * g + i1]) - a) * fu;
+    float b = asfloat(farMaps[base + j1 * g + i0]);
+    b = b + (asfloat(farMaps[base + j1 * g + i1]) - b) * fu;
+    return a + (b - a) * fv;
+}
+
+// Reloaded at each sample so a centre or rotation from an earlier sample is
+// not kept live across the datum chart.
+float4 far_body_dir(uint bodyIndex)
+{
+    return farTable[0].body[bodyIndex].dir_rho;
+}
+
+float4 far_body_rot(uint bodyIndex)
+{
+    return farTable[0].body[bodyIndex].rot;
+}
+
+// Radial slope u·ray at parameter t. Same f32 ops as far_march_sample.
+float far_radial_slope(float3 ray, uint bodyIndex, float t)
+{
+    float3 center = far_body_dir(bodyIndex).xyz;
+    float3 p = ray * t - center;
+    float rad = length(p);
+    float3 uWorld = p / rad;
+    return dot(uWorld, ray);
+}
+
+// (f, r, df/dt). Slope is u·ray. Rays inside the lo-sphere disc match the
+// robust march to 1e-6 relative hit distance with that term alone.
+// Centre and rotation are reloaded here and dropped before the chart.
+void far_march_sample(
+    float3 ray, uint bodyIndex, float rho, float distance, uint map,
+    inout int evals, float t, out float f, out float r, out float slope)
+{
+    evals += 1;
+    f = -rho;
+    r = 0.0;
+    slope = 0.0;
+    float facing;
+    float centerSq;
+    float raySq;
+    float rad;
+    float3 uBody;
+    {
+        float3 center = far_body_dir(bodyIndex).xyz;
+        float4 rot = far_body_rot(bodyIndex);
+        float3 p = ray * t - center;
+        rad = length(p);
+        if (!(rad < 1e-8))
+        {
+            float3 uWorld = p / rad;
+            // These do not read the datum. Finishing them first drops p,
+            // uWorld, centre and rotation before the chart.
+            slope = dot(uWorld, ray);
+            facing = dot(ray, center);
+            centerSq = dot(center, center);
+            raySq = dot(ray, ray);
+            uBody = far_inv_rotate(rot, uWorld);
+        }
+    }
+    if (rad < 1e-8)
+        return;
+    float value = far_datum_value(map, uBody);
+    r = rho + value / distance;
+    // |p| - r cancels in f32 when both are near 1. Same |p|^2 - r^2 form
+    // as the robust march, so a hit a few metres out still agrees.
+    float oneMinusR = (1.0 - rho) - value / distance;
+    float diffSq = t * t * raySq - 2.0 * t * facing
+        + (centerSq - 1.0) + oneMinusR * (1.0 + r);
+    f = diffSq / (rad + r);
+}
+
+bool far_positive_root(float facing, float radius, out float t)
+{
+    float tNear;
+    float tFar;
+    t = 0.0;
+    if (!far_sphere_roots(facing, radius, tNear, tFar))
+        return false;
+    if (tNear > 0.0)
+    {
+        t = tNear;
+        return true;
+    }
+    if (tFar > 0.0)
+    {
+        t = tFar;
+        return true;
+    }
+    return false;
+}
+
+// Another Newton step would move t by less than 1e-8 relative, inside the
+// 1e-6 agreement band of the robust march. A shallow
+// slope falls back to FAR_MAP_FTOL: a graze stays small across a wide interval.
+bool far_fast_settled(float t, float f, float slope)
+{
+    if (abs(slope) > 1e-4)
+        return abs(f / slope) <= 1e-8 * max(abs(t), 1e-12);
+    return abs(f) <= FAR_MAP_FTOL;
+}
+
+// Illinois regula falsi. The retained endpoint's weight is halved so a stuck
+// side does not burn the remaining samples. A small residual takes a Newton
+// step from the radial slope; with no sample left, sphere curvature corrects it.
+float far_regula(
+    float3 ray, uint bodyIndex, float rho, float distance, uint map,
+    inout int evals, float a0, float b0, float fa0, float fb0)
+{
+    float a = a0;
+    float b = b0;
+    float fa = fa0;
+    float fb = fb0;
+    float wa = fa;
+    float wb = fb;
+    [loop]
+    while (evals < FAR_MAP_CAP)
+    {
+        float den = wb - wa;
+        // Relative, not absolute: a 1e-7 bracket is a large fraction of a
+        // hit that sits a few metres in front of a planet-sized body.
+        float span = max(max(abs(a), abs(b)), 1e-6);
+        if (abs(den) < 1e-20 || abs(b - a) <= 1e-8 * span)
+            break;
+        float tn = b - wb * (b - a) / den;
+        if (!(tn > min(a, b) && tn < max(a, b)))
+            break;
+        float ft;
+        float rt;
+        float st;
+        far_march_sample(ray, bodyIndex, rho, distance, map, evals, tn, ft, rt, st);
+        if (far_fast_settled(tn, ft, st))
+            return tn;
+        if (abs(st) > 1e-4 && abs(ft) < 2e-3)
+        {
+            float t2 = tn - ft / st;
+            // lo/hi are min/max of the bracket. Recomputing them after the
+            // sample keeps those two floats out of the chart.
+            if (t2 > min(a, b) && t2 < max(a, b) && abs(t2 - tn) < 5e-3)
+            {
+                if (!(evals < FAR_MAP_CAP))
+                {
+                    float3 center = far_body_dir(bodyIndex).xyz;
+                    float3 p = ray * tn - center;
+                    float rad = length(p);
+                    float srad = dot(p / rad, ray);
+                    float curve = (1.0 - srad * srad) / rad;
+                    float hden = st - ft * curve / (2.0 * st);
+                    float tH = (abs(hden) > 1e-4 && rad > 1e-8) ? (tn - ft / hden) : t2;
+                    if (abs(tH - tn) < 5e-3)
+                        return tH;
+                    return t2;
+                }
+                float f2;
+                float r2;
+                float s2;
+                far_march_sample(ray, bodyIndex, rho, distance, map, evals, t2, f2, r2, s2);
+                if (far_fast_settled(t2, f2, s2))
+                    return t2;
+                if (abs(s2) > 1e-4 && abs(f2) < 1e-3)
+                {
+                    // Halley. Accept only inside the settle band; a wider
+                    // step goes back into the bracket.
+                    // The first sample's slope, recomputed so it is not live
+                    // across this second datum fetch.
+                    float stR = far_radial_slope(ray, bodyIndex, tn);
+                    float d2 = abs(t2 - tn) > 1e-6 ? (s2 - stR) / (t2 - tn) : 0.0;
+                    float hden = s2 - f2 * d2 / (2.0 * s2);
+                    float t3 = abs(hden) > 1e-4 ? (t2 - f2 / hden) : (t2 - f2 / s2);
+                    float lo = min(a, b);
+                    float hi = max(a, b);
+                    if (t3 > lo && t3 < hi && abs(f2 / s2) <= 1e-8 * max(abs(t2), 1e-12))
+                        return t3;
+                }
+                if (ft * f2 <= 0.0)
+                {
+                    if (tn < t2)
+                    {
+                        a = tn;
+                        b = t2;
+                        fa = ft;
+                        fb = f2;
+                    }
+                    else
+                    {
+                        a = t2;
+                        b = tn;
+                        fa = f2;
+                        fb = ft;
+                    }
+                    wa = fa;
+                    wb = fb;
+                    continue;
+                }
+                if (abs(f2) < abs(ft))
+                {
+                    if (fa * f2 <= 0.0)
+                    {
+                        b = t2;
+                        fb = f2;
+                        wb = f2;
+                    }
+                    else
+                    {
+                        a = t2;
+                        fa = f2;
+                        wa = f2;
+                    }
+                    continue;
+                }
+            }
+        }
+        if (fa * ft <= 0.0)
+        {
+            b = tn;
+            fb = ft;
+            wb = ft;
+            wa *= 0.5;
+        }
+        else
+        {
+            a = tn;
+            fa = ft;
+            wa = ft;
+            wb *= 0.5;
+        }
+    }
+    if (!(evals < FAR_MAP_CAP))
+    {
+        float den = fb - fa;
+        if (abs(den) > 1e-20)
+        {
+            float tn = b - fb * (b - a) / den;
+            if (tn > min(a, b) && tn < max(a, b))
+                return tn;
+        }
+    }
+    return abs(fa) <= abs(fb) ? a : b;
+}
 
 #if 0
 // Finite-difference normal kept for comparison. Two one-sided steps of half
@@ -596,6 +909,41 @@ float3 far_mapped_normal_fd(float4 rot, float3 uWorld, float rho, float distance
 // Outward normal of the bilinear patch at uWorld. On the +X face centre,
 // d(uHat)/d(xi) × d(uHat)/d(eta) points inward, so the outward normal is
 // dp/d(eta) × dp/d(xi). A flat patch is exactly radial.
+// Chart point q = n + tu*tx + tv*ty. Axis bases, so this is a permutation
+// of (1, tx, ty), not three live basis vectors.
+float3 far_chart_q(uint face, float tx, float ty)
+{
+    if (face == 0u)
+        return float3(1.0, -tx, ty);
+    if (face == 1u)
+        return float3(-1.0, tx, ty);
+    if (face == 2u)
+        return float3(tx, 1.0, ty);
+    if (face == 3u)
+        return float3(tx, -1.0, -ty);
+    if (face == 4u)
+        return float3(tx, -ty, 1.0);
+    return float3(tx, ty, -1.0);
+}
+
+// dq/d(xi) = tu * dtx, dq/d(eta) = tv * dty. One vector at a time.
+float3 far_chart_dq(uint face, float scale, bool eta)
+{
+    float s = eta ? 0.0 : scale;
+    float e = eta ? scale : 0.0;
+    if (face == 0u)
+        return float3(0.0, -s, e);
+    if (face == 1u)
+        return float3(0.0, s, e);
+    if (face == 2u)
+        return float3(s, 0.0, e);
+    if (face == 3u)
+        return float3(s, 0.0, -e);
+    if (face == 4u)
+        return float3(s, -e, 0.0);
+    return float3(s, e, 0.0);
+}
+
 float3 far_mapped_normal(float4 rot, float3 uWorld, float rho, float distance, uint map)
 {
     float3 u = far_inv_rotate(rot, uWorld);
@@ -609,31 +957,65 @@ float3 far_mapped_normal(float4 rot, float3 uWorld, float rho, float distance, u
     float dr_dxi = drDxi / distance;
     float dr_deta = drDeta / distance;
     uint face = far_dom_face(u);
-    float3 tu;
-    float3 n;
-    float3 tv;
-    far_face_basis(face, tu, n, tv);
-    float den = dot(u, n);
+    float den;
+    float du;
+    float dv;
+    if (face == 0u)
+    {
+        den = u.x;
+        du = -u.y;
+        dv = u.z;
+    }
+    else if (face == 1u)
+    {
+        den = -u.x;
+        du = u.y;
+        dv = u.z;
+    }
+    else if (face == 2u)
+    {
+        den = u.y;
+        du = u.x;
+        dv = u.z;
+    }
+    else if (face == 3u)
+    {
+        den = -u.y;
+        du = u.x;
+        dv = -u.z;
+    }
+    else if (face == 4u)
+    {
+        den = u.z;
+        du = u.x;
+        dv = -u.y;
+    }
+    else
+    {
+        den = -u.z;
+        du = u.x;
+        dv = u.y;
+    }
     if (abs(den) < 1e-8)
         return uWorld;
     float quarter = 0.7853981633974483;
-    float xi = (4.0 / 3.14159265358979323846) * far_atan_approx(dot(u, tu) / den);
-    float eta = (4.0 / 3.14159265358979323846) * far_atan_approx(dot(u, tv) / den);
+    float xi = (4.0 / 3.14159265358979323846) * far_atan_approx(du / den);
+    float eta = (4.0 / 3.14159265358979323846) * far_atan_approx(dv / den);
     float tx = tan(xi * quarter);
     float ty = tan(eta * quarter);
     float dtx = quarter * (1.0 + tx * tx);
     float dty = quarter * (1.0 + ty * ty);
-    float3 q = n + tu * tx + tv * ty;
+    float3 q = far_chart_q(face, tx, ty);
     float s = length(q);
     if (!(s > 1e-8))
         return uWorld;
     float3 uHat = q / s;
-    float3 dqDxi = tu * dtx;
-    float3 dqDeta = tv * dty;
-    float3 duDxi = dqDxi / s - uHat * (dot(uHat, dqDxi) / s);
-    float3 duDeta = dqDeta / s - uHat * (dot(uHat, dqDeta) / s);
-    float3 dpDxi = uHat * dr_dxi + duDxi * r;
-    float3 dpDeta = uHat * dr_deta + duDeta * r;
+    float3 dq = far_chart_dq(face, dtx, false);
+    float3 duD = dq / s - uHat * (dot(uHat, dq) / s);
+    float3 dpDxi = uHat * dr_dxi + duD * r;
+    dq = far_chart_dq(face, dty, true);
+    duD = dq / s - uHat * (dot(uHat, dq) / s);
+    float3 dpDeta = uHat * dr_deta + duD * r;
     float3 nBody = cross(dpDeta, dpDxi);
     if (dot(nBody, nBody) < 1e-20)
         return uWorld;
@@ -641,302 +1023,326 @@ float3 far_mapped_normal(float4 rot, float3 uWorld, float rho, float distance, u
 }
 
 bool far_mapped_finish(
-    float3 ray, float3 center, float tHit, float rho, float distance, float4 rot, uint map,
-    out float t, out float3 nrm, out uint face)
+    float3 ray, uint bodyIndex, float tHit, float rho, float distance, uint map,
+    out float t, out uint face)
 {
     t = 0.0;
-    nrm = float3(0.0, 0.0, 0.0);
     face = 0u;
     if (!(tHit > 0.0))
         return false;
+    float3 center = far_body_dir(bodyIndex).xyz;
+    float4 rot = far_body_rot(bodyIndex);
     float3 p = ray * tHit - center;
     float rad = length(p);
     if (rad < 1e-8)
         return false;
-    float3 uWorld = p / rad;
     t = tHit;
-    nrm = far_mapped_normal(rot, uWorld, rho, distance, map);
-    face = far_dom_face(far_inv_rotate(rot, uWorld));
+    // The analytic normal is one shade-time fetch. Returning it here kept a
+    // float3 live on every exit of the march.
+    face = far_dom_face(far_inv_rotate(rot, p / rad));
     return true;
 }
 
-// |p| - r without cancelling two quantities near 1. |p|^2 - r^2 is
-// t^2 |ray|^2 - 2 t facing + (|dir|^2 - 1) + (1 - r)(1 + r).
-float far_mapped_f(
-    float3 ray, float3 center, float t, float rho, float distance, float4 rot, uint map,
-    float facing, float ray2, float dir2)
-{
-    float3 p = ray * t - center;
-    float rad = length(p);
-    if (rad < 1e-8)
-        return -rho;
-    float h = far_datum(map, far_inv_rotate(rot, p / rad));
-    float r = rho + h / distance;
-    float oneMinusR = (1.0 - rho) - h / distance;
-    float diffSq = t * t * ray2 - 2.0 * t * facing + (dir2 - 1.0) + oneMinusR * (1.0 + r);
-    return diffSq / (rad + r);
-}
-
-// Look between two positive samples. False when both sit further out than the
-// datum range (no root can hide there) or when the probes stay positive.
-bool far_mapped_hunt(
-    float3 ray, float3 center, float rho, float distance, float4 rot, uint map,
-    float facing, float ray2, float dir2,
-    float lo, float hi, float flo, float fhi, float allowance,
-    out float ba, out float bb, out float bfa, out float bfb)
-{
-    ba = lo;
-    bb = hi;
-    bfa = flo;
-    bfb = fhi;
-    if (!(min(flo, fhi) <= allowance) || !(hi > lo))
-        return false;
-    float pt = lo;
-    float pf = flo;
-    [loop]
-    for (int h = 1; h <= FAR_MAP_HUNT; h++)
-    {
-        float tm = lo + (hi - lo) * (float(h) / float(FAR_MAP_HUNT + 1));
-        float fm = far_mapped_f(ray, center, tm, rho, distance, rot, map, facing, ray2, dir2);
-        if (pf * fm <= 0.0)
-        {
-            ba = pt;
-            bb = tm;
-            bfa = pf;
-            bfb = fm;
-            return true;
-        }
-        pt = tm;
-        pf = fm;
-    }
-    if (pf * fhi <= 0.0)
-    {
-        ba = pt;
-        bb = hi;
-        bfa = pf;
-        bfb = fhi;
-        return true;
-    }
-    return false;
-}
-
-// Datum surface. A bounding-sphere miss has already returned. A sign-change
-// search walks the bracket: one datum cell projected on the ray, capped, and
-// always the closest approach. A segment still within the datum range of the
-// surface is probed inside (FAR_MAP_HUNT): a highland edge is negative only
-// between those samples, and it is not always the closest segment.
-// Anderson-Björck then tightens the bracket; a step that fails to halve the
-// width is bisected next. The caller applied the horizon gate. Host mirror:
-// ray_mapped in src/far_body.rs.
+// Datum surface. Fixed-point pulls from the lo-sphere entrance
+// (t <- ray ∩ sphere(r(dir))), then Illinois regula on the bracket those
+// pulls form. A ray that misses the lo sphere walks in from the hi entrance
+// and finishes a shallow graze with one Newton step. At most FAR_MAP_CAP
+// datum samples. The analytic normal is one fetch at shade time: inlining
+// the patch derivative into every return blew the register budget. The
+// caller has already applied the horizon gate.
 bool far_ray_mapped(
-    float3 ray, float3 center, float rho, float distance, float4 rot, uint map,
-    out float t, out float3 nrm, out uint face)
+    float3 ray, uint bodyIndex, float rho, float distance, uint map,
+    out float t, out uint face)
 {
     t = 0.0;
-    nrm = float3(0.0, 0.0, 0.0);
     face = 0u;
     float minOff = asfloat(farMaps[map * 8u + 2u]);
     float maxOff = asfloat(farMaps[map * 8u + 3u]);
     float rhoLo = rho + minOff / distance;
     float rhoHi = rho + maxOff / distance;
-    float facing = dot(ray, center);
+    float facing;
+    {
+        // Dies before the first datum sample. Later uses reload.
+        float3 center = far_body_dir(bodyIndex).xyz;
+        facing = dot(ray, center);
+    }
     float tHiIn;
     float tHiOut;
     if (!far_sphere_roots(facing, rhoHi, tHiIn, tHiOut) || !(tHiOut > 0.0))
         return false;
     float tStart = max(tHiIn, 0.0);
+    int evals = 0;
     float tLo;
     float tLoFar;
     bool loHit = far_sphere_roots(facing, rhoLo, tLo, tLoFar) && tLo > 0.0;
-    float tEnd = loHit ? min(tLo, tHiOut) : tHiOut;
-    float ray2 = dot(ray, ray);
-    float dir2 = dot(center, center);
-    if (!(tEnd > tStart) || tEnd - tStart < 1e-5)
+    if (loHit)
     {
-        float tHit = tEnd > 0.0 ? tEnd : tStart;
-        return far_mapped_finish(ray, center, tHit, rho, distance, rot, map, t, nrm, face);
+        float bSpan = max(tLo, tStart);
+        if (bSpan - tStart < 1e-5)
+            return far_mapped_finish(ray, bodyIndex, tLo > 0.0 ? tLo : tStart, rho, distance, map, t, face);
+        float f;
+        float r;
+        float slope;
+        far_march_sample(ray, bodyIndex, rho, distance, map, evals, tLo, f, r, slope);
+        if (far_fast_settled(tLo, f, slope))
+            return far_mapped_finish(ray, bodyIndex, tLo, rho, distance, map, t, face);
+        float curT = tLo;
+        bool hasBracket = false;
+        float ba = 0.0;
+        float bb = 0.0;
+        float bfa = 0.0;
+        float bfb = 0.0;
+        [loop]
+        for (int step = 0; step < 2; step++)
+        {
+            if (!(evals < FAR_MAP_CAP))
+                break;
+            // The far root of a sphere that contains the camera is the back
+            // of the planet. Step with the radial slope instead; that stays
+            // on the near surface. A 1e-8 absolute stop froze hits near the
+            // eye a step short of the root.
+            float tNear;
+            float tFar;
+            float tn;
+            bool haveNear = far_sphere_roots(facing, r, tNear, tFar) && tNear > tStart && tNear < tHiOut;
+            if (haveNear)
+                tn = tNear;
+            else if (abs(slope) > 1e-4 && abs(f) < 0.05)
+            {
+                tn = curT - f / slope;
+                if (!(tn > tStart && tn < tHiOut))
+                    break;
+            }
+            else
+                break;
+            if (abs(tn - curT) <= 1e-12)
+                break;
+            if (hasBracket && (tn <= ba || tn >= bb))
+                break;
+            float ft;
+            float rt;
+            float st;
+            far_march_sample(ray, bodyIndex, rho, distance, map, evals, tn, ft, rt, st);
+            if (f * ft <= 0.0)
+            {
+                hasBracket = true;
+                if (curT < tn)
+                {
+                    ba = curT;
+                    bb = tn;
+                    bfa = f;
+                    bfb = ft;
+                }
+                else
+                {
+                    ba = tn;
+                    bb = curT;
+                    bfa = ft;
+                    bfb = f;
+                }
+            }
+            if (far_fast_settled(tn, ft, st))
+                return far_mapped_finish(ray, bodyIndex, tn, rho, distance, map, t, face);
+            curT = tn;
+            f = ft;
+            r = rt;
+            slope = st;
+        }
+        // The camera sample catches an eye inside the body. A bracket whose
+        // near end is already outside does not need it.
+        float nearF = ba <= bb ? bfa : bfb;
+        bool needEntrance = !hasBracket || (tStart == 0.0 && nearF < 0.0);
+        if (needEntrance)
+        {
+            if (!(evals < FAR_MAP_CAP))
+                return far_mapped_finish(ray, bodyIndex, curT, rho, distance, map, t, face);
+            float fa;
+            float ra;
+            float sa;
+            far_march_sample(ray, bodyIndex, rho, distance, map, evals, tStart, fa, ra, sa);
+            // Same camera clamp as the robust march: |f| <= 1e-5 at t == 0
+            // is clearance, not a root, and finishing there drops the ray.
+            if (tStart == 0.0 && abs(fa) <= 1e-5)
+            {
+                if (fa <= 0.0)
+                    return false;
+            }
+            else if (abs(fa) <= 1e-5)
+                return far_mapped_finish(ray, bodyIndex, tStart, rho, distance, map, t, face);
+            else if (fa < 0.0)
+                return false;
+            if (!hasBracket)
+            {
+                if (fa * f <= 0.0)
+                {
+                    hasBracket = true;
+                    if (tStart < curT)
+                    {
+                        ba = tStart;
+                        bb = curT;
+                        bfa = fa;
+                        bfb = f;
+                    }
+                    else
+                    {
+                        ba = curT;
+                        bb = tStart;
+                        bfa = f;
+                        bfb = fa;
+                    }
+                }
+                else
+                {
+                    return far_mapped_finish(ray, bodyIndex, curT, rho, distance, map, t, face);
+                }
+            }
+        }
+        if (!hasBracket)
+            return far_mapped_finish(ray, bodyIndex, curT, rho, distance, map, t, face);
+        float tHit = far_regula(ray, bodyIndex, rho, distance, map, evals, ba, bb, bfa, bfb);
+        return far_mapped_finish(ray, bodyIndex, tHit, rho, distance, map, t, face);
     }
-    float fStart = far_mapped_f(ray, center, tStart, rho, distance, rot, map, facing, ray2, dir2);
-    if (fStart < -1e-5)
+    float f0;
+    float r0;
+    float slope0;
+    far_march_sample(ray, bodyIndex, rho, distance, map, evals, tStart, f0, r0, slope0);
+    if (f0 < -1e-5)
         return false;
-    if (abs(fStart) <= 1e-5)
-        return far_mapped_finish(ray, center, tStart, rho, distance, rot, map, t, nrm, face);
-    uint g = max(farMaps[map * 8u], 2u);
-    float cells = float(g - 1u);
-    float cell = 1.5707963267948966 / cells;
-    float3 p0 = ray * tStart - center;
-    float rad0 = length(p0);
-    if (rad0 < rho)
-        rad0 = rho;
-    float sinPhi = 0.0;
-    if (rad0 > 1e-8)
-        sinPhi = length(cross(ray, p0 / rad0));
-    float sinUse = sinPhi > 0.05 ? sinPhi : 0.05;
-    float dt = cell * rad0 / sinUse;
-    float span = tEnd - tStart;
-    float dtUse = dt > 1e-8 ? dt : 1e-8;
-    int n = int(clamp(ceil(span / dtUse), 1.0, float(FAR_MAP_COARSE)));
-    float tClose = clamp(facing, tStart, tEnd);
-    float prevT = tStart;
-    float prevF = fStart;
+    if (abs(f0) <= 1e-5 && tStart > 0.0)
+        return far_mapped_finish(ray, bodyIndex, tStart, rho, distance, map, t, face);
+    if (!(tStart > 0.0) && f0 <= 0.0)
+        return false;
+    float fEnter = f0;
+    float curT = tStart;
+    float f = f0;
+    float r = r0;
+    float slope = slope0;
     bool hasBracket = false;
     float ba = 0.0;
     float bb = 0.0;
     float bfa = 0.0;
     float bfb = 0.0;
-    float allowance = abs(maxOff - minOff) / distance;
     [loop]
-    for (int i = 1; i <= n; i++)
+    while (evals + 1 < FAR_MAP_CAP)
     {
-        float tn = (i == n) ? tEnd : (tStart + span * (float(i) / float(n)));
-        if (tClose > prevT + 1e-8 && tClose < tn - 1e-8)
+        float tn;
+        if (!far_positive_root(facing, r, tn) || !(tn > tStart && tn <= tHiOut))
+            break;
+        if (abs(tn - curT) <= 1e-8)
+            break;
+        float ft;
+        float rt;
+        float st;
+        far_march_sample(ray, bodyIndex, rho, distance, map, evals, tn, ft, rt, st);
+        if (f * ft <= 0.0)
         {
-            float fc = far_mapped_f(ray, center, tClose, rho, distance, rot, map, facing, ray2, dir2);
-            if (prevF * fc <= 0.0)
+            hasBracket = true;
+            if (curT < tn)
             {
-                hasBracket = true;
-                ba = prevT;
-                bb = tClose;
-                bfa = prevF;
-                bfb = fc;
-                break;
+                ba = curT;
+                bb = tn;
+                bfa = f;
+                bfb = ft;
             }
-            if (far_mapped_hunt(
-                    ray, center, rho, distance, rot, map, facing, ray2, dir2,
-                    prevT, tClose, prevF, fc, allowance, ba, bb, bfa, bfb))
+            else
             {
-                hasBracket = true;
-                break;
+                ba = tn;
+                bb = curT;
+                bfa = ft;
+                bfb = f;
             }
-            prevT = tClose;
-            prevF = fc;
+            break;
         }
-        float ft = far_mapped_f(ray, center, tn, rho, distance, rot, map, facing, ray2, dir2);
+        if (far_fast_settled(tn, ft, st))
+            return far_mapped_finish(ray, bodyIndex, tn, rho, distance, map, t, face);
+        curT = tn;
+        f = ft;
+        r = rt;
+        slope = st;
+    }
+    if (!hasBracket && abs(slope) > 1e-4 && abs(f) < 0.05)
+    {
+        float ts = curT - f / slope;
+        if (ts > tStart && ts < tHiOut && abs(ts - curT) > 1e-8 && abs(ts - curT) < 0.05)
+        {
+            if (evals < FAR_MAP_CAP)
+            {
+                float fs;
+                float rs;
+                float ss;
+                far_march_sample(ray, bodyIndex, rho, distance, map, evals, ts, fs, rs, ss);
+                if (abs(fs) <= 1e-5)
+                {
+                    if (abs(ss) > 1e-4)
+                    {
+                        float t2 = ts - fs / ss;
+                        if (t2 > tStart && t2 < tHiOut && abs(t2 - ts) < 2e-3)
+                            return far_mapped_finish(ray, bodyIndex, t2, rho, distance, map, t, face);
+                    }
+                    return far_mapped_finish(ray, bodyIndex, ts, rho, distance, map, t, face);
+                }
+                if (f * fs <= 0.0)
+                {
+                    hasBracket = true;
+                    if (curT < ts)
+                    {
+                        ba = curT;
+                        bb = ts;
+                        bfa = f;
+                        bfb = fs;
+                    }
+                    else
+                    {
+                        ba = ts;
+                        bb = curT;
+                        bfa = fs;
+                        bfb = f;
+                    }
+                }
+                else if (abs(fs) < 1e-3 && abs(ss) > 1e-4)
+                {
+                    float t2 = ts - fs / ss;
+                    if (t2 > tStart && t2 < tHiOut && abs(t2 - ts) < 2e-3)
+                        return far_mapped_finish(ray, bodyIndex, t2, rho, distance, map, t, face);
+                }
+            }
+            else if (abs(f) < 1e-3)
+            {
+                return far_mapped_finish(ray, bodyIndex, ts, rho, distance, map, t, face);
+            }
+        }
+    }
+    if (hasBracket)
+    {
+        float tHit = far_regula(ray, bodyIndex, rho, distance, map, evals, ba, bb, bfa, bfb);
+        return far_mapped_finish(ray, bodyIndex, tHit, rho, distance, map, t, face);
+    }
+    float prevT = tStart;
+    float prevF = fEnter;
+    int left = FAR_MAP_CAP - evals;
+    if (left < 0)
+        left = 0;
+    [loop]
+    for (int i = 1; i <= left; i++)
+    {
+        if (!(evals < FAR_MAP_CAP))
+            break;
+        float tn = tStart + (tHiOut - tStart) * (float(i) / float(left));
+        float ft;
+        float rt;
+        float st;
+        far_march_sample(ray, bodyIndex, rho, distance, map, evals, tn, ft, rt, st);
+        if (far_fast_settled(tn, ft, st))
+            return far_mapped_finish(ray, bodyIndex, tn, rho, distance, map, t, face);
         if (prevF * ft <= 0.0)
         {
-            hasBracket = true;
-            ba = prevT;
-            bb = tn;
-            bfa = prevF;
-            bfb = ft;
-            break;
-        }
-        if (far_mapped_hunt(
-                ray, center, rho, distance, rot, map, facing, ray2, dir2,
-                prevT, tn, prevF, ft, allowance, ba, bb, bfa, bfb))
-        {
-            hasBracket = true;
-            break;
+            float tHit = far_regula(ray, bodyIndex, rho, distance, map, evals, prevT, tn, prevF, ft);
+            return far_mapped_finish(ray, bodyIndex, tHit, rho, distance, map, t, face);
         }
         prevT = tn;
         prevF = ft;
     }
-    if (!hasBracket)
-    {
-        // No sign change. Entering the lo sphere with f on zero is a graze
-        // of the minimum surface. The hi-sphere exit is not: f is small
-        // there on a highland far side that the ray never hit.
-        if (loHit && prevF <= 1e-5)
-            return far_mapped_finish(ray, center, prevT, rho, distance, rot, map, t, nrm, face);
-        return false;
-    }
-    float a = ba;
-    float b = bb;
-    float fa = bfa;
-    float fb = bfb;
-    if (a > b)
-    {
-        float swapT = a;
-        a = b;
-        b = swapT;
-        float swapF = fa;
-        fa = fb;
-        fb = swapF;
-    }
-    float wa = fa;
-    float wb = fb;
-    int retained = 0;
-    bool forceBisect = false;
-    [loop]
-    for (int step = 0; step < FAR_MAP_REFINE; step++)
-    {
-        float width = b - a;
-        float scale = min(abs(a), abs(b));
-        if (scale < 1e-4)
-            scale = 1e-4;
-        if (!(width > FAR_MAP_TTOL * scale))
-            break;
-        float den = wb - wa;
-        float secant = (abs(den) > 1e-20) ? (b - wb * width / den) : (0.5 * (a + b));
-        bool secantOk = secant > a && secant < b;
-        bool bisect = forceBisect || !secantOk;
-        float c = bisect ? (0.5 * (a + b)) : secant;
-        forceBisect = false;
-        if (!(c > a && c < b))
-            break;
-        float fc = far_mapped_f(ray, center, c, rho, distance, rot, map, facing, ray2, dir2);
-        float cScale = scale > abs(c) ? scale : abs(c);
-        if (abs(fc) <= FAR_MAP_FTOL && width <= FAR_MAP_TTOL * cScale)
-            return far_mapped_finish(ray, center, c, rho, distance, rot, map, t, nrm, face);
-        float oldWidth = width;
-        if (fa * fc <= 0.0)
-        {
-            float discarded = fb;
-            b = c;
-            fb = fc;
-            wb = fc;
-            if (bisect)
-            {
-                wa = fa;
-                retained = 0;
-            }
-            else if (retained == 1)
-            {
-                float m = 0.5;
-                if (abs(discarded) > 1e-20)
-                    m = 1.0 - fc / discarded;
-                if (!(m > 0.0) || m > 1e8)
-                    m = 0.5;
-                wa *= m;
-            }
-            else
-            {
-                wa = fa;
-                retained = 1;
-            }
-        }
-        else
-        {
-            float discarded = fa;
-            a = c;
-            fa = fc;
-            wa = fc;
-            if (bisect)
-            {
-                wb = fb;
-                retained = 0;
-            }
-            else if (retained == 2)
-            {
-                float m = 0.5;
-                if (abs(discarded) > 1e-20)
-                    m = 1.0 - fc / discarded;
-                if (!(m > 0.0) || m > 1e8)
-                    m = 0.5;
-                wb *= m;
-            }
-            else
-            {
-                wb = fb;
-                retained = 2;
-            }
-        }
-        if (b - a > 0.5 * oldWidth)
-            forceBisect = true;
-    }
-    float mid = 0.5 * (a + b);
-    float tHit = (mid > a && mid < b) ? mid : (abs(fa) <= abs(fb) ? a : b);
-    return far_mapped_finish(ray, center, tHit, rho, distance, rot, map, t, nrm, face);
+    return false;
 }
 
 #ifndef FAR_NO_MAPPED
@@ -1159,7 +1565,8 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
 
 // `px` is the pixel angle, from fwidth in the entry point (uniform flow).
 // `pix` is SV_Position.xy (framebuffer pixels, origin top-left).
-// `inscatter` is the viewer's sky radiance along `ray` (no sun disc, moon or stars).
+// The viewer's sky radiance is recomputed at shade time. Carrying that
+// float3 through the march was live across every regula sample.
 // Pass 1 only searches. Albedo and lighting run once, for the nearest hit, so a
 // pixel a single body covers matches the old per-hit shade. Hits are ordered by
 // world depth `t * distance` and rims and point blobs by `facing * distance`;
@@ -1184,7 +1591,7 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
 // behind the final hit on `tPoint` / `tRim` while its stored depth is still
 // in front, or fail the gate against the running hit and still have a stored
 // depth in front of the final hit.
-float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix)
+float3 far_bodies(float3 ray, float3 col, float px, float2 pix)
 {
     uint n = min(farTable[0].header.x, 32u);
     if (n == 0u)
@@ -1218,16 +1625,11 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
     float bestT = 0.0;
     uint bestI = 0u;
     uint bestFace = 0u;
-    // 0 none, 1 sphere (coverage lerp), 2 inner wall, 3 opaque replace, 4 mapped.
-    // Sphere and inner normals are rebuilt after the loop. A cube, rounded or
-    // mapped hit still carries its normal: repeating that march would inline
-    // it twice. A sphere-only compile has no such store, so the float3 is not
-    // live across the search.
+    // 0 none, 1 sphere (coverage lerp), 2 inner wall, 3 cube, 4 mapped,
+    // 5 rounded gradient, 6 rounded enclosing-sphere fallback.
+    // Every normal is rebuilt once after the loop, before the additive
+    // pass. Carrying a float3 across the march or the limb spilled.
     uint bestKind = 0u;
-#if !defined(FAR_NO_ROUNDED) || !defined(FAR_NO_MAPPED) || !defined(FAR_NO_CUBE)
-#define FAR_KEEP_NORMAL
-    float3 bestN = float3(0.0, 0.0, 0.0);
-#endif
     // Bit i: body i would have pushed one additive (see far_bodies).
     uint addMask = 0u;
 
@@ -1238,14 +1640,18 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         mask &= mask - 1u;
         // Reject before touching the 160-byte record. `f <= 0` also drops the
         // rounded air rim's ghost ring at the antipode (that rim has no facing test).
-        float4 c = farTable[0].cone[i];
-        if (c.w >= 0.0)
         {
-            float f = dot(ray, c.xyz);
-            float3 x = cross(ray, c.xyz);
-            float lim = c.w + 3.0 * px; // 3 px covers the 1.25 px rim, the 0.5 px AA edge and the blob tail
-            if (f <= 0.0 || dot(x, x) > lim * lim)
-                continue;
+            // The cone dies in this block. A float4 carried into the march
+            // is four registers at the regula sample.
+            float4 c = farTable[0].cone[i];
+            if (c.w >= 0.0)
+            {
+                float f = dot(ray, c.xyz);
+                float3 x = cross(ray, c.xyz);
+                float lim = c.w + 3.0 * px; // 3 px covers the 1.25 px rim, the 0.5 px AA edge and the blob tail
+                if (f <= 0.0 || dot(x, x) > lim * lim)
+                    continue;
+            }
         }
 
         float4 dirRho = farTable[0].body[i].dir_rho;
@@ -1283,8 +1689,9 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         float3 center = dirRho.xyz;
         float facing = dot(ray, center);
         // World distance. Normalised `t` and `facing` live in this body's unit space.
+        // The facing*distance gate is recomputed at each rim. A stored copy
+        // stayed live across the mapped march.
         float distance = farTable[0].body[i].albedo2.w;
-        float facingDepth = facing * distance;
         // Inside the sphere every direction hits the far wall, including away from the centre.
         // A rounded body can contain the camera in its enclosing sphere while the camera is
         // still outside the solid, so a ray away from the centre may meet the bulge.
@@ -1292,8 +1699,6 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         if (!inner && !rounded && !mapped && facing <= 0.0)
             continue;
 
-        float3 air = atmo.rgb;
-        bool hasAir = dot(air, air) > 0.0;
         if (inner)
         {
             float t = 0.0;
@@ -1323,7 +1728,6 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         }
 
         float t = 0.0;
-        float3 nrm = float3(0.0, 0.0, 0.0);
         uint face = 0u;
         bool hit = false;
         [branch]
@@ -1332,6 +1736,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
             float s = length(cross(ray, center));
             if (s <= rho)
             {
+                float3 nrm = float3(0.0, 0.0, 0.0);
                 hit = far_ray_sphere(ray, center, rho, facing, t, nrm);
                 if (hit && t * distance < bestDepth)
                 {
@@ -1342,10 +1747,10 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                     bestKind = 1u;
                 }
             }
-            else if (hasAir)
+            else if (dot(atmo.rgb, atmo.rgb) > 0.0)
             {
                 float width = max(rho * 0.05, px * 1.25);
-                if (s < rho + width && facingDepth < bestDepth)
+                if (s < rho + width && facing * distance < bestDepth)
                     addMask |= 1u << i;
             }
         }
@@ -1354,23 +1759,24 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         {
             float pExp = asfloat(farTable[0].body[i].seed.y);
             float4 rot = farTable[0].body[i].rot;
-            hit = far_ray_rounded(ray, center, rho, rot, pExp, facing, t, nrm, face);
+            hit = far_ray_rounded(ray, center, rho, rot, pExp, facing, t, face);
             if (hit && t * distance < bestDepth)
             {
                 bestDepth = t * distance;
                 bestT = t;
                 bestI = i;
-                bestFace = face;
-                bestN = nrm;
-                bestKind = 3u;
+                bestFace = face & 7u;
+                // Bit 3 is the enclosing-sphere fallback. The gradient case
+                // is far_lp at bestT, same as far_round_at.
+                bestKind = (face & 8u) != 0u ? 6u : 5u;
             }
-            else if (!hit && hasAir)
+            else if (!hit && dot(atmo.rgb, atmo.rgb) > 0.0)
             {
                 float pRim = max(pExp, 2.0);
                 float rhoB = rho * pow(3.0, 0.5 - 1.0 / pRim);
                 float s = length(cross(ray, center));
                 float width = max(rhoB * 0.05, px * 1.25);
-                if (s > rhoB && s < rhoB + width && facingDepth < bestDepth)
+                if (s > rhoB && s < rhoB + width && facing * distance < bestDepth)
                     addMask |= 1u << i;
             }
         }
@@ -1380,33 +1786,38 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         {
             uint mapPlus = farTable[0].body[i].seed.z;
             float horizon = farTable[0].body[i].albedo0.w;
-            float airThick = farTable[0].body[i].albedo1.w;
             // Above the scalar horizon plane, or above the azimuth table,
-            // before any intersection, including the limb.
+            // before any intersection, including the limb. Air thickness is
+            // loaded after the march so it is not live across the chart.
             if (mapPlus == 0u || mapPlus > 8u || !(distance > 0.0) || dot(ray, -center) > horizon
                 || far_above_horizon(i, ray, center))
                 continue;
             uint map = mapPlus - 1u;
-            float4 rot = farTable[0].body[i].rot;
-            hit = far_ray_mapped(ray, center, rho, distance, rot, map, t, nrm, face);
+            // Centre and rotation are reloaded inside the march. Keeping the
+            // vectors here would hold them across every datum sample.
+            hit = far_ray_mapped(ray, i, rho, distance, map, t, face);
             if (hit && t * distance < bestDepth)
             {
                 bestDepth = t * distance;
                 bestT = t;
                 bestI = i;
                 bestFace = face;
-                bestN = nrm;
+                // Radial placeholder only. The analytic normal is fetched
+                // once at shade time, so it is not live across this loop.
                 bestKind = 4u;
             }
-            else if (!hit && airThick > 0.0 && facing > 0.0 && facingDepth < bestDepth)
+            else if (!hit && facing > 0.0 && facing * distance < bestDepth)
             {
+                float airThick = farTable[0].body[i].albedo1.w;
                 // The colour is rebuilt in pass 2. The bit records that the
                 // local shell test passed against the running depth.
                 float rSurf;
                 float outer;
                 float s;
-                if (far_mapped_limb(
-                        ray, center, facing, rho, distance, rot, map, airThick, px, rSurf, outer, s))
+                float3 limbC = far_body_dir(i).xyz;
+                float4 rot = far_body_rot(i);
+                if (airThick > 0.0 && far_mapped_limb(
+                        ray, limbC, facing, rho, distance, rot, map, airThick, px, rSurf, outer, s))
                     addMask |= 1u << i;
             }
         }
@@ -1415,6 +1826,7 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         else
         {
             float4 rot = farTable[0].body[i].rot;
+            float3 nrm = float3(0.0, 0.0, 0.0);
             hit = far_ray_cube(ray, center, rho, rot, t, nrm, face);
             if (hit && t * distance < bestDepth)
             {
@@ -1422,10 +1834,9 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
                 bestT = t;
                 bestI = i;
                 bestFace = face;
-                bestN = nrm;
                 bestKind = 3u;
             }
-            else if (!hit && hasAir)
+            else if (!hit && dot(atmo.rgb, atmo.rgb) > 0.0)
             {
                 float rhoRim = rho * 1.035 + px * 0.5;
                 float tRim;
@@ -1439,29 +1850,11 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
 #endif
     }
 
-    float3 add = float3(0.0, 0.0, 0.0);
-    // Pass 1 set addMask for every term the old array would have pushed.
-    // Walking only those bits is the same test, without a miss per other body.
-    bits &= addMask;
-    [loop]
-    while (bits != 0u)
-    {
-        uint i = firstbitlow(bits);
-        bits &= bits - 1u;
-        float distance = farTable[0].body[i].albedo2.w;
-        float facingDepth = dot(ray, farTable[0].body[i].dir_rho.xyz) * distance;
-        // Stored depth of every additive. Terms the running gate rejected
-        // never have their bit set, so this is the array's post-loop test.
-        if (facingDepth < bestDepth)
-            add += far_add_rgb(i, ray, px, flip);
-    }
-
-    // Sphere and inner normals match far_ray_sphere / far_ray_inner exactly,
-    // including the un-normalised scale. Coverage uses the same cross length
-    // pass 1 tested. Heavy shapes already stored bestN.
-#ifndef FAR_KEEP_NORMAL
+    // Shade before the additive pass so the rebuilt normal is dead before
+    // the limb. Sphere and inner normals match far_ray_sphere / far_ray_inner
+    // exactly, including the un-normalised scale. Coverage uses the same
+    // cross length pass 1 tested.
     float3 bestN = float3(0.0, 0.0, 0.0);
-#endif
     float bestCov = 1.0;
     if (bestKind == 1u || bestKind == 2u)
     {
@@ -1480,18 +1873,29 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
 
     if (bestKind != 0u)
     {
-        float4 dirRho = farTable[0].body[bestI].dir_rho;
-        float rho = dirRho.w;
-        float3 center = dirRho.xyz;
-        float4 rot = farTable[0].body[bestI].rot;
-        float3 air = farTable[0].body[bestI].atmosphere.rgb;
-        float3 bodyP = far_inv_rotate(rot, ray * bestT - center);
+        float rho = farTable[0].body[bestI].dir_rho.w;
         if (bestKind == 4u)
         {
 #ifndef FAR_NO_MAPPED
             // Terrain fog, the same factor mesh3d applies, replaces far_through_air.
             uint mapPlus = farTable[0].body[bestI].seed.z;
             float distance = farTable[0].body[bestI].albedo2.w;
+            // The normal runs before air, inscatter and the kept body point
+            // exist, so those vectors are not live inside the chart derivative.
+            float4 rot = farTable[0].body[bestI].rot;
+            float3 uN;
+            {
+                float3 center = farTable[0].body[bestI].dir_rho.xyz;
+                float3 bodyP = far_inv_rotate(rot, ray * bestT - center);
+                float radN = length(bodyP);
+                uN = radN > 1e-8 ? bodyP / radN : float3(0.0, 1.0, 0.0);
+            }
+            uint mapN = (mapPlus >= 1u && mapPlus <= 8u) ? mapPlus - 1u : 0u;
+            bestN = far_mapped_normal(rot, uN, rho, distance, mapN);
+            float3 center = farTable[0].body[bestI].dir_rho.xyz;
+            float3 bodyP = far_inv_rotate(rot, ray * bestT - center);
+            float3 air = farTable[0].body[bestI].atmosphere.rgb;
+            float3 inscatter = sky_radiance(ray, frame);
             float3 alb = far_face(bestI, bestFace);
             if (mapPlus >= 1u && mapPlus <= 8u)
             {
@@ -1558,6 +1962,38 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
         }
         else
         {
+            // Reloaded here so the mapped normal above does not carry them.
+            float3 center = farTable[0].body[bestI].dir_rho.xyz;
+            float4 rot = farTable[0].body[bestI].rot;
+            float3 air = farTable[0].body[bestI].atmosphere.rgb;
+            float3 bodyP = far_inv_rotate(rot, ray * bestT - center);
+            float3 inscatter = sky_radiance(ray, frame);
+#ifndef FAR_NO_CUBE
+            if (bestKind == 3u)
+                bestN = far_rotate(rot, far_face_normal(bestFace));
+#endif
+#ifndef FAR_NO_ROUNDED
+            if (bestKind == 5u || bestKind == 6u)
+            {
+                float p = clamp(asfloat(farTable[0].body[bestI].seed.y), 2.0, 32.0);
+                if (bestKind == 6u)
+                {
+                    float rhoB = rho * pow(3.0, 0.5 - 1.0 / p) * (1.0 + 2.0e-4);
+                    bestN = (ray * bestT - center) / rhoB;
+                }
+                else
+                {
+                    float3 o = far_inv_rotate(rot, -center);
+                    float3 d = far_inv_rotate(rot, ray);
+                    float sLp;
+                    float3 gLp;
+                    far_lp(o + d * bestT, p, sLp, gLp);
+                    float glen = length(gLp);
+                    if (glen > 1e-8)
+                        bestN = far_rotate(rot, gLp / glen);
+                }
+            }
+#endif
             bool sphereAlb = bestKind == 1u || bestKind == 2u;
             float3 alb = far_albedo(bestI, bodyP, bestFace, sphereAlb, rho);
             bool core = bestKind == 2u;
@@ -1568,6 +2004,24 @@ float3 far_bodies(float3 ray, float3 col, float3 inscatter, float px, float2 pix
             else
                 col = shaded;
         }
+    }
+
+    float3 add = float3(0.0, 0.0, 0.0);
+    // Pass 1 set addMask for every term the old array would have pushed.
+    // Walking only those bits is the same test, without a miss per other body.
+    // The normal is already consumed, so this limb does not keep a float3.
+    bits &= addMask;
+    [loop]
+    while (bits != 0u)
+    {
+        uint i = firstbitlow(bits);
+        bits &= bits - 1u;
+        float distance = farTable[0].body[i].albedo2.w;
+        float facingDepth = dot(ray, farTable[0].body[i].dir_rho.xyz) * distance;
+        // Stored depth of every additive. Terms the running gate rejected
+        // never have their bit set, so this is the array's post-loop test.
+        if (facingDepth < bestDepth)
+            add += far_add_rgb(i, ray, px, flip);
     }
     col += add;
     return col;

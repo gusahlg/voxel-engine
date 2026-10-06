@@ -441,30 +441,15 @@ const SLANG_CONST_ALLOWLIST: &[(&str, &str)] = &[
          the CPU reads it, and a genconst entry would be a public constant",
     ),
     (
-        "FAR_MAP_COARSE",
-        "coarse sign-change probes on a mapped ray, the same cap as \
-         MAPPED_COARSE_CAP in src/far_body.rs. A search limit, not a scene tunable",
-    ),
-    (
-        "FAR_MAP_REFINE",
-        "secant or bisection steps after a mapped sign change, the same cap as \
-         MAPPED_REFINE_CAP in src/far_body.rs. A search limit, not a scene tunable",
-    ),
-    (
         "FAR_MAP_FTOL",
-        "early-out on |radius - r(dir)| once the t bracket is already tight, \
-         the same tolerance as MAPPED_F_TOL in src/far_body.rs",
+        "shallow-slope settle tolerance of the fixed-point mapped march, the \
+         same value as MAPPED_F_TOL in src/far_body.rs. A search limit, not a \
+         scene tunable",
     ),
     (
-        "FAR_MAP_TTOL",
-        "relative width of the normalised-t bracket, the same tolerance as \
-         MAPPED_T_TOL in src/far_body.rs",
-    ),
-    (
-        "FAR_MAP_HUNT",
-        "extra probes in a coarse mapped segment that could hide a highland \
-         edge, the same count as MAPPED_HUNT in src/far_body.rs. A search \
-         limit, not a scene tunable",
+        "FAR_MAP_CAP",
+        "datum samples of the fixed-point mapped march, the same cap as \
+         MAPPED_EVAL_CAP in src/far_body.rs. A search limit, not a scene tunable",
     ),
 ];
 

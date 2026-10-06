@@ -10,7 +10,8 @@
 //! base run is stably split into tiles the sun and moon discs miss, then the
 //! rest, and the heavy run is split into mapped-interior tiles, then the rest.
 //! A mapped-interior tile lies inside the horizon disc or, with the eye
-//! outside the lo sphere, inside that sphere's disc.
+//! outside the lo sphere, inside that sphere's disc. That prefix is drawn
+//! at 2×2. The edge band stays at full rate. Both use the fixed-point march.
 //! Two azimuthal horizon tables follow the body records. Each is 256 sines
 //! of elevation around the local up of a Mapped body the eye is inside the
 //! hi+air ball of. A tile whose cone sits above its table loses that body's
@@ -1375,7 +1376,9 @@ fn split_coarse_base(
 }
 
 /// Stably partition the heavy run into mapped-interior tiles, then the rest.
-/// Returns the coarse count. A tile qualifies when its mask is exactly one
+/// Returns the coarse count. Both runs use the fixed-point march. The prefix
+/// is drawn at 2×2; the suffix, where the silhouette and the limb live, stays
+/// at full rate. A tile qualifies when its mask is exactly one
 /// mapped body (no other body, and so no nearer body, can cover it) and its
 /// cone lies strictly inside one of:
 ///
@@ -3029,8 +3032,8 @@ mod tests {
     use crate::camera::{Camera3D, Lens, WarpMap, WarpStrength};
     use crate::color::LinearRgb;
     use crate::far_body::{
-        FarBody, FarMapId, FarShape, ray_cube, ray_inner_sphere, ray_mapped, ray_mapped_limb,
-        ray_rounded, ray_sphere, store,
+        FarBody, FarMapId, FarShape, ray_cube, ray_inner_sphere, ray_mapped, ray_mapped_fast,
+        ray_mapped_limb, ray_rounded, ray_sphere, store,
     };
 
     fn pack_table(bodies: &[FarBody], view: Option<FarView>) -> FarTableGpu {
@@ -5323,7 +5326,7 @@ mod tests {
                         if !ray.is_finite() {
                             continue;
                         }
-                        let hit = ray_mapped(
+                        let hit = ray_mapped_fast(
                             ray,
                             body.dir,
                             rho,

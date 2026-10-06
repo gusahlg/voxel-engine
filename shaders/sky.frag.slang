@@ -123,7 +123,7 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     // stands. SKY_BASE leaves both out.
 #ifndef SKY_BASE
     float px = max(length(fwidth(ray)), 1e-6);
-    col = far_bodies(ray, col, inscatter, px, input.frag_pos.xy);
+    col = far_bodies(ray, col, px, input.frag_pos.xy);
 #endif
 
     // Slab clouds composite LAST so opaque cloud occludes the sun/moon/stars it
