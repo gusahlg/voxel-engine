@@ -2027,4 +2027,246 @@ float3 far_bodies(float3 ray, float3 col, float px, float2 pix)
     return col;
 }
 
+// Source key for VOXEL_SKY_DEBUG. The fragment calls this only from the
+// uniform branch on sky_tangent.w, so the colour path does not run it.
+// Slang leaves the call uninlined. Channels are 1 or 0.25 before the steep
+// remap add in sky.frag:
+//   R — a mapped surface hit won and would be shaded (bestKind == 4)
+//   G — mapped miss-ray limbs that passed the depth test summed to a channel
+//       above 1e-6 (the additive shell; stars stay under it)
+//   B — a mapped ray was skipped by far_above_horizon or by the per-body
+//       gate dot(ray, -center) > albedo0.w, after the same cone and tile mask
+//       as far_bodies
+// The rejects match far_bodies, including a closer non-mapped hit clearing R.
+#ifndef FAR_NO_MAPPED
+float3 far_sky_debug_rgb(float3 ray, float px, float2 pix)
+{
+    float3 dbg = float3(0.25, 0.25, 0.25);
+    uint n = min(farTable[0].header.x, 32u);
+    if (n == 0u)
+        return dbg;
+
+    uint live = n == 32u ? 0xffffffffu : ((1u << n) - 1u);
+    uint tilePx = farTable[0].header.y;
+    uint tilesX = farTable[0].header.z;
+    uint tilesY = farTable[0].header.w;
+    uint mask;
+    if (tilePx == 0u || tilesX == 0u || tilesY == 0u)
+        mask = live;
+    else
+    {
+        float2 p = max(pix, float2(0.0, 0.0));
+        uint tx = min(uint(p.x) / tilePx, tilesX - 1u);
+        uint ty = min(uint(p.y) / tilePx, tilesY - 1u);
+        mask = farTable[0].tile_mask[ty * tilesX + tx] & live;
+    }
+    if (mask == 0u)
+        return dbg;
+
+    uint bits = mask;
+    float flip = frame.light.w * 2.0 - 1.0;
+    float bestDepth = 1e30;
+    uint bestKind = 0u;
+    uint addMask = 0u;
+    bool horizonSkip = false;
+
+    [loop]
+    while (mask != 0u)
+    {
+        uint i = firstbitlow(mask);
+        mask &= mask - 1u;
+        {
+            float4 c = farTable[0].cone[i];
+            if (c.w >= 0.0)
+            {
+                float f = dot(ray, c.xyz);
+                float3 x = cross(ray, c.xyz);
+                float lim = c.w + 3.0 * px;
+                if (f <= 0.0 || dot(x, x) > lim * lim)
+                    continue;
+            }
+        }
+
+        float4 dirRho = farTable[0].body[i].dir_rho;
+        float4 atmo = farTable[0].body[i].atmosphere;
+        float rho = dirRho.w;
+        float shape = atmo.w;
+        bool inner = shape > 1.5 && shape < 2.5;
+#ifndef FAR_NO_ROUNDED
+        bool rounded = shape > 2.5 && shape < 3.5;
+#else
+        bool rounded = false;
+#endif
+        bool mapped = shape > 3.5 && shape < 4.5;
+        [branch]
+        if (inner)
+        {
+            if (!(rho > 1.0))
+                continue;
+        }
+        else if (mapped)
+        {
+            if (!(rho > 0.0))
+                continue;
+        }
+        else if (!(rho > 0.0 && rho < 1.0))
+            continue;
+        float3 center = dirRho.xyz;
+        float facing = dot(ray, center);
+        float distance = farTable[0].body[i].albedo2.w;
+        if (!inner && !rounded && !mapped && facing <= 0.0)
+            continue;
+
+        if (inner)
+        {
+            float t = 0.0;
+            float3 nrm = float3(0.0, 0.0, 0.0);
+            if (far_ray_inner(ray, center, rho, facing, t, nrm) && t * distance < bestDepth)
+            {
+                bestDepth = t * distance;
+                bestKind = 2u;
+            }
+            continue;
+        }
+        bool sphere = shape > 0.5 && shape < 1.5;
+        float ang = (rho * 2.0) / px;
+        [branch]
+        if (!mapped && ang < 0.7 && facing > 0.0)
+        {
+            float tPoint = 1.0 - rho;
+            if (tPoint * distance < bestDepth)
+                addMask |= 1u << i;
+            continue;
+        }
+
+        float t = 0.0;
+        uint face = 0u;
+        bool hit = false;
+        [branch]
+        if (sphere)
+        {
+            float s = length(cross(ray, center));
+            if (s <= rho)
+            {
+                float3 nrm = float3(0.0, 0.0, 0.0);
+                hit = far_ray_sphere(ray, center, rho, facing, t, nrm);
+                if (hit && t * distance < bestDepth)
+                {
+                    bestDepth = t * distance;
+                    bestKind = 1u;
+                }
+            }
+            else if (dot(atmo.rgb, atmo.rgb) > 0.0)
+            {
+                float width = max(rho * 0.05, px * 1.25);
+                if (s < rho + width && facing * distance < bestDepth)
+                    addMask |= 1u << i;
+            }
+        }
+#ifndef FAR_NO_ROUNDED
+        else if (rounded)
+        {
+            float pExp = asfloat(farTable[0].body[i].seed.y);
+            float4 rot = farTable[0].body[i].rot;
+            hit = far_ray_rounded(ray, center, rho, rot, pExp, facing, t, face);
+            if (hit && t * distance < bestDepth)
+            {
+                bestDepth = t * distance;
+                bestKind = (face & 8u) != 0u ? 6u : 5u;
+            }
+            else if (!hit && dot(atmo.rgb, atmo.rgb) > 0.0)
+            {
+                float pRim = max(pExp, 2.0);
+                float rhoB = rho * pow(3.0, 0.5 - 1.0 / pRim);
+                float s = length(cross(ray, center));
+                float width = max(rhoB * 0.05, px * 1.25);
+                if (s > rhoB && s < rhoB + width && facing * distance < bestDepth)
+                    addMask |= 1u << i;
+            }
+        }
+#endif
+        else if (mapped)
+        {
+            uint mapPlus = farTable[0].body[i].seed.z;
+            float horizon = farTable[0].body[i].albedo0.w;
+            // Same short-circuit as far_bodies: a bad map or distance is not
+            // a horizon skip. The gate and the azimuth table are.
+            if (mapPlus == 0u || mapPlus > 8u || !(distance > 0.0))
+                continue;
+            if (dot(ray, -center) > horizon || far_above_horizon(i, ray, center))
+            {
+                horizonSkip = true;
+                continue;
+            }
+            uint map = mapPlus - 1u;
+            hit = far_ray_mapped(ray, i, rho, distance, map, t, face);
+            if (hit && t * distance < bestDepth)
+            {
+                bestDepth = t * distance;
+                bestKind = 4u;
+            }
+            else if (!hit && facing > 0.0 && facing * distance < bestDepth)
+            {
+                float airThick = farTable[0].body[i].albedo1.w;
+                float rSurf;
+                float outer;
+                float s;
+                float3 limbC = far_body_dir(i).xyz;
+                float4 rot = far_body_rot(i);
+                if (airThick > 0.0 && far_mapped_limb(
+                        ray, limbC, facing, rho, distance, rot, map, airThick, px, rSurf, outer, s))
+                    addMask |= 1u << i;
+            }
+        }
+#ifndef FAR_NO_CUBE
+        else
+        {
+            float4 rot = farTable[0].body[i].rot;
+            float3 nrm = float3(0.0, 0.0, 0.0);
+            hit = far_ray_cube(ray, center, rho, rot, t, nrm, face);
+            if (hit && t * distance < bestDepth)
+            {
+                bestDepth = t * distance;
+                bestKind = 3u;
+            }
+            else if (!hit && dot(atmo.rgb, atmo.rgb) > 0.0)
+            {
+                float rhoRim = rho * 1.035 + px * 0.5;
+                float tRim;
+                float3 nRim;
+                uint faceRim;
+                if (rhoRim < 1.0 && far_ray_cube(ray, center, rhoRim, rot, tRim, nRim, faceRim) && tRim * distance < bestDepth)
+                    addMask |= 1u << i;
+            }
+        }
+#endif
+    }
+
+    if (bestKind == 4u)
+        dbg.r = 1.0;
+    if (horizonSkip)
+        dbg.b = 1.0;
+
+    float3 limb = float3(0.0, 0.0, 0.0);
+    bits &= addMask;
+    [loop]
+    while (bits != 0u)
+    {
+        uint i = firstbitlow(bits);
+        bits &= bits - 1u;
+        float distance = farTable[0].body[i].albedo2.w;
+        float facingDepth = dot(ray, farTable[0].body[i].dir_rho.xyz) * distance;
+        if (facingDepth < bestDepth)
+        {
+            float shape = farTable[0].body[i].atmosphere.w;
+            if (shape > 3.5 && shape < 4.5)
+                limb += far_add_rgb(i, ray, px, flip);
+        }
+    }
+    if (max(limb.x, max(limb.y, limb.z)) > 1e-6)
+        dbg.g = 1.0;
+    return dbg;
+}
+#endif
+
 #endif

@@ -1650,6 +1650,35 @@ fn zeroed_table() -> Box<FarTableGpu> {
     unsafe { Box::from_raw(ptr) }
 }
 
+/// Index in `bodies` (the pre-frustum list [`horizon_dip`] walks) and the rho
+/// that dip used. `None` when no outside body sits under the viewer.
+fn ground_pick(
+    bodies: &[FarBody],
+    sky_up: glam::Vec3,
+    map_min: &[f32; MAX_FAR_MAPS],
+) -> Option<(usize, f32)> {
+    let (_, up, _) = super::uniforms::local_sky_basis(sky_up);
+    let down = -up;
+    let mut best = -1.0f32;
+    let mut index = None;
+    for (i, body) in bodies.iter().take(MAX_FAR_BODIES).enumerate() {
+        let rho = horizon_rho(body, map_min);
+        if !(rho.is_finite() && rho > 0.0 && rho < 1.0) {
+            continue;
+        }
+        let dir = body.dir;
+        let len2 = dir.length_squared();
+        if !(len2 > 0.0) || !dir.is_finite() {
+            continue;
+        }
+        if dir.dot(down) > 0.5 * len2.sqrt() && rho > best {
+            best = rho;
+            index = Some(i);
+        }
+    }
+    index.map(|i| (i, best))
+}
+
 /// Sine of the geometric horizon dip below the local horizontal.
 ///
 /// The ground body is the outside body (`0 < rho < 1`) with the largest rho
@@ -1672,27 +1701,10 @@ pub(crate) fn horizon_dip(
     sky_up: glam::Vec3,
     map_min: &[f32; MAX_FAR_MAPS],
 ) -> f32 {
-    let (_, up, _) = super::uniforms::local_sky_basis(sky_up);
-    let down = -up;
-    let mut best = -1.0f32;
-    for body in bodies.iter().take(MAX_FAR_BODIES) {
-        let rho = horizon_rho(body, map_min);
-        if !(rho.is_finite() && rho > 0.0 && rho < 1.0) {
-            continue;
-        }
-        let dir = body.dir;
-        let len2 = dir.length_squared();
-        if !(len2 > 0.0) || !dir.is_finite() {
-            continue;
-        }
-        if dir.dot(down) > 0.5 * len2.sqrt() && rho > best {
-            best = rho;
-        }
-    }
-    if !(best >= 0.0) {
+    let Some((_, rho)) = ground_pick(bodies, sky_up, map_min) else {
         return 0.0;
-    }
-    (1.0 - best * best).max(0.0).sqrt().clamp(0.0, 0.5)
+    };
+    (1.0 - rho * rho).max(0.0).sqrt().clamp(0.0, 0.5)
 }
 
 /// `radius/distance`. A mapped body adds the map's minimum datum offset first
@@ -2758,6 +2770,112 @@ fn pack_table_cached(
     (table, dip)
 }
 
+/// Once a second while `VOXEL_SKY_DEBUG=1`. The dip is the value returned to
+/// the UBO. `index` is the pre-frustum list [`horizon_dip`] walks. Horizon
+/// lines are the kept-body slot the shader indexes, with that table's bin at
+/// the camera's forward azimuth.
+fn log_sky_debug(
+    bodies: &[FarBody],
+    table: &FarTableGpu,
+    view: Option<&FarView>,
+    dip: f32,
+    map_min: &[f32; MAX_FAR_MAPS],
+    sky_up: glam::Vec3,
+) {
+    if !sky_debug_log_due() {
+        return;
+    }
+    let n = bodies.len().min(MAX_FAR_BODIES);
+    let listed = &bodies[..n];
+    match ground_pick(listed, sky_up, map_min) {
+        Some((index, rho)) => {
+            let shape = sky_debug_shape(&listed[index].shape);
+            eprintln!("sky-debug dip={dip} ground index={index} shape={shape} rho={rho}");
+        }
+        None => eprintln!("sky-debug dip={dip} ground=none"),
+    }
+    let forward = view.and_then(camera_forward);
+    for slot in 0..HORIZON_TABLES {
+        let kept = table.horizon_id[slot];
+        if kept == u32::MAX {
+            continue;
+        }
+        let kept_us = kept as usize;
+        if kept_us >= MAX_FAR_BODIES {
+            continue;
+        }
+        let start = slot * HORIZON_BINS;
+        let bins = &table.horizon_sin[start..start + HORIZON_BINS];
+        let mut lo = bins[0];
+        let mut hi = bins[0];
+        for v in &bins[1..] {
+            lo = lo.min(*v);
+            hi = hi.max(*v);
+        }
+        let gpu = &table.body[kept_us];
+        let map_plus = gpu.seed[2];
+        let map = map_plus.saturating_sub(1);
+        let center = glam::Vec3::new(gpu.dir_rho[0], gpu.dir_rho[1], gpu.dir_rho[2]);
+        match forward.and_then(|dir| horizon_forward_sample(center, dir, bins)) {
+            Some((az, bin, sine)) => eprintln!(
+                "sky-debug horizon slot={slot} kept={kept} map={map} min={lo} max={hi} forward_az={az} bin={bin} sin={sine}"
+            ),
+            None => eprintln!(
+                "sky-debug horizon slot={slot} kept={kept} map={map} min={lo} max={hi} forward=none"
+            ),
+        }
+    }
+}
+
+fn sky_debug_shape(shape: &FarShape) -> String {
+    match *shape {
+        FarShape::Cube => "cube".to_string(),
+        FarShape::Sphere => "sphere".to_string(),
+        FarShape::InnerSphere => "inner".to_string(),
+        FarShape::Rounded { exponent } => format!("rounded({exponent})"),
+        FarShape::Mapped { map, horizon, air } => {
+            format!("mapped(map={}, horizon={horizon}, air={air})", map.0)
+        }
+    }
+}
+
+/// Look direction. Row 3 of `view_proj` points that way; [`ViewBasis::back`]
+/// is the camera's +Z, opposite the look.
+fn camera_forward(view: &FarView) -> Option<glam::Vec3> {
+    ViewBasis::from_view_proj(view.view_proj).map(|basis| -basis.back)
+}
+
+/// `(azimuth, bin, sine)` of `forward` in the horizon frame whose up is
+/// centre → eye (`-center`). The bin matches `far_above_horizon`.
+fn horizon_forward_sample(
+    center: glam::Vec3,
+    forward: glam::Vec3,
+    bins: &[f32],
+) -> Option<(f32, usize, f32)> {
+    let up = -center;
+    let (east, north) = horizon_axes(up)?;
+    let len2 = up.length_squared();
+    let up = up / len2.sqrt();
+    let az = horizon_azimuth(forward, up, east, north);
+    let bin = horizon_bin(az);
+    bins.get(bin).copied().map(|sine| (az, bin, sine))
+}
+
+fn sky_debug_log_due() -> bool {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static NEXT: Mutex<Option<Instant>> = Mutex::new(None);
+    let Ok(mut next) = NEXT.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    if next.is_some_and(|t| now < t) {
+        return false;
+    }
+    *next = Some(now + Duration::from_secs(1));
+    true
+}
+
 /// Per-slot far-body SSBO. Identical bytes skip the map write.
 /// `tiles` is the view-space tile cones, rebuilt when the projection, the
 /// render extent, or the tile size changes and reused across camera turns.
@@ -2997,6 +3115,9 @@ impl FarBodyRing {
             u64::from(draw.n_coarse_far),
         );
         self.draw[slot] = draw;
+        if super::uniforms::sky_debug_enabled() {
+            log_sky_debug(bodies, &table, view.as_ref(), dip, &map_min, sky_up);
+        }
         let bytes = table_bytes(&table);
         let lists = list_bytes(&table);
         if self.last[slot]

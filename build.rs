@@ -1200,7 +1200,7 @@ fn derived_lane_table() -> Vec<Lane> {
         },
         Lane {
             name: "sky_tangent",
-            doc: "Engine-derived local sky basis (not in FrameUniformsGpu). xyz = tangent:\nthe world axis least aligned with up, rejected into the plane (ties X, then Y,\nthen Z). +Y up yields +X. w unused.",
+            doc: "Engine-derived local sky basis (not in FrameUniformsGpu). xyz = tangent:\nthe world axis least aligned with up, rejected into the plane (ties X, then Y,\nthen Z). +Y up yields +X. w = 1 when the process was started with\nVOXEL_SKY_DEBUG=1, else 0. The sky fragment treats a non-zero w as a uniform\nand replaces its colour with a source key (mapped surface, mapped air limb,\nhorizon skip, and the steep horizon-dip remap). Every other reader uses xyz\nonly. 0 leaves the sky colour path unchanged.",
         },
         Lane {
             name: "sky_up",

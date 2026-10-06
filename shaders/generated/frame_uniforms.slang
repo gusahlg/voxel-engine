@@ -51,7 +51,11 @@ struct FrameUniforms
     float4 shadow_bounce;
     // Engine-derived local sky basis (not in FrameUniformsGpu). xyz = tangent:
     // the world axis least aligned with up, rejected into the plane (ties X, then Y,
-    // then Z). +Y up yields +X. w unused.
+    // then Z). +Y up yields +X. w = 1 when the process was started with
+    // VOXEL_SKY_DEBUG=1, else 0. The sky fragment treats a non-zero w as a uniform
+    // and replaces its colour with a source key (mapped surface, mapped air limb,
+    // horizon skip, and the steep horizon-dip remap). Every other reader uses xyz
+    // only. 0 leaves the sky colour path unchanged.
     float4 sky_tangent;
     // Engine-derived. xyz = unit local up (default +Y). w = altitude above the
     // local datum from set_local_frame. The cloud slab reads anim.w (the game writes
