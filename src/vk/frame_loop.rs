@@ -445,11 +445,13 @@ impl Renderer {
     /// swapchain no longer matches the window size. Some presentation stacks
     /// (Windows compositor states, Wine) report SUBOPTIMAL persistently even
     /// for a correctly sized swapchain; recreating on the flag alone then
-    /// rebuilds the swapchain and render targets every frame, indefinitely.
-    /// Genuine size changes still recreate via `on_resize`/OUT_OF_DATE.
+    /// rebuilds the swapchain every frame, indefinitely. Genuine size changes
+    /// still recreate via `on_resize` / OUT_OF_DATE. A mismatch is marked
+    /// stale so the swapchain is rebuilt even if a later resize lands back on
+    /// this extent before the apply (the plan then still sees the stale flag).
     pub(super) fn recreate_if_stale(&mut self) {
         if self.swapchain.extent != self.size {
-            self.needs_recreate = true;
+            self.mark_swapchain_stale();
         }
     }
 
@@ -520,10 +522,10 @@ impl Renderer {
                     }
                     // No image available; drop the present.
                     Err(vk::Result::NOT_READY) | Err(vk::Result::TIMEOUT) => {}
-                    // OUT_OF_DATE/SURFACE_LOST: environmental, recreate next frame.
-                    // Other errors are unrecoverable.
+                    // OUT_OF_DATE/SURFACE_LOST: environmental, recreate the
+                    // swapchain next frame. Other errors are unrecoverable.
                     Err(err) => match Env::classify(err) {
-                        Some(Env::OutOfDate | Env::SurfaceLost) => self.needs_recreate = true,
+                        Some(Env::OutOfDate | Env::SurfaceLost) => self.mark_swapchain_stale(),
                         _ => panic!("acquire_next_image failed: {err:?}"),
                     },
                 }

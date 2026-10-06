@@ -11,6 +11,10 @@ pub struct Swapchain {
     pub image_views: Vec<vk::ImageView>,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
+    /// Present mode actually created (FIFO when vsync is on, otherwise
+    /// IMMEDIATE / MAILBOX / FIFO fallback). Compared against the mode the
+    /// pending vsync would select so a no-op toggle does not rebuild.
+    pub present_mode: vk::PresentModeKHR,
     /// Whether the swapchain images carry `TRANSFER_SRC` (screenshot copies).
     /// False on surfaces that don't support it — captures must refuse
     /// gracefully instead of recording an invalid copy.
@@ -80,10 +84,39 @@ fn choose_composite(supported: vk::CompositeAlphaFlagsKHR) -> vk::CompositeAlpha
     vk::CompositeAlphaFlagsKHR::OPAQUE
 }
 
+/// Extent the next swapchain will adopt for `window_extent`.
+///
+/// A real `current_extent` (not `u32::MAX`) wins: the surface already knows
+/// the size, and creating anything else is `OUT_OF_DATE` on the next acquire.
+/// Wayland reports `u32::MAX` and the window size is clamped to the supported
+/// range.
+pub(super) fn choose_swapchain_extent(
+    capabilities: &vk::SurfaceCapabilitiesKHR,
+    window_extent: vk::Extent2D,
+) -> vk::Extent2D {
+    if capabilities.current_extent.width != u32::MAX {
+        capabilities.current_extent
+    } else {
+        vk::Extent2D {
+            width: window_extent.width.clamp(
+                capabilities.min_image_extent.width,
+                capabilities.max_image_extent.width,
+            ),
+            height: window_extent.height.clamp(
+                capabilities.min_image_extent.height,
+                capabilities.max_image_extent.height,
+            ),
+        }
+    }
+}
+
 /// Choose the present mode. Without vsync, prefer IMMEDIATE (MAILBOX still
 /// syncs to refresh on some platforms); FIFO — the only mode the spec
 /// guarantees — is the vsync path and the universal fallback.
-fn choose_present_mode(vsync: bool, available: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+pub(super) fn choose_present_mode(
+    vsync: bool,
+    available: &[vk::PresentModeKHR],
+) -> vk::PresentModeKHR {
     if vsync {
         return vk::PresentModeKHR::FIFO;
     }
@@ -143,20 +176,7 @@ impl Swapchain {
         }
 
         // If current_extent == u32::MAX (Wayland), clamp window size to supported range.
-        let extent = if capabilities.current_extent.width != u32::MAX {
-            capabilities.current_extent
-        } else {
-            vk::Extent2D {
-                width: window_extent.width.clamp(
-                    capabilities.min_image_extent.width,
-                    capabilities.max_image_extent.width,
-                ),
-                height: window_extent.height.clamp(
-                    capabilities.min_image_extent.height,
-                    capabilities.max_image_extent.height,
-                ),
-            }
-        };
+        let extent = choose_swapchain_extent(&capabilities, window_extent);
 
         let loader = khr::swapchain::Device::new(instance, &device.device);
         let queue_family_indices = [device.graphics_family, device.present_family];
@@ -233,6 +253,7 @@ impl Swapchain {
             image_views,
             format: surface_format.format,
             extent,
+            present_mode,
             screenshot_capable,
         }
     }

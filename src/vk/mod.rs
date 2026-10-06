@@ -248,7 +248,14 @@ pub(crate) struct Renderer {
 
     vsync: Pending<bool>,
     msaa: Pending<SampleCount>,
+    /// Something may need applying (resize, vsync, MSAA, scale, or a stale
+    /// swapchain). Cleared by `apply_pending` after the plan runs, including
+    /// when the plan is empty.
     needs_recreate: bool,
+    /// Acquire/present returned OUT_OF_DATE or SURFACE_LOST, or
+    /// `recreate_if_stale` saw a size mismatch. Forces a swapchain rebuild
+    /// even when the window size and present mode are unchanged.
+    swapchain_stale: bool,
     /// Render target scale relative to window.
     render_scale: Pending<f32>,
     /// Offscreen render extent.
@@ -727,6 +734,7 @@ impl Renderer {
             vsync: Pending::new(vsync),
             msaa: Pending::new(msaa),
             needs_recreate: false,
+            swapchain_stale: false,
             render_scale: Pending::new(render_scale),
             render_extent,
             last_present: std::time::Instant::now(),
@@ -742,13 +750,29 @@ impl Renderer {
         Ok((renderer, reply))
     }
 
-    /// Handle window resize and flag swapchain rebuild.
+    /// Store the window size. A rebuild is scheduled only when that size
+    /// differs from the swapchain extent, so a same-size `Resized` (winit /
+    /// Wayland repeats the current size) does not apply. A later change back
+    /// to the swapchain extent does not set the flag; if an earlier size had
+    /// set it, `recreate_plan` sees equal extents and applies nothing. This
+    /// does not clear `needs_recreate`: a pending MSAA, scale,
+    /// or vsync change must survive a same-size event.
     pub(crate) fn on_resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         self.size = vk::Extent2D {
             width: size.width,
             height: size.height,
         };
+        if self.size != self.swapchain.extent {
+            self.needs_recreate = true;
+        }
+    }
+
+    /// OUT_OF_DATE / SURFACE_LOST, or a SUBOPTIMAL swapchain whose extent no
+    /// longer matches the window. `needs_recreate` only means "look"; the
+    /// stale flag is what forces the swapchain half of the plan.
+    pub(super) fn mark_swapchain_stale(&mut self) {
         self.needs_recreate = true;
+        self.swapchain_stale = true;
     }
 
     // Setters driven by RenderCmd; getters cached main-side in RenderClient.

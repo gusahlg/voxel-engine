@@ -2,6 +2,9 @@
 /// flat floor, orbiting camera, debug overlay. Keys: F fullscreen, V vsync,
 /// A MSAA, M materials (array vs procedural), Esc quit.
 /// `VOXEL_DEMO_FAR=1` pins that startup view and draws one of each far shape.
+/// `VOXEL_DEMO_RECREATE_CYCLE=1` after ~2s steps vsync, MSAA, render scale, and
+/// fullscreen (every ~60 frames) and quits, so a validation run hits every
+/// recreate plan.
 use voxel_engine::{
     Ao, Camera3D, Color, Config, Detail, FarBody, FarMapDesc, FarMapId, FarShape, Key, Light,
     LinearRgb, MATERIAL_FLAG_PROCEDURAL, MaterialDesc, MeshData, MeshVertex, Normal, Pass, Quat,
@@ -483,6 +486,52 @@ fn install_far_showcase(eng: &mut voxel_engine::Engine) {
     }
 }
 
+/// One step of `VOXEL_DEMO_RECREATE_CYCLE`. MSAA steps the way the A key does,
+/// then returns to the count from before that step.
+fn demo_recreate_step(eng: &mut voxel_engine::Engine, step: u32, msaa_before: &mut u32) {
+    match step {
+        0 => {
+            log::info!("demo recreate cycle: vsync on");
+            eng.set_vsync(true);
+        }
+        1 => {
+            log::info!("demo recreate cycle: vsync off");
+            eng.set_vsync(false);
+        }
+        2 => {
+            *msaa_before = eng.msaa();
+            let next = if eng.msaa() >= eng.max_msaa() {
+                1
+            } else {
+                eng.msaa() * 2
+            };
+            log::info!("demo recreate cycle: msaa {next}");
+            eng.set_msaa(next);
+        }
+        3 => {
+            log::info!("demo recreate cycle: msaa {}", *msaa_before);
+            eng.set_msaa(*msaa_before);
+        }
+        4 => {
+            log::info!("demo recreate cycle: render scale 0.5");
+            eng.set_render_scale(0.5);
+        }
+        5 => {
+            log::info!("demo recreate cycle: render scale 1.0");
+            eng.set_render_scale(1.0);
+        }
+        6 => {
+            log::info!("demo recreate cycle: fullscreen on");
+            eng.set_fullscreen(true);
+        }
+        7 => {
+            log::info!("demo recreate cycle: fullscreen off");
+            eng.set_fullscreen(false);
+        }
+        _ => {}
+    }
+}
+
 fn main() {
     env_logger::init();
 
@@ -505,6 +554,14 @@ fn main() {
     let autoshot = std::env::var("VOXEL_AUTOSHOT").is_ok();
     // Far-body showcase. Unset leaves the orbit, the sky, and the scene as they are.
     let far_demo = std::env::var("VOXEL_DEMO_FAR").is_ok();
+    // After ~2s, every ~60 frames: vsync on, off, MSAA up, MSAA back,
+    // scale 0.5, scale 1, fullscreen on, fullscreen off, then quit.
+    let recreate_cycle = std::env::var("VOXEL_DEMO_RECREATE_CYCLE").is_ok();
+    let mut cycle_origin: Option<std::time::Instant> = None;
+    let mut cycle_started = false;
+    let mut cycle_frames: u32 = 0;
+    let mut cycle_step: u32 = 0;
+    let mut cycle_msaa: u32 = 1;
     let mut frame_n: u32 = 0;
 
     voxel_engine::run(
@@ -532,6 +589,33 @@ fn main() {
                     Err(e) => log::error!("autoshot failed ({}): {e}", path.display()),
                 }
                 return false;
+            }
+            if recreate_cycle {
+                let origin = cycle_origin.get_or_insert_with(std::time::Instant::now);
+                if origin.elapsed().as_secs_f32() >= 2.0 {
+                    let fire = if !cycle_started {
+                        cycle_started = true;
+                        cycle_frames = 0;
+                        true
+                    } else {
+                        cycle_frames += 1;
+                        if cycle_frames >= 60 {
+                            cycle_frames = 0;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if fire {
+                        // Eight steps, then one more 60-frame gap so the last
+                        // fullscreen restore is applied and presented, then quit.
+                        if cycle_step >= 8 {
+                            return false;
+                        }
+                        demo_recreate_step(eng, cycle_step, &mut cycle_msaa);
+                        cycle_step += 1;
+                    }
+                }
             }
             if eng.is_key_pressed(Key::F) {
                 let now = !eng.fullscreen();
