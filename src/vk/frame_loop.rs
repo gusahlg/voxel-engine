@@ -223,6 +223,7 @@ impl Renderer {
             crate::profile::gauge(crate::profile::Gauge::FarTiles, 0);
             crate::profile::gauge(crate::profile::Gauge::SkyCoarse, 0);
             crate::profile::gauge(crate::profile::Gauge::SkyCoarseFar, 0);
+            crate::profile::gauge(crate::profile::Gauge::SkyMapsolo, 0);
             0.0
         };
         // Per-frame UBO (set 0, binding 2). A 3D scene always carries lighting

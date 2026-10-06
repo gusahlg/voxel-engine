@@ -210,6 +210,7 @@ const SKY_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv")
 const SKY_BASE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_base.frag.spv"));
 const SKY_NOMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_nomap.frag.spv"));
 const SKY_SPHERE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_sphere.frag.spv"));
+const SKY_MAPSOLO_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_mapsolo.frag.spv"));
 const TONEMAP_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.vert.spv"));
 const TONEMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
 const TONEMAP_TAA_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap_taa.frag.spv"));
@@ -277,7 +278,8 @@ pub struct Pipelines {
     /// the five-sample fixed-point march. `sky_base` compiles the far-body
     /// call out. `sky_nomap` drops the mapped march. `sky_sphere` keeps
     /// spheres and inner spheres. The `sky_tile_*` pipelines are the same
-    /// fragments on instanced tile quads. All of them share `layout_sky`.
+    /// fragments on instanced tile quads. `sky_tile_mapsolo` is the loop-free
+    /// single-Mapped fragment. All of them share `layout_sky`.
     pub sky: vk::Pipeline,
     pub sky_base: vk::Pipeline,
     pub sky_nomap: vk::Pipeline,
@@ -288,9 +290,15 @@ pub struct Pipelines {
     /// has no pipeline 2×2 rate, or `VOXEL_SKY_COARSE=0`.
     pub sky_tile_base_coarse: Option<vk::Pipeline>,
     /// Full sky fragment (the fixed-point mapped march included) at a 2×2
-    /// fragment size. Mapped-interior tiles bind this. `None` under the same
-    /// conditions as [`Self::sky_tile_base_coarse`].
+    /// fragment size. Mapped-interior tiles bind this when mapsolo is off.
+    /// `None` under the same conditions as [`Self::sky_tile_base_coarse`].
     pub sky_tile_coarse: Option<vk::Pipeline>,
+    /// Loop-free fragment for a tile whose mask is exactly one Mapped body.
+    pub sky_tile_mapsolo: vk::Pipeline,
+    /// `sky_tile_mapsolo` at a 2×2 fragment size. The lo-sphere interior of a
+    /// single-Mapped tile binds this. `None` under the same conditions as
+    /// [`Self::sky_tile_coarse`].
+    pub sky_tile_mapsolo_coarse: Option<vk::Pipeline>,
     pub sky_tile_nomap: vk::Pipeline,
     pub sky_tile_sphere: vk::Pipeline,
     pub layout_sky: vk::PipelineLayout,
@@ -521,6 +529,8 @@ impl Pipelines {
         let sky_base_frag = pass::shader_module(device, SKY_BASE_FRAG, "sky base fragment");
         let sky_nomap_frag = pass::shader_module(device, SKY_NOMAP_FRAG, "sky nomap fragment");
         let sky_sphere_frag = pass::shader_module(device, SKY_SPHERE_FRAG, "sky sphere fragment");
+        let sky_mapsolo_frag =
+            pass::shader_module(device, SKY_MAPSOLO_FRAG, "sky mapsolo fragment");
 
         let builder = PipelineBuilder {
             device,
@@ -912,6 +922,26 @@ impl Pipelines {
                 coarse_cfg(),
             )
         });
+        let sky_tile_mapsolo = builder.build(
+            sky_tile_vert,
+            sky_mapsolo_frag,
+            &[],
+            &[],
+            layout_sky,
+            "sky_tile_mapsolo",
+            sky_cfg(),
+        );
+        let sky_tile_mapsolo_coarse = sky_coarse.then(|| {
+            builder.build(
+                sky_tile_vert,
+                sky_mapsolo_frag,
+                &[],
+                &[],
+                layout_sky,
+                "sky_tile_mapsolo_coarse",
+                coarse_cfg(),
+            )
+        });
 
         // Tonemap: its own builder — writes the present format at single-sample
         // with no depth attachment; never VRS.
@@ -1068,6 +1098,7 @@ impl Pipelines {
             device.destroy_shader_module(sky_base_frag, None);
             device.destroy_shader_module(sky_nomap_frag, None);
             device.destroy_shader_module(sky_sphere_frag, None);
+            device.destroy_shader_module(sky_mapsolo_frag, None);
         }
 
         let vrs_compute = fsr.map(|_| create_vrs_compute(device, cache, stats));
@@ -1104,6 +1135,8 @@ impl Pipelines {
             sky_tile_base,
             sky_tile_base_coarse,
             sky_tile_coarse,
+            sky_tile_mapsolo,
+            sky_tile_mapsolo_coarse,
             sky_tile_nomap,
             sky_tile_sphere,
             layout_sky,
@@ -1217,6 +1250,10 @@ impl Pipelines {
                 device.destroy_pipeline(p, None);
             }
             if let Some(p) = self.sky_tile_coarse {
+                device.destroy_pipeline(p, None);
+            }
+            device.destroy_pipeline(self.sky_tile_mapsolo, None);
+            if let Some(p) = self.sky_tile_mapsolo_coarse {
                 device.destroy_pipeline(p, None);
             }
             device.destroy_pipeline(self.sky_tile_nomap, None);
