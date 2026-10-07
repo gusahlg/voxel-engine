@@ -572,12 +572,13 @@ impl Renderer {
                 // Targets: depth and rate images were recreated (layout
                 // UNDEFINED). Skip VRS until a classify at the end of the
                 // first post-recreate use primes the rate image. Sampleable
-                // depth begins UNDEFINED regardless. Not touched when the
-                // targets survive.
+                // and MS depth begin UNDEFINED regardless, with no classifier
+                // read left to wait on. Not touched when the targets survive.
                 for slot in 0..FRAMES_IN_FLIGHT as usize {
                     let s = &mut self.slots[FrameSlot::new(slot)];
                     s.vrs_ready = false;
                     s.vrs_history = false;
+                    s.vrs_ms_depth_read = false;
                 }
                 // Targets: previous-frame depth samples are invalid until a
                 // subsequent store.
@@ -606,6 +607,7 @@ impl Renderer {
                     self.device.fragment_shading_rate.as_ref(),
                     self.device.sky_coarse_ok(self.targets.samples),
                     self.device.independent_blend,
+                    self.device.vrs_depth_ms_ok(self.targets.samples),
                     self.device.shader_stats.as_ref(),
                 );
             }

@@ -335,6 +335,9 @@ impl super::Renderer {
     /// until the next scene-pass begin of this slot. Mix fill/copy/host
     /// barriers run only while profiling.
     ///
+    /// `depth_ms` ([`super::SceneDepthUse::ClassifyMs`]): read sample 0 of the
+    /// stored MS depth with the `vrs_ms` pipeline instead of the resolve.
+    ///
     /// Only called when classifying, so both `vrs` and `vrs_compute` are
     /// present. `cmd` must be recording, outside a render pass.
     pub(super) unsafe fn record_vrs_generate(
@@ -342,6 +345,7 @@ impl super::Renderer {
         cmd: vk::CommandBuffer,
         slot: usize,
         d_threshold: f32,
+        depth_ms: bool,
     ) {
         let device = &self.device.device;
         let vrs = self.targets.vrs.as_ref().expect("classify_vrs implies vrs");
@@ -350,10 +354,20 @@ impl super::Renderer {
             .vrs_compute
             .as_ref()
             .expect("classify_vrs implies vrs_compute");
-        // Sampleable depth is already in SAMPLEABLE_DEPTH_REST_LAYOUT (the
-        // post-scene rest barrier). MSAA: this is the single-sample resolve;
-        // single-sampled it is the depth image itself.
-        let depth = self.targets.sampleable_depth(slot);
+        // Depth is already in SAMPLEABLE_DEPTH_REST_LAYOUT (the post-scene
+        // rest barrier). Sampleable: the single-sample resolve under MSAA,
+        // else the depth image itself. Classify-only MSAA: the stored MS depth
+        // attachment, read through the sample-0 pipeline (same layout).
+        let (pipeline, depth_view) = if depth_ms {
+            (
+                compute
+                    .pipeline_ms
+                    .expect("ClassifyMs implies the vrs_ms pipeline"),
+                self.targets.depth[slot].view(),
+            )
+        } else {
+            (compute.pipeline, self.targets.sampleable_depth(slot).view())
+        };
         let tiles = vrs.tiles();
         let use_history = self.slots[FrameSlot::new(slot)].vrs_history;
         let allow_4x4 = self
@@ -373,10 +387,10 @@ impl super::Renderer {
             flags |= FLAG_WRITE_MIX;
         }
         unsafe {
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, compute.pipeline);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             let depth_info = [vk::DescriptorImageInfo::default()
                 .sampler(compute.depth_sampler)
-                .image_view(depth.view())
+                .image_view(depth_view)
                 .image_layout(SAMPLEABLE_DEPTH_REST_LAYOUT)];
             let rate_info = [vk::DescriptorImageInfo::default()
                 .image_view(vrs.view(slot))

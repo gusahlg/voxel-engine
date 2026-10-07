@@ -8,8 +8,8 @@ use super::{Renderer, depth_range};
 
 /// Resting layout of the single-sample sampleable depth after the scene pass.
 ///
-/// Contract: when a later pass *this frame* samples that image (see
-/// [`sampleable_depth_consumed`]), [`scene_pass::RenderPass::end`] transitions
+/// Contract: when a later pass *this frame* samples that image
+/// ([`SceneDepthUse::Sampleable`]), [`scene_pass::RenderPass::end`] transitions
 /// it (the MSAA resolve target when multisampled, else the depth image) from
 /// the scene-pass write scope ([`sampleable_depth_attachment_state`]) to this
 /// layout in the same `vkCmdPipelineBarrier2` as the offscreen HDR finalize,
@@ -26,30 +26,82 @@ use super::{Renderer, depth_range};
 /// pass stores depth with `DONT_CARE` (and skips the MSAA SAMPLE_ZERO resolve).
 /// The next scene pass of this slot begins the image from `UNDEFINED` in
 /// either case (contents are cleared every frame, so the discard is free).
-/// The multisampled `depth` attachment is unchanged: it still begins from
-/// UNDEFINED and is never sampled.
+/// The multisampled `depth` attachment also begins from UNDEFINED. It is
+/// sampled only on classify-only MSAA frames ([`SceneDepthUse::ClassifyMs`]):
+/// stored instead of resolved, it rests in this same layout for the VRS
+/// classifier (see [`Renderer::ms_depth_classify_barrier`]).
 pub(crate) const SAMPLEABLE_DEPTH_REST_LAYOUT: vk::ImageLayout =
     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 
-/// True when a later pass this frame samples the scene's sampleable depth.
+/// What the scene pass leaves of its depth for later passes this frame.
+/// Chosen once per frame by [`scene_depth_use`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SceneDepthUse {
+    /// Nothing samples depth: `DONT_CARE` store, no MSAA resolve, no rest
+    /// barrier.
+    Discard,
+    /// The single-sample sampleable depth (the MSAA SAMPLE_ZERO resolve, else
+    /// the depth attachment itself) is stored and rests in
+    /// [`SAMPLEABLE_DEPTH_REST_LAYOUT`]. Every consumer, the VRS classifier
+    /// included, samples that image.
+    Sampleable,
+    /// Multisampled, and the VRS classifier is the only consumer: no resolve.
+    /// The MS depth attachment is stored and rests in
+    /// [`SAMPLEABLE_DEPTH_REST_LAYOUT`]; `vrs_ms.comp.spv` loads sample 0.
+    ClassifyMs,
+}
+
+impl SceneDepthUse {
+    /// The scene-pass depth attachment (the MS depth when multisampled) is
+    /// stored rather than discarded.
+    pub(crate) fn stores_attachment(self, multisampled: bool) -> bool {
+        match self {
+            Self::Discard => false,
+            Self::Sampleable => !multisampled,
+            Self::ClassifyMs => true,
+        }
+    }
+
+    /// The single-sample sampleable depth holds this frame's depth after the
+    /// pass: what [`PrevDepthTrack::finish`] records as stored.
+    pub(crate) fn sampleable_stored(self) -> bool {
+        self == Self::Sampleable
+    }
+}
+
+/// Picks this frame's [`SceneDepthUse`].
 ///
-/// Consumers, computed once per frame:
-/// - VRS classify (same submit), even on unpresented frames;
+/// The single-sample sampleable depth is needed by:
 /// - quarter-res spill/godrays (same submit), on presented frames with bloom
 ///   or a live godray march;
 /// - fused TAA tonemap (later present submit), on presented frames with TAA;
 /// - next-frame water absorption (later submit, same queue): this frame stores
 ///   so the following frame can sample.
 ///
+/// The VRS classifier (same submit, presented or not) samples it too whenever
+/// it exists. When the classifier is the only consumer and `classify_ms`
+/// (MSAA with the `vrs_ms` pipeline), it loads sample 0 of the stored MS depth
+/// instead, so most unpresented frames skip the full-resolution resolve.
+/// Single-sampled, the depth attachment is the sampleable image, so classify
+/// alone is still [`SceneDepthUse::Sampleable`].
+///
 /// Minimap and screenshot capture do not sample depth.
-pub(crate) fn sampleable_depth_consumed(
+pub(crate) fn scene_depth_use(
+    classify_ms: bool,
     will_present: bool,
     taa: bool,
     spill_live: bool,
     classify_vrs: bool,
     absorb_store: bool,
-) -> bool {
-    absorb_store || classify_vrs || (will_present && (taa || spill_live))
+) -> SceneDepthUse {
+    let sampleable = absorb_store || (will_present && (taa || spill_live));
+    if sampleable || (classify_vrs && !classify_ms) {
+        SceneDepthUse::Sampleable
+    } else if classify_vrs {
+        SceneDepthUse::ClassifyMs
+    } else {
+        SceneDepthUse::Discard
+    }
 }
 
 const DEPTH_SLOTS: usize = FRAMES_IN_FLIGHT as usize;
@@ -166,7 +218,7 @@ impl Renderer {
 
     /// Scene-pass → rest: sampleable depth becomes [`SAMPLEABLE_DEPTH_REST_LAYOUT`].
     ///
-    /// Issued only when [`sampleable_depth_consumed`] is true. Src is the
+    /// Issued only for [`SceneDepthUse::Sampleable`]. Src is the
     /// attachment-write scope (depth tests, or COLOR_ATTACHMENT_OUTPUT for the
     /// MSAA SAMPLE_ZERO resolve). Dst covers every consumer that samples it
     /// without a further transition: VRS compute, the quarter-res spill compute
@@ -186,11 +238,40 @@ impl Renderer {
             .image(self.targets.sampleable_depth(slot).image())
             .subresource_range(depth_range())
     }
+
+    /// Scene-pass → classifier read of the multisampled depth attachment
+    /// ([`SceneDepthUse::ClassifyMs`]; no resolve ran).
+    ///
+    /// Src is the attachment's own depth tests and its `STORE` (depth store
+    /// ops run in `LATE_FRAGMENT_TESTS` / `DEPTH_STENCIL_ATTACHMENT_WRITE`).
+    /// Dst is the classifier alone (`COMPUTE_SHADER` / `SHADER_SAMPLED_READ`),
+    /// later in this submit. The image rests in [`SAMPLEABLE_DEPTH_REST_LAYOUT`]
+    /// until the next scene pass of this slot discards it from `UNDEFINED`;
+    /// that begin adds `COMPUTE_SHADER` to its source scope
+    /// (`SlotState::vrs_ms_depth_read`).
+    pub(super) fn ms_depth_classify_barrier(&self, slot: usize) -> vk::ImageMemoryBarrier2<'_> {
+        vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            )
+            .src_access_mask(
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            )
+            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+            .old_layout(Self::depth_pass_layout())
+            .new_layout(SAMPLEABLE_DEPTH_REST_LAYOUT)
+            .image(self.targets.depth[slot].image())
+            .subresource_range(depth_range())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use SceneDepthUse::{ClassifyMs, Discard, Sampleable};
 
     #[test]
     fn sampled_depth_resolve_uses_color_output_sync_scope() {
@@ -217,25 +298,84 @@ mod tests {
         );
     }
 
+    /// `(will_present, taa, spill_live, classify_vrs, absorb_store)` for all 32
+    /// combinations.
+    fn all_inputs() -> impl Iterator<Item = (bool, bool, bool, bool, bool)> {
+        (0u32..32).map(|m| (m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0, m & 16 != 0))
+    }
+
     #[test]
-    fn sampleable_depth_consumed_gates_on_actual_consumers() {
-        // Nothing samples: TAA off, no spill, no VRS, no absorb — even if presenting.
-        assert!(!sampleable_depth_consumed(
-            false, false, false, false, false
-        ));
-        assert!(!sampleable_depth_consumed(true, false, false, false, false));
-        // VRS classify samples in the same submit, presented or not.
-        assert!(sampleable_depth_consumed(false, false, false, true, false));
-        assert!(sampleable_depth_consumed(true, false, false, true, false));
-        // Fused TAA tonemap samples only on presented frames.
-        assert!(sampleable_depth_consumed(true, true, false, false, false));
-        assert!(!sampleable_depth_consumed(false, true, false, false, false));
-        // Spill/godrays sample only on presented frames.
-        assert!(sampleable_depth_consumed(true, false, true, false, false));
-        assert!(!sampleable_depth_consumed(false, false, true, false, false));
-        // Absorb Blend stores for the next frame, presented or not.
-        assert!(sampleable_depth_consumed(false, false, false, false, true));
-        assert!(sampleable_depth_consumed(true, false, false, false, true));
+    fn scene_depth_use_gates_on_actual_consumers() {
+        // (will_present, taa, spill_live, classify_vrs, absorb_store), then the
+        // use without and with the sample-0 MS classifier.
+        let cases = [
+            // Nothing samples: TAA off, no spill, no VRS, no absorb — even if presenting.
+            ((false, false, false, false, false), Discard, Discard),
+            ((true, false, false, false, false), Discard, Discard),
+            // Fused TAA tonemap samples only on presented frames.
+            ((true, true, false, false, false), Sampleable, Sampleable),
+            ((false, true, false, false, false), Discard, Discard),
+            // Spill/godrays sample only on presented frames.
+            ((true, false, true, false, false), Sampleable, Sampleable),
+            ((false, false, true, false, false), Discard, Discard),
+            // Absorb Blend stores for the next frame, presented or not.
+            ((false, false, false, false, true), Sampleable, Sampleable),
+            ((true, false, false, false, true), Sampleable, Sampleable),
+            // VRS classify reads in the same submit, presented or not. MSAA
+            // loads sample 0 of the MS depth unless another consumer needs
+            // the resolve anyway.
+            ((false, false, false, true, false), Sampleable, ClassifyMs),
+            ((true, false, false, true, false), Sampleable, ClassifyMs),
+            ((false, true, true, true, false), Sampleable, ClassifyMs),
+            ((true, true, false, true, false), Sampleable, Sampleable),
+            ((true, false, true, true, false), Sampleable, Sampleable),
+            ((false, false, false, true, true), Sampleable, Sampleable),
+        ];
+        for ((present, taa, spill, classify, absorb), single, ms) in cases {
+            let without = scene_depth_use(false, present, taa, spill, classify, absorb);
+            let with = scene_depth_use(true, present, taa, spill, classify, absorb);
+            assert_eq!((without, with), (single, ms));
+        }
+    }
+
+    #[test]
+    fn scene_depth_use_without_ms_classify_is_the_old_consumed_gate() {
+        // Single-sampled (or no `vrs_ms` pipeline): the sampleable depth is
+        // stored exactly when any consumer exists, the classifier included.
+        for (present, taa, spill, classify, absorb) in all_inputs() {
+            let consumed = absorb || classify || (present && (taa || spill));
+            let use_ = scene_depth_use(false, present, taa, spill, classify, absorb);
+            assert_ne!(use_, ClassifyMs);
+            assert_eq!(use_ == Sampleable, consumed, "{use_:?}");
+        }
+    }
+
+    #[test]
+    fn scene_depth_use_ms_classify_resolves_only_for_other_consumers() {
+        for (present, taa, spill, classify, absorb) in all_inputs() {
+            let resolved = absorb || (present && (taa || spill));
+            let use_ = scene_depth_use(true, present, taa, spill, classify, absorb);
+            assert_eq!(use_.sampleable_stored(), resolved, "{use_:?}");
+            assert_eq!(use_ == ClassifyMs, classify && !resolved, "{use_:?}");
+            assert_eq!(use_ == Discard, !classify && !resolved, "{use_:?}");
+        }
+    }
+
+    #[test]
+    fn scene_depth_use_attachment_store() {
+        // Single-sampled: the attachment is the sampleable depth.
+        assert!(!Discard.stores_attachment(false));
+        assert!(Sampleable.stores_attachment(false));
+        // MSAA: the resolve feeds consumers, so the MS attachment is stored
+        // only when the classifier reads it directly.
+        assert!(!Discard.stores_attachment(true));
+        assert!(!Sampleable.stores_attachment(true));
+        assert!(ClassifyMs.stores_attachment(true));
+        // Water absorption sees a stored sampleable depth only from the
+        // resolved / single-sample path, never from a classify-only frame.
+        assert!(Sampleable.sampleable_stored());
+        assert!(!ClassifyMs.sampleable_stored());
+        assert!(!Discard.sampleable_stored());
     }
 
     fn extent(w: u32, h: u32) -> vk::Extent2D {

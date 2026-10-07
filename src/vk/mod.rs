@@ -84,7 +84,9 @@ use texture::FontAtlas;
 use timeline::{BinarySemaphore, Timeline, TimelineValue};
 use transfer::TransferLane;
 
-pub(super) use depth::{PrevDepthTrack, SAMPLEABLE_DEPTH_REST_LAYOUT, sampleable_depth_consumed};
+pub(super) use depth::{
+    PrevDepthTrack, SAMPLEABLE_DEPTH_REST_LAYOUT, SceneDepthUse, scene_depth_use,
+};
 pub(crate) use present::HdrReadable;
 
 /// Recoverable environmental events raised by acquire/present. `OutOfDate`
@@ -128,6 +130,10 @@ struct SlotState {
     vrs_ready: bool,
     /// History image holds a raw classification from a previous VRS dispatch.
     vrs_history: bool,
+    /// The previous use of this slot ended with the classifier reading the
+    /// stored MS depth ([`SceneDepthUse::ClassifyMs`]): the next scene-pass
+    /// begin adds `COMPUTE_SHADER` to the depth transition's source scope.
+    vrs_ms_depth_read: bool,
 }
 
 /// Minimap texture edge length in texels.
@@ -465,6 +471,7 @@ impl Renderer {
             device.fragment_shading_rate.as_ref(),
             device.sky_coarse_ok(targets.samples),
             device.independent_blend,
+            device.vrs_depth_ms_ok(targets.samples),
             device.shader_stats.as_ref(),
         );
 
@@ -540,6 +547,7 @@ impl Renderer {
             indirect: HostBuffer::new(vk::BufferUsageFlags::INDIRECT_BUFFER),
             vrs_ready: false,
             vrs_history: false,
+            vrs_ms_depth_read: false,
         }));
 
         let present_semaphores = create_present_semaphores(&device.device, swapchain.images.len());
