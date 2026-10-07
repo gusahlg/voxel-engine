@@ -5,6 +5,9 @@
 /// `VOXEL_DEMO_RECREATE_CYCLE=1` after ~2s steps vsync, MSAA, render scale, and
 /// fullscreen (every ~60 frames) and quits, so a validation run hits every
 /// recreate plan.
+/// `VOXEL_DEMO_VRS=1` turns on `RenderFlags::vrs`, `VOXEL_DEMO_MSAA=<n>` starts
+/// at that sample count, and `VOXEL_DEMO_FULLSCREEN=1` starts fullscreen, so a
+/// validation run can cover VRS + MSAA at the output's full resolution.
 use voxel_engine::{
     Ao, Camera3D, Color, Config, Detail, FarBody, FarMapDesc, FarMapId, FarShape, Key, Light,
     LinearRgb, MATERIAL_FLAG_PROCEDURAL, MaterialDesc, MeshData, MeshVertex, Normal, Pass, Quat,
@@ -563,12 +566,26 @@ fn main() {
     let mut cycle_step: u32 = 0;
     let mut cycle_msaa: u32 = 1;
     let mut frame_n: u32 = 0;
+    // Test aids: VRS (classifier + rate attachment), a starting MSAA count,
+    // and a fullscreen start.
+    let flags = voxel_engine::RenderFlags {
+        vrs: std::env::var("VOXEL_DEMO_VRS").is_ok_and(|v| v != "0"),
+        ..voxel_engine::RenderFlags::default()
+    };
+    let msaa = std::env::var("VOXEL_DEMO_MSAA")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let fullscreen = std::env::var("VOXEL_DEMO_FULLSCREEN").is_ok_and(|v| v != "0");
 
     voxel_engine::run(
         Config {
             title: "voxel_engine demo".into(),
             target_fps: 0,
             vsync: false,
+            msaa,
+            flags,
+            fullscreen,
             ..Config::default()
         },
         move |eng| {

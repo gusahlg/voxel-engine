@@ -215,6 +215,7 @@ const TONEMAP_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.ve
 const TONEMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
 const TONEMAP_TAA_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap_taa.frag.spv"));
 const VRS_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vrs.comp.spv"));
+const VRS_MS_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vrs_ms.comp.spv"));
 
 /// The VRS classifier compute pipeline plus the depth sampler it reads through.
 /// Present exactly when attachment VRS is enabled. Set 0 is push-descriptor:
@@ -222,6 +223,12 @@ const VRS_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vrs.comp.spv")
 /// binding 2 = history storage image, binding 3 = mix histogram SSBO.
 pub struct VrsCompute {
     pub pipeline: vk::Pipeline,
+    /// Same layout, binding 0 is the multisampled depth attachment (sample-0
+    /// loads; the sampler is unused). `Some` when [`Device::vrs_depth_ms_ok`]
+    /// held for the sample count these pipelines were built for.
+    ///
+    /// [`Device::vrs_depth_ms_ok`]: super::device::Device::vrs_depth_ms_ok
+    pub pipeline_ms: Option<vk::Pipeline>,
     pub layout: vk::PipelineLayout,
     pub set_layout: vk::DescriptorSetLayout,
     pub depth_sampler: vk::Sampler,
@@ -349,6 +356,7 @@ impl Pipelines {
         fsr: Option<&FragmentShadingRate>,
         sky_coarse: bool,
         independent_blend: bool,
+        vrs_depth_ms: bool,
         stats: Option<&super::shader_stats::Loader>,
     ) -> Self {
         // 3D set 0: binding 0 = offsets SSBO (vertex), binding 1 = texture
@@ -1101,7 +1109,7 @@ impl Pipelines {
             device.destroy_shader_module(sky_mapsolo_frag, None);
         }
 
-        let vrs_compute = fsr.map(|_| create_vrs_compute(device, cache, stats));
+        let vrs_compute = fsr.map(|_| create_vrs_compute(device, cache, vrs_depth_ms, stats));
 
         Self {
             vrs_compute,
@@ -1207,6 +1215,9 @@ impl Pipelines {
         unsafe {
             if let Some(v) = &self.vrs_compute {
                 device.destroy_pipeline(v.pipeline, None);
+                if let Some(p) = v.pipeline_ms {
+                    device.destroy_pipeline(p, None);
+                }
                 device.destroy_pipeline_layout(v.layout, None);
                 device.destroy_descriptor_set_layout(v.set_layout, None);
                 device.destroy_sampler(v.depth_sampler, None);
@@ -1502,10 +1513,11 @@ impl PipelineBuilder<'_> {
 fn create_vrs_compute(
     device: &ash::Device,
     cache: vk::PipelineCache,
+    depth_ms: bool,
     stats: Option<&super::shader_stats::Loader>,
 ) -> VrsCompute {
     let bindings = [
-        // Depth, sampled by the classifier.
+        // Depth, sampled by the classifier (or the MS depth, loaded by `vrs_ms`).
         vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -1538,11 +1550,14 @@ fn create_vrs_compute(
         "vrs",
     );
     let pipeline = pass::compute_pipeline(device, cache, layout, VRS_COMP, "vrs", stats);
+    let pipeline_ms = depth_ms
+        .then(|| pass::compute_pipeline(device, cache, layout, VRS_MS_COMP, "vrs_ms", stats));
 
     let depth_sampler = pass::nearest_clamp_sampler(device, "VRS depth");
 
     VrsCompute {
         pipeline,
+        pipeline_ms,
         layout,
         set_layout,
         depth_sampler,

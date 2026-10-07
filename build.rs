@@ -337,6 +337,17 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             "tonemap_taa.frag.spv",
         )
     });
+    // VRS classifier reading sample 0 of the multisampled depth attachment:
+    // MSAA frames that classify but need no resolved depth skip the resolve.
+    jobs.push(ShaderJob {
+        defines: &[("VRS_DEPTH_MS", None)],
+        ..job(
+            "shaders/vrs.comp.slang",
+            Stage::Compute,
+            "computeMain",
+            "vrs_ms.comp.spv",
+        )
+    });
     jobs
 }
 
