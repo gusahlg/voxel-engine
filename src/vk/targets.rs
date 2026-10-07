@@ -384,6 +384,9 @@ pub struct RenderTargets {
     pub(crate) resolved_depth: [Option<ImageResource>; FRAMES_IN_FLIGHT as usize],
     pub depth_format: vk::Format,
     /// `Some` only when multisampled; `None` is single-sampled (no MSAA image).
+    /// One image shared by every slot (unlike `depth` / `offscreen`): each
+    /// scene-pass begin orders its discard after the previous frame's colour
+    /// writes and resolve.
     pub(crate) msaa: Option<ImageResource>,
     /// Per-slot offscreen color targets (swapchain format/extent, single
     /// sampled): each frame draws — or MSAA-resolves — into `offscreen[slot]`,

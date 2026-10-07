@@ -154,12 +154,18 @@ impl<'a> RenderPass<'a> {
                 barrier_count += 1;
             }
             if let Some(msaa) = &r.targets.msaa {
-                // MSAA color: src NONE / NONE (`UNDEFINED` discard).
+                // MSAA color: ONE image shared by every slot, so the slot
+                // timeline wait does not prove it idle — the previous frame
+                // (another slot, possibly still on the GPU) wrote it and its
+                // AVERAGE resolve read it. Src COLOR_ATTACHMENT_OUTPUT /
+                // COLOR_ATTACHMENT_WRITE orders this discard after both
+                // (attachment writes and resolves run in that stage).
                 // Dst COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE.
-                // Old UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
+                // Old UNDEFINED → COLOR_ATTACHMENT_OPTIMAL: contents are
+                // cleared or fully covered by the sky every frame.
                 image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
                     .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
                     .old_layout(vk::ImageLayout::UNDEFINED)
