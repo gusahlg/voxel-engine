@@ -74,10 +74,11 @@ pub(crate) struct FarBodyGpu {
     pub seed: [u32; 4],
 }
 
-/// Mask words in the GPU table. `shaders/far_body.slang` `tile_mask` is this
-/// long. 8192 tiles cover 7680×4320 at 64 px; a larger render extent uses a
-/// coarser tile so the count still fits.
+/// Mask words in the GPU table. `tile_mask` in `shaders/far_table.slang` is
+/// sized by the generated twin. 8192 tiles cover 7680×4320 at 64 px; a larger
+/// render extent uses a coarser tile so the count still fits.
 const MAX_FAR_TILES: usize = 8192;
+const _: () = assert!(crate::genconst::MAX_FAR_TILES as usize == MAX_FAR_TILES);
 /// Preferred tile, in pixels. Coarsens when the grid would exceed [`MAX_FAR_TILES`].
 const TILE_FINE_PX: u32 = 64;
 const TILE_COARSE_PX: u32 = 128;
@@ -126,9 +127,11 @@ pub(crate) struct FarTableGpu {
 unsafe impl Zeroable for FarTableGpu {}
 unsafe impl Pod for FarTableGpu {}
 
-/// Bins in one azimuthal horizon table. Matches `horizon_sin` in
-/// `shaders/far_table.slang` (two tables, back to back).
+/// Bins in one azimuthal horizon table. `horizon_sin` in
+/// `shaders/far_table.slang` holds two tables, back to back, sized by the
+/// generated twin.
 const HORIZON_BINS: usize = 256;
+const _: () = assert!(crate::genconst::FAR_HORIZON_BINS as usize == HORIZON_BINS);
 /// Tables published per frame. The two Mapped bodies with the largest rho.
 const HORIZON_TABLES: usize = 2;
 /// Added to every stored sine. A sample sitting on the bound stays inside.
@@ -4325,21 +4328,22 @@ mod tests {
 
     #[test]
     fn shader_tile_mask_length_matches_the_host_cap() {
+        // The arrays are sized by the generated constants, and each Rust twin
+        // is asserted equal to its generated value at compile time.
         let src = include_str!("../../shaders/far_table.slang");
-        let mask = format!("uint tile_mask[{MAX_FAR_TILES}]");
-        let index = format!("uint tile_index[{MAX_FAR_TILES}]");
-        assert!(
-            src.contains(&mask),
-            "shader tile_mask length drifted from {MAX_FAR_TILES}"
-        );
-        assert!(
-            src.contains(&index),
-            "shader tile_index length drifted from {MAX_FAR_TILES}"
-        );
+        for decl in [
+            "float4 cone[MAX_FAR_BODIES]",
+            "FarGpu body[MAX_FAR_BODIES]",
+            "uint tile_mask[MAX_FAR_TILES]",
+            "uint tile_index[MAX_FAR_TILES]",
+        ] {
+            assert!(src.contains(decl), "far_table.slang has no `{decl}`");
+        }
         assert!(src.contains("uint4 list_header"));
+        let horizon = format!("float horizon_sin[{HORIZON_TABLES} * FAR_HORIZON_BINS]");
         assert!(
-            src.contains("float horizon_sin[512]"),
-            "horizon table length drifted from 2 * {HORIZON_BINS}"
+            src.contains(&horizon),
+            "horizon table length drifted from {HORIZON_TABLES} * {HORIZON_BINS}"
         );
         assert!(src.contains("uint4 horizon_id"));
         let vert = include_str!("../../shaders/sky_tile.vert.slang");

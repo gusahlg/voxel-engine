@@ -1878,4 +1878,37 @@ fn mirror_constants_match_the_shader() {
         T_FAR.to_bits(),
         "far_ray_cube far t"
     );
+
+    // Composite start depth. The single-mapped variant tests its hit and limb
+    // against the same value the loop starts `bestDepth` at, so a mapsolo tile
+    // keeps the loop's pixels.
+    let solo = shader_fn(src, "float4 far_mapped_solo(");
+    let sentinels = literals_after(src, "float bestDepth = ");
+    let solo_tests = literals_after(solo, "distance < ");
+    assert_eq!(solo_tests.len(), 2, "far_mapped_solo depth tests");
+    for lit in sentinels.into_iter().chain(solo_tests) {
+        assert_eq!(float_bits(lit), T_FAR.to_bits(), "far depth sentinel");
+    }
+}
+
+/// The shaders size the far table and the map arrays with generated constants
+/// whose Rust twins are asserted equal at compile time. The cube sampler
+/// switch is still written out by hand: one constant-index arm per map slot.
+#[test]
+fn shader_map_slots_match_the_host() {
+    let src = include_str!("../../shaders/far_body.slang");
+    assert!(src.contains("SamplerCube farAlbedo[MAX_FAR_MAPS];"));
+    let cube = shader_fn(src, "float3 far_cube(");
+    let guards: Vec<u32> = literals_after(cube, "if (map == ")
+        .into_iter()
+        .map(uint)
+        .collect();
+    let expect: Vec<u32> = (0..MAX_FAR_MAPS as u32 - 1).collect();
+    assert_eq!(guards, expect, "far_cube guards");
+    let arms: Vec<u32> = literals_after(cube, "farAlbedo[")
+        .into_iter()
+        .map(uint)
+        .collect();
+    let expect: Vec<u32> = (0..MAX_FAR_MAPS as u32).collect();
+    assert_eq!(arms, expect, "far_cube arms");
 }

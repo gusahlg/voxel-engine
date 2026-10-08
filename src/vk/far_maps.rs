@@ -42,7 +42,11 @@ const DATUM_CONSUMER: CopyConsumer = (
 const MAX_G: usize = 65;
 /// Floats reserved for one map, including the padding past a smaller `g`.
 const SLOT_FLOATS: usize = 6 * MAX_G * MAX_G;
-const HEADER_UINTS: usize = MAX_FAR_MAPS * 8;
+/// Words in one map header. `shaders/far_body.slang` indexes the headers with
+/// the generated twin.
+const HEADER_STRIDE: usize = 8;
+const _: () = assert!(crate::genconst::FAR_MAP_HEADER_STRIDE as usize == HEADER_STRIDE);
+const HEADER_UINTS: usize = MAX_FAR_MAPS * HEADER_STRIDE;
 const BUFFER_UINTS: usize = HEADER_UINTS + MAX_FAR_MAPS * SLOT_FLOATS;
 /// Six cube faces, bit `f` for face `f`.
 const FACE_MASK: u32 = 0b11_1111;
@@ -645,7 +649,7 @@ impl FarMaps {
 
     fn write_header(&mut self, id: usize) {
         let slot = &self.slots[id];
-        let b = id * 8;
+        let b = id * HEADER_STRIDE;
         self.words[b] = slot.g;
         self.words[b + 1] = (id * SLOT_FLOATS) as u32;
         self.words[b + 2] = slot.min_off.to_bits();
