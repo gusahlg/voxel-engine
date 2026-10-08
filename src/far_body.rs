@@ -24,6 +24,12 @@ pub const MAX_FAR_BODIES: usize = 32;
 /// Datum-mapped planets the sky pass can hold at once.
 pub const MAX_FAR_MAPS: usize = 8;
 
+// The sky shaders size the far table and the map arrays with the generated
+// twins. A tile mask word has one bit per kept body.
+const _: () = assert!(crate::genconst::MAX_FAR_BODIES as usize == MAX_FAR_BODIES);
+const _: () = assert!(MAX_FAR_BODIES <= u32::BITS as usize);
+const _: () = assert!(crate::genconst::MAX_FAR_MAPS as usize == MAX_FAR_MAPS);
+
 /// Slot of one datum and its albedo cube. Valid ids are `0..`[`MAX_FAR_MAPS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FarMapId(pub u8);

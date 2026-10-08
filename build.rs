@@ -464,13 +464,14 @@ const SLANG_CONST_ALLOWLIST: &[(&str, &str)] = &[
     (
         "FAR_MAP_FTOL",
         "shallow-slope settle tolerance of the fixed-point mapped march, the \
-         same value as MAPPED_F_TOL in src/far_body.rs. A search limit, not a \
-         scene tunable",
+         same value as MAPPED_F_TOL in src/far_body/mirror.rs (pinned by \
+         mirror_constants_match_the_shader). A search limit, not a scene tunable",
     ),
     (
         "FAR_MAP_CAP",
         "datum samples of the fixed-point mapped march, the same cap as \
-         MAPPED_EVAL_CAP in src/far_body.rs. A search limit, not a scene tunable",
+         MAPPED_EVAL_CAP in src/far_body/mirror.rs (pinned by \
+         mirror_constants_match_the_shader). A search limit, not a scene tunable",
     ),
 ];
 
@@ -1140,6 +1141,33 @@ fn build_table() -> Vec<Def> {
             name: "GLOW_SCALE",
             doc: "HDR emissive scale for MaterialDesc.glow: after lighting, add\n(glow/255) * GLOW_SCALE * albedo. Default 4.0. Read by mesh3d.frag via material.slang.",
             val: Val::Scalar(4.0),
+        },
+        // Far-body buffer layout: far_table.slang and far_body.slang size their
+        // arrays and index math with these. Each Rust twin asserts it is equal.
+        Def {
+            name: "MAX_FAR_BODIES",
+            doc: "Far bodies kept per frame: the FarTable cone and body arrays, and the\nbodies a tile mask word can name. Twin of far_body::MAX_FAR_BODIES.",
+            val: Val::UInt(32),
+        },
+        Def {
+            name: "MAX_FAR_MAPS",
+            doc: "Datum-map slots: the farAlbedo cube array and the map headers at the\nstart of the farMaps buffer. Twin of far_body::MAX_FAR_MAPS.",
+            val: Val::UInt(8),
+        },
+        Def {
+            name: "FAR_MAP_HEADER_STRIDE",
+            doc: "uints in one map header of the farMaps buffer. The datum floats start\nafter MAX_FAR_MAPS headers. Twin of HEADER_STRIDE in vk/far_maps.rs.",
+            val: Val::UInt(8),
+        },
+        Def {
+            name: "FAR_HORIZON_BINS",
+            doc: "Azimuth bins in one far-body horizon table. FarTable.horizon_sin holds\ntwo tables. Twin of HORIZON_BINS in vk/far_bodies.rs.",
+            val: Val::UInt(256),
+        },
+        Def {
+            name: "MAX_FAR_TILES",
+            doc: "Screen tiles in the FarTable tile_mask and tile_index arrays.\nTwin of MAX_FAR_TILES in vk/far_bodies.rs.",
+            val: Val::UInt(8192),
         },
     ]
 }
