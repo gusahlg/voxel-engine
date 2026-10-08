@@ -9,7 +9,7 @@ use super::device::Anisotropy;
 use super::image::color_range;
 use super::image_upload::{ImageUpload, upload_image};
 use super::timeline::TimelineValue;
-use super::transfer::{TransferCtx, TransferLane, UploadRetire};
+use super::transfer::{Tier, TransferCtx, TransferLane, UploadRetire};
 
 /// Floor on allocated array layers so mid-game palette growth does not
 /// recreate the image. Capped by `limits.maxImageArrayLayers`.
@@ -31,7 +31,7 @@ pub struct BlockTextures {
     mip_levels: u32,
     /// CPU palette; used for diffs and for a capacity-overflow rebuild.
     layer_pixels: Vec<Vec<u8>>,
-    /// High-water of layers written on the GPU (sampled vs never sampled).
+    /// High-water of layers written on the GPU: the prefix a grow copies.
     /// All `capacity` layers rest in SHADER_READ_ONLY after creation.
     written: u32,
     pending: Vec<PendingLayer>,
@@ -190,6 +190,130 @@ pub(crate) fn grow_transition_plan(
         init_layer_count: capacity,
         dst_runs: consecutive_runs(dst),
         src_layer_count: copied,
+    }
+}
+
+/// Barriers of one in-place layer upload, one per run of layers.
+///
+/// - `DedicatedFamily`: graphics releases the layers (after the frames that
+///   sampled them), the lane acquires them, copies and releases them back,
+///   and the recording frame acquires them before its first draw. Each
+///   release/acquire pair has the same families, layouts and ranges.
+/// - `SecondQueueSameFamily`: no ownership changes. The lane waits for the
+///   last submitted frame and transitions to `TRANSFER_DST` and back; the
+///   recording frame waits on the lane.
+/// - `SameQueueFallback`: both transitions are in the frame command buffer,
+///   after the fragment reads of earlier frames.
+struct LayerUploadBarriers {
+    /// Graphics-side release, submitted before the lane batch.
+    release: Vec<vk::ImageMemoryBarrier2<'static>>,
+    /// `SHADER_READ` → `TRANSFER_DST` where the copies are recorded.
+    to_dst: Vec<vk::ImageMemoryBarrier2<'static>>,
+    /// `TRANSFER_DST` → `SHADER_READ` after the copies.
+    to_sampled: Vec<vk::ImageMemoryBarrier2<'static>>,
+    /// Graphics-side acquire in the recording frame.
+    acquire: Vec<vk::ImageMemoryBarrier2<'static>>,
+}
+
+fn layer_upload_barriers(
+    image: vk::Image,
+    mip_levels: u32,
+    runs: &[(u32, u32)],
+    tier: Tier,
+    graphics_family: u32,
+    lane_family: u32,
+) -> LayerUploadBarriers {
+    let qfot = tier == Tier::DedicatedFamily;
+    let separate = tier != Tier::SameQueueFallback;
+    let each =
+        |make: &dyn Fn(vk::ImageMemoryBarrier2<'static>) -> vk::ImageMemoryBarrier2<'static>| {
+            runs.iter()
+                .map(|&(base, count)| {
+                    make(
+                        vk::ImageMemoryBarrier2::default()
+                            .image(image)
+                            .subresource_range(color_range(0, mip_levels, base, count)),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+    let families = |b: vk::ImageMemoryBarrier2<'static>, src: u32, dst: u32| {
+        if qfot {
+            b.src_queue_family_index(src).dst_queue_family_index(dst)
+        } else {
+            b
+        }
+    };
+    let into_lane = |b: vk::ImageMemoryBarrier2<'static>| {
+        families(
+            b.old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+            graphics_family,
+            lane_family,
+        )
+    };
+    let into_graphics = |b: vk::ImageMemoryBarrier2<'static>| {
+        families(
+            b.old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            lane_family,
+            graphics_family,
+        )
+    };
+    let release = if qfot {
+        each(&|b| {
+            into_lane(b)
+                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                .dst_access_mask(vk::AccessFlags2::NONE)
+        })
+    } else {
+        Vec::new()
+    };
+    let to_dst = each(&|b| {
+        let b = into_lane(b)
+            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
+        if separate {
+            // Chains on the lane's semaphore wait at `COPY`.
+            b.src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::NONE)
+        } else {
+            b.src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+        }
+    });
+    let to_sampled = each(&|b| {
+        let b = into_graphics(b)
+            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
+        if separate {
+            // The frame's semaphore wait on the lane makes the texels visible.
+            b.dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                .dst_access_mask(vk::AccessFlags2::NONE)
+        } else {
+            b.dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+        }
+    });
+    let acquire = if qfot {
+        // Chains on the frame's lane wait, which includes these stages.
+        each(&|b| {
+            into_graphics(b)
+                .src_stage_mask(BLOCK_TEXTURE_CONSUMER_STAGES)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+        })
+    } else {
+        Vec::new()
+    };
+    LayerUploadBarriers {
+        release,
+        to_dst,
+        to_sampled,
+        acquire,
     }
 }
 
@@ -373,9 +497,11 @@ impl BlockTextures {
             && layer_count <= self.capacity
     }
 
-    /// Pending writes to layers the GPU already sampled (need overwrite sync).
+    /// Pending in-place layer writes. Every layer, written or not, is in the
+    /// view earlier frames sample, so the frame loop submits those frames
+    /// before [`Self::flush`] orders the upload after them.
     pub fn has_overwrite_pending(&self) -> bool {
-        self.pending.iter().any(|p| p.index < self.written)
+        !self.pending.is_empty()
     }
 
     pub fn has_garbage(&self) -> bool {
@@ -530,16 +656,6 @@ impl BlockTextures {
         }
         let mut pending = std::mem::take(&mut self.pending);
         pending.sort_by_key(|p| p.index);
-        let overwrite: Vec<u32> = pending
-            .iter()
-            .filter(|p| p.index < self.written)
-            .map(|p| p.index)
-            .collect();
-        let fresh: Vec<u32> = pending
-            .iter()
-            .filter(|p| p.index >= self.written)
-            .map(|p| p.index)
-            .collect();
 
         let device = ctx.device;
         let graphics_cmd = ctx.graphics_cmd;
@@ -554,41 +670,37 @@ impl BlockTextures {
         );
 
         let separate_queue = ctx.lane.is_separate_queue();
-        let needs_qfot = ctx.lane.needs_ownership_transfer();
-        let mip_levels = self.mip_levels;
         let image = self.image;
+        // Every pending layer is ordered like an overwrite: the sampled view
+        // spans the whole capacity, so earlier frames access fresh layers too
+        // (VUID-vkCmdDraw-None-09600). The frame loop has submitted those
+        // frames (`has_overwrite_pending`); the lane waits for them below.
+        let runs = consecutive_runs(pending.iter().map(|p| p.index).collect());
+        let barriers = layer_upload_barriers(
+            image,
+            self.mip_levels,
+            &runs,
+            ctx.lane.tier(),
+            graphics_family,
+            ctx.lane.family(),
+        );
 
-        let extra_wait = if !overwrite.is_empty() && needs_qfot {
-            // Release the sampled layers on graphics so the lane can acquire them.
-            let mut release = Vec::new();
-            for (base, count) in consecutive_runs(overwrite.clone()) {
-                release.push(
-                    vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                        .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                        .dst_access_mask(vk::AccessFlags2::NONE)
-                        .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                        .src_queue_family_index(graphics_family)
-                        .dst_queue_family_index(ctx.lane.family())
-                        .image(image)
-                        .subresource_range(color_range(0, mip_levels, base, count)),
-                );
-            }
+        // What the lane waits for before its first barrier, which chains on
+        // the wait's stage (`COPY`).
+        let extra_wait = if !barriers.release.is_empty() {
             Some(unsafe {
                 self.retire.submit_release(
                     device,
                     ctx.graphics_queue,
                     done_at,
-                    &vk::DependencyInfo::default().image_memory_barriers(&release),
+                    &vk::DependencyInfo::default().image_memory_barriers(&barriers.release),
                 )
             })
-        } else if !overwrite.is_empty() && separate_queue {
+        } else if separate_queue {
             Some((
                 ctx.graphics_timeline.semaphore(),
                 ctx.last_render_value,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::PipelineStageFlags2::COPY,
             ))
         } else {
             None
@@ -597,69 +709,11 @@ impl BlockTextures {
         let lane = &mut *ctx.lane;
         let lane_batch = separate_queue.then(|| unsafe { lane.begin(device) });
         let record_cmd = lane_batch.as_ref().map_or(graphics_cmd, |b| b.cmd());
-
-        let mut to_dst = Vec::new();
-        if needs_qfot {
-            for (base, count) in consecutive_runs(overwrite.clone()) {
-                to_dst.push(
-                    vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                        .src_access_mask(vk::AccessFlags2::NONE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                        .src_queue_family_index(graphics_family)
-                        .dst_queue_family_index(lane.family())
-                        .image(image)
-                        .subresource_range(color_range(0, mip_levels, base, count)),
-                );
-            }
-        } else {
-            let src_stage = if separate_queue {
-                vk::PipelineStageFlags2::NONE
-            } else {
-                vk::PipelineStageFlags2::FRAGMENT_SHADER
-            };
-            let src_access = if separate_queue {
-                vk::AccessFlags2::NONE
-            } else {
-                vk::AccessFlags2::SHADER_SAMPLED_READ
-            };
-            for (base, count) in consecutive_runs(overwrite.clone()) {
-                to_dst.push(
-                    vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(src_stage)
-                        .src_access_mask(src_access)
-                        .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                        .image(image)
-                        .subresource_range(color_range(0, mip_levels, base, count)),
-                );
-            }
-        }
-        for (base, count) in consecutive_runs(fresh.clone()) {
-            to_dst.push(
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .image(image)
-                    .subresource_range(color_range(0, mip_levels, base, count)),
-            );
-        }
         unsafe {
-            if !to_dst.is_empty() {
-                device.cmd_pipeline_barrier2(
-                    record_cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&to_dst),
-                );
-            }
+            device.cmd_pipeline_barrier2(
+                record_cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&barriers.to_dst),
+            );
             for (_index, regions) in &packed.per_layer {
                 device.cmd_copy_buffer_to_image(
                     record_cmd,
@@ -669,71 +723,20 @@ impl BlockTextures {
                     regions,
                 );
             }
-        }
-
-        let all_indices: Vec<u32> = pending.iter().map(|p| p.index).collect();
-        let mut to_sampled = Vec::new();
-        for (base, count) in consecutive_runs(all_indices) {
-            let mut b = vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image(image)
-                .subresource_range(color_range(0, mip_levels, base, count));
-            if needs_qfot {
-                b = b
-                    .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .dst_access_mask(vk::AccessFlags2::NONE)
-                    .src_queue_family_index(lane.family())
-                    .dst_queue_family_index(graphics_family);
-            } else if separate_queue {
-                b = b
-                    .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .dst_access_mask(vk::AccessFlags2::NONE);
-            } else {
-                b = b
-                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ);
-            }
-            to_sampled.push(b);
-        }
-        unsafe {
-            if !to_sampled.is_empty() {
-                device.cmd_pipeline_barrier2(
-                    record_cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
-                );
-            }
+            device.cmd_pipeline_barrier2(
+                record_cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&barriers.to_sampled),
+            );
         }
 
         let arrived_at = if let Some(lane_batch) = lane_batch {
             let value = unsafe { lane.submit_after(device, lane_batch, extra_wait) };
-            if needs_qfot {
-                let mut acquire = Vec::new();
-                let uploaded: Vec<u32> = pending.iter().map(|p| p.index).collect();
-                for (base, count) in consecutive_runs(uploaded) {
-                    acquire.push(
-                        vk::ImageMemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                            .src_access_mask(vk::AccessFlags2::NONE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                            .src_queue_family_index(lane.family())
-                            .dst_queue_family_index(graphics_family)
-                            .image(image)
-                            .subresource_range(color_range(0, mip_levels, base, count)),
-                    );
-                }
+            if !barriers.acquire.is_empty() {
                 unsafe {
-                    if !acquire.is_empty() {
-                        device.cmd_pipeline_barrier2(
-                            graphics_cmd,
-                            &vk::DependencyInfo::default().image_memory_barriers(&acquire),
-                        );
-                    }
+                    device.cmd_pipeline_barrier2(
+                        graphics_cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&barriers.acquire),
+                    );
                 }
             }
             self.retire.retire_on_lane(value, (staging, staging_mem));
@@ -1143,6 +1146,183 @@ mod tests {
         GrowTransitionPlan, MIN_LAYER_CAPACITY, build_mip_chain, changed_layer_indices,
         consecutive_runs, grow_plan, grow_transition_plan, layer_capacity,
     };
+
+    mod upload_barriers {
+        use super::super::{BLOCK_TEXTURE_CONSUMER_STAGES, layer_upload_barriers};
+        use crate::vk::transfer::Tier;
+        use ash::vk::{self, Handle};
+
+        const GRAPHICS: u32 = 0;
+        const LANE: u32 = 1;
+        const RUNS: [(u32, u32); 2] = [(1, 1), (4, 3)];
+        const MIPS: u32 = 5;
+
+        /// What both halves of an ownership transfer must agree on.
+        fn transfer_key(
+            b: &vk::ImageMemoryBarrier2<'_>,
+        ) -> (vk::ImageLayout, vk::ImageLayout, u32, u32, u64, [u32; 5]) {
+            let r = b.subresource_range;
+            (
+                b.old_layout,
+                b.new_layout,
+                b.src_queue_family_index,
+                b.dst_queue_family_index,
+                b.image.as_raw(),
+                [
+                    r.aspect_mask.as_raw(),
+                    r.base_mip_level,
+                    r.level_count,
+                    r.base_array_layer,
+                    r.layer_count,
+                ],
+            )
+        }
+
+        fn stages(b: &vk::ImageMemoryBarrier2<'_>) -> [u64; 4] {
+            [
+                b.src_stage_mask.as_raw(),
+                b.src_access_mask.as_raw(),
+                b.dst_stage_mask.as_raw(),
+                b.dst_access_mask.as_raw(),
+            ]
+        }
+
+        fn build(tier: Tier) -> super::super::LayerUploadBarriers {
+            layer_upload_barriers(vk::Image::from_raw(9), MIPS, &RUNS, tier, GRAPHICS, LANE)
+        }
+
+        fn assert_runs(barriers: &[vk::ImageMemoryBarrier2<'_>]) {
+            assert_eq!(barriers.len(), RUNS.len());
+            for (b, &(base, count)) in barriers.iter().zip(&RUNS) {
+                let r = b.subresource_range;
+                assert_eq!(r.aspect_mask, vk::ImageAspectFlags::COLOR);
+                assert_eq!((r.base_mip_level, r.level_count), (0, MIPS));
+                assert_eq!((r.base_array_layer, r.layer_count), (base, count));
+            }
+        }
+
+        #[test]
+        fn dedicated_family_halves_match_and_chain_on_the_waits() {
+            let b = build(Tier::DedicatedFamily);
+            for set in [&b.release, &b.to_dst, &b.to_sampled, &b.acquire] {
+                assert_runs(set);
+            }
+            for i in 0..RUNS.len() {
+                // Graphics → lane: release and acquire are the same transfer.
+                assert_eq!(transfer_key(&b.release[i]), transfer_key(&b.to_dst[i]));
+                assert_eq!(
+                    (b.release[i].old_layout, b.release[i].new_layout),
+                    (
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL
+                    )
+                );
+                assert_eq!(
+                    (
+                        b.release[i].src_queue_family_index,
+                        b.release[i].dst_queue_family_index
+                    ),
+                    (GRAPHICS, LANE)
+                );
+                // Lane → graphics.
+                assert_eq!(transfer_key(&b.to_sampled[i]), transfer_key(&b.acquire[i]));
+                assert_eq!(
+                    (b.acquire[i].old_layout, b.acquire[i].new_layout),
+                    (
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                    )
+                );
+                assert_eq!(
+                    (
+                        b.acquire[i].src_queue_family_index,
+                        b.acquire[i].dst_queue_family_index
+                    ),
+                    (LANE, GRAPHICS)
+                );
+                // Release after earlier fragment reads; lane acquire chains on
+                // its `COPY` wait; frame acquire on its fragment-stage wait.
+                assert_eq!(
+                    stages(&b.release[i]),
+                    stages(
+                        &vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                            .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    )
+                );
+                assert_eq!(b.to_dst[i].src_stage_mask, vk::PipelineStageFlags2::COPY);
+                assert_eq!(b.acquire[i].src_stage_mask, BLOCK_TEXTURE_CONSUMER_STAGES);
+                assert_eq!(
+                    b.acquire[i].dst_access_mask,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ
+                );
+            }
+        }
+
+        #[test]
+        fn same_family_tiers_move_no_ownership() {
+            for tier in [Tier::SecondQueueSameFamily, Tier::SameQueueFallback] {
+                let b = build(tier);
+                assert!(b.release.is_empty() && b.acquire.is_empty());
+                assert_runs(&b.to_dst);
+                assert_runs(&b.to_sampled);
+                for barrier in b.to_dst.iter().chain(&b.to_sampled) {
+                    assert_eq!(
+                        barrier.src_queue_family_index,
+                        barrier.dst_queue_family_index
+                    );
+                }
+                for (to_dst, to_sampled) in b.to_dst.iter().zip(&b.to_sampled) {
+                    assert_eq!(
+                        (to_dst.old_layout, to_dst.new_layout),
+                        (
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL
+                        )
+                    );
+                    assert_eq!(
+                        (to_sampled.old_layout, to_sampled.new_layout),
+                        (
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                        )
+                    );
+                }
+            }
+            // Second queue: chains on the lane's `COPY` wait; the frame waits
+            // on the lane. Same queue: ordered against fragment reads.
+            let second = build(Tier::SecondQueueSameFamily);
+            assert_eq!(
+                second.to_dst[0].src_stage_mask,
+                vk::PipelineStageFlags2::COPY
+            );
+            assert_eq!(
+                second.to_sampled[0].dst_stage_mask,
+                vk::PipelineStageFlags2::NONE
+            );
+            let same = build(Tier::SameQueueFallback);
+            assert_eq!(
+                (
+                    same.to_dst[0].src_stage_mask,
+                    same.to_dst[0].src_access_mask
+                ),
+                (
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ
+                )
+            );
+            assert_eq!(
+                (
+                    same.to_sampled[0].dst_stage_mask,
+                    same.to_sampled[0].dst_access_mask
+                ),
+                (
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ
+                )
+            );
+        }
+    }
 
     #[test]
     fn capacity_is_next_power_of_two_at_least_64_capped_by_device() {
