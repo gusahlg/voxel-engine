@@ -5,6 +5,8 @@
 /// offscreen image. Recreated on resize and on MSAA changes.
 use ash::vk;
 
+use crate::switches::{Switch, on_if_set_nonzero};
+
 use super::SampleCount;
 use super::buffers::FRAMES_IN_FLIGHT;
 use super::image::{
@@ -721,9 +723,11 @@ impl RenderTargets {
 /// (first [`RenderTargets::new`]); not a public API. Any value other than
 /// `"0"` enables the packed 11-bit offscreen attempt.
 fn hdr_11bit_requested() -> bool {
-    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *REQUESTED.get_or_init(|| std::env::var("VOXEL_HDR_11BIT").is_ok_and(|v| v != "0"))
+    VOXEL_HDR_11BIT.get()
 }
+
+/// Read by [`hdr_11bit_requested`].
+pub(crate) static VOXEL_HDR_11BIT: Switch<bool> = Switch::new("VOXEL_HDR_11BIT", on_if_set_nonzero);
 
 /// Optimal-tiling features the HDR offscreen (and MSAA color, when present)
 /// actually use: rendered into, blended (transparent/water/debug/HUD), and

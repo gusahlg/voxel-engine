@@ -439,3 +439,12 @@ static const uint FAR_HORIZON_BINS = 256;
 // Twin of MAX_FAR_TILES in vk/far_bodies.rs.
 static const uint MAX_FAR_TILES = 8192;
 
+// Smallest FarShape::Rounded exponent (2 is the sphere). The host drops a
+// body below it; the sky clamps p into [FAR_ROUNDED_P_MIN, FAR_ROUNDED_P_MAX].
+static const float FAR_ROUNDED_P_MIN = 2.0f;
+
+// Largest FarShape::Rounded exponent the sky draws. A larger p draws this
+// shape: the march, the normal, the air rim and the host cone bound all clamp
+// to it, so the rim stays on the drawn corners and inside the cone.
+static const float FAR_ROUNDED_P_MAX = 32.0f;
+

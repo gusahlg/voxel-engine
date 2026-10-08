@@ -11,17 +11,21 @@ use std::sync::OnceLock;
 
 use ash::vk;
 
+use crate::switches::Switch;
+
 pub(crate) type Loader = ash::khr::pipeline_executable_properties::Device;
+
+/// `VOXEL_SHADER_STATS`: unset or `0` is 0, `2` is 2, any other value is 1.
+pub(crate) static VOXEL_SHADER_STATS: Switch<u8> =
+    Switch::new("VOXEL_SHADER_STATS", |raw| match raw {
+        None | Some("0") => 0,
+        Some("2") => 2,
+        Some(_) => 1,
+    });
 
 /// `0` off, `1` statistics, `2` statistics plus internal representations.
 pub(crate) fn mode() -> u8 {
-    static MODE: OnceLock<u8> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VOXEL_SHADER_STATS") {
-        Ok(v) if v == "0" => 0,
-        Ok(v) if v == "2" => 2,
-        Ok(_) => 1,
-        Err(_) => 0,
-    })
+    VOXEL_SHADER_STATS.get()
 }
 
 pub(crate) fn enabled() -> bool {

@@ -5,7 +5,8 @@
 
 use glam::{Quat, Vec3};
 
-use super::far_map_basis;
+use super::{far_map_basis, rounded_bound, rounded_p};
+use crate::genconst::FAR_ROUNDED_P_MIN;
 
 /// A hit in normalised space. `t` is along the unit view ray. `normal` is world
 /// space. `face` is the cube face (0 = +X … 5 = −Z), the dominant axis of a
@@ -240,11 +241,25 @@ fn rounded_at(
     })
 }
 
+/// Relative width of a rounded body's air rim.
+pub(super) const RIM_WIDTH: f32 = 0.05;
+/// Floor on that width, in pixel angles.
+pub(super) const RIM_MIN_PX: f32 = 1.25;
+
+/// Sines `(inner, outer)` of a rounded body's air rim at pixel angle `px`. A
+/// ray that misses the solid takes the rim when `inner < ‖ray × dir‖ < outer`.
+/// Mirror of the rounded rim in `far_add_rgb` and the two pass-1 rim gates.
+pub(crate) fn rounded_rim_band(rho: f32, exponent: f32, px: f32) -> (f32, f32) {
+    let rho_b = rounded_bound(rho, exponent);
+    let width = (rho_b * RIM_WIDTH).max(px * RIM_MIN_PX);
+    (rho_b, rho_b + width)
+}
+
 /// Ray from the origin against the superellipsoid of face radius `rho` centred
-/// on unit `dir`. `exponent` is p ≥ 2. The enclosing sphere is
-/// `rho · 3^(1/2 − 1/p)`, padded a hair so its entry stays outside the solid.
-/// A miss that merely grazes that sphere, where the sphere lies on the body,
-/// reports the sphere point rather than a hole.
+/// on unit `dir`. `exponent` is p ≥ 2, drawn as [`rounded_p`]. The enclosing
+/// sphere is [`rounded_bound`], padded a hair so its entry stays outside the
+/// solid. A miss that merely grazes that sphere, where the sphere lies on the
+/// body, reports the sphere point rather than a hole.
 pub(crate) fn ray_rounded(
     ray: Vec3,
     dir: Vec3,
@@ -253,16 +268,16 @@ pub(crate) fn ray_rounded(
     exponent: f32,
 ) -> Option<FarHit> {
     if !(rho > 0.0 && rho < 1.0)
-        || !(exponent >= 2.0)
+        || !(exponent >= FAR_ROUNDED_P_MIN)
         || !exponent.is_finite()
         || !ray.is_finite()
         || !dir.is_finite()
     {
         return None;
     }
-    let p = exponent.clamp(2.0, 32.0);
+    let p = rounded_p(exponent);
     // Exact bound, then a hair so `pow` cannot place the entry inside a corner.
-    let rho_b = rho * 3.0f32.powf(0.5 - 1.0 / p) * (1.0 + ROUNDED_BOUND_PAD);
+    let rho_b = rounded_bound(rho, exponent) * (1.0 + ROUNDED_BOUND_PAD);
     let facing = ray.dot(dir);
     let disc = facing * facing - (1.0 - rho_b * rho_b);
     if !(disc >= 0.0) || !disc.is_finite() {

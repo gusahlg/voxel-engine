@@ -17,6 +17,7 @@ use crate::genconst::{
     GLOW_EDGE0, GLOW_EDGE1, GLOW_POW_DAY, GLOW_POW_SUNSET, SHADOW_BOUNCE_TINT, SHADOW_SKY_AMBIENT,
 };
 use crate::rev::{FrameSlot, PerSlot};
+use crate::switches::{Switch, on_if_one};
 use crate::vk::buffers::HostBuffer;
 
 /// Packed into `shadow_bounce.w` as `f32::from_bits`; shaders `asuint` the lane.
@@ -122,9 +123,11 @@ impl Default for LocalFrame {
 /// Any other value, including unset, leaves the lane at 0 and the sky path
 /// unchanged. Read once.
 pub(crate) fn sky_debug_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("VOXEL_SKY_DEBUG").is_ok_and(|v| v == "1"))
+    VOXEL_SKY_DEBUG.get()
 }
+
+/// Read by [`sky_debug_enabled`].
+pub(crate) static VOXEL_SKY_DEBUG: Switch<bool> = Switch::new("VOXEL_SKY_DEBUG", on_if_one);
 
 /// Orthonormal sky basis `(tangent, up, bitangent)`.
 ///

@@ -3,8 +3,14 @@
 /// Callers don't branch on availability; only sync behavior changes by tier.
 use ash::vk;
 
+use super::mesh_residency::CopyConsumer;
 use super::retire::RetireQueue;
 use super::timeline::{Timeline, TimelineValue};
+
+/// Stage at which a lane batch waits for graphics before it overwrites data
+/// earlier frames read: the copy's own stage, so the copy and the barriers
+/// recorded before it chain on the wait.
+pub(crate) const LANE_COPY_WAIT_STAGE: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::COPY;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Tier {
@@ -422,7 +428,7 @@ impl UploadRetire {
         let sem = tmp.semaphore();
         let value = completion.value();
         self.release_cmds.push(done_at, (tmp, cmd));
-        (sem, value, vk::PipelineStageFlags2::COPY)
+        (sem, value, LANE_COPY_WAIT_STAGE)
     }
 
     /// Free graphics-side staging and release command buffers up to the
@@ -459,6 +465,152 @@ impl UploadRetire {
                 device.free_command_buffers(pool, &[cmd]);
             });
         }
+    }
+}
+
+/// Barriers of one staged copy into a storage-buffer range that graphics
+/// reads at `consumer` (the material table, the far-map datum). `overwrite`:
+/// earlier frames read the range, and the frame loop has submitted them
+/// (`has_overwrite_pending`).
+///
+/// - `DedicatedFamily`: on an overwrite, graphics releases the range after
+///   those reads and the lane acquires it, chained on its wait at
+///   [`LANE_COPY_WAIT_STAGE`]. After the copy the lane releases the range and
+///   the recording frame acquires it, chained on its lane wait at the
+///   consumer stage. Both halves of each pair have the same families and range.
+/// - `SecondQueueSameFamily`: no barriers. On an overwrite the lane waits for
+///   the last submitted frame at [`LANE_COPY_WAIT_STAGE`]; the recording frame
+///   waits on the lane.
+/// - `SameQueueFallback`: in the frame command buffer, the copy follows the
+///   earlier reads (overwrite only) and precedes this frame's reads.
+#[derive(Default)]
+pub(crate) struct BufferUploadBarriers {
+    /// Graphics-side release, submitted before the lane batch.
+    pub release: Option<vk::BufferMemoryBarrier2<'static>>,
+    /// Where the copy is recorded, before it.
+    pub before_copy: Option<vk::BufferMemoryBarrier2<'static>>,
+    /// Where the copy is recorded, after it.
+    pub after_copy: Option<vk::BufferMemoryBarrier2<'static>>,
+    /// Graphics-side acquire in the recording frame.
+    pub acquire: Option<vk::BufferMemoryBarrier2<'static>>,
+}
+
+/// `dst` is `(buffer, offset, size)`.
+pub(crate) fn buffer_upload_barriers(
+    dst: (vk::Buffer, u64, u64),
+    consumer: CopyConsumer,
+    overwrite: bool,
+    tier: Tier,
+    graphics_family: u32,
+    lane_family: u32,
+) -> BufferUploadBarriers {
+    use vk::{AccessFlags2 as A, PipelineStageFlags2 as S};
+    type B = vk::BufferMemoryBarrier2<'static>;
+    let (buffer, offset, size) = dst;
+    let range = B::default().buffer(buffer).offset(offset).size(size);
+    // First -> second synchronization scope, each (stages, accesses).
+    let scopes = |b: B, from: CopyConsumer, to: CopyConsumer| {
+        b.src_stage_mask(from.0)
+            .src_access_mask(from.1)
+            .dst_stage_mask(to.0)
+            .dst_access_mask(to.1)
+    };
+    let none = (S::NONE, A::NONE);
+    let copy = (S::COPY, A::TRANSFER_WRITE);
+    match tier {
+        Tier::DedicatedFamily => {
+            let to_lane = range
+                .src_queue_family_index(graphics_family)
+                .dst_queue_family_index(lane_family);
+            let to_graphics = range
+                .src_queue_family_index(lane_family)
+                .dst_queue_family_index(graphics_family);
+            let lane_wait = (LANE_COPY_WAIT_STAGE, A::NONE);
+            let frame_wait = (consumer.0, A::NONE);
+            BufferUploadBarriers {
+                release: overwrite.then(|| scopes(to_lane, consumer, none)),
+                before_copy: overwrite.then(|| scopes(to_lane, lane_wait, copy)),
+                after_copy: Some(scopes(to_graphics, copy, none)),
+                acquire: Some(scopes(to_graphics, frame_wait, consumer)),
+            }
+        }
+        Tier::SecondQueueSameFamily => BufferUploadBarriers::default(),
+        Tier::SameQueueFallback => BufferUploadBarriers {
+            before_copy: overwrite.then(|| scopes(range, consumer, copy)),
+            after_copy: Some(scopes(range, copy, consumer)),
+            ..BufferUploadBarriers::default()
+        },
+    }
+}
+
+/// Copy `staging` into `dst` (`(buffer, offset, size)`), a storage-buffer
+/// range graphics reads at `consumer`: on the lane, or in the frame command
+/// buffer on `SameQueueFallback`. Barriers and `overwrite` as in
+/// [`buffer_upload_barriers`]. Returns the lane value the frame must wait on
+/// at the consumer stage. Staging retires on the timeline that reads it. No
+/// host wait.
+pub(crate) unsafe fn upload_buffer_range(
+    ctx: &mut TransferCtx<'_>,
+    retire: &mut UploadRetire,
+    dst: (vk::Buffer, u64, u64),
+    staging: (vk::Buffer, vk::DeviceMemory),
+    consumer: CopyConsumer,
+    overwrite: bool,
+) -> Option<TimelineValue> {
+    let device = ctx.device;
+    let graphics_cmd = ctx.graphics_cmd;
+    let done_at = ctx.done_at;
+    let separate = ctx.lane.is_separate_queue();
+    let barriers = buffer_upload_barriers(
+        dst,
+        consumer,
+        overwrite,
+        ctx.lane.tier(),
+        ctx.graphics_family,
+        ctx.lane.family(),
+    );
+    let extra_wait = if let Some(release) = barriers.release.as_ref() {
+        let release =
+            vk::DependencyInfo::default().buffer_memory_barriers(std::slice::from_ref(release));
+        Some(unsafe { retire.submit_release(device, ctx.graphics_queue, done_at, &release) })
+    } else if separate && overwrite {
+        Some((
+            ctx.graphics_timeline.semaphore(),
+            ctx.last_render_value,
+            LANE_COPY_WAIT_STAGE,
+        ))
+    } else {
+        None
+    };
+    let lane = &mut *ctx.lane;
+    let lane_batch = separate.then(|| unsafe { lane.begin(device) });
+    let record_cmd = lane_batch.as_ref().map_or(graphics_cmd, |b| b.cmd());
+    let (buffer, offset, size) = dst;
+    let region = vk::BufferCopy::default().dst_offset(offset).size(size);
+    unsafe {
+        cmd_buffer_barrier(device, record_cmd, barriers.before_copy.as_ref());
+        device.cmd_copy_buffer(record_cmd, staging.0, buffer, &[region]);
+        cmd_buffer_barrier(device, record_cmd, barriers.after_copy.as_ref());
+    }
+    let Some(lane_batch) = lane_batch else {
+        retire.retire_on_graphics(done_at, staging);
+        return None;
+    };
+    let value = unsafe { lane.submit_after(device, lane_batch, extra_wait) };
+    unsafe { cmd_buffer_barrier(device, graphics_cmd, barriers.acquire.as_ref()) };
+    retire.retire_on_lane(value, staging);
+    Some(value)
+}
+
+pub(crate) unsafe fn cmd_buffer_barrier(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    barrier: Option<&vk::BufferMemoryBarrier2<'_>>,
+) {
+    if let Some(barrier) = barrier {
+        let dep =
+            vk::DependencyInfo::default().buffer_memory_barriers(std::slice::from_ref(barrier));
+        unsafe { device.cmd_pipeline_barrier2(cmd, &dep) };
     }
 }
 
@@ -517,5 +669,87 @@ mod tests {
         ring.reclaim(TimelineValue::from_raw_for_test(5));
         ring.reclaim(TimelineValue::from_raw_for_test(5));
         assert_eq!(ring.take_free(), Some(1));
+    }
+
+    mod buffer_upload {
+        use super::super::{
+            BufferUploadBarriers, LANE_COPY_WAIT_STAGE, Tier, buffer_upload_barriers,
+        };
+        use ash::vk::{self, AccessFlags2 as A, Handle, PipelineStageFlags2 as S};
+
+        const GRAPHICS: u32 = 0;
+        const LANE: u32 = 1;
+        const STAGE: S = S::FRAGMENT_SHADER;
+        const READS: A = A::SHADER_STORAGE_READ;
+
+        fn build(tier: Tier, overwrite: bool) -> BufferUploadBarriers {
+            let dst = (vk::Buffer::from_raw(7), 256, 1024);
+            buffer_upload_barriers(dst, (STAGE, READS), overwrite, tier, GRAPHICS, LANE)
+        }
+
+        /// Families and range: what both halves of a transfer must agree on.
+        fn key(b: Option<vk::BufferMemoryBarrier2<'_>>) -> (u32, u32, u64, u64, u64) {
+            let b = b.expect("barrier present");
+            let families = (b.src_queue_family_index, b.dst_queue_family_index);
+            (families.0, families.1, b.buffer.as_raw(), b.offset, b.size)
+        }
+
+        fn stages(b: Option<vk::BufferMemoryBarrier2<'_>>) -> (S, A, S, A) {
+            let b = b.expect("barrier present");
+            (
+                b.src_stage_mask,
+                b.src_access_mask,
+                b.dst_stage_mask,
+                b.dst_access_mask,
+            )
+        }
+
+        #[test]
+        fn dedicated_family_halves_match_and_chain_on_the_waits() {
+            let b = build(Tier::DedicatedFamily, true);
+            assert_eq!(key(b.release), (GRAPHICS, LANE, 7, 256, 1024));
+            assert_eq!(key(b.release), key(b.before_copy));
+            assert_eq!(key(b.after_copy), (LANE, GRAPHICS, 7, 256, 1024));
+            assert_eq!(key(b.after_copy), key(b.acquire));
+            // Release after earlier reads; the lane acquire chains on the
+            // lane's wait (`COPY`), the frame acquire on the frame's lane
+            // wait (the consumer stage).
+            assert_eq!(stages(b.release), (STAGE, READS, S::NONE, A::NONE));
+            assert_eq!(LANE_COPY_WAIT_STAGE, S::COPY);
+            let lane_acquire = (LANE_COPY_WAIT_STAGE, A::NONE, S::COPY, A::TRANSFER_WRITE);
+            assert_eq!(stages(b.before_copy), lane_acquire);
+            let lane_release = (S::COPY, A::TRANSFER_WRITE, S::NONE, A::NONE);
+            assert_eq!(stages(b.after_copy), lane_release);
+            assert_eq!(stages(b.acquire), (STAGE, A::NONE, STAGE, READS));
+            // First upload: nothing to take from graphics.
+            let first = build(Tier::DedicatedFamily, false);
+            assert!(first.release.is_none() && first.before_copy.is_none());
+            assert_eq!(stages(first.after_copy), lane_release);
+            assert_eq!(key(first.after_copy), key(first.acquire));
+            assert_eq!(stages(first.acquire), stages(b.acquire));
+        }
+
+        #[test]
+        fn same_family_tiers_move_no_ownership() {
+            for overwrite in [false, true] {
+                // Ordered by the lane wait and the frame's wait on the lane.
+                let second = build(Tier::SecondQueueSameFamily, overwrite);
+                assert!(second.release.is_none() && second.before_copy.is_none());
+                assert!(second.after_copy.is_none() && second.acquire.is_none());
+
+                let same = build(Tier::SameQueueFallback, overwrite);
+                assert!(same.release.is_none() && same.acquire.is_none());
+                assert_eq!(same.before_copy.is_some(), overwrite);
+                for b in same.before_copy.into_iter().chain(same.after_copy) {
+                    assert_eq!(key(Some(b)), (0, 0, 7, 256, 1024));
+                }
+                let after = (S::COPY, A::TRANSFER_WRITE, STAGE, READS);
+                assert_eq!(stages(same.after_copy), after);
+                if overwrite {
+                    let before = (STAGE, READS, S::COPY, A::TRANSFER_WRITE);
+                    assert_eq!(stages(same.before_copy), before);
+                }
+            }
+        }
     }
 }

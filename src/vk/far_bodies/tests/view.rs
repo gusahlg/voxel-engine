@@ -5,7 +5,9 @@ use super::support::{
 };
 use crate::camera::{Camera3D, Lens, WarpMap, WarpStrength};
 use crate::color::LinearRgb;
-use crate::far_body::mirror::{ray_cube, ray_inner_sphere, ray_mapped, ray_rounded, ray_sphere};
+use crate::far_body::mirror::{
+    ray_cube, ray_inner_sphere, ray_mapped, ray_rounded, ray_sphere, rounded_rim_band,
+};
 use crate::far_body::{FarBody, FarShape, MAX_FAR_BODIES, MAX_FAR_MAPS};
 use crate::vk::far_bodies::cones::cone_bound;
 use crate::vk::far_bodies::tiles::pixel_ndc;
@@ -223,9 +225,7 @@ fn beyond_rim(ray: Vec3, body: &FarBody, px: f32) -> bool {
             facing <= 0.0 || s >= rim
         }
         FarShape::Rounded { exponent } => {
-            let p = exponent.clamp(2.0, 32.0);
-            let rho_b = rho * 3.0f32.powf(0.5 - 1.0 / p);
-            let rim = rho_b + (0.05 * rho_b).max(1.25 * px);
+            let (_, rim) = rounded_rim_band(rho, exponent, px);
             facing <= 0.0 || s >= rim
         }
         FarShape::Cube => {

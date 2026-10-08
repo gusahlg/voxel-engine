@@ -1,5 +1,7 @@
 use ash::{ext, khr, vk};
 
+use crate::switches::{Switch, on_unless_zero};
+
 /// Proof that `VK_EXT_memory_budget` is enabled.
 #[derive(Clone, Copy)]
 pub struct MemoryBudget {
@@ -768,6 +770,8 @@ fn advertised_shading_rates(
 /// `VOXEL_SKY_COARSE=0` disables 2×2 sky tiles. Any other value, including
 /// unset, leaves them on when the device can do it. Read once.
 fn sky_coarse_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| !std::env::var("VOXEL_SKY_COARSE").is_ok_and(|v| v == "0"))
+    VOXEL_SKY_COARSE.get()
 }
+
+/// Read by [`sky_coarse_enabled`].
+pub(crate) static VOXEL_SKY_COARSE: Switch<bool> = Switch::new("VOXEL_SKY_COARSE", on_unless_zero);

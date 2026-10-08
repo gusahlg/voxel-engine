@@ -6,6 +6,8 @@ use ash::{ext, vk};
 use raw_window_handle::RawDisplayHandle;
 use std::ffi::{CStr, c_char, c_void};
 
+use crate::switches::Switch;
+
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
 pub struct InstanceBundle {
@@ -17,11 +19,16 @@ pub struct InstanceBundle {
 /// Validation defaults to on for debug builds; VOXEL_ENGINE_VALIDATION=0/1
 /// overrides in either direction.
 fn validation_requested() -> bool {
-    match std::env::var("VOXEL_ENGINE_VALIDATION") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"),
-        Err(_) => cfg!(debug_assertions),
-    }
+    VOXEL_ENGINE_VALIDATION.get()
 }
+
+/// Read by [`validation_requested`]. `0`, `false` and `off` (any case) turn
+/// validation off; any other value turns it on.
+pub(crate) static VOXEL_ENGINE_VALIDATION: Switch<bool> =
+    Switch::new("VOXEL_ENGINE_VALIDATION", |raw| match raw {
+        Some(v) => v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"),
+        None => cfg!(debug_assertions),
+    });
 
 unsafe extern "system" fn debug_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,

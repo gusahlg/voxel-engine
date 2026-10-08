@@ -8,9 +8,12 @@
 use ash::vk;
 
 use super::alloc::{create_buffer, create_filled_staging};
-use super::mesh_residency::{CopyBarrier, CopyConsumer, copy_barrier};
+use super::mesh_residency::CopyConsumer;
 use super::timeline::{Timeline, TimelineValue};
-use super::transfer::{TransferCtx, TransferLane, UploadRetire};
+use super::transfer::{
+    TransferCtx, TransferLane, UploadRetire, buffer_upload_barriers, cmd_buffer_barrier,
+    upload_buffer_range,
+};
 use crate::material::{
     MATERIAL_DESC_CAPACITY, MaterialDesc, default_material_table, write_material_append,
     write_material_set,
@@ -161,151 +164,19 @@ impl MaterialTable {
         self.pending_lo = 0;
         self.pending_hi = 0;
 
-        let device = ctx.device;
-        let graphics_cmd = ctx.graphics_cmd;
-        let graphics_family = ctx.graphics_family;
         let offset = u64::from(lo) * ENTRY_BYTES;
         let size = u64::from(hi - lo) * ENTRY_BYTES;
         let bytes = bytemuck::cast_slice(&self.cpu[lo as usize..hi as usize]);
-        let (staging, staging_mem) =
-            create_filled_staging(device, &ctx.memory_props(), bytes, "material desc staging");
-
-        let separate_queue = ctx.lane.is_separate_queue();
-        let needs_qfot = ctx.lane.needs_ownership_transfer();
-        let buffer = self.buffer;
-
-        let extra_wait = if needs_qfot {
-            // Release the range earlier frames read so the lane can acquire it.
-            let release = [vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)
-                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                .dst_access_mask(vk::AccessFlags2::NONE)
-                .src_queue_family_index(graphics_family)
-                .dst_queue_family_index(ctx.lane.family())
-                .buffer(buffer)
-                .offset(offset)
-                .size(size)];
-            Some(unsafe {
-                self.retire.submit_release(
-                    device,
-                    ctx.graphics_queue,
-                    ctx.done_at,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&release),
-                )
-            })
-        } else if separate_queue {
-            Some((
-                ctx.graphics_timeline.semaphore(),
-                ctx.last_render_value,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            ))
-        } else {
-            None
-        };
-
-        let lane = &mut *ctx.lane;
-        let lane_batch = separate_queue.then(|| unsafe { lane.begin(device) });
-        let record_cmd = lane_batch.as_ref().map_or(graphics_cmd, |b| b.cmd());
-
-        unsafe {
-            if !separate_queue {
-                let to_dst = [vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .buffer(buffer)
-                    .offset(offset)
-                    .size(size)];
-                device.cmd_pipeline_barrier2(
-                    record_cmd,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&to_dst),
-                );
-            } else if needs_qfot {
-                let acquire = [vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .src_queue_family_index(graphics_family)
-                    .dst_queue_family_index(lane.family())
-                    .buffer(buffer)
-                    .offset(offset)
-                    .size(size)];
-                device.cmd_pipeline_barrier2(
-                    record_cmd,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&acquire),
-                );
-            }
-            let region = vk::BufferCopy::default()
-                .src_offset(0)
-                .dst_offset(offset)
-                .size(size);
-            device.cmd_copy_buffer(record_cmd, staging, buffer, &[region]);
-        }
-
-        if let Some(lane_batch) = lane_batch {
-            let release = needs_qfot.then(|| {
-                copy_barrier(
-                    buffer,
-                    offset,
-                    size,
-                    MATERIAL_CONSUMER,
-                    CopyBarrier::Release {
-                        src_family: lane.family(),
-                        dst_family: graphics_family,
-                    },
-                )
-            });
-            unsafe {
-                if let Some(release) = release.as_ref() {
-                    device.cmd_pipeline_barrier2(
-                        record_cmd,
-                        &vk::DependencyInfo::default()
-                            .buffer_memory_barriers(std::slice::from_ref(release)),
-                    );
-                }
-            }
-            let value = unsafe { lane.submit_after(device, lane_batch, extra_wait) };
-            if needs_qfot {
-                let acquire = [copy_barrier(
-                    buffer,
-                    offset,
-                    size,
-                    MATERIAL_CONSUMER,
-                    CopyBarrier::Acquire {
-                        src_family: lane.family(),
-                        dst_family: graphics_family,
-                    },
-                )];
-                unsafe {
-                    device.cmd_pipeline_barrier2(
-                        graphics_cmd,
-                        &vk::DependencyInfo::default().buffer_memory_barriers(&acquire),
-                    );
-                }
-            }
-            self.retire.retire_on_lane(value, (staging, staging_mem));
-            Some(value)
-        } else {
-            let to_shader = [copy_barrier(
-                buffer,
-                offset,
-                size,
-                MATERIAL_CONSUMER,
-                CopyBarrier::Draw,
-            )];
-            unsafe {
-                device.cmd_pipeline_barrier2(
-                    record_cmd,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&to_shader),
-                );
-            }
-            self.retire
-                .retire_on_graphics(ctx.done_at, (staging, staging_mem));
-            None
-        }
+        let staging = create_filled_staging(
+            ctx.device,
+            &ctx.memory_props(),
+            bytes,
+            "material desc staging",
+        );
+        // Earlier frames read the table, and the frame loop has submitted
+        // them (`has_overwrite_pending`): every flush is an overwrite.
+        let dst = (self.buffer, offset, size);
+        unsafe { upload_buffer_range(ctx, &mut self.retire, dst, staging, MATERIAL_CONSUMER, true) }
     }
 
     /// Init-time full-table copy; host-waits the transfer (OnceBeforeUse).
@@ -325,8 +196,16 @@ impl MaterialTable {
         let (staging, staging_mem) =
             create_filled_staging(device, &memory_props, bytes, "material desc staging");
         let separate_queue = lane.is_separate_queue();
-        let needs_qfot = lane.needs_ownership_transfer();
         let buffer = self.buffer;
+        // A first upload: graphics has not read the table yet.
+        let barriers = buffer_upload_barriers(
+            (buffer, 0, TABLE_BYTES),
+            MATERIAL_CONSUMER,
+            false,
+            lane.tier(),
+            graphics_family,
+            lane.family(),
+        );
 
         enum Batch {
             Lane(super::transfer::LaneRecording),
@@ -365,39 +244,12 @@ impl MaterialTable {
         unsafe {
             let region = vk::BufferCopy::default().size(TABLE_BYTES);
             device.cmd_copy_buffer(copy_cmd, staging, buffer, &[region]);
-            if needs_qfot {
-                let release = [copy_barrier(
-                    buffer,
-                    0,
-                    TABLE_BYTES,
-                    MATERIAL_CONSUMER,
-                    CopyBarrier::Release {
-                        src_family: lane.family(),
-                        dst_family: graphics_family,
-                    },
-                )];
-                device.cmd_pipeline_barrier2(
-                    copy_cmd,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&release),
-                );
-            } else if !separate_queue {
-                let to_shader = [copy_barrier(
-                    buffer,
-                    0,
-                    TABLE_BYTES,
-                    MATERIAL_CONSUMER,
-                    CopyBarrier::Draw,
-                )];
-                device.cmd_pipeline_barrier2(
-                    copy_cmd,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&to_shader),
-                );
-            }
+            cmd_buffer_barrier(device, copy_cmd, barriers.after_copy.as_ref());
         }
         match batch {
             Batch::Lane(batch) => {
                 let value = unsafe { lane.submit(device, batch) };
-                if needs_qfot {
+                if let Some(acquire) = barriers.acquire.as_ref() {
                     let alloc = vk::CommandBufferAllocateInfo::default()
                         .command_pool(command_pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
@@ -413,20 +265,8 @@ impl MaterialTable {
                         device
                             .begin_command_buffer(acquire_cmd, &begin)
                             .expect("Failed to begin material-desc acquire command buffer");
-                        let acquire = [copy_barrier(
-                            buffer,
-                            0,
-                            TABLE_BYTES,
-                            MATERIAL_CONSUMER,
-                            CopyBarrier::Acquire {
-                                src_family: lane.family(),
-                                dst_family: graphics_family,
-                            },
-                        )];
-                        device.cmd_pipeline_barrier2(
-                            acquire_cmd,
-                            &vk::DependencyInfo::default().buffer_memory_barriers(&acquire),
-                        );
+                        // Chains on the `ALL_COMMANDS` lane wait below.
+                        cmd_buffer_barrier(device, acquire_cmd, Some(acquire));
                         device
                             .end_command_buffer(acquire_cmd)
                             .expect("Failed to end material-desc acquire command buffer");

@@ -27,6 +27,7 @@ pub mod profile;
 pub mod rev;
 mod screenshot;
 pub mod skeleton;
+mod switches;
 mod vk;
 
 pub use cage::CageHandle;
