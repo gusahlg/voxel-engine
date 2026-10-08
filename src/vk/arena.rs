@@ -11,14 +11,19 @@ use super::cull_math::{
 use super::pipeline::EyeSplit;
 use crate::mesh::Pass;
 
-/// Mesh AABB in world/block space: `aabb_min/max * scale + local_off`, relative
-/// to `block`. The GPU cull buckets by AABB-centre distance; a centre always
-/// lies inside its box, so a union of these boxes bounds every possible centre.
+/// Mesh AABB relative to `block`: `min`/`max` are `aabb_min/max * scale` and
+/// `local_off` is the record's mover offset (zero for a cage's corner box).
+/// They stay apart because `cull.comp.slang` adds the offset to the
+/// camera-relative block first, `aabb * scale + ((block - cam) - frac +
+/// local_off)`, and the CPU cull must round the same way. The GPU cull
+/// buckets by AABB-centre distance; a centre always lies inside its box, so a
+/// union of these boxes bounds every possible centre.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MeshAabb {
     pub block: [i32; 3],
     pub min: [f32; 3],
     pub max: [f32; 3],
+    pub local_off: [f32; 3],
 }
 
 impl MeshAabb {
@@ -26,22 +31,16 @@ impl MeshAabb {
         block: [0; 3],
         min: [0.0; 3],
         max: [0.0; 3],
+        local_off: [0.0; 3],
     };
 
     pub(crate) fn from_record(rec: &MeshRecord) -> Self {
         let s = rec.detail_scale();
         Self {
             block: rec.block,
-            min: [
-                rec.aabb_min[0] * s + rec.local_off[0],
-                rec.aabb_min[1] * s + rec.local_off[1],
-                rec.aabb_min[2] * s + rec.local_off[2],
-            ],
-            max: [
-                rec.aabb_max[0] * s + rec.local_off[0],
-                rec.aabb_max[1] * s + rec.local_off[1],
-                rec.aabb_max[2] * s + rec.local_off[2],
-            ],
+            min: rec.aabb_min.map(|v| v * s),
+            max: rec.aabb_max.map(|v| v * s),
+            local_off: rec.local_off,
         }
     }
 
@@ -53,7 +52,18 @@ impl MeshAabb {
             block: cage.anchor,
             min,
             max,
+            local_off: [0.0; 3],
         }
+    }
+
+    /// `(min + local_off, max + local_off)`, relative to `block`: the box the
+    /// arena union grows by.
+    fn offset_box(&self) -> ([f32; 3], [f32; 3]) {
+        let o = self.local_off;
+        (
+            [self.min[0] + o[0], self.min[1] + o[1], self.min[2] + o[2]],
+            [self.max[0] + o[0], self.max[1] + o[1], self.max[2] + o[2]],
+        )
     }
 
     /// Axis-aligned corners of this box, relative to `block`. Bit 0 = +x,
@@ -61,11 +71,12 @@ impl MeshAabb {
     /// the corner box itself.
     #[cfg(test)]
     pub(crate) fn box_corners(self) -> [[f32; 3]; 8] {
+        let (min, max) = self.offset_box();
         std::array::from_fn(|i| {
             [
-                if i & 1 == 0 { self.min[0] } else { self.max[0] },
-                if i & 2 == 0 { self.min[1] } else { self.max[1] },
-                if i & 4 == 0 { self.min[2] } else { self.max[2] },
+                if i & 1 == 0 { min[0] } else { max[0] },
+                if i & 2 == 0 { min[1] } else { max[1] },
+                if i & 4 == 0 { min[2] } else { max[2] },
             ]
         })
     }
@@ -93,10 +104,11 @@ impl ArenaUnion {
     };
 
     fn from_aabb(aabb: MeshAabb) -> Self {
+        let (min, max) = aabb.offset_box();
         Self {
             origin: aabb.block,
-            min: aabb.min,
-            max: aabb.max,
+            min,
+            max,
             dirty: false,
             valid: true,
         }
@@ -112,9 +124,10 @@ impl ArenaUnion {
             aabb.block[1].wrapping_sub(self.origin[1]) as f32,
             aabb.block[2].wrapping_sub(self.origin[2]) as f32,
         ];
+        let (min, max) = aabb.offset_box();
         for i in 0..3 {
-            self.min[i] = self.min[i].min(aabb.min[i] + d[i]);
-            self.max[i] = self.max[i].max(aabb.max[i] + d[i]);
+            self.min[i] = self.min[i].min(min[i] + d[i]);
+            self.max[i] = self.max[i].max(max[i] + d[i]);
         }
     }
 
@@ -226,8 +239,11 @@ pub(crate) struct ArenaDirectory {
     slots: Vec<Option<(u32, Option<usize>, NonZeroU32)>>,
     /// Per-slot world AABB, parallel to `slots` (only valid when the slot is live).
     aabbs: Vec<MeshAabb>,
-    /// CPU-cull SoA: block-relative AABB `[min.xyz, max.xyz]`, parallel to `slots`.
+    /// CPU-cull SoA: block-relative scaled AABB `[min.xyz, max.xyz]`, before
+    /// the mover offset ([`MeshAabb`]). Parallel to `slots`.
     cull_aabb: Vec<[f32; 6]>,
+    /// CPU-cull SoA: the AABB's mover offset (zero when caged), parallel to `slots`.
+    cull_local_off: Vec<[f32; 3]>,
     /// CPU-cull SoA: integer block of each slot's AABB, parallel to `slots`.
     cull_block: Vec<[i32; 3]>,
     /// CPU-cull SoA: packed arena/pass/lod (0 = dead to cull). Parallel to `slots`.
@@ -276,6 +292,7 @@ impl ArenaDirectory {
             slots: Vec::new(),
             aabbs: Vec::new(),
             cull_aabb: Vec::new(),
+            cull_local_off: Vec::new(),
             cull_block: Vec::new(),
             cull_bits: Vec::new(),
             cull_index_count: Vec::new(),
@@ -394,6 +411,7 @@ impl ArenaDirectory {
             self.slots.resize(n, None);
             self.aabbs.resize(n, MeshAabb::ZERO);
             self.cull_aabb.resize(n, [0.0; 6]);
+            self.cull_local_off.resize(n, [0.0; 3]);
             self.cull_block.resize(n, [0; 3]);
             self.cull_bits.resize(n, 0);
             self.cull_index_count.resize(n, 0);
@@ -588,9 +606,15 @@ impl ArenaDirectory {
             .map_or(0, |(a, _, _)| a + 1)
     }
 
-    /// Block-relative AABB `[min.xyz, max.xyz]` for the CPU cull hot loop.
+    /// Block-relative scaled AABB `[min.xyz, max.xyz]`, before the mover
+    /// offset, for the CPU cull hot loop.
     pub(crate) fn cull_aabbs(&self) -> &[[f32; 6]] {
         &self.cull_aabb
+    }
+
+    /// Mover offset of each slot's AABB, parallel to [`Self::cull_aabbs`].
+    pub(crate) fn cull_local_offs(&self) -> &[[f32; 3]] {
+        &self.cull_local_off
     }
 
     /// Integer block of each slot's AABB, parallel to [`Self::cull_aabbs`].
@@ -664,6 +688,7 @@ impl ArenaDirectory {
             aabb.max[1],
             aabb.max[2],
         ];
+        self.cull_local_off[i] = aabb.local_off;
         self.cull_block[i] = aabb.block;
         // Blend (no lane) is dead to the CPU cull: the shader skips pass > 1.
         // Preserve the face-runs bit; [`Self::note_cull_draw`] sets it.
@@ -876,6 +901,7 @@ mod tests {
         block: [0; 3],
         min: [0.0; 3],
         max: [1.0; 3],
+        local_off: [0.0; 3],
     };
 
     fn origin_eye() -> EyeSplit {
@@ -1377,6 +1403,7 @@ mod tests {
             block: [0, 0, z],
             min: [0.0; 3],
             max: [0.0; 3],
+            local_off: [0.0; 3],
         };
         // 300 is past 256. 3000 is inside the default LOD bucket 2 (2048..8192).
         // 10000 is past 8192, so both scales keep only the last bucket.
@@ -1458,6 +1485,7 @@ mod tests {
             block: [0, 0, 300],
             min: [0.0; 3],
             max: [1.0; 3],
+            local_off: [0.0; 3],
         };
         let mut dir = ArenaDirectory::new();
         dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL, far);
@@ -1475,6 +1503,7 @@ mod tests {
             block: [0; 3],
             min: [0.0, 0.0, 0.0],
             max: [1.0, 1.0, 20.0],
+            local_off: [0.0; 3],
         };
         let mut dir = ArenaDirectory::new();
         dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL, span);
@@ -1489,6 +1518,7 @@ mod tests {
             block: [0, 0, 300],
             min: [0.0; 3],
             max: [1.0; 3],
+            local_off: [0.0; 3],
         };
         let mut dir = ArenaDirectory::new();
         dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL, UNIT);
@@ -1513,6 +1543,7 @@ mod tests {
             block: [0, 0, 300],
             min: [0.0; 3],
             max: [1.0; 3],
+            local_off: [0.0; 3],
         };
         let mut dir = ArenaDirectory::new();
         dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL, UNIT);
@@ -1530,6 +1561,7 @@ mod tests {
             block: [0, 0, 300],
             min: [0.0; 3],
             max: [1.0; 3],
+            local_off: [0.0; 3],
         };
         let mut dir = ArenaDirectory::new();
         dir.note_upload(0, G1, buf(1), Pass::Opaque, FULL, UNIT);

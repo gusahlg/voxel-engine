@@ -11,13 +11,6 @@ use crate::color::LinearRgb;
 #[cfg(test)]
 pub(crate) mod mirror;
 
-/// The `src/vk/far_bodies.rs` tests import these from here.
-#[cfg(test)]
-pub(crate) use mirror::{
-    ray_cube, ray_inner_sphere, ray_mapped, ray_mapped_fast, ray_mapped_limb, ray_rounded,
-    ray_sphere,
-};
-
 /// Bodies kept from one [`crate::Frame3D::set_far_bodies`] call. Extra entries are dropped.
 pub const MAX_FAR_BODIES: usize = 32;
 

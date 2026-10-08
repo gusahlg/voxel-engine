@@ -306,6 +306,12 @@ impl Frustum {
         self.planes
     }
 
+    /// Raw planes, unnormalized: tests place a plane exactly on a box face.
+    #[cfg(test)]
+    pub(crate) fn from_planes(planes: [Vec4; 5]) -> Self {
+        Self { planes }
+    }
+
     pub fn intersects_aabb(&self, min: Vec3, max: Vec3) -> bool {
         for plane in &self.planes {
             let n = plane.truncate();

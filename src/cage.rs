@@ -210,6 +210,7 @@ pub(crate) fn corner_aabb(corners: [[f32; 3]; 8]) -> ([f32; 3], [f32; 3]) {
 
 /// Camera-relative position of local `q` through the cage. `q` is the cell
 /// position times the detail scale, in `[0, 16·scale]³` before micro-offsets.
+/// Rounds like `cage_world` in `cage.slang`: `(p + (anchor − cam)) − frac`.
 #[cfg(test)]
 pub(crate) fn placed(
     anchor: [i32; 3],
@@ -222,12 +223,7 @@ pub(crate) fn placed(
     let edge = 16.0 * scale;
     let t = [q[0] / edge, q[1] / edge, q[2] / edge];
     let p = trilinear(corners, t);
-    let d = [
-        anchor[0].wrapping_sub(cam_block[0]) as f32 - cam_frac[0],
-        anchor[1].wrapping_sub(cam_block[1]) as f32 - cam_frac[1],
-        anchor[2].wrapping_sub(cam_block[2]) as f32 - cam_frac[2],
-    ];
-    [p[0] + d[0], p[1] + d[1], p[2] + d[2]]
+    std::array::from_fn(|k| (p[k] + anchor[k].wrapping_sub(cam_block[k]) as f32) - cam_frac[k])
 }
 
 /// Camera-relative position of an uncaged mesh: `q + local_off + (block − cam)`.
