@@ -305,7 +305,10 @@ uint far_dom_face(float3 n)
     return n.z >= 0.0 ? 4u : 5u;
 }
 
-// s = ‖q‖_p and grad s. The origin reports zero.
+// s = ‖q‖_p and grad s, normalised by the largest component m: each ratio
+// |q_i|/m is in [0, 1] and one term is 1, so no p overflows f32 and a small
+// term only underflows to 0. grad_i = sign(q_i) (|q_i|/s)^(p-1), written as
+// (|q_i|/m)^p / sum * s / |q_i|. The origin reports zero.
 void far_lp(float3 q, float p, out float s, out float3 g)
 {
     float3 a = abs(q);
@@ -327,28 +330,6 @@ void far_lp(float3 q, float p, out float s, out float3 g)
     if (a.z > 0.0) g.z = pz / sum * s / a.z * sign(q.z);
 }
 
-// Sample at tHit when it is outside the solid. The face is the gradient's
-// dominant axis. Shade rebuilds the world normal with one far_lp at the hit,
-// so this march does not carry a float3 out.
-bool far_round_at(float3 o, float3 d, float tHit, float p, float rho, out float t, out uint face)
-{
-    t = 0.0;
-    face = 0u;
-    if (!(tHit > 0.0))
-        return false;
-    float s;
-    float3 g;
-    far_lp(o + d * tHit, p, s, g);
-    if (!(s >= rho))
-        return false;
-    float glen = length(g);
-    if (!(glen > 1e-8))
-        return false;
-    t = tHit;
-    face = far_dom_face(g);
-    return true;
-}
-
 // The exponent a rounded body is drawn with. The march, the normal and the air
 // rims take p only through here, and the host cone bound clamps the same way
 // (far_body::rounded_p), so a body past the cap is the FAR_ROUNDED_P_MAX shape
@@ -366,11 +347,18 @@ float far_round_bound(float rho, float exponent)
     return rho * pow(3.0, 0.5 - 1.0 / far_round_p(exponent));
 }
 
-// Superellipsoid of face radius rho. Bound is far_round_bound, padded a hair
-// so the entry stays outside the solid. A graze of that sphere, where it meets
-// the body, falls back to the sphere point rather than opening a hole.
+// Superellipsoid of face radius rho. The ray is searched on its part inside
+// both far_round_bound, padded a hair so the entry stays outside the solid,
+// and the cube [-rho, rho]^3 that holds the body. A large p sits within
+// 1 - 3^(-1/p) of that cube, so the first sample is already near the surface.
+// s = ‖q‖_p is convex along a ray, so Newton from the entry never steps past
+// the first root and every sample stays outside the solid. A slope that has
+// stopped falling, or a step past the exit, proves a miss; a step under 1e-5
+// of t is the hit. A graze still moving after the budget is a hit when it is
+// within 0.1% of the surface. The closest approach to the centre is not a
+// bracket: near an edge it can be outside a solid the ray still crosses.
 // No world normal: a carried float3 across this loop spilled. Shade rebuilds
-// the gradient, or the enclosing-sphere radial when face bit 3 is set.
+// the gradient at the hit.
 bool far_ray_rounded(float3 ray, float3 center, float rho, float4 rot, float exponent, float facing, out float t, out uint face)
 {
     t = 0.0;
@@ -381,103 +369,55 @@ bool far_ray_rounded(float3 ray, float3 center, float rho, float4 rot, float exp
     if (disc < 0.0)
         return false;
     float sd = sqrt(disc);
-    float tNear = facing - sd;
-    float tFar = facing + sd;
-    if (!(tFar > 0.0))
+    float lo = max(facing - sd, 0.0);
+    float hi = facing + sd;
+    if (!(hi > 0.0))
         return false;
 
     float3 o = far_inv_rotate(rot, -center);
     float3 d = far_inv_rotate(rot, ray);
-    float t0 = max(tNear, 0.0);
+    uint slabFace = 0u;
+    if (!far_slab(o.x, d.x, rho, lo, hi, slabFace, 0u))
+        return false;
+    if (!far_slab(o.y, d.y, rho, lo, hi, slabFace, 1u))
+        return false;
+    if (!far_slab(o.z, d.z, rho, lo, hi, slabFace, 2u))
+        return false;
+
+    // A camera inside the solid stops at lo = 0, which is not a hit. A ray
+    // grazing the flat middle of a face converges linearly (about (p-1)/p a
+    // step); the budget is ROUNDED_STEPS, set against an f64 reference in
+    // far_body/tests.rs.
     float s;
     float3 g;
-    far_lp(o, p, s, g);
-    if (t0 == 0.0 && s <= rho)
-        return false;
-
-    float tC = clamp(facing, t0, tFar);
-    far_lp(o + d * tC, p, s, g);
-    if (s > rho)
-    {
-        if (s <= rho * 1.001 && tC > 0.0 && far_round_at(o, d, tC, p, rho, t, face))
-            return true;
-        if (tNear > 0.0 && sd <= rhoB * 0.02)
-        {
-            far_lp(o + d * tNear, p, s, g);
-            if (s >= rho && s <= rho * 1.01)
-            {
-                t = tNear;
-                // far_dom_face(inv_rotate(rot, (ray*t-center)/rhoB)). A positive
-                // scale does not change the dominant axis.
-                face = far_dom_face(o + d * tNear) | 8u;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    float lo = t0;
-    float hi = tC;
     [loop]
-    for (uint step = 0u; step < 6u; step++)
+    for (uint step = 0u; step < 9u; step++)
     {
-        float sL;
-        far_lp(o + d * lo, p, sL, g);
-        if (sL >= rho && sL <= rho * (1.0 + 2.0e-5))
-            break;
-        if (hi - lo < 1e-6)
+        far_lp(o + d * lo, p, s, g);
+        float f = s - rho;
+        if (!(f > 0.0))
             break;
         float slope = dot(g, d);
-        bool moved = false;
-        if (slope < -1e-8)
+        float dt = -f / slope;
+        lo += dt;
+        // A slope that is not falling, or a step past the exit, is a miss.
+        if (!(slope < 0.0) || !(lo < hi))
         {
-            float tN = lo - (sL - rho) / slope;
-            if (tN > lo && tN < hi)
-            {
-                float sN;
-                far_lp(o + d * tN, p, sN, g);
-                if (sN >= rho)
-                {
-                    lo = tN;
-                    moved = true;
-                }
-                else
-                    hi = tN;
-            }
+            lo = -1.0;
+            break;
         }
-        if (!moved)
-        {
-            float sH;
-            far_lp(o + d * hi, p, sH, g);
-            float tF = 0.5 * (lo + hi);
-            float span = sL - sH;
-            if (abs(span) > 1e-12)
-            {
-                float guess = lo + (hi - lo) * (sL - rho) / span;
-                if (guess > lo && guess < hi)
-                    tF = guess;
-            }
-            float sF;
-            far_lp(o + d * tF, p, sF, g);
-            if (sF >= rho)
-                lo = tF;
-            else
-                hi = tF;
-        }
+        if (dt <= lo * 1.0e-5)
+            break;
     }
-    if (far_round_at(o, d, lo, p, rho, t, face))
-        return true;
-    if (tNear > 0.0)
-    {
-        far_lp(o + d * tNear, p, s, g);
-        if (s >= rho)
-        {
-            t = tNear;
-            face = far_dom_face(o + d * tNear) | 8u;
-            return true;
-        }
-    }
-    return false;
+    if (!(lo > 0.0))
+        return false;
+    // The face is the gradient's dominant axis at the hit.
+    far_lp(o + d * lo, p, s, g);
+    if (!(s <= rho * 1.001) || !(length(g) > 1e-8))
+        return false;
+    t = lo;
+    face = far_dom_face(g);
+    return true;
 }
 
 float3 far_face(uint i, uint face)
@@ -1937,7 +1877,7 @@ float3 far_bodies(float3 ray, float3 col, float px, float2 pix)
     uint bestI = 0u;
     uint bestFace = 0u;
     // 0 none, 1 sphere (coverage lerp), 2 inner wall, 3 cube, 4 mapped,
-    // 5 rounded gradient, 6 rounded enclosing-sphere fallback.
+    // 5 rounded (gradient).
     // Every normal is rebuilt once after the loop, before the additive
     // pass. Carrying a float3 across the march or the limb spilled.
     uint bestKind = 0u;
@@ -2064,10 +2004,9 @@ float3 far_bodies(float3 ray, float3 col, float px, float2 pix)
                 bestDepth = t * distance;
                 bestT = t;
                 bestI = i;
-                bestFace = face & 7u;
-                // Bit 3 is the enclosing-sphere fallback. The gradient case
-                // is far_lp at bestT, same as far_round_at.
-                bestKind = (face & 8u) != 0u ? 6u : 5u;
+                bestFace = face;
+                // The normal is far_lp at bestT, the march's last sample.
+                bestKind = 5u;
             }
             else if (!hit && dot(atmo.rgb, atmo.rgb) > 0.0)
             {
@@ -2192,25 +2131,17 @@ float3 far_bodies(float3 ray, float3 col, float px, float2 pix)
                 bestN = far_rotate(rot, far_face_normal(bestFace));
 #endif
 #ifndef FAR_NO_ROUNDED
-            if (bestKind == 5u || bestKind == 6u)
+            if (bestKind == 5u)
             {
                 float pExp = asfloat(farTable[0].body[bestI].seed.y);
-                if (bestKind == 6u)
-                {
-                    float rhoB = far_round_bound(rho, pExp) * (1.0 + 2.0e-4);
-                    bestN = (ray * bestT - center) / rhoB;
-                }
-                else
-                {
-                    float3 o = far_inv_rotate(rot, -center);
-                    float3 d = far_inv_rotate(rot, ray);
-                    float sLp;
-                    float3 gLp;
-                    far_lp(o + d * bestT, far_round_p(pExp), sLp, gLp);
-                    float glen = length(gLp);
-                    if (glen > 1e-8)
-                        bestN = far_rotate(rot, gLp / glen);
-                }
+                float3 o = far_inv_rotate(rot, -center);
+                float3 d = far_inv_rotate(rot, ray);
+                float sLp;
+                float3 gLp;
+                far_lp(o + d * bestT, far_round_p(pExp), sLp, gLp);
+                float glen = length(gLp);
+                if (glen > 1e-8)
+                    bestN = far_rotate(rot, gLp / glen);
             }
 #endif
             bool sphereAlb = bestKind == 1u || bestKind == 2u;
@@ -2367,7 +2298,7 @@ float3 far_sky_debug_rgb(float3 ray, float px, float2 pix)
             if (hit && t * distance < bestDepth)
             {
                 bestDepth = t * distance;
-                bestKind = (face & 8u) != 0u ? 6u : 5u;
+                bestKind = 5u;
             }
             else if (!hit && dot(atmo.rgb, atmo.rgb) > 0.0)
             {

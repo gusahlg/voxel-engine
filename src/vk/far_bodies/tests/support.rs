@@ -111,8 +111,9 @@ pub(super) fn random_body(rng: &mut Rng, seed: u32) -> FarBody {
         0 => (FarShape::Sphere, 1.0, rng.range(0.002, 0.9)),
         1 => (FarShape::Cube, 1.0, rng.range(0.002, 0.9)),
         2 => (
+            // Log-uniform over [2, 32768]: the sphere up past the cap.
             FarShape::Rounded {
-                exponent: rng.range(2.0, 32.0),
+                exponent: 2.0 * 2.0f32.powf(rng.range(0.0, 14.0)),
             },
             1.0,
             rng.range(0.002, 0.85),

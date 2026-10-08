@@ -445,6 +445,8 @@ static const float FAR_ROUNDED_P_MIN = 2.0f;
 
 // Largest FarShape::Rounded exponent the sky draws. A larger p draws this
 // shape: the march, the normal, the air rim and the host cone bound all clamp
-// to it, so the rim stays on the drawn corners and inside the cone.
-static const float FAR_ROUNDED_P_MAX = 32.0f;
+// to it, so the rim stays on the drawn corners and inside the cone. Its corner
+// sits at 3^(-1/16384) = 0.99993 of a cube corner (0.1 px short at an 860 px
+// face radius), so a larger cap draws nothing visibly new.
+static const float FAR_ROUNDED_P_MAX = 16384.0f;
 
