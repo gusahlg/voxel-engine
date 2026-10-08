@@ -38,8 +38,9 @@ pub(crate) const CULL_BUCKET_SPLITS: [f32; 3] = [
 /// Default coarse-LOD split multiplier. Edges become 512 / 2048 / 8192.
 /// `VOXEL_LOD_BUCKET_SCALE=1` restores the full-res edges.
 pub(crate) const DEFAULT_LOD_BUCKET_SCALE: f32 = 32.0;
-/// Squared full-res edges. The splits are powers of two, so `d² >= split²`
-/// matches `length >= split` exactly and the hot path skips the sqrt.
+/// Squared full-res edges. The splits are powers of two, so `split²` is exact
+/// and is the [`sqrt_ge_threshold`] of `split`: `d² >= split²` matches the
+/// shader's `length >= split` exactly and the hot path skips the sqrt.
 const FULL_BUCKET_EDGE_SQ: [f32; 3] = [
     crate::genconst::CULL_BUCKET_SPLIT_0 * crate::genconst::CULL_BUCKET_SPLIT_0,
     crate::genconst::CULL_BUCKET_SPLIT_1 * crate::genconst::CULL_BUCKET_SPLIT_1,
@@ -139,16 +140,32 @@ pub(crate) fn group_bucket_scale(group: u32) -> f32 {
     }
 }
 
-/// Squared edges for `scale`. Scale 1 returns [`FULL_BUCKET_EDGE_SQ`] so the
-/// full-res compare stays the const power-of-two test. Other power-of-two
-/// products (the default 32) stay exact the same way; a non-dyadic scale
-/// still compares `d²` against `(split * scale)²`, matching the shader's
-/// `length >= split * scale` wherever that product is exact.
+/// `d²` thresholds for `scale`: `d² >= t` exactly when the shader's
+/// `length(centre) >= split * scale`. Scale 1 returns the const
+/// [`FULL_BUCKET_EDGE_SQ`]; any other scale (once per cull, not per mesh)
+/// goes through [`sqrt_ge_threshold`].
 fn bucket_edge_sq(scale: f32) -> [f32; 3] {
     if scale == 1.0 {
         return FULL_BUCKET_EDGE_SQ;
     }
-    bucket_splits(scale).map(|e| e * e)
+    bucket_splits(scale).map(sqrt_ge_threshold)
+}
+
+/// Smallest `t` with `sqrt(t) >= edge`. f32 sqrt is correctly rounded and
+/// monotonic, so `d2 >= t` is exactly `sqrt(d2) >= edge`. A power-of-two edge
+/// gives `edge * edge`. Other edges can be an ulp off: at `edge = 20`
+/// (`VOXEL_LOD_BUCKET_SCALE=1.25`) the float just below 400 has sqrt 20, so
+/// `d2 >= edge * edge` would put that centre one bucket nearer than the
+/// shader's `length >= edge`.
+fn sqrt_ge_threshold(edge: f32) -> f32 {
+    let mut t = edge * edge;
+    while t.sqrt() < edge {
+        t = t.next_up();
+    }
+    while t > 0.0 && t.next_down().sqrt() >= edge {
+        t = t.next_down();
+    }
+    t
 }
 
 /// Camera-distance bucket of an AABB centre, matching `cull.comp.slang`
@@ -292,14 +309,20 @@ const CAGE_DET_REL: f32 = 1e-8;
 /// Added to `2 * d`. Same literal as the cull shader.
 const CAGE_VIS_BIAS: f32 = 1e-3;
 
+/// The cull reads `vis` only; tests assert the rest.
 #[derive(Clone, Copy, Debug)]
 struct CageFaceVis {
     /// Upload order +X,+Y,+Z,−X,−Y,−Z.
     vis: [bool; 6],
-    /// Max corner error of corners 3,5,6,7, in min-edge lengths. `eps = 2d + bias`.
-    /// The cull reads `vis` only; tests assert `d`.
+    /// Max corner error of corners 3,5,6,7, in min-edge lengths.
     #[cfg_attr(not(test), allow(dead_code))]
     d: f32,
+    /// `2d + bias`, the margin on each `t_cam` test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    eps: f32,
+    /// The camera in the cage's affine frame.
+    #[cfg_attr(not(test), allow(dead_code))]
+    t_cam: [f32; 3],
 }
 
 #[inline(always)]
@@ -380,11 +403,13 @@ fn cage_direction_vis(p: [[f32; 3]; 8]) -> Option<CageFaceVis> {
     let inv = 1.0 / det;
     let t_cam = [dot3(b, c12) * inv, dot3(b, c20) * inv, dot3(b, c01) * inv];
     let min_edge = l0.min(l1).min(l2);
+    // Left to right like the shader's `P0 + e0 + e1`: `(P0 + e0) + e1`.
     let err = |idx: usize, predict: [f32; 3]| len3(sub3(p[idx], predict));
-    let dev = err(3, add3(p[0], add3(e0, e1)))
-        .max(err(5, add3(p[0], add3(e0, e2))))
-        .max(err(6, add3(p[0], add3(e1, e2))))
-        .max(err(7, add3(p[0], add3(e0, add3(e1, e2)))));
+    let p01 = add3(p[0], e0);
+    let dev = err(3, add3(p01, e1))
+        .max(err(5, add3(p01, e2)))
+        .max(err(6, add3(add3(p[0], e1), e2)))
+        .max(err(7, add3(add3(p01, e1), e2)));
     let d = dev / min_edge;
     let eps = 2.0 * d + CAGE_VIS_BIAS;
     Some(CageFaceVis {
@@ -397,6 +422,8 @@ fn cage_direction_vis(p: [[f32; 3]; 8]) -> Option<CageFaceVis> {
             t_cam[2] < 1.0 + eps,
         ],
         d,
+        eps,
+        t_cam,
     })
 }
 
@@ -478,16 +505,24 @@ fn emit_part(
     }
 }
 
+/// Camera-relative box of one SoA slot, rounded as `cull.comp.slang` does:
+/// `offset = (block - cam_block) - cam_frac + local_off`, then
+/// `aabb * scale + offset` (`aabb` is stored scaled; the scale is a power of
+/// two, so that product is exact). A caged slot has a zero offset and its
+/// corner box: the shader's `corners_aabb + ((anchor - cam_block) - cam_frac)`
+/// (`(anchor - cam_block) - cam_frac` is never `-0`, so adding the zero
+/// changes no bit).
 #[inline(always)]
 fn cam_relative_soa(
     aabb: [f32; 6],
+    local_off: [f32; 3],
     block: [i32; 3],
     eye_block: [i32; 3],
     eye_frac: [f32; 3],
 ) -> ([f32; 3], [f32; 3]) {
-    let dx = block[0].wrapping_sub(eye_block[0]) as f32 - eye_frac[0];
-    let dy = block[1].wrapping_sub(eye_block[1]) as f32 - eye_frac[1];
-    let dz = block[2].wrapping_sub(eye_block[2]) as f32 - eye_frac[2];
+    let dx = block[0].wrapping_sub(eye_block[0]) as f32 - eye_frac[0] + local_off[0];
+    let dy = block[1].wrapping_sub(eye_block[1]) as f32 - eye_frac[1] + local_off[1];
+    let dz = block[2].wrapping_sub(eye_block[2]) as f32 - eye_frac[2] + local_off[2];
     (
         [aabb[0] + dx, aabb[1] + dy, aabb[2] + dz],
         [aabb[3] + dx, aabb[4] + dy, aabb[5] + dz],
@@ -739,7 +774,7 @@ fn cpu_cull_legacy(
                 .get(slot as usize)
                 .copied()
                 .unwrap_or([0; 3]);
-            let (mn, mx) = cam_relative_soa(aabb, block, eye.block, eye.frac);
+            let (mn, mx) = cam_relative_soa(aabb, [0.0; 3], block, eye.block, eye.frac);
             (mn, mx, rec.detail_scale())
         } else {
             cam_relative_aabb(rec, eye)
@@ -852,6 +887,7 @@ fn cull_fast_solid(
 ) -> [u32; STATS_COUNT] {
     let mut stats = [0u32; STATS_COUNT];
     let aabbs = dir.cull_aabbs();
+    let local_offs = dir.cull_local_offs();
     let blocks = dir.cull_blocks();
     let bits_soa = dir.cull_bits();
     let index_counts = dir.cull_index_counts();
@@ -874,8 +910,9 @@ fn cull_fast_solid(
             continue;
         }
         let aabb = unsafe { *aabbs.get_unchecked(i) };
+        let local_off = unsafe { *local_offs.get_unchecked(i) };
         let block = unsafe { *blocks.get_unchecked(i) };
-        let (mn, mx) = cam_relative_soa(aabb, block, eye_block, eye_frac);
+        let (mn, mx) = cam_relative_soa(aabb, local_off, block, eye_block, eye_frac);
         if !aabb_in_planes(cam_planes, mn, mx) {
             continue;
         }
@@ -928,6 +965,7 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
 ) -> [u32; STATS_COUNT] {
     let mut stats = [0u32; STATS_COUNT];
     let aabbs = dir.cull_aabbs();
+    let local_offs = dir.cull_local_offs();
     let blocks = dir.cull_blocks();
     let bits_soa = dir.cull_bits();
     let index_counts = dir.cull_index_counts();
@@ -956,8 +994,9 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
             continue;
         }
         let aabb = unsafe { *aabbs.get_unchecked(i) };
+        let local_off = unsafe { *local_offs.get_unchecked(i) };
         let block = unsafe { *blocks.get_unchecked(i) };
-        let (mn, mx) = cam_relative_soa(aabb, block, eye_block, eye_frac);
+        let (mn, mx) = cam_relative_soa(aabb, local_off, block, eye_block, eye_frac);
         let pass = super::arena::cull_bits_pass(bits);
         let lod = super::arena::cull_bits_lod(bits);
         let arena = super::arena::cull_bits_arena(bits) - 1;
@@ -1124,6 +1163,9 @@ impl Group {
         Group::CagedLod,
     ];
 }
+
+#[cfg(test)]
+mod shader_mirror;
 
 #[cfg(test)]
 mod tests {
@@ -1716,6 +1758,7 @@ mod tests {
                 block: [0; 3],
                 min: mn,
                 max: mx,
+                local_off: [0.0; 3],
             };
             let full = opaque_rec(mn, mx);
             let mut lod = opaque_rec(mn, mx);
@@ -1891,6 +1934,7 @@ mod tests {
                     block: rec.block,
                     min: rec.aabb_min,
                     max: rec.aabb_max,
+                    local_off: [0.0; 3],
                 };
                 dir.note_upload_caged(slot, G1, buf(buf_id), rec.pass(), lod, aabb, corners);
             } else {
@@ -2118,17 +2162,20 @@ mod tests {
             block: [0; 3],
             min: [-1.0, -1.0, -11.0],
             max: [1.0, 1.0, -9.0],
+            local_off: [0.0; 3],
         };
         let behind = MeshAabb {
             block: [0; 3],
             min: [-1.0, -1.0, 9.0],
             max: [1.0, 1.0, 11.0],
+            local_off: [0.0; 3],
         };
         // In the frustum, and strictly inside a 10-block clip box.
         let inside = MeshAabb {
             block: [0; 3],
             min: [-1.0, -1.0, -6.0],
             max: [1.0, 1.0, -4.0],
+            local_off: [0.0; 3],
         };
         let mut dir = ArenaDirectory::new();
         dir.note_upload(0, G1, buf(1), Pass::Opaque, false, front);
@@ -2607,6 +2654,7 @@ mod tests {
                 block: [0; 3],
                 min: side_mn,
                 max: side_mx,
+                local_off: [0.0; 3],
             },
             side_corners,
         );
@@ -2620,6 +2668,7 @@ mod tests {
                 block: [0; 3],
                 min: y_mn,
                 max: y_mx,
+                local_off: [0.0; 3],
             },
             y_corners,
         );
@@ -2633,6 +2682,7 @@ mod tests {
                 block: [0; 3],
                 min: singular.aabb_min,
                 max: singular.aabb_max,
+                local_off: [0.0; 3],
             },
             [[0.0; 3]; 8],
         );
