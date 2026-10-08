@@ -154,19 +154,19 @@ pub(crate) fn ray_cube(ray: Vec3, dir: Vec3, rho: f32, rotation: Quat) -> Option
     })
 }
 
-/// Newton / secant steps on the rounded implicit. A radial hit lands in one step;
-/// a graze spends the rest of the budget shrinking the bracket.
-pub(super) const ROUNDED_STEPS: u32 = 6;
+/// Newton steps on the rounded implicit before the last sample. A hit away
+/// from the silhouette settles in two or three. A ray grazing the flat middle
+/// of a face converges linearly (ratio about (p - 1) / p) and spends the rest;
+/// the f64 reference test (`rounded_march_matches_the_f64_reference`) sets
+/// the count.
+pub(super) const ROUNDED_STEPS: u32 = 9;
 /// Relative pad on the enclosing sphere `rho · 3^(1/2 − 1/p)`.
 pub(super) const ROUNDED_BOUND_PAD: f32 = 2.0e-4;
-/// A closest-approach sample at most this factor outside the body is the hit.
+/// A Newton step at most this fraction of `t` ends the march.
+pub(super) const ROUNDED_STEP_TOL: f32 = 1.0e-5;
+/// A ray still moving after the budget is a hit when its last sample is at
+/// most this factor outside the body.
 pub(super) const ROUNDED_SNAP: f32 = 1.001;
-/// Enclosing-sphere half-chord, relative to its radius, that is a graze.
-pub(super) const ROUNDED_GRAZE: f32 = 0.02;
-/// A grazing entry at most this factor outside the body is the sphere point.
-pub(super) const ROUNDED_GRAZE_BAND: f32 = 1.01;
-/// Relative band outside the body where the march stops.
-pub(super) const ROUNDED_SETTLE: f32 = 2.0e-5;
 
 /// Dominant axis of a body-space normal. Ties break toward X, then Y, then Z.
 fn dom_face(n: Vec3) -> u32 {
@@ -182,7 +182,8 @@ fn dom_face(n: Vec3) -> u32 {
     }
 }
 
-/// `s = ‖q‖_p` and its gradient. Zero at the origin.
+/// `s = ‖q‖_p` and its gradient, normalised by the largest component so no
+/// `p` overflows f32. Zero at the origin. Mirror of `far_lp`.
 pub(super) fn lp_grad(q: Vec3, p: f32) -> (f32, Vec3) {
     let ax = q.x.abs();
     let ay = q.y.abs();
@@ -213,34 +214,6 @@ pub(super) fn lp_grad(q: Vec3, p: f32) -> (f32, Vec3) {
     (s, g)
 }
 
-/// Hit at `t_hit` when that sample is outside the solid. Normal from the gradient.
-fn rounded_at(
-    ray_o: Vec3,
-    ray_d: Vec3,
-    rotation: Quat,
-    t_hit: f32,
-    p: f32,
-    rho: f32,
-) -> Option<FarHit> {
-    if !(t_hit > 0.0) {
-        return None;
-    }
-    let (s, g) = lp_grad(ray_o + ray_d * t_hit, p);
-    if !(s >= rho) || !s.is_finite() {
-        return None;
-    }
-    let glen = g.length();
-    if !(glen > 1e-8) || !glen.is_finite() {
-        return None;
-    }
-    let body_n = g / glen;
-    Some(FarHit {
-        t: t_hit,
-        normal: rotate(rotation, body_n),
-        face: dom_face(body_n),
-    })
-}
-
 /// Relative width of a rounded body's air rim.
 pub(super) const RIM_WIDTH: f32 = 0.05;
 /// Floor on that width, in pixel angles.
@@ -256,10 +229,12 @@ pub(crate) fn rounded_rim_band(rho: f32, exponent: f32, px: f32) -> (f32, f32) {
 }
 
 /// Ray from the origin against the superellipsoid of face radius `rho` centred
-/// on unit `dir`. `exponent` is p ≥ 2, drawn as [`rounded_p`]. The enclosing
-/// sphere is [`rounded_bound`], padded a hair so its entry stays outside the
-/// solid. A miss that merely grazes that sphere, where the sphere lies on the
-/// body, reports the sphere point rather than a hole.
+/// on unit `dir`. `exponent` is p ≥ 2, drawn as [`rounded_p`]. The march runs
+/// on the part of the ray inside both the enclosing sphere [`rounded_bound`],
+/// padded a hair so its entry stays outside the solid, and the cube
+/// `[-rho, rho]^3` that holds the body. Newton from that entry on the convex
+/// `‖q‖_p` along the ray never passes the first root; a slope that is not
+/// falling, or a step past the exit, is a miss.
 pub(crate) fn ray_rounded(
     ray: Vec3,
     dir: Vec3,
@@ -284,98 +259,55 @@ pub(crate) fn ray_rounded(
         return None;
     }
     let sd = disc.sqrt();
-    let t_near = facing - sd;
-    let t_far = facing + sd;
-    if !(t_far > 0.0) {
+    let mut lo = (facing - sd).max(0.0);
+    let mut hi = facing + sd;
+    if !(hi > 0.0) {
         return None;
     }
     let inv = conjugate(rotation);
     let o = rotate(inv, -dir);
     let d = rotate(inv, ray);
-    let t0 = t_near.max(0.0);
-    let (s0, _) = lp_grad(o, p);
-    if t0 == 0.0 && s0 <= rho {
+    let mut slab_face = 0u32;
+    if !slab_axis(o.x, d.x, rho, &mut lo, &mut hi, &mut slab_face, 0)
+        || !slab_axis(o.y, d.y, rho, &mut lo, &mut hi, &mut slab_face, 1)
+        || !slab_axis(o.z, d.z, rho, &mut lo, &mut hi, &mut slab_face, 2)
+    {
         return None;
     }
-    let t_c = facing.clamp(t0, t_far);
-    let (s_c, _) = lp_grad(o + d * t_c, p);
-    if s_c > rho {
-        if s_c <= rho * ROUNDED_SNAP && t_c > 0.0 {
-            if let Some(hit) = rounded_at(o, d, rotation, t_c, p, rho) {
-                return Some(hit);
-            }
-        }
-        // Grazing the enclosing sphere where that sphere meets the body.
-        if t_near > 0.0 && sd <= rho_b * ROUNDED_GRAZE {
-            let (s_b, _) = lp_grad(o + d * t_near, p);
-            if s_b >= rho && s_b <= rho * ROUNDED_GRAZE_BAND {
-                let n = (ray * t_near - dir) / rho_b;
-                return Some(FarHit {
-                    t: t_near,
-                    normal: n,
-                    face: dom_face(rotate(inv, n)),
-                });
-            }
-        }
-        return None;
-    }
-    let mut lo = t0;
-    let mut hi = t_c;
+    // A camera inside the solid stops at lo = 0, which is not a hit.
     for _ in 0..ROUNDED_STEPS {
-        let (s_l, g_l) = lp_grad(o + d * lo, p);
-        if s_l >= rho && s_l <= rho * (1.0 + ROUNDED_SETTLE) {
+        let (s, g) = lp_grad(o + d * lo, p);
+        let f = s - rho;
+        if !(f > 0.0) {
             break;
         }
-        if hi - lo < 1e-6 {
+        let slope = g.dot(d);
+        let dt = -f / slope;
+        lo += dt;
+        if !(slope < 0.0) || !(lo < hi) {
+            return None;
+        }
+        if dt <= lo * ROUNDED_STEP_TOL {
             break;
         }
-        let slope = g_l.dot(d);
-        let mut moved = false;
-        if slope < -1e-8 {
-            let t_n = lo - (s_l - rho) / slope;
-            if t_n > lo && t_n < hi {
-                let (s_n, _) = lp_grad(o + d * t_n, p);
-                if s_n >= rho {
-                    lo = t_n;
-                    moved = true;
-                } else {
-                    hi = t_n;
-                }
-            }
-        }
-        if !moved {
-            let (s_h, _) = lp_grad(o + d * hi, p);
-            let mut t_f = 0.5 * (lo + hi);
-            let span = s_l - s_h;
-            if span.abs() > 1e-12 {
-                let guess = lo + (hi - lo) * (s_l - rho) / span;
-                if guess > lo && guess < hi {
-                    t_f = guess;
-                }
-            }
-            let (s_f, _) = lp_grad(o + d * t_f, p);
-            if s_f >= rho {
-                lo = t_f;
-            } else {
-                hi = t_f;
-            }
-        }
     }
-    if let Some(hit) = rounded_at(o, d, rotation, lo, p, rho) {
-        return Some(hit);
+    if !(lo > 0.0) {
+        return None;
     }
-    if t_near > 0.0 {
-        let (s_b, _) = lp_grad(o + d * t_near, p);
-        if s_b >= rho {
-            let n = (ray * t_near - dir) / rho_b;
-            return Some(FarHit {
-                t: t_near,
-                normal: n,
-                face: dom_face(rotate(inv, n)),
-            });
-        }
+    let (s, g) = lp_grad(o + d * lo, p);
+    if !(s <= rho * ROUNDED_SNAP) {
+        return None;
     }
-    None
+    let glen = g.length();
+    if !(glen > 1e-8) || !glen.is_finite() {
+        return None;
+    }
+    let body_n = g / glen;
+    Some(FarHit {
+        t: lo,
+        normal: rotate(rotation, body_n),
+        face: dom_face(body_n),
+    })
 }
 
 /// Coefficients `c6 .. c0` of [`atan_approx`] as f32 bits, the `asfloat`

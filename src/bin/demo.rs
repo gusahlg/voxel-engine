@@ -14,7 +14,9 @@
 /// append and grow upload paths.
 /// `VOXEL_DEMO_ROUNDED_P=<p>` sets the showcase rounded body's exponent (any
 /// finite `p >= 2`; unset keeps 4), so a capture can cover `p` above the
-/// shader's cap.
+/// shader's cap. `VOXEL_DEMO_ROUNDED_P=cube` draws that body as a
+/// `FarShape::Cube` of the same size, rotation and colours, the shape a large
+/// `p` converges to.
 use voxel_engine::{
     Ao, Camera3D, Color, Config, Detail, FarBody, FarMapDesc, FarMapId, FarShape, Key, Light,
     LinearRgb, MATERIAL_FLAG_PROCEDURAL, MaterialDesc, MeshData, MeshVertex, Normal, Pass, Quat,
@@ -246,6 +248,18 @@ fn demo_rounded_p() -> f32 {
         .unwrap_or(FAR_ROUNDED_P)
 }
 
+/// Shape of the showcase rounded body: a cube for `VOXEL_DEMO_ROUNDED_P=cube`,
+/// else rounded with [`demo_rounded_p`].
+fn demo_rounded_shape() -> FarShape {
+    if std::env::var("VOXEL_DEMO_ROUNDED_P").is_ok_and(|text| text == "cube") {
+        FarShape::Cube
+    } else {
+        FarShape::Rounded {
+            exponent: demo_rounded_p(),
+        }
+    }
+}
+
 /// Horizon sine for the showcase planet. An override uses the hi-sphere limb
 /// (`-sqrt(1 - rho_hi²)`, rho_hi = rho × 1.12) so interior tiles exist. The
 /// datum's largest bump is `0.12 * radius`. Unset keeps 1, which disables the
@@ -456,9 +470,7 @@ fn far_showcase_bodies() -> [FarBody; 5] {
         at(
             2,
             0.06,
-            FarShape::Rounded {
-                exponent: demo_rounded_p(),
-            },
+            demo_rounded_shape(),
             Quat::IDENTITY,
             rounded_alb,
             LinearRgb([0.35, 0.95, 0.55]),

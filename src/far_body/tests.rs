@@ -299,11 +299,27 @@ fn outside(q: Vec3, rho: f32, p: f32) -> bool {
     s + rho * 1.0e-4 >= rho
 }
 
+/// Exponents the rounded tests cover: the sphere, the range the game sends,
+/// and the cap.
+const ROUNDED_PS: [f32; 9] = [
+    2.0,
+    4.0,
+    16.0,
+    32.0,
+    64.0,
+    256.0,
+    1024.0,
+    4096.0,
+    FAR_ROUNDED_P_MAX,
+];
+
 #[test]
 fn rounded_hits_analytic_face_edge_and_corner() {
     let rho = 0.3f32;
     let tilt = Quat::from_xyzw(0.2, -0.4, 0.1, 0.8).normalize();
-    for p in [2.0f32, 2.17, 10.0] {
+    let mut ps = vec![2.17f32, 10.0];
+    ps.extend(ROUNDED_PS);
+    for p in ps {
         let corner = Vec3::ONE.normalize();
         let radial = rho / lp_grad(corner, p).0;
         let bound = rho * 3.0f32.powf(0.5 - 1.0 / p);
@@ -367,7 +383,9 @@ fn rounded_grazing_never_hits_inside() {
         Vec3::new(-1.0, 2.0, 0.0).normalize(),
         Vec3::new(2.0, -0.5, 0.0).normalize(),
     ];
-    for p in [2.0f32, 2.17, 10.0] {
+    let mut ps = vec![2.17f32, 10.0];
+    ps.extend(ROUNDED_PS);
+    for p in ps {
         for rho in [0.35f32, 0.97] {
             let bound = rho * 3.0f32.powf(0.5 - 1.0 / p);
             let centre = Vec3::Z;
@@ -397,6 +415,295 @@ fn rounded_grazing_never_hits_inside() {
                     ray_rounded(ray, centre, rho, Quat::IDENTITY, p).is_none(),
                     "p {p} rho {rho} ray outside the bound hit"
                 );
+            }
+        }
+    }
+}
+
+/// `‖q‖_p` in f64, normalised by the largest component like the shader.
+fn lp64(q: glam::DVec3, p: f64) -> f64 {
+    let a = q.abs();
+    let m = a.max_element();
+    if m == 0.0 {
+        return 0.0;
+    }
+    m * ((a.x / m).powf(p) + (a.y / m).powf(p) + (a.z / m).powf(p)).powf(1.0 / p)
+}
+
+/// Unit gradient of `‖q‖_p` in f64: `sign(q_i) (|q_i| / s)^(p - 1)`.
+fn lp_normal64(q: glam::DVec3, p: f64) -> glam::DVec3 {
+    let s = lp64(q, p);
+    let a = q.abs();
+    glam::DVec3::new(
+        (a.x / s).powf(p - 1.0) * q.x.signum(),
+        (a.y / s).powf(p - 1.0) * q.y.signum(),
+        (a.z / s).powf(p - 1.0) * q.z.signum(),
+    )
+    .normalize()
+}
+
+/// Body-space ray of world `ray` toward a body on `dir`, rotated in f32 the
+/// way `ray_rounded` does, then widened.
+fn rounded_body_ray(ray: Vec3, dir: Vec3, rotation: Quat) -> (glam::DVec3, glam::DVec3) {
+    let inv = conjugate(rotation);
+    (rotate(inv, -dir).as_dvec3(), rotate(inv, ray).as_dvec3())
+}
+
+/// First root `t > 0` of `‖o + d t‖_p = rho` in f64, independent of the
+/// march: golden-section minimum of the convex norm on the cube chord, then
+/// bisection from the entry. `None` for a miss or a camera inside the solid.
+fn rounded_reference(o: glam::DVec3, d: glam::DVec3, rho: f64, p: f64) -> Option<f64> {
+    if lp64(o, p) <= rho {
+        return None;
+    }
+    let (mut a, mut b) = (0.0f64, f64::MAX);
+    for axis in 0..3 {
+        if d[axis].abs() < 1e-300 {
+            if o[axis].abs() > rho {
+                return None;
+            }
+            continue;
+        }
+        let t1 = (-rho - o[axis]) / d[axis];
+        let t2 = (rho - o[axis]) / d[axis];
+        a = a.max(t1.min(t2));
+        b = b.min(t1.max(t2));
+    }
+    if !(a <= b) {
+        return None;
+    }
+    let f = |t: f64| lp64(o + d * t, p) - rho;
+    if f(a) <= 0.0 {
+        return Some(a);
+    }
+    let gr = 0.5 * (5.0f64.sqrt() - 1.0);
+    let (mut lo, mut hi) = (a, b);
+    let mut inside = None;
+    for _ in 0..90 {
+        let x1 = hi - gr * (hi - lo);
+        let x2 = lo + gr * (hi - lo);
+        let (f1, f2) = (f(x1), f(x2));
+        if f1 <= 0.0 || f2 <= 0.0 {
+            inside = Some(if f1 <= 0.0 { x1 } else { x2 });
+            break;
+        }
+        if f1 < f2 { hi = x2 } else { lo = x1 }
+    }
+    let inside = inside?;
+    let (mut l, mut h) = (a, inside);
+    for _ in 0..80 {
+        let m = 0.5 * (l + h);
+        if f(m) > 0.0 { l = m } else { h = m }
+    }
+    Some(0.5 * (l + h))
+}
+
+/// Whether some ray `px` (radians) away from `ray` is of the other f64 class
+/// than `hit`: the ray sits within about a pixel of the silhouette.
+fn near_rounded_silhouette(
+    ray: Vec3,
+    dir: Vec3,
+    rho: f32,
+    rotation: Quat,
+    p: f32,
+    hit: bool,
+    px: f64,
+) -> bool {
+    let u = ray.any_orthonormal_vector().as_dvec3();
+    let v = ray.as_dvec3().cross(u);
+    (0..16).any(|k| {
+        let a = k as f64 * std::f64::consts::TAU / 16.0;
+        let w = u * a.cos() + v * a.sin();
+        let r = (ray.as_dvec3() * px.cos() + w * px.sin())
+            .normalize()
+            .as_vec3();
+        let (o, d) = rounded_body_ray(r, dir, rotation);
+        rounded_reference(o, d, rho as f64, p as f64).is_some() != hit
+    })
+}
+
+/// Rotations for the reference checks: axis-aligned, generic, a corner
+/// facing the camera, and an edge facing it.
+fn rounded_rotations() -> [Quat; 4] {
+    [
+        Quat::IDENTITY,
+        Quat::from_xyzw(0.2, -0.4, 0.1, 0.8).normalize(),
+        Quat::from_rotation_arc(
+            Vec3::ONE.normalize(),
+            Vec3::new(0.3, -0.2, -1.0).normalize(),
+        ),
+        Quat::from_rotation_arc(
+            Vec3::new(1.0, 1.0, 0.0).normalize(),
+            -Vec3::new(0.3, -0.2, 1.0).normalize(),
+        ),
+    ]
+}
+
+/// The march against an independent f64 root of the same p-norm, on a ray
+/// grid over the enclosing sphere's disc. A pixel is 1080 px across a 60°
+/// field. For every exponent, four sizes (rho 0.06 to 0.9) and four
+/// orientations:
+/// - no ray more than a pixel inside the f64 silhouette misses, and no ray
+///   more than a pixel outside it hits;
+/// - where both hit, `|t - t64| / t64 <= 1e-4` unless the ray is within a
+///   pixel of the silhouette;
+/// - the normal is within 0.1° of the f64 gradient at the f64 hit wherever
+///   that gradient turns by under 0.01° over a 1e-5 move of `t` (the edge
+///   band of a large p is far below a pixel and is left out).
+/// Run with `--nocapture` for the per-exponent table.
+#[test]
+fn rounded_march_matches_the_f64_reference() {
+    let px = 2.0 * (30.0f64.to_radians()).tan() / 1080.0;
+    let dir = Vec3::new(0.3, -0.2, 1.0).normalize();
+    let u = dir.any_orthonormal_vector();
+    let v = dir.cross(u);
+    let n = 64;
+    eprintln!(
+        "p          rays   hits  t err max  >1e-4 at edge  edge misses  edge extra  normal max"
+    );
+    for p in ROUNDED_PS {
+        let (mut rays, mut hits) = (0u32, 0u32);
+        let (mut t_err, mut n_err) = (0.0f64, 0.0f64);
+        let (mut edge_t, mut edge_misses, mut edge_extra) = (0u32, 0u32, 0u32);
+        for rho in [0.06f32, 0.3, 0.55, 0.9] {
+            for rotation in rounded_rotations() {
+                let ext = (rounded_bound(rho, p) * 1.05).min(0.999);
+                for j in 0..n {
+                    for i in 0..n {
+                        let sx = ext * (2.0 * (i as f32 + 0.5) / n as f32 - 1.0);
+                        let sy = ext * (2.0 * (j as f32 + 0.5) / n as f32 - 1.0);
+                        let r2 = sx * sx + sy * sy;
+                        if r2 >= ext * ext {
+                            continue;
+                        }
+                        let ray = (dir * (1.0 - r2).sqrt() + u * sx + v * sy).normalize();
+                        rays += 1;
+                        let (o, d) = rounded_body_ray(ray, dir, rotation);
+                        let want = rounded_reference(o, d, rho as f64, p as f64);
+                        let got = ray_rounded(ray, dir, rho, rotation, p);
+                        let what = format!("p {p} rho {rho} rot {rotation} ray {ray}");
+                        match (want, got) {
+                            (Some(t64), Some(hit)) => {
+                                hits += 1;
+                                let err = (hit.t as f64 - t64).abs() / t64;
+                                t_err = t_err.max(err);
+                                if err > 1e-4 {
+                                    assert!(
+                                        near_rounded_silhouette(
+                                            ray, dir, rho, rotation, p, true, px
+                                        ),
+                                        "{what}: t {} vs {t64} ({err:e}) a pixel inside",
+                                        hit.t
+                                    );
+                                    edge_t += 1;
+                                }
+                                let n64 = lp_normal64(o + d * t64, p as f64);
+                                let turn = lp_normal64(o + d * (t64 * (1.0 - 1e-5)), p as f64)
+                                    .angle_between(lp_normal64(
+                                        o + d * (t64 * (1.0 + 1e-5)),
+                                        p as f64,
+                                    ))
+                                    .to_degrees();
+                                if turn < 0.01 {
+                                    let body_n = rotate(conjugate(rotation), hit.normal).as_dvec3();
+                                    let e = body_n.angle_between(n64).to_degrees();
+                                    n_err = n_err.max(e);
+                                    assert!(e < 0.1, "{what}: normal off by {e} deg");
+                                }
+                            }
+                            (Some(_), None) => {
+                                assert!(
+                                    near_rounded_silhouette(ray, dir, rho, rotation, p, true, px),
+                                    "{what}: missed a pixel inside the silhouette"
+                                );
+                                edge_misses += 1;
+                            }
+                            (None, Some(hit)) => {
+                                assert!(
+                                    near_rounded_silhouette(ray, dir, rho, rotation, p, false, px),
+                                    "{what}: hit at {} a pixel outside the silhouette",
+                                    hit.t
+                                );
+                                edge_extra += 1;
+                            }
+                            (None, None) => {}
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{p:<7} {rays:7} {hits:6}  {t_err:9.2e}  {edge_t:13}  {edge_misses:11}  {edge_extra:10}  {n_err:9.4}°"
+        );
+    }
+}
+
+/// Scan lines across the body, through the centre and through the corner a
+/// view sees: the hits are one unbroken run, its ends sit within a pixel of
+/// the f64 silhouette, and `t` along it follows the f64 root.
+#[test]
+fn rounded_silhouette_is_continuous() {
+    let px = 2.0 * (30.0f64.to_radians()).tan() / 1080.0;
+    let dir = Vec3::new(-0.2, 0.1, 1.0).normalize();
+    for p in ROUNDED_PS {
+        for rho in [0.06f32, 0.4] {
+            for rotation in rounded_rotations() {
+                let bound = rounded_bound(rho, p);
+                // A corner's direction from the camera, and the centre.
+                let corner = dir + rotation * (Vec3::ONE * rho);
+                for through in [dir, corner.normalize()] {
+                    for angle in [0.0f32, 1.1, 2.3] {
+                        let side = dir.any_orthonormal_vector();
+                        let side = Quat::from_axis_angle(dir, angle) * side;
+                        let samples = 500;
+                        let mut run: Vec<(usize, f32, f64)> = Vec::new();
+                        let mut want_run: Vec<usize> = Vec::new();
+                        let mut gaps = 0;
+                        let step = 2.2 * bound / samples as f32;
+                        for k in 0..=samples {
+                            let s = -1.1 * bound + step * k as f32;
+                            let ray = (through + side * s).normalize();
+                            let (o, d) = rounded_body_ray(ray, dir, rotation);
+                            let want = rounded_reference(o, d, rho as f64, p as f64);
+                            if want.is_some() {
+                                want_run.push(k);
+                            }
+                            if let Some(hit) = ray_rounded(ray, dir, rho, rotation, p) {
+                                if let Some(&(last, _, _)) = run.last() {
+                                    if last + 1 != k {
+                                        gaps += 1;
+                                    }
+                                }
+                                run.push((k, hit.t, want.unwrap_or(f64::NAN)));
+                            }
+                        }
+                        let what = format!("p {p} rho {rho} rot {rotation} angle {angle}");
+                        assert_eq!(gaps, 0, "{what}: the hits are not one run");
+                        if want_run.is_empty() {
+                            assert!(run.len() <= 1, "{what}: hits with no f64 surface");
+                            continue;
+                        }
+                        assert!(!run.is_empty(), "{what}: no hits on the f64 surface");
+                        // The scan step in radians, roughly.
+                        let step_rad = step as f64;
+                        let ends = |k: usize| k as f64 * step_rad;
+                        let (first, last) = (run[0].0, run[run.len() - 1].0);
+                        let (wf, wl) = (want_run[0], want_run[want_run.len() - 1]);
+                        assert!(
+                            (ends(first) - ends(wf)).abs() <= px + step_rad
+                                && (ends(last) - ends(wl)).abs() <= px + step_rad,
+                            "{what}: run {first}..{last} vs f64 {wf}..{wl}"
+                        );
+                        for &(_, t, t64) in &run {
+                            if t64.is_finite() {
+                                assert!(
+                                    ((t as f64) - t64).abs() <= 2e-3 * t64,
+                                    "{what}: t {t} vs {t64} on the run"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1834,7 +2141,8 @@ fn mirror_constants_match_the_shader() {
         "far_mapped_air_chord samples"
     );
 
-    // Rounded body: march budget and pads.
+    // Rounded body: march budget, step tolerance and snap band, the cube clip
+    // the mirror starts from, and no enclosing-sphere fallback hit.
     let rounded = shader_fn(src, "bool far_ray_rounded(");
     assert_eq!(
         uint(literal_after(rounded, "step < ")),
@@ -1842,10 +2150,8 @@ fn mirror_constants_match_the_shader() {
         "far_ray_rounded steps"
     );
     for (marker, value) in [
-        ("if (s <= rho * ", ROUNDED_SNAP),
-        ("sd <= rhoB * ", ROUNDED_GRAZE),
-        ("s >= rho && s <= rho * ", ROUNDED_GRAZE_BAND),
-        ("sL <= rho * (1.0 + ", ROUNDED_SETTLE),
+        ("!(s <= rho * ", ROUNDED_SNAP),
+        ("dt <= lo * ", ROUNDED_STEP_TOL),
     ] {
         assert_eq!(
             float_bits(literal_after(rounded, marker)),
@@ -1883,8 +2189,8 @@ fn mirror_constants_match_the_shader() {
         rounded.contains("float p = far_round_p(exponent);"),
         "march exponent"
     );
-    // The march and the enclosing-sphere normal pad the corner sphere; the
-    // three air rims (far_add_rgb and both pass-1 gates) do not.
+    // The march pads the corner sphere; the three air rims (far_add_rgb and
+    // both pass-1 gates) do not.
     let mut padded = 0;
     let mut rims = 0;
     for (at, _) in src.match_indices("far_round_bound(rho, ") {
@@ -1902,7 +2208,21 @@ fn mirror_constants_match_the_shader() {
             rims += 1;
         }
     }
-    assert_eq!((padded, rims), (2, 3), "far_round_bound call sites");
+    assert_eq!((padded, rims), (1, 3), "far_round_bound call sites");
+    for axis in ["x", "y", "z"] {
+        assert!(
+            rounded.contains(&format!("far_slab(o.{axis}, d.{axis}, rho, lo, hi, ")),
+            "far_ray_rounded cube clip on {axis}"
+        );
+    }
+    assert!(
+        !rounded.contains("| 8u"),
+        "enclosing-sphere fallback face bit"
+    );
+    assert!(
+        !src.contains("bestKind == 6u"),
+        "enclosing-sphere fallback shade"
+    );
     let widths = literals_after(src, "float width = max(rhoB * ");
     assert_eq!(widths.len(), 3, "rounded rim widths");
     for lit in widths {

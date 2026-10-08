@@ -57,9 +57,9 @@ mod tests {
         assert_eq!(SPILL_WG, 8);
         assert_eq!(TAA_TILE, 16);
         assert_eq!(EXPOSURE_TILE % 8, 0);
-        // FarShape::Rounded: 2 is the sphere; the sky caps p at 32.
+        // FarShape::Rounded: 2 is the sphere; the sky caps p at 16384.
         assert_eq!(FAR_ROUNDED_P_MIN, 2.0);
-        assert_eq!(FAR_ROUNDED_P_MAX, 32.0);
+        assert_eq!(FAR_ROUNDED_P_MAX, 16384.0);
     }
 
     #[test]

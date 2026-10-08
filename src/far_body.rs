@@ -40,8 +40,9 @@ pub enum FarShape {
     /// `|x|^p + |y|^p + |z|^p = radius^p` in body space. `exponent` is p ≥ 2
     /// (2 is the sphere; large p approaches the cube). Face centres sit at
     /// `radius`; a unit direction `d` meets the surface at `radius / ‖d‖_p`.
-    /// The sky draws p up to [`crate::genconst::FAR_ROUNDED_P_MAX`] (32); a
-    /// larger exponent draws that shape, air rim included.
+    /// The sky draws p up to [`crate::genconst::FAR_ROUNDED_P_MAX`] (16384,
+    /// whose corners sit at 0.99993 of a cube corner); a larger exponent draws
+    /// that shape, air rim included.
     Rounded {
         exponent: f32,
     },

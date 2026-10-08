@@ -64,15 +64,15 @@ fn cone_bound_matches_what_the_shader_can_draw() {
         (1.05 * rho_b).to_bits()
     );
 
-    // The shader clamps the exponent to 32; the cone uses that same p.
-    let steep = sample(FarShape::Rounded { exponent: 80.0 }, 1.0, 0.1);
-    let p32 = FAR_ROUNDED_P_MAX;
-    assert_eq!(p32, 32.0);
-    let rho_b32 = 0.1 * 3.0f32.powf(0.5 - 1.0 / p32) * (1.0 + 2.0e-4);
-    assert!(1.05 * rho_b32 < 0.99);
+    // The shader clamps the exponent to the cap; the cone uses that same p.
+    let steep = sample(FarShape::Rounded { exponent: 1.0e6 }, 1.0, 0.1);
+    let cap = FAR_ROUNDED_P_MAX;
+    assert_eq!(cap, 16384.0);
+    let rho_b_cap = 0.1 * 3.0f32.powf(0.5 - 1.0 / cap) * (1.0 + 2.0e-4);
+    assert!(1.05 * rho_b_cap < 0.99);
     assert_eq!(
         pack_table(std::slice::from_ref(&steep), None).cone[0][3].to_bits(),
-        (1.05 * rho_b32).to_bits()
+        (1.05 * rho_b_cap).to_bits()
     );
 
     let wall = sample(FarShape::InnerSphere, 2.0, 5.0);
@@ -192,10 +192,10 @@ fn mapped_cone_widens_by_the_air_shell() {
 }
 
 /// The rounded air rim takes the exponent the march and the cone take. Past
-/// the cap it used to sit on the unclamped corner sphere, up to 3.5% outside
-/// the drawn corners: a gap between the solid and the rim, and a rim past the
-/// cone. Each body is placed so that the view ray tangent to its corner
-/// sphere touches a corner, the one place the solid reaches that sphere.
+/// the cap it used to sit on the unclamped corner sphere, outside the drawn
+/// corners: a gap between the solid and the rim, and a rim past the cone.
+/// Each body is placed so that the view ray tangent to its corner sphere
+/// touches a corner, the one place the solid reaches that sphere.
 #[test]
 fn rounded_rim_meets_the_drawn_corner_inside_the_cone() {
     let tilt = Quat::from_xyzw(0.2, -0.4, 0.1, 0.8).normalize();
@@ -208,7 +208,20 @@ fn rounded_rim_meets_the_drawn_corner_inside_the_cone() {
     // 1080p at 60°.
     let pixels = [1.0e-5f32, 2.0 * (60.0f32.to_radians() * 0.5).tan() / 1080.0];
     let no_maps = [0.0f32; MAX_FAR_MAPS];
-    for exponent in [2.0f32, 4.0, 16.0, 32.0, 33.0, 64.0, 1000.0] {
+    for exponent in [
+        2.0f32,
+        4.0,
+        16.0,
+        32.0,
+        33.0,
+        64.0,
+        256.0,
+        1000.0,
+        1024.0,
+        FAR_ROUNDED_P_MAX,
+        2.0 * FAR_ROUNDED_P_MAX,
+        1.0e6,
+    ] {
         for rho in [0.06f32, 0.3] {
             let body = sample(FarShape::Rounded { exponent }, 1.0, rho);
             let bound = cone_bound(&body, &no_maps);

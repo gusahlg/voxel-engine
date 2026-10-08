@@ -1178,8 +1178,8 @@ fn build_table() -> Vec<Def> {
         },
         Def {
             name: "FAR_ROUNDED_P_MAX",
-            doc: "Largest FarShape::Rounded exponent the sky draws. A larger p draws this\nshape: the march, the normal, the air rim and the host cone bound all clamp\nto it, so the rim stays on the drawn corners and inside the cone.",
-            val: Val::Scalar(32.0),
+            doc: "Largest FarShape::Rounded exponent the sky draws. A larger p draws this\nshape: the march, the normal, the air rim and the host cone bound all clamp\nto it, so the rim stays on the drawn corners and inside the cone. Its corner\nsits at 3^(-1/16384) = 0.99993 of a cube corner (0.1 px short at an 860 px\nface radius), so a larger cap draws nothing visibly new.",
+            val: Val::Scalar(16384.0),
         },
     ]
 }
