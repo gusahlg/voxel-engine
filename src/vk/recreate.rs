@@ -595,20 +595,13 @@ impl Renderer {
             let samples_changed = self.targets.samples != prev_samples;
             if samples_changed || format_changed {
                 self.pipelines.destroy(&self.device.device);
-                self.pipelines = Pipelines::new(
-                    &self.device.device,
+                self.pipelines = Pipelines::for_targets(
+                    &self.device,
                     self.pipeline_cache,
-                    self.targets.color_format,
+                    &self.targets,
                     self.swapchain.format,
-                    self.targets.depth_format,
-                    self.targets.samples,
                     self.atlas.set_layout,
                     self.mesh3d_set_layout,
-                    self.device.fragment_shading_rate.as_ref(),
-                    self.device.sky_coarse_ok(self.targets.samples),
-                    self.device.independent_blend,
-                    self.device.vrs_depth_ms_ok(self.targets.samples),
-                    self.device.shader_stats.as_ref(),
                 );
             }
 

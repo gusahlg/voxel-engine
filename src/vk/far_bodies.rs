@@ -28,6 +28,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::far_body::{FarBody, FarShape, MAX_FAR_BODIES, MAX_FAR_MAPS};
 use crate::rev::{FrameSlot, PerSlot};
 use crate::vk::buffers::HostBuffer;
+use crate::vk::pipeline::{SkyFrag, SkyRate};
 
 /// `VOXEL_FAR_CULL=0` disables the cone reject, the CPU frustum compaction, and
 /// the per-tile mask (every tile keeps every surviving body). Any other value,
@@ -1559,11 +1560,32 @@ fn partition_mapsolo(table: &mut FarTableGpu) -> u32 {
 
 /// Which body fragment a draw needs. `Full` has every shape. `NoMap` drops the
 /// mapped march. `Sphere` keeps spheres and inner spheres.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SkyBodyPipe {
+    #[default]
     Full,
     NoMap,
     Sphere,
+}
+
+impl SkyBodyPipe {
+    pub(crate) fn frag(self) -> SkyFrag {
+        match self {
+            Self::Full => SkyFrag::Full,
+            Self::NoMap => SkyFrag::NoMap,
+            Self::Sphere => SkyFrag::Sphere,
+        }
+    }
+}
+
+/// One instanced tile-quad draw: `count` tiles from tile-list slot `first`
+/// (the draw's firstInstance) on the `(frag, Tile, rate)` sky pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SkyRun {
+    pub frag: SkyFrag,
+    pub rate: SkyRate,
+    pub first: u32,
+    pub count: u32,
 }
 
 /// How `record_sky` draws this frame. Tile quads only when the mask is a real
@@ -1571,7 +1593,7 @@ pub(crate) enum SkyBodyPipe {
 /// least one kept body. Otherwise one fullscreen triangle. No kept bodies use
 /// the body-free pipeline. A frame with no mapped body uses `NoMap`, and a
 /// frame of only spheres and inner spheres uses `Sphere`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SkyDraw {
     pub quads: bool,
     /// Fullscreen triangle uses the body-free pipeline.
@@ -1583,8 +1605,6 @@ pub(crate) struct SkyDraw {
     pub n_sphere: u32,
     /// Tiles whose mask meets a cube, rounded or mapped body.
     pub n_heavy: u32,
-    /// `n_sphere + n_heavy`. `far.tiles`.
-    pub n_full: u32,
     /// Coarse-eligible prefix of the base run. `sky.coarse`. Zero unless a
     /// query actually split the prefix.
     pub n_coarse: u32,
@@ -1598,24 +1618,87 @@ pub(crate) struct SkyDraw {
     pub n_mapsolo: u32,
 }
 
-impl Default for SkyDraw {
-    fn default() -> Self {
-        Self {
-            quads: false,
-            base: false,
-            body: SkyBodyPipe::Full,
-            n_base: 0,
-            n_sphere: 0,
-            n_heavy: 0,
-            n_full: 0,
-            n_coarse: 0,
-            n_coarse_far: 0,
-            n_mapsolo: 0,
+impl SkyDraw {
+    /// Tile-quad draws in upload order: base coarse, base fine, sphere,
+    /// mapsolo coarse, mapsolo fine, heavy coarse, heavy fine. Each `first`
+    /// is the sum of the counts before it, which is where [`fill_tile_lists`],
+    /// [`partition_mapsolo`] and the `split_coarse_*` pair put those tiles.
+    /// Empty runs are `None`; all are `None` when the sky is one fullscreen
+    /// triangle.
+    ///
+    /// `coarse` is [`SkyPipelines::has_coarse`], the same switch the CPU
+    /// split read. Without the 2×2 pipelines a coarse prefix stays at the
+    /// head of its fine run. With mapsolo on, the heavy interior is a prefix
+    /// of the mapsolo run, so the heavy coarse run is empty. With it off,
+    /// mapped-interior tiles are a prefix of the whole heavy run and draw on
+    /// the full fragment at 2×2.
+    ///
+    /// [`SkyPipelines::has_coarse`]: super::pipeline::SkyPipelines::has_coarse
+    pub(crate) fn runs(&self, coarse: bool) -> [Option<SkyRun>; 7] {
+        if !self.quads {
+            return [None; 7];
+        }
+        let if_coarse = |n: u32| if coarse { n } else { 0 };
+        let base_coarse = if_coarse(self.n_coarse.min(self.n_base));
+        let mapsolo = self.n_mapsolo.min(self.n_heavy);
+        let mapsolo_coarse = if_coarse(self.n_coarse_far.min(mapsolo));
+        let heavy_coarse = if_coarse(
+            self.n_coarse_far
+                .saturating_sub(mapsolo)
+                .min(self.n_heavy - mapsolo),
+        );
+        let mut first = 0u32;
+        [
+            (SkyFrag::Base, SkyRate::Coarse, base_coarse),
+            (SkyFrag::Base, SkyRate::Fine, self.n_base - base_coarse),
+            (SkyFrag::Sphere, SkyRate::Fine, self.n_sphere),
+            (SkyFrag::MapSolo, SkyRate::Coarse, mapsolo_coarse),
+            (SkyFrag::MapSolo, SkyRate::Fine, mapsolo - mapsolo_coarse),
+            (SkyFrag::Full, SkyRate::Coarse, heavy_coarse),
+            (
+                self.body.frag(),
+                SkyRate::Fine,
+                self.n_heavy - mapsolo - heavy_coarse,
+            ),
+        ]
+        .map(|(frag, rate, count)| {
+            let run = (count > 0).then_some(SkyRun {
+                frag,
+                rate,
+                first,
+                count,
+            });
+            first += count;
+            run
+        })
+    }
+
+    /// The fullscreen triangle's fragment: body-free with no kept body, else
+    /// the frame's body fragment.
+    pub(crate) fn fullscreen_frag(&self) -> SkyFrag {
+        if self.base {
+            SkyFrag::Base
+        } else {
+            self.body.frag()
         }
     }
-}
 
-impl SkyDraw {
+    /// `sky.coarse`, `sky.coarse_far` and `sky.mapsolo`.
+    fn publish_gauges(&self) {
+        crate::profile::gauge(crate::profile::Gauge::SkyCoarse, u64::from(self.n_coarse));
+        crate::profile::gauge(
+            crate::profile::Gauge::SkyCoarseFar,
+            u64::from(self.n_coarse_far),
+        );
+        crate::profile::gauge(crate::profile::Gauge::SkyMapsolo, u64::from(self.n_mapsolo));
+    }
+
+    /// Zeroes every gauge [`FarBodyRing::write`] publishes: a frame with no sky.
+    pub(crate) fn zero_gauges() {
+        publish_far_gauges(0, 0, 0);
+        Self::default().publish_gauges();
+    }
+
     fn body_pipe(table: &FarTableGpu) -> SkyBodyPipe {
         if has_mapped(table) {
             SkyBodyPipe::Full
@@ -1631,37 +1714,33 @@ impl SkyDraw {
         let tile_px = table.header[1];
         let tiles_x = table.header[2];
         let tiles_y = table.header[3];
-        let (n_base, n_sphere, n_heavy) = tile_split(table);
-        let n_full = n_sphere + n_heavy;
+        let body = Self::body_pipe(table);
         let tiled = cull && tile_px != 0 && tiles_x != 0 && tiles_y != 0 && bodies != 0;
-        if tiled {
-            Self {
-                quads: true,
-                base: false,
-                body: Self::body_pipe(table),
-                n_base,
-                n_sphere,
-                n_heavy,
-                n_full,
-                n_coarse: 0,
-                n_coarse_far: 0,
-                n_mapsolo: count_mapsolo(table),
-            }
-        } else {
-            Self {
-                quads: false,
+        if !tiled {
+            return Self {
                 base: bodies == 0,
-                body: Self::body_pipe(table),
-                n_base: 0,
-                n_sphere: 0,
-                n_heavy: 0,
-                n_full: 0,
-                n_coarse: 0,
-                n_coarse_far: 0,
-                n_mapsolo: 0,
-            }
+                body,
+                ..Self::default()
+            };
+        }
+        let (n_base, n_sphere, n_heavy) = tile_split(table);
+        Self {
+            quads: true,
+            body,
+            n_base,
+            n_sphere,
+            n_heavy,
+            n_mapsolo: count_mapsolo(table),
+            ..Self::default()
         }
     }
+}
+
+/// `far.bodies` (offered), `far.drawn` (kept) and `far.tiles` (mask != 0).
+fn publish_far_gauges(offered: u64, drawn: u64, tiles: u64) {
+    crate::profile::gauge(crate::profile::Gauge::FarBodies, offered);
+    crate::profile::gauge(crate::profile::Gauge::FarDrawn, drawn);
+    crate::profile::gauge(crate::profile::Gauge::FarTiles, tiles);
 }
 
 /// Bytes the GPU reads this frame: the body table plus one mask per live tile.
@@ -3169,13 +3248,11 @@ impl FarBodyRing {
             sky_up,
         );
         self.publish_horizons(&mut table, view.as_ref(), maps, &map_max, &map_min);
-        let offered = bodies.len().min(MAX_FAR_BODIES) as u64;
-        crate::profile::gauge(crate::profile::Gauge::FarBodies, offered);
-        crate::profile::gauge(crate::profile::Gauge::FarDrawn, u64::from(table.header[0]));
         // `far.tiles` is the full-pipeline tile count (mask != 0).
         debug_assert_eq!(u64::from(table.list_header[1]), nonzero_tiles(&table));
-        crate::profile::gauge(
-            crate::profile::Gauge::FarTiles,
+        publish_far_gauges(
+            bodies.len().min(MAX_FAR_BODIES) as u64,
+            u64::from(table.header[0]),
             u64::from(table.list_header[1]),
         );
         let mut draw = SkyDraw::from_table(&table, far_cull_enabled());
@@ -3197,12 +3274,7 @@ impl FarBodyRing {
                 }
             }
         }
-        crate::profile::gauge(crate::profile::Gauge::SkyCoarse, u64::from(draw.n_coarse));
-        crate::profile::gauge(
-            crate::profile::Gauge::SkyCoarseFar,
-            u64::from(draw.n_coarse_far),
-        );
-        crate::profile::gauge(crate::profile::Gauge::SkyMapsolo, u64::from(draw.n_mapsolo));
+        draw.publish_gauges();
         self.draw[slot] = draw;
         if super::uniforms::sky_debug_enabled() {
             log_sky_debug(bodies, &table, view.as_ref(), dip, &map_min, sky_up);
@@ -4352,7 +4424,12 @@ mod tests {
         let draw = SkyDraw::from_table(&table, true);
         assert!(draw.quads);
         assert_eq!(
-            (draw.n_base, draw.n_sphere, draw.n_heavy, draw.n_full),
+            (
+                draw.n_base,
+                draw.n_sphere,
+                draw.n_heavy,
+                table.list_header[1]
+            ),
             (2, 1, 1, 2)
         );
         assert_eq!(draw.n_coarse, 0);
@@ -4419,7 +4496,7 @@ mod tests {
                 draw.n_base,
                 draw.n_sphere,
                 draw.n_heavy,
-                draw.n_full,
+                table.list_header[1],
                 draw.n_mapsolo
             ),
             (1, 1, 4, 5, 2)
@@ -5573,6 +5650,312 @@ mod tests {
             assert!(
                 !both_coarse.contains(&index),
                 "full-run tile {index} went coarse"
+            );
+        }
+    }
+
+    /// One command of the pre-table `record_sky` tile path.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LegacyCmd {
+        Bind(SkyFrag, SkyRate),
+        Draw { count: u32, first: u32 },
+    }
+
+    /// `record_sky`'s bind+draw sequence as of 09812b7 (`scene_pass.rs`
+    /// 876-936 and 1013-1091), copied with each pipeline named by its
+    /// `(frag, rate)` row. The three coarse `Option`s were built together, so
+    /// they are one `coarse` flag; `sky_tile_heavy` is the body fragment at
+    /// 1×1. `Err` is the fullscreen triangle's fragment.
+    fn legacy_sky_cmds(draw: &SkyDraw, coarse: bool) -> Result<Vec<LegacyCmd>, SkyFrag> {
+        use LegacyCmd::{Bind, Draw};
+        let pipe = coarse.then_some(());
+        let tile_base_coarse = pipe.map(|_| (SkyFrag::Base, SkyRate::Coarse));
+        let tile_base = (SkyFrag::Base, SkyRate::Fine);
+        let tile_sphere = (SkyFrag::Sphere, SkyRate::Fine);
+        let tile_mapsolo = (SkyFrag::MapSolo, SkyRate::Fine);
+        let tile_mapsolo_coarse = pipe.map(|_| (SkyFrag::MapSolo, SkyRate::Coarse));
+        let tile_coarse = pipe.map(|_| (SkyFrag::Full, SkyRate::Coarse));
+        let tile_heavy = (draw.body.frag(), SkyRate::Fine);
+        let quads = draw.quads && (draw.n_base > 0 || draw.n_sphere > 0 || draw.n_heavy > 0);
+        let fullscreen = if draw.base {
+            SkyFrag::Base
+        } else {
+            draw.body.frag()
+        };
+        let n_coarse = tile_base_coarse.map_or(0, |_| draw.n_coarse.min(draw.n_base));
+        let n_fine = draw.n_base - n_coarse;
+        let n_mapsolo = draw.n_mapsolo.min(draw.n_heavy);
+        let n_mapsolo_coarse = tile_mapsolo_coarse.map_or(0, |_| draw.n_coarse_far.min(n_mapsolo));
+        let n_mapsolo_fine = n_mapsolo - n_mapsolo_coarse;
+        let n_full_coarse = tile_coarse.map_or(0, |_| {
+            draw.n_coarse_far
+                .saturating_sub(n_mapsolo)
+                .min(draw.n_heavy - n_mapsolo)
+        });
+        let n_full_fine = draw.n_heavy - n_mapsolo - n_full_coarse;
+        if !quads {
+            return Err(fullscreen);
+        }
+        let first = if n_coarse > 0 {
+            tile_base_coarse.unwrap_or(tile_base)
+        } else if n_fine > 0 {
+            tile_base
+        } else if draw.n_sphere > 0 {
+            tile_sphere
+        } else if n_mapsolo_coarse > 0 {
+            tile_mapsolo_coarse.unwrap_or(tile_mapsolo)
+        } else if n_mapsolo_fine > 0 {
+            tile_mapsolo
+        } else if n_full_coarse > 0 {
+            tile_coarse.unwrap_or(tile_heavy)
+        } else {
+            tile_heavy
+        };
+        let bind = |(frag, rate): (SkyFrag, SkyRate)| Bind(frag, rate);
+        let mut cmds = vec![bind(first)];
+        if n_coarse > 0 {
+            cmds.push(Draw {
+                count: n_coarse,
+                first: 0,
+            });
+        }
+        if n_fine > 0 {
+            if n_coarse > 0 {
+                cmds.push(bind(tile_base));
+            }
+            cmds.push(Draw {
+                count: n_fine,
+                first: n_coarse,
+            });
+        }
+        if draw.n_sphere > 0 {
+            if draw.n_base > 0 {
+                cmds.push(bind(tile_sphere));
+            }
+            cmds.push(Draw {
+                count: draw.n_sphere,
+                first: draw.n_base,
+            });
+        }
+        let heavy_start = draw.n_base + draw.n_sphere;
+        if n_mapsolo_coarse > 0 {
+            if draw.n_base > 0 || draw.n_sphere > 0 {
+                cmds.push(bind(tile_mapsolo_coarse.unwrap_or(tile_mapsolo)));
+            }
+            cmds.push(Draw {
+                count: n_mapsolo_coarse,
+                first: heavy_start,
+            });
+        }
+        if n_mapsolo_fine > 0 {
+            if draw.n_base > 0 || draw.n_sphere > 0 || n_mapsolo_coarse > 0 {
+                cmds.push(bind(tile_mapsolo));
+            }
+            cmds.push(Draw {
+                count: n_mapsolo_fine,
+                first: heavy_start + n_mapsolo_coarse,
+            });
+        }
+        if n_full_coarse > 0 {
+            if draw.n_base > 0 || draw.n_sphere > 0 || n_mapsolo > 0 {
+                cmds.push(bind(tile_coarse.unwrap_or(tile_heavy)));
+            }
+            cmds.push(Draw {
+                count: n_full_coarse,
+                first: heavy_start + n_mapsolo,
+            });
+        }
+        if n_full_fine > 0 {
+            if draw.n_base > 0 || draw.n_sphere > 0 || n_mapsolo > 0 || n_full_coarse > 0 {
+                cmds.push(bind(tile_heavy));
+            }
+            cmds.push(Draw {
+                count: n_full_fine,
+                first: heavy_start + n_mapsolo + n_full_coarse,
+            });
+        }
+        Ok(cmds)
+    }
+
+    /// Each draw of a command list, with the pipeline bound when it runs.
+    fn bound_draws(cmds: &[LegacyCmd]) -> Vec<SkyRun> {
+        let mut bound = None;
+        let mut draws = Vec::new();
+        for cmd in cmds {
+            match *cmd {
+                LegacyCmd::Bind(frag, rate) => bound = Some((frag, rate)),
+                LegacyCmd::Draw { count, first } => {
+                    let (frag, rate) = bound.expect("a draw before any bind");
+                    draws.push(SkyRun {
+                        frag,
+                        rate,
+                        first,
+                        count,
+                    });
+                }
+            }
+        }
+        draws
+    }
+
+    /// Every `[u32; N]` with `v[i]` in `0..=max[i]`.
+    fn grid<const N: usize>(max: [u32; N]) -> impl Iterator<Item = [u32; N]> {
+        let total: u32 = max.iter().map(|m| m + 1).product();
+        (0..total).map(move |code| {
+            let mut rest = code;
+            std::array::from_fn(|i| {
+                let value = rest % (max[i] + 1);
+                rest /= max[i] + 1;
+                value
+            })
+        })
+    }
+
+    /// `SkyDraw::runs` draws what the hand-unrolled `record_sky` drew: the
+    /// same runs, counts, firstInstance values and bound pipelines, the same
+    /// first pipeline, and the fullscreen triangle in the same cases. Small
+    /// counts exhaustively, with the coarse and mapsolo prefixes past their
+    /// runs to hit the clamps, coarse pipelines on and off, and mapsolo on
+    /// (`n_mapsolo` free) and off (`n_mapsolo == 0`, what `count_mapsolo`
+    /// returns then).
+    #[test]
+    fn sky_runs_match_legacy_counts() {
+        let bodies = [SkyBodyPipe::Full, SkyBodyPipe::NoMap, SkyBodyPipe::Sphere];
+        let mut cases = 0u32;
+        for [
+            quads,
+            base,
+            body,
+            coarse,
+            mapsolo,
+            n_base,
+            n_sphere,
+            n_heavy,
+            n_coarse,
+            n_coarse_far,
+            n_mapsolo,
+        ] in grid([1, 1, 2, 1, 1, 3, 2, 3, 4, 4, 4])
+        {
+            if mapsolo == 0 && n_mapsolo != 0 {
+                continue;
+            }
+            let coarse = coarse == 1;
+            let draw = SkyDraw {
+                quads: quads == 1,
+                base: base == 1,
+                body: bodies[body as usize],
+                n_base,
+                n_sphere,
+                n_heavy,
+                n_coarse,
+                n_coarse_far,
+                n_mapsolo,
+            };
+            let runs: Vec<SkyRun> = draw.runs(coarse).into_iter().flatten().collect();
+            match legacy_sky_cmds(&draw, coarse) {
+                Err(fullscreen) => {
+                    assert!(runs.is_empty(), "{draw:?} coarse {coarse}");
+                    assert_eq!(draw.fullscreen_frag(), fullscreen, "{draw:?}");
+                }
+                Ok(cmds) => {
+                    assert_eq!(runs, bound_draws(&cmds), "{draw:?} coarse {coarse}");
+                    assert_eq!(
+                        cmds[0],
+                        LegacyCmd::Bind(runs[0].frag, runs[0].rate),
+                        "{draw:?} coarse {coarse}"
+                    );
+                }
+            }
+            cases += 1;
+        }
+        assert_eq!(cases, 2 * 2 * 3 * 2 * (1 + 5) * 4 * 3 * 4 * 5 * 5);
+    }
+
+    /// The runs cut the uploaded tile list where the CPU partition put each
+    /// class. Built in `FarBodyRing::write` order (`fill_tile_lists` inside
+    /// the pack, then `partition_mapsolo`, then the two coarse splits), they
+    /// cover the live list contiguously from slot 0, and every tile in a run
+    /// has that run's class.
+    #[test]
+    fn sky_runs_tile_the_cpu_partition() {
+        let view = view_pitched(0.0, 90.0, 1280, 720);
+        let frames = TileFrames::build(&view).expect("frames");
+        assert!(frames.matches(&view));
+        let map_max = [0.0f32; MAX_FAR_MAPS];
+        let map_min = [0.0f32; MAX_FAR_MAPS];
+        // The planet below the horizon, a sphere on its disc (shared heavy
+        // tiles) and a sphere up in the sky (sphere-only tiles).
+        let bodies = [
+            mapped_down(4.0, 1.0, 0.0, 0.0),
+            placed(Vec3::new(0.0, -1.0, -1.0), 0.15, FarShape::Sphere, 2),
+            placed(Vec3::new(0.4, 0.3, -1.0), 0.05, FarShape::Sphere, 3),
+        ];
+        // The sun up and to the left of the view axis keeps the base tiles
+        // around its disc at 1x1. The moon is behind the camera.
+        let query = coarse_query(Vec3::new(-0.4, 0.4, -1.0), false);
+        for [mapsolo, coarse] in grid([1, 1]) {
+            let (mapsolo, coarse) = (mapsolo == 1, coarse == 1);
+            let mut table = super::pack_table(&bodies, Some(view), &map_max);
+            let mut draw = SkyDraw::from_table(&table, true);
+            assert!(draw.quads);
+            draw.n_mapsolo = if mapsolo {
+                partition_mapsolo(&mut table)
+            } else {
+                0
+            };
+            if coarse {
+                draw.n_coarse = split_coarse_base(&mut table, &frames, &view, &query);
+                draw.n_coarse_far = split_coarse_far(&mut table, &frames, &view, &query, &map_min);
+            }
+            let label = format!("mapsolo {mapsolo} coarse {coarse} {draw:?}");
+            let runs: Vec<SkyRun> = draw.runs(coarse).into_iter().flatten().collect();
+            let n = used_tiles(&table);
+            let mut next = 0u32;
+            for run in &runs {
+                assert_eq!(run.first, next, "{label}");
+                next += run.count;
+            }
+            assert_eq!(next as usize, n, "{label}");
+            let mut live = table.tile_index[..n].to_vec();
+            live.sort_unstable();
+            assert!(
+                live.iter().enumerate().all(|(i, &index)| index == i as u32),
+                "{label}"
+            );
+
+            let heavy = heavy_mask(&table);
+            for run in &runs {
+                let end = (run.first + run.count) as usize;
+                for &index in &table.tile_index[run.first as usize..end] {
+                    let mask = table.tile_mask[index as usize];
+                    let solo = mask_is_mapsolo(&table, mask);
+                    let ok = match (run.frag, run.rate) {
+                        (SkyFrag::Base, _) => mask == 0,
+                        (SkyFrag::Sphere, _) => mask != 0 && mask & heavy == 0,
+                        (SkyFrag::MapSolo, _) => solo,
+                        (_, SkyRate::Coarse) => !mapsolo && solo,
+                        (_, SkyRate::Fine) => mask & heavy != 0 && !(mapsolo && solo),
+                    };
+                    assert!(ok, "{label}: tile {index} mask {mask:#x} in {run:?}");
+                }
+            }
+            let has = |frag: SkyFrag, rate: SkyRate| {
+                runs.iter().any(|run| run.frag == frag && run.rate == rate)
+            };
+            assert!(has(SkyFrag::Base, SkyRate::Fine), "{label}");
+            assert!(has(SkyFrag::Sphere, SkyRate::Fine), "{label}");
+            assert!(has(SkyFrag::Full, SkyRate::Fine), "{label}");
+            assert_eq!(has(SkyFrag::Base, SkyRate::Coarse), coarse, "{label}");
+            assert_eq!(has(SkyFrag::MapSolo, SkyRate::Fine), mapsolo, "{label}");
+            assert_eq!(
+                has(SkyFrag::MapSolo, SkyRate::Coarse),
+                mapsolo && coarse,
+                "{label}"
+            );
+            assert_eq!(
+                has(SkyFrag::Full, SkyRate::Coarse),
+                !mapsolo && coarse,
+                "{label}"
             );
         }
     }
