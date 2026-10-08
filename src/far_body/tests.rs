@@ -1853,13 +1853,63 @@ fn mirror_constants_match_the_shader() {
             "far_ray_rounded `{marker}`"
         );
     }
-    // Every copy of the enclosing-sphere bound, not only the intersection's.
-    for lit in literals_after(src, "pow(3.0, 0.5 - 1.0 / p) * (1.0 + ") {
-        assert_eq!(
-            float_bits(lit),
-            ROUNDED_BOUND_PAD.to_bits(),
-            "rounded bound pad"
-        );
+    // One exponent clamp and one corner sphere, the host's rounded_p and
+    // rounded_bound, and every exponent use goes through them (SH-7: the rims
+    // once took max(p, 2) while the march and the cone took [2, 32]).
+    assert!(
+        shader_fn(src, "float far_round_p(")
+            .contains("return clamp(exponent, FAR_ROUNDED_P_MIN, FAR_ROUNDED_P_MAX);"),
+        "far_round_p"
+    );
+    assert!(
+        shader_fn(src, "float far_round_bound(")
+            .contains("return rho * pow(3.0, 0.5 - 1.0 / far_round_p(exponent));"),
+        "far_round_bound"
+    );
+    assert_eq!(src.matches("pow(3.0, ").count(), 1, "corner sphere");
+    assert_eq!(src.matches("clamp(exponent").count(), 1, "exponent clamp");
+    let loads = src.matches("float pExp = asfloat(").count();
+    assert_eq!(loads, src.matches(".seed.y)").count(), "exponent loads");
+    let routed = loads
+        + src.matches("far_round_bound(rho, pExp)").count()
+        + src.matches("far_round_p(pExp)").count()
+        + src.matches("rot, pExp, facing").count();
+    assert_eq!(
+        src.matches("pExp").count(),
+        routed,
+        "an exponent use outside far_round_p"
+    );
+    assert!(
+        rounded.contains("float p = far_round_p(exponent);"),
+        "march exponent"
+    );
+    // The march and the enclosing-sphere normal pad the corner sphere; the
+    // three air rims (far_add_rgb and both pass-1 gates) do not.
+    let mut padded = 0;
+    let mut rims = 0;
+    for (at, _) in src.match_indices("far_round_bound(rho, ") {
+        let line = src[at..].lines().next().unwrap_or_default();
+        if let Some(i) = line.find(") * (1.0 + ") {
+            let lit = &line[i + ") * (1.0 + ".len()..];
+            assert_eq!(
+                float_bits(lit.trim_end_matches(");")),
+                ROUNDED_BOUND_PAD.to_bits(),
+                "rounded bound pad: {line}"
+            );
+            padded += 1;
+        } else {
+            assert!(line.ends_with(");"), "{line}");
+            rims += 1;
+        }
+    }
+    assert_eq!((padded, rims), (2, 3), "far_round_bound call sites");
+    let widths = literals_after(src, "float width = max(rhoB * ");
+    assert_eq!(widths.len(), 3, "rounded rim widths");
+    for lit in widths {
+        assert_eq!(float_bits(lit), RIM_WIDTH.to_bits(), "rim width");
+    }
+    for lit in literals_after(src, "max(rhoB * 0.05, px * ") {
+        assert_eq!(float_bits(lit), RIM_MIN_PX.to_bits(), "rim pixel floor");
     }
 
     // Cube slabs.

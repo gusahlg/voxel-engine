@@ -349,7 +349,24 @@ bool far_round_at(float3 o, float3 d, float tHit, float p, float rho, out float 
     return true;
 }
 
-// Superellipsoid of face radius rho. Bound is rho * 3^(1/2 - 1/p), padded a hair
+// The exponent a rounded body is drawn with. The march, the normal and the air
+// rims take p only through here, and the host cone bound clamps the same way
+// (far_body::rounded_p), so a body past the cap is the FAR_ROUNDED_P_MAX shape
+// everywhere.
+float far_round_p(float exponent)
+{
+    return clamp(exponent, FAR_ROUNDED_P_MIN, FAR_ROUNDED_P_MAX);
+}
+
+// Corner reach rho * 3^(1/2 - 1/p) of the drawn shape, from the body's raw
+// exponent: the enclosing sphere before its pad, and the air rim's inner edge.
+// Twin of far_body::rounded_bound.
+float far_round_bound(float rho, float exponent)
+{
+    return rho * pow(3.0, 0.5 - 1.0 / far_round_p(exponent));
+}
+
+// Superellipsoid of face radius rho. Bound is far_round_bound, padded a hair
 // so the entry stays outside the solid. A graze of that sphere, where it meets
 // the body, falls back to the sphere point rather than opening a hole.
 // No world normal: a carried float3 across this loop spilled. Shade rebuilds
@@ -358,8 +375,8 @@ bool far_ray_rounded(float3 ray, float3 center, float rho, float4 rot, float exp
 {
     t = 0.0;
     face = 0u;
-    float p = clamp(exponent, 2.0, 32.0);
-    float rhoB = rho * pow(3.0, 0.5 - 1.0 / p) * (1.0 + 2.0e-4);
+    float p = far_round_p(exponent);
+    float rhoB = far_round_bound(rho, exponent) * (1.0 + 2.0e-4);
     float disc = facing * facing - (1.0 - rhoB * rhoB);
     if (disc < 0.0)
         return false;
@@ -1848,8 +1865,7 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
     if (rounded)
     {
         float pExp = asfloat(farTable[0].body[i].seed.y);
-        float pRim = max(pExp, 2.0);
-        float rhoB = rho * pow(3.0, 0.5 - 1.0 / pRim);
+        float rhoB = far_round_bound(rho, pExp);
         float s = length(cross(ray, center));
         float width = max(rhoB * 0.05, px * 1.25);
         float u = saturate((s - rhoB) / width);
@@ -2055,8 +2071,7 @@ float3 far_bodies(float3 ray, float3 col, float px, float2 pix)
             }
             else if (!hit && dot(atmo.rgb, atmo.rgb) > 0.0)
             {
-                float pRim = max(pExp, 2.0);
-                float rhoB = rho * pow(3.0, 0.5 - 1.0 / pRim);
+                float rhoB = far_round_bound(rho, pExp);
                 float s = length(cross(ray, center));
                 float width = max(rhoB * 0.05, px * 1.25);
                 if (s > rhoB && s < rhoB + width && facing * distance < bestDepth)
@@ -2179,10 +2194,10 @@ float3 far_bodies(float3 ray, float3 col, float px, float2 pix)
 #ifndef FAR_NO_ROUNDED
             if (bestKind == 5u || bestKind == 6u)
             {
-                float p = clamp(asfloat(farTable[0].body[bestI].seed.y), 2.0, 32.0);
+                float pExp = asfloat(farTable[0].body[bestI].seed.y);
                 if (bestKind == 6u)
                 {
-                    float rhoB = rho * pow(3.0, 0.5 - 1.0 / p) * (1.0 + 2.0e-4);
+                    float rhoB = far_round_bound(rho, pExp) * (1.0 + 2.0e-4);
                     bestN = (ray * bestT - center) / rhoB;
                 }
                 else
@@ -2191,7 +2206,7 @@ float3 far_bodies(float3 ray, float3 col, float px, float2 pix)
                     float3 d = far_inv_rotate(rot, ray);
                     float sLp;
                     float3 gLp;
-                    far_lp(o + d * bestT, p, sLp, gLp);
+                    far_lp(o + d * bestT, far_round_p(pExp), sLp, gLp);
                     float glen = length(gLp);
                     if (glen > 1e-8)
                         bestN = far_rotate(rot, gLp / glen);
@@ -2356,8 +2371,7 @@ float3 far_sky_debug_rgb(float3 ray, float px, float2 pix)
             }
             else if (!hit && dot(atmo.rgb, atmo.rgb) > 0.0)
             {
-                float pRim = max(pExp, 2.0);
-                float rhoB = rho * pow(3.0, 0.5 - 1.0 / pRim);
+                float rhoB = far_round_bound(rho, pExp);
                 float s = length(cross(ray, center));
                 float width = max(rhoB * 0.05, px * 1.25);
                 if (s > rhoB && s < rhoB + width && facing * distance < bestDepth)

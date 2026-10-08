@@ -7,6 +7,7 @@
 use glam::{Quat, Vec3};
 
 use crate::color::LinearRgb;
+use crate::genconst::{FAR_ROUNDED_P_MAX, FAR_ROUNDED_P_MIN};
 
 #[cfg(test)]
 pub(crate) mod mirror;
@@ -39,6 +40,8 @@ pub enum FarShape {
     /// `|x|^p + |y|^p + |z|^p = radius^p` in body space. `exponent` is p ≥ 2
     /// (2 is the sphere; large p approaches the cube). Face centres sit at
     /// `radius`; a unit direction `d` meets the surface at `radius / ‖d‖_p`.
+    /// The sky draws p up to [`crate::genconst::FAR_ROUNDED_P_MAX`] (32); a
+    /// larger exponent draws that shape, air rim included.
     Rounded {
         exponent: f32,
     },
@@ -219,10 +222,24 @@ pub(crate) fn validate_far_map_face(
     Ok(())
 }
 
+/// The exponent the sky draws a rounded body with: `exponent` clamped to
+/// `[FAR_ROUNDED_P_MIN, FAR_ROUNDED_P_MAX]`. Twin of `far_round_p` in
+/// `far_body.slang`.
+pub(crate) fn rounded_p(exponent: f32) -> f32 {
+    exponent.clamp(FAR_ROUNDED_P_MIN, FAR_ROUNDED_P_MAX)
+}
+
+/// Corner reach `rho · 3^(1/2 − 1/p)` of the drawn rounded body at the
+/// clamped exponent: the enclosing sphere before its pad, and the air rim's
+/// inner edge. Twin of `far_round_bound` in `far_body.slang`.
+pub(crate) fn rounded_bound(rho: f32, exponent: f32) -> f32 {
+    rho * 3.0f32.powf(0.5 - 1.0 / rounded_p(exponent))
+}
+
 fn keep(body: &FarBody) -> Option<FarBody> {
     match body.shape {
         FarShape::Rounded { exponent } => {
-            if !(exponent >= 2.0) || !exponent.is_finite() {
+            if !(exponent >= FAR_ROUNDED_P_MIN) || !exponent.is_finite() {
                 return None;
             }
         }

@@ -12,6 +12,9 @@
 /// material table every ~60 frames (or only the parts in a comma list of
 /// `far`, `set`, `append`, `mat`), so a validation run hits the overwrite,
 /// append and grow upload paths.
+/// `VOXEL_DEMO_ROUNDED_P=<p>` sets the showcase rounded body's exponent (any
+/// finite `p >= 2`; unset keeps 4), so a capture can cover `p` above the
+/// shader's cap.
 use voxel_engine::{
     Ao, Camera3D, Color, Config, Detail, FarBody, FarMapDesc, FarMapId, FarShape, Key, Light,
     LinearRgb, MATERIAL_FLAG_PROCEDURAL, MaterialDesc, MeshData, MeshVertex, Normal, Pass, Quat,
@@ -199,6 +202,8 @@ const FAR_DATUM_RES: u32 = 33;
 const FAR_ALBEDO_SIZE: u32 = 64;
 /// Reference radius fraction for the mapped planet (`rho`).
 const FAR_MAPPED_RHO: f32 = 0.12;
+/// Exponent of the showcase rounded body.
+const FAR_ROUNDED_P: f32 = 4.0;
 
 /// Next non-colliding `screenshots/watt-<utc-secs>.png`. Autoshot cannot use
 /// [`Engine::screenshot`](voxel_engine::Engine::screenshot): that encode is
@@ -229,6 +234,16 @@ fn demo_mapped_override() -> Option<f32> {
 /// Showcase planet rho. Unset (or an unusable override) keeps [`FAR_MAPPED_RHO`].
 fn demo_mapped_rho() -> f32 {
     demo_mapped_override().unwrap_or(FAR_MAPPED_RHO)
+}
+
+/// Showcase rounded exponent: `VOXEL_DEMO_ROUNDED_P` when it parses as a
+/// finite `p >= 2` (what `FarShape::Rounded` keeps), else [`FAR_ROUNDED_P`].
+fn demo_rounded_p() -> f32 {
+    std::env::var("VOXEL_DEMO_ROUNDED_P")
+        .ok()
+        .and_then(|text| text.parse::<f32>().ok())
+        .filter(|p| p.is_finite() && *p >= voxel_engine::genconst::FAR_ROUNDED_P_MIN)
+        .unwrap_or(FAR_ROUNDED_P)
 }
 
 /// Horizon sine for the showcase planet. An override uses the hi-sphere limb
@@ -441,7 +456,9 @@ fn far_showcase_bodies() -> [FarBody; 5] {
         at(
             2,
             0.06,
-            FarShape::Rounded { exponent: 4.0 },
+            FarShape::Rounded {
+                exponent: demo_rounded_p(),
+            },
             Quat::IDENTITY,
             rounded_alb,
             LinearRgb([0.35, 0.95, 0.55]),
@@ -921,7 +938,10 @@ fn showcase_ang(body: &FarBody, max_off: f32) -> f32 {
         FarShape::Sphere => rho * 1.05,
         FarShape::Cube => rho * 3.0f32.sqrt() * 1.035,
         FarShape::Rounded { exponent } => {
-            rho * 3.0f32.powf(0.5 - 1.0 / exponent) * (1.0 + 2.0e-4) * 1.05
+            // The sky draws the clamped exponent, rim included.
+            use voxel_engine::genconst::{FAR_ROUNDED_P_MAX, FAR_ROUNDED_P_MIN};
+            let p = exponent.clamp(FAR_ROUNDED_P_MIN, FAR_ROUNDED_P_MAX);
+            rho * 3.0f32.powf(0.5 - 1.0 / p) * (1.0 + 2.0e-4) * 1.05
         }
         FarShape::Mapped { air, .. } => (body.radius + max_off + air) / body.distance,
         FarShape::InnerSphere => rho,
@@ -1013,7 +1033,7 @@ fn far_showcase_matches_the_shape_contract() {
     assert!(matches!(bodies[1].shape, FarShape::Cube));
     assert!(matches!(
         bodies[2].shape,
-        FarShape::Rounded { exponent } if (exponent - 4.0).abs() < 1e-6
+        FarShape::Rounded { exponent } if (exponent - FAR_ROUNDED_P).abs() < 1e-6
     ));
     match bodies[3].shape {
         FarShape::Mapped { map, horizon, air } => {

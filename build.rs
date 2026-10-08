@@ -1169,6 +1169,18 @@ fn build_table() -> Vec<Def> {
             doc: "Screen tiles in the FarTable tile_mask and tile_index arrays.\nTwin of MAX_FAR_TILES in vk/far_bodies.rs.",
             val: Val::UInt(8192),
         },
+        // Rounded far-body exponent range. far_body.slang's far_round_p and the
+        // host's far_body::rounded_p clamp through it at every use.
+        Def {
+            name: "FAR_ROUNDED_P_MIN",
+            doc: "Smallest FarShape::Rounded exponent (2 is the sphere). The host drops a\nbody below it; the sky clamps p into [FAR_ROUNDED_P_MIN, FAR_ROUNDED_P_MAX].",
+            val: Val::Scalar(2.0),
+        },
+        Def {
+            name: "FAR_ROUNDED_P_MAX",
+            doc: "Largest FarShape::Rounded exponent the sky draws. A larger p draws this\nshape: the march, the normal, the air rim and the host cone bound all clamp\nto it, so the rim stays on the drawn corners and inside the cone.",
+            val: Val::Scalar(32.0),
+        },
     ]
 }
 
