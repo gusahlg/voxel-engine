@@ -419,3 +419,23 @@ static const uint DETAIL_GPU_BIAS = 2;
 // (glow/255) * GLOW_SCALE * albedo. Default 4.0. Read by mesh3d.frag via material.slang.
 static const float GLOW_SCALE = 4.0f;
 
+// Far bodies kept per frame: the FarTable cone and body arrays, and the
+// bodies a tile mask word can name. Twin of far_body::MAX_FAR_BODIES.
+static const uint MAX_FAR_BODIES = 32;
+
+// Datum-map slots: the farAlbedo cube array and the map headers at the
+// start of the farMaps buffer. Twin of far_body::MAX_FAR_MAPS.
+static const uint MAX_FAR_MAPS = 8;
+
+// uints in one map header of the farMaps buffer. The datum floats start
+// after MAX_FAR_MAPS headers. Twin of HEADER_STRIDE in vk/far_maps.rs.
+static const uint FAR_MAP_HEADER_STRIDE = 8;
+
+// Azimuth bins in one far-body horizon table. FarTable.horizon_sin holds
+// two tables. Twin of HORIZON_BINS in vk/far_bodies.rs.
+static const uint FAR_HORIZON_BINS = 256;
+
+// Screen tiles in the FarTable tile_mask and tile_index arrays.
+// Twin of MAX_FAR_TILES in vk/far_bodies.rs.
+static const uint MAX_FAR_TILES = 8192;
+

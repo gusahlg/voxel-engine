@@ -3,6 +3,9 @@
 #ifndef VOXEL_FAR_TABLE_SLANG
 #define VOXEL_FAR_TABLE_SLANG
 
+// Array sizes come from the generated constants (build.rs build_table).
+#include "common.slang"
+
 // Ten float4 lanes, 160 bytes. atmosphere.a is the shape: 0 cube, 1 sphere,
 // 2 inner sphere, 3 rounded, 4 mapped.
 // seed.x is the noise seed (unused for mapped). seed.y is the rounded
@@ -34,11 +37,12 @@ struct FarTable
     // x = count, y = tile size in pixels, z = tiles_x, w = tiles_y.
     // yzw are 0 when the host has no view; the shader then walks every body.
     uint4 header;
-    float4 cone[32]; // xyz = dir, w = sine bound (-1 = never reject)
-    FarGpu body[32];
+    float4 cone[MAX_FAR_BODIES]; // xyz = dir, w = sine bound (-1 = never reject)
+    FarGpu body[MAX_FAR_BODIES];
     // Azimuthal horizon tables for at most two Mapped bodies the eye is inside
     // the hi+air ball of. x and y are the kept-body index of table 0 and 1,
-    // or 0xffffffff when that table is unused. z is the bin count (256). w is 0.
+    // or 0xffffffff when that table is unused. z is the bin count
+    // (FAR_HORIZON_BINS). w is 0.
     // Bin b of a table is an upper bound on sin(elevation) of any surface or
     // air-shell point in that azimuth sector. Elevation is above the plane
     // perpendicular to the body's local up (centre → eye). Azimuth 0 faces
@@ -48,18 +52,21 @@ struct FarTable
     // A ray whose sin(elevation) is above its bin skips the mapped march and
     // the limb. Unused bins are 1, so they never reject.
     uint4 horizon_id;
-    float horizon_sin[512];
-    // Bit k is kept body k. One word per tile, row-major. Host cap is 8192.
-    uint tile_mask[8192];
+    float horizon_sin[2 * FAR_HORIZON_BINS];
+    // Bit k is kept body k. One word per tile, row-major.
+    uint tile_mask[MAX_FAR_TILES];
     // Tile-quad draws. Not read by far_bodies.
     // x = n_base (mask == 0), y = n_full (mask != 0), z = width, w = height.
-    // tile_index is three ascending row-major runs: mask == 0, then tiles
-    // whose bits are only spheres or inner spheres, then the rest. n_full is
-    // the last two runs. The vertex shader reads Vulkan InstanceIndex
-    // (includes firstInstance), not D3D SV_InstanceID. The CPU's firstInstance
-    // selects the run.
+    // tile_index is three runs: mask == 0, then tiles whose bits are only
+    // spheres or inner spheres, then the rest. n_full is the last two runs.
+    // Each run starts ascending row-major. The host may then stably reorder
+    // the first and the last run so the tiles it draws with other pipelines
+    // come first (coarse base tiles; single-mapped tiles and the coarse
+    // mapped interiors). The vertex shader reads Vulkan InstanceIndex
+    // (includes firstInstance), not D3D SV_InstanceID. The CPU's
+    // firstInstance selects the run or prefix.
     uint4 list_header;
-    uint tile_index[8192];
+    uint tile_index[MAX_FAR_TILES];
 };
 
 #endif

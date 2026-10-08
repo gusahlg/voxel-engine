@@ -8,6 +8,10 @@
 /// `VOXEL_DEMO_VRS=1` turns on `RenderFlags::vrs`, `VOXEL_DEMO_MSAA=<n>` starts
 /// at that sample count, and `VOXEL_DEMO_FULLSCREEN=1` starts fullscreen, so a
 /// validation run can cover VRS + MSAA at the output's full resolution.
+/// `VOXEL_DEMO_UPLOAD_CYCLE=1` re-uploads far map 0, block textures and the
+/// material table every ~60 frames (or only the parts in a comma list of
+/// `far`, `set`, `append`, `mat`), so a validation run hits the overwrite,
+/// append and grow upload paths.
 use voxel_engine::{
     Ao, Camera3D, Color, Config, Detail, FarBody, FarMapDesc, FarMapId, FarShape, Key, Light,
     LinearRgb, MATERIAL_FLAG_PROCEDURAL, MaterialDesc, MeshData, MeshVertex, Normal, Pass, Quat,
@@ -489,6 +493,97 @@ fn install_far_showcase(eng: &mut voxel_engine::Engine) {
     }
 }
 
+/// Uploads `VOXEL_DEMO_UPLOAD_CYCLE` repeats: `1` or `all` for every part,
+/// else a comma list of `far`, `set`, `append` and `mat`.
+#[derive(Clone, Copy, Default)]
+struct UploadCycle {
+    far: bool,
+    set: bool,
+    append: bool,
+    mat: bool,
+}
+
+impl UploadCycle {
+    fn from_env() -> Option<Self> {
+        let text = std::env::var("VOXEL_DEMO_UPLOAD_CYCLE").ok()?;
+        match text.trim() {
+            "0" | "" => return None,
+            "1" | "all" => {
+                return Some(Self {
+                    far: true,
+                    set: true,
+                    append: true,
+                    mat: true,
+                });
+            }
+            _ => {}
+        }
+        let mut parts = Self::default();
+        for part in text.split(',') {
+            match part.trim() {
+                "far" => parts.far = true,
+                "set" => parts.set = true,
+                "append" => parts.append = true,
+                "mat" => parts.mat = true,
+                other => log::warn!("VOXEL_DEMO_UPLOAD_CYCLE: unknown part {other:?}"),
+            }
+        }
+        Some(parts)
+    }
+}
+
+/// One step of `VOXEL_DEMO_UPLOAD_CYCLE`. `far` re-sets far map 0 (a pending
+/// replacement cube and a datum overwrite). `set` rewrites block-texture
+/// layer 1 in place and `append` adds one layer (a grow once the palette
+/// passes its capacity; past 100 layers the palette drops back to the three
+/// base layers in place). `mat` edits the material table: a set on even steps,
+/// an append on odd ones.
+fn demo_upload_step(
+    eng: &mut voxel_engine::Engine,
+    parts: UploadCycle,
+    step: u32,
+    layers: &mut Vec<Vec<u8>>,
+    procedural: &mut bool,
+) {
+    log::info!("demo upload cycle: step {step}");
+    if parts.far {
+        install_far_showcase(eng);
+    }
+    let mut set = parts.set;
+    if layers.len() >= 100 {
+        layers.truncate(3);
+        set = true;
+    }
+    if parts.set {
+        let tint = (step % 4) as u8 * 40;
+        for px in layers[CHECKER_LAYER as usize].chunks_exact_mut(4) {
+            px[2] = px[0].saturating_sub(tint);
+        }
+    }
+    if set {
+        eng.set_block_textures(16, layers);
+    }
+    if parts.append {
+        let shade = (step % 200) as u8;
+        let extra: Vec<u8> = [shade, 255 - shade, 128, 255].repeat(16 * 16);
+        eng.append_block_textures(std::slice::from_ref(&extra));
+        layers.push(extra);
+    }
+    if !parts.mat {
+        return;
+    }
+    if step.is_multiple_of(2) {
+        *procedural = !*procedural;
+        if *procedural {
+            eng.set_material_descs(&demo_procedural_materials());
+        } else {
+            eng.set_material_descs(&demo_array_materials());
+        }
+    } else {
+        eng.append_material_descs(&[MaterialDesc::ARRAY_LAYER]);
+    }
+}
+
 /// One step of `VOXEL_DEMO_RECREATE_CYCLE`. MSAA steps the way the A key does,
 /// then returns to the count from before that step.
 fn demo_recreate_step(eng: &mut voxel_engine::Engine, step: u32, msaa_before: &mut u32) {
@@ -566,6 +661,11 @@ fn main() {
     let mut cycle_step: u32 = 0;
     let mut cycle_msaa: u32 = 1;
     let mut frame_n: u32 = 0;
+    // Every ~60 frames after the first uploads: far map, block textures and
+    // materials again (see `demo_upload_step`).
+    let upload_cycle = UploadCycle::from_env();
+    let mut upload_step: u32 = 0;
+    let mut upload_layers = block_texture_layers(16);
     // Test aids: VRS (classifier + rate attachment), a starting MSAA count,
     // and a fullscreen start.
     let flags = voxel_engine::RenderFlags {
@@ -706,6 +806,19 @@ fn main() {
                         Detail::new(1),
                     ),
                 );
+            }
+            if let Some(parts) = upload_cycle
+                && frame_n > 60
+                && frame_n.is_multiple_of(60)
+            {
+                demo_upload_step(
+                    eng,
+                    parts,
+                    upload_step,
+                    &mut upload_layers,
+                    &mut procedural_mats,
+                );
+                upload_step += 1;
             }
 
             // Scroll to zoom: each notch nudges the vertical FOV, scrolling up

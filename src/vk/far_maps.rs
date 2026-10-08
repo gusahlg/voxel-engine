@@ -21,22 +21,32 @@
 
 use ash::vk;
 
-use super::alloc::{create_buffer, find_memory_type};
+use super::alloc::{create_buffer, create_filled_staging};
 use super::buffers::RetireQueue;
-use super::image::allocate_and_bind_image;
-use super::mesh_residency::{CopyBarrier, copy_barrier};
-use super::timeline::{Timeline, TimelineValue};
-use super::transfer::TransferLane;
+use super::image::{allocate_and_bind_image, color_range};
+use super::mesh_residency::{CopyBarrier, CopyConsumer, copy_barrier};
+use super::timeline::TimelineValue;
+use super::transfer::{TransferCtx, UploadRetire};
 use crate::far_body::{FarMapError, MAX_FAR_MAPS};
 
 /// Stages that first read the datum buffer and the albedo cubes (sky fragment).
 pub(crate) const FAR_MAP_CONSUMER_STAGES: vk::PipelineStageFlags2 =
     vk::PipelineStageFlags2::FRAGMENT_SHADER;
 
+/// Copy-barrier consumer of the datum buffer: sky-fragment storage reads.
+const DATUM_CONSUMER: CopyConsumer = (
+    FAR_MAP_CONSUMER_STAGES,
+    vk::AccessFlags2::SHADER_STORAGE_READ,
+);
+
 const MAX_G: usize = 65;
 /// Floats reserved for one map, including the padding past a smaller `g`.
 const SLOT_FLOATS: usize = 6 * MAX_G * MAX_G;
-const HEADER_UINTS: usize = MAX_FAR_MAPS * 8;
+/// Words in one map header. `shaders/far_body.slang` indexes the headers with
+/// the generated twin.
+const HEADER_STRIDE: usize = 8;
+const _: () = assert!(crate::genconst::FAR_MAP_HEADER_STRIDE as usize == HEADER_STRIDE);
+const HEADER_UINTS: usize = MAX_FAR_MAPS * HEADER_STRIDE;
 const BUFFER_UINTS: usize = HEADER_UINTS + MAX_FAR_MAPS * SLOT_FLOATS;
 /// Six cube faces, bit `f` for face `f`.
 const FACE_MASK: u32 = 0b11_1111;
@@ -299,11 +309,8 @@ pub(crate) struct FarMaps {
     inflight_faces: Vec<InflightFace>,
     pending_retire: Vec<GpuCube>,
     image_retire: RetireQueue<GpuCube>,
-    staging_retire: RetireQueue<(vk::Buffer, vk::DeviceMemory)>,
-    transfer_retire: RetireQueue<(vk::Buffer, vk::DeviceMemory)>,
-    /// Graphics-pool command buffers used for a dedicated-family release.
-    release_cmds: RetireQueue<(Timeline, vk::CommandBuffer)>,
-    command_pool: vk::CommandPool,
+    /// Face and datum staging, and the dedicated-family datum release.
+    retire: UploadRetire,
     /// Bit i is set after map i's cube allocation has failed and been logged.
     /// Cleared when a later `set_map` installs a cube or an explicit
     /// `albedo_size` of 0, so the next failure logs again. Not per frame.
@@ -376,10 +383,7 @@ impl FarMaps {
             inflight_faces: Vec::new(),
             pending_retire: Vec::new(),
             image_retire: RetireQueue::new(),
-            staging_retire: RetireQueue::new(),
-            transfer_retire: RetireQueue::new(),
-            release_cmds: RetireQueue::new(),
-            command_pool,
+            retire: UploadRetire::new(command_pool, "far-map"),
             oom_logged: 0,
         }
     }
@@ -456,10 +460,7 @@ impl FarMaps {
     }
 
     pub(crate) fn has_garbage(&self) -> bool {
-        !self.image_retire.is_empty()
-            || !self.staging_retire.is_empty()
-            || !self.transfer_retire.is_empty()
-            || !self.release_cmds.is_empty()
+        !self.image_retire.is_empty() || self.retire.has_garbage()
     }
 
     /// A datum overwrite of a buffer graphics has already read, a face blit
@@ -648,7 +649,7 @@ impl FarMaps {
 
     fn write_header(&mut self, id: usize) {
         let slot = &self.slots[id];
-        let b = id * 8;
+        let b = id * HEADER_STRIDE;
         self.words[b] = slot.g;
         self.words[b + 1] = (id * SLOT_FLOATS) as u32;
         self.words[b + 2] = slot.min_off.to_bits();
@@ -662,23 +663,13 @@ impl FarMaps {
     /// Record pending clears, face blits, and the datum copy. Returns the
     /// transfer-lane value the graphics submit must wait on, if the copy left
     /// this command buffer.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn flush(
-        &mut self,
-        instance: &ash::Instance,
-        device: &ash::Device,
-        physical: vk::PhysicalDevice,
-        lane: &mut TransferLane,
-        graphics_cmd: vk::CommandBuffer,
-        graphics_queue: vk::Queue,
-        graphics_family: u32,
-        graphics_timeline: &Timeline,
-        last_render_value: TimelineValue,
-        done_at: TimelineValue,
-    ) -> Option<TimelineValue> {
+    pub unsafe fn flush(&mut self, ctx: &mut TransferCtx<'_>) -> Option<TimelineValue> {
+        let device = ctx.device;
+        let graphics_cmd = ctx.graphics_cmd;
+        let done_at = ctx.done_at;
         unsafe {
             if !self.inflight_faces.is_empty() {
-                let current = graphics_timeline.counter(device);
+                let current = ctx.graphics_timeline.counter(device);
                 self.promote_landed(current);
             }
             if !self.dummy.cleared {
@@ -693,23 +684,12 @@ impl FarMaps {
                     prepare_cube(device, graphics_cmd, &mut cube.cube);
                 }
             }
-            let face_staging = self.record_faces(instance, device, physical, graphics_cmd, done_at);
-            if let Some((buffer, memory)) = face_staging {
-                self.staging_retire.push(done_at, (buffer, memory));
+            let face_staging = self.record_faces(ctx);
+            if let Some(staging) = face_staging {
+                self.retire.retire_on_graphics(done_at, staging);
             }
             let wait = if self.buffer_dirty {
-                self.upload_buffer(
-                    instance,
-                    device,
-                    physical,
-                    lane,
-                    graphics_cmd,
-                    graphics_queue,
-                    graphics_family,
-                    graphics_timeline,
-                    last_render_value,
-                    done_at,
-                )
+                self.upload_buffer(ctx)
             } else {
                 None
             };
@@ -766,12 +746,11 @@ impl FarMaps {
     /// retired by the caller at `done_at`.
     unsafe fn record_faces(
         &mut self,
-        instance: &ash::Instance,
-        device: &ash::Device,
-        physical: vk::PhysicalDevice,
-        cmd: vk::CommandBuffer,
-        done_at: TimelineValue,
+        ctx: &TransferCtx<'_>,
     ) -> Option<(vk::Buffer, vk::DeviceMemory)> {
+        let device = ctx.device;
+        let cmd = ctx.graphics_cmd;
+        let done_at = ctx.done_at;
         let faces = std::mem::take(&mut self.pending_faces);
         if faces.is_empty() {
             return None;
@@ -812,8 +791,8 @@ impl FarMaps {
         if jobs.is_empty() {
             return None;
         }
-        let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
-        let (staging, staging_mem) = unsafe { fill_staging(device, &memory_props, &packed) };
+        let (staging, staging_mem) =
+            create_filled_staging(device, &ctx.memory_props(), &packed, "far-map staging");
         for job in &jobs {
             let (image, mips, size) = {
                 let cube = &self.slots[job.id]
@@ -850,51 +829,51 @@ impl FarMaps {
         Some((staging, staging_mem))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn upload_buffer(
-        &mut self,
-        instance: &ash::Instance,
-        device: &ash::Device,
-        physical: vk::PhysicalDevice,
-        lane: &mut TransferLane,
-        graphics_cmd: vk::CommandBuffer,
-        graphics_queue: vk::Queue,
-        graphics_family: u32,
-        graphics_timeline: &Timeline,
-        last_render_value: TimelineValue,
-        done_at: TimelineValue,
-    ) -> Option<TimelineValue> {
+    unsafe fn upload_buffer(&mut self, ctx: &mut TransferCtx<'_>) -> Option<TimelineValue> {
         self.buffer_dirty = false;
-        let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
+        let device = ctx.device;
+        let graphics_cmd = ctx.graphics_cmd;
+        let graphics_family = ctx.graphics_family;
+        let done_at = ctx.done_at;
         let bytes: &[u8] = bytemuck::cast_slice(&self.words);
-        let (staging, staging_mem) = unsafe { fill_staging(device, &memory_props, bytes) };
-        let separate = lane.is_separate_queue();
-        let qfot = lane.needs_ownership_transfer();
+        let (staging, staging_mem) =
+            create_filled_staging(device, &ctx.memory_props(), bytes, "far-map staging");
+        let separate = ctx.lane.is_separate_queue();
+        let qfot = ctx.lane.needs_ownership_transfer();
         let buffer = self.buffer;
         let size = bytes.len() as u64;
         let reads = vk::AccessFlags2::SHADER_STORAGE_READ;
 
         let extra_wait = if qfot && self.buffer_on_graphics {
+            // Release the datum earlier frames read so the lane can acquire it.
+            let release = [vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)
+                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                .dst_access_mask(vk::AccessFlags2::NONE)
+                .src_queue_family_index(graphics_family)
+                .dst_queue_family_index(ctx.lane.family())
+                .buffer(buffer)
+                .size(size)];
             Some(unsafe {
-                self.submit_release(
+                self.retire.submit_release(
                     device,
-                    graphics_queue,
-                    graphics_family,
-                    lane.family(),
+                    ctx.graphics_queue,
                     done_at,
-                    size,
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&release),
                 )
             })
         } else if separate && self.buffer_on_graphics {
             Some((
-                graphics_timeline.semaphore(),
-                last_render_value,
+                ctx.graphics_timeline.semaphore(),
+                ctx.last_render_value,
                 vk::PipelineStageFlags2::FRAGMENT_SHADER,
             ))
         } else {
             None
         };
 
+        let lane = &mut *ctx.lane;
         let lane_batch = separate.then(|| unsafe { lane.begin(device) });
         let record_cmd = lane_batch.as_ref().map_or(graphics_cmd, |b| b.cmd());
         unsafe {
@@ -935,9 +914,11 @@ impl FarMaps {
 
         let arrived = if let Some(lane_batch) = lane_batch {
             if qfot {
-                let release = [datum_barrier(
+                let release = [copy_barrier(
                     buffer,
+                    0,
                     size,
+                    DATUM_CONSUMER,
                     CopyBarrier::Release {
                         src_family: lane.family(),
                         dst_family: graphics_family,
@@ -952,9 +933,11 @@ impl FarMaps {
             }
             let value = unsafe { lane.submit_after(device, lane_batch, extra_wait) };
             if qfot {
-                let acquire = [datum_barrier(
+                let acquire = [copy_barrier(
                     buffer,
+                    0,
                     size,
+                    DATUM_CONSUMER,
                     CopyBarrier::Acquire {
                         src_family: lane.family(),
                         dst_family: graphics_family,
@@ -967,111 +950,49 @@ impl FarMaps {
                     );
                 }
             }
-            self.transfer_retire.push(value, (staging, staging_mem));
+            self.retire.retire_on_lane(value, (staging, staging_mem));
             Some(value)
         } else {
-            let to_shader = [datum_barrier(buffer, size, CopyBarrier::Draw)];
+            let to_shader = [copy_barrier(
+                buffer,
+                0,
+                size,
+                DATUM_CONSUMER,
+                CopyBarrier::Draw,
+            )];
             unsafe {
                 device.cmd_pipeline_barrier2(
                     graphics_cmd,
                     &vk::DependencyInfo::default().buffer_memory_barriers(&to_shader),
                 );
             }
-            self.staging_retire.push(done_at, (staging, staging_mem));
+            self.retire
+                .retire_on_graphics(done_at, (staging, staging_mem));
             None
         };
         self.buffer_on_graphics = true;
         arrived
     }
 
-    unsafe fn submit_release(
-        &mut self,
-        device: &ash::Device,
-        graphics_queue: vk::Queue,
-        graphics_family: u32,
-        transfer_family: u32,
-        done_at: TimelineValue,
-        size: u64,
-    ) -> (vk::Semaphore, TimelineValue, vk::PipelineStageFlags2) {
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmd = unsafe {
-            device
-                .allocate_command_buffers(&alloc)
-                .expect("far-map release command buffer")[0]
-        };
-        unsafe {
-            device
-                .begin_command_buffer(
-                    cmd,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .expect("begin far-map release");
-            let release = [vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)
-                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                .dst_access_mask(vk::AccessFlags2::NONE)
-                .src_queue_family_index(graphics_family)
-                .dst_queue_family_index(transfer_family)
-                .buffer(self.buffer)
-                .size(size)];
-            device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().buffer_memory_barriers(&release),
-            );
-            device.end_command_buffer(cmd).expect("end far-map release");
-        }
-        let mut tmp = unsafe { Timeline::new(device) };
-        let rs = tmp.begin_render(cmd);
-        let completion = unsafe { rs.submit(device, graphics_queue, &tmp, None) };
-        let sem = tmp.semaphore();
-        let value = completion.value();
-        self.release_cmds.push(done_at, (tmp, cmd));
-        (sem, value, vk::PipelineStageFlags2::COPY)
-    }
-
     pub unsafe fn collect(&mut self, device: &ash::Device, current: TimelineValue) {
         unsafe {
-            self.staging_retire.collect(current, |(buffer, memory)| {
-                destroy_staging(device, buffer, memory)
-            });
+            self.retire.collect(device, current);
             self.image_retire
                 .collect(current, |cube| cube.destroy(device));
-            let pool = self.command_pool;
-            self.release_cmds.collect(current, |(timeline, cmd)| {
-                timeline.destroy(device);
-                device.free_command_buffers(pool, &[cmd]);
-            });
         }
     }
 
     pub unsafe fn collect_transfer(&mut self, device: &ash::Device, current: TimelineValue) {
-        unsafe {
-            self.transfer_retire.collect(current, |(buffer, memory)| {
-                destroy_staging(device, buffer, memory)
-            });
-        }
+        unsafe { self.retire.collect_transfer(device, current) };
     }
 
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe {
-            self.staging_retire
-                .collect_all(|(buffer, memory)| destroy_staging(device, buffer, memory));
-            self.transfer_retire
-                .collect_all(|(buffer, memory)| destroy_staging(device, buffer, memory));
+            self.retire.destroy(device);
             self.image_retire.collect_all(|cube| cube.destroy(device));
             for cube in self.pending_retire.drain(..) {
                 cube.destroy(device);
             }
-            let pool = self.command_pool;
-            self.release_cmds.collect_all(|(timeline, cmd)| {
-                timeline.destroy(device);
-                device.free_command_buffers(pool, &[cmd]);
-            });
             self.dummy.destroy(device);
             for slot in &mut self.slots {
                 let retired = slot.cubes.clear();
@@ -1086,35 +1007,6 @@ impl FarMaps {
             device.destroy_buffer(self.buffer, None);
             device.free_memory(self.memory, None);
         }
-    }
-}
-
-fn datum_barrier(
-    buffer: vk::Buffer,
-    size: u64,
-    role: CopyBarrier,
-) -> vk::BufferMemoryBarrier2<'static> {
-    let barrier = copy_barrier(buffer, 0, size, vk::AccessFlags2::SHADER_STORAGE_READ, role);
-    match role {
-        CopyBarrier::Draw | CopyBarrier::Acquire { .. } => barrier
-            .dst_stage_mask(FAR_MAP_CONSUMER_STAGES)
-            .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ),
-        CopyBarrier::Release { .. } => barrier,
-    }
-}
-
-fn color_range(
-    base_mip: u32,
-    mips: u32,
-    base_layer: u32,
-    layers: u32,
-) -> vk::ImageSubresourceRange {
-    vk::ImageSubresourceRange {
-        aspect_mask: vk::ImageAspectFlags::COLOR,
-        base_mip_level: base_mip,
-        level_count: mips,
-        base_array_layer: base_layer,
-        layer_count: layers,
     }
 }
 
@@ -1401,55 +1293,21 @@ unsafe fn blit_face(
     }
 }
 
-unsafe fn fill_staging(
-    device: &ash::Device,
-    memory_props: &vk::PhysicalDeviceMemoryProperties,
-    bytes: &[u8],
-) -> (vk::Buffer, vk::DeviceMemory) {
-    let size = bytes.len() as vk::DeviceSize;
-    let info = vk::BufferCreateInfo::default()
-        .size(size.max(1))
-        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    unsafe {
-        let staging = device
-            .create_buffer(&info, None)
-            .expect("create far-map staging buffer");
-        let req = device.get_buffer_memory_requirements(staging);
-        let alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
-            .memory_type_index(find_memory_type(
-                memory_props,
-                req.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            ));
-        let memory = device
-            .allocate_memory(&alloc, None)
-            .expect("allocate far-map staging memory");
-        device
-            .bind_buffer_memory(staging, memory, 0)
-            .expect("bind far-map staging memory");
-        if !bytes.is_empty() {
-            let ptr = device
-                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-                .expect("map far-map staging memory");
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
-            device.unmap_memory(memory);
-        }
-        (staging, memory)
-    }
-}
-
-unsafe fn destroy_staging(device: &ash::Device, buffer: vk::Buffer, memory: vk::DeviceMemory) {
-    unsafe {
-        device.destroy_buffer(buffer, None);
-        device.free_memory(memory, None);
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{FACE_MASK, Retired, SlotCubes};
+    use super::{DATUM_CONSUMER, FACE_MASK, Retired, SlotCubes};
+    use ash::vk;
+
+    #[test]
+    fn datum_copy_consumer_is_fragment_storage_reads() {
+        assert_eq!(
+            DATUM_CONSUMER,
+            (
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_STORAGE_READ,
+            )
+        );
+    }
 
     fn complete(id: u32, size: u32, generation: u32) -> SlotCubes<u32> {
         let mut cubes = SlotCubes::new();

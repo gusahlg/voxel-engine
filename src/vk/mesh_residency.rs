@@ -13,33 +13,39 @@ use super::transfer::TransferLane;
 const TRANSFER_BUDGET_BYTES_PER_FRAME: u64 = 8 * 1024 * 1024;
 
 /// A staged host→device copy owned by a not-yet-flushed [`GpuResident`].
-/// The role of one staged-copy buffer barrier: the same-queue copy→draw
+/// The role of one staged-copy buffer barrier: the same-queue copy→consumer
 /// barrier, or the release/acquire halves of a queue-family ownership
-/// transfer. Six call sites used to restate the stage/access pairings
+/// transfer. Call sites used to restate the stage/access pairings
 /// field-by-field — the exact part a reviewer must get right — so the
 /// pairings live here once and a site states only its buffer range, its
-/// draw-side reads, and its role.
+/// graphics-side consumer, and its role.
 #[derive(Clone, Copy)]
 pub(crate) enum CopyBarrier {
-    /// Same queue: copy → vertex input, visible in this submission.
+    /// Same queue: copy → consumer, visible in this submission.
     Draw,
     /// QFOT release on the transfer queue: copy → nothing (ownership leaves).
     Release { src_family: u32, dst_family: u32 },
-    /// QFOT acquire on graphics: nothing → vertex input (ownership arrives).
+    /// QFOT acquire on graphics: nothing → consumer (ownership arrives).
     Acquire { src_family: u32, dst_family: u32 },
 }
 
+/// The graphics-side first reader of a staged copy: its stage and the access
+/// it reads with.
+pub(crate) type CopyConsumer = (vk::PipelineStageFlags2, vk::AccessFlags2);
+
 /// Build one staged-copy barrier for `role` over `buffer[offset..offset+size]`;
-/// `reads` is the draw-side access the data feeds (vertex+index for meshes,
-/// index-only for the shared quad IBO). Ignored by `Release`, whose
-/// destination half is the acquire's job.
+/// `consumer` is what the data feeds on graphics (vertex input with
+/// vertex+index reads for meshes, index-only for the shared quad IBO,
+/// fragment storage reads for the material table and the far-map datum).
+/// Ignored by `Release`, whose destination half is the acquire's job.
 pub(crate) fn copy_barrier(
     buffer: vk::Buffer,
     offset: u64,
     size: u64,
-    reads: vk::AccessFlags2,
+    consumer: CopyConsumer,
     role: CopyBarrier,
 ) -> vk::BufferMemoryBarrier2<'static> {
+    let (stage, reads) = consumer;
     let barrier = vk::BufferMemoryBarrier2::default()
         .buffer(buffer)
         .offset(offset)
@@ -48,7 +54,7 @@ pub(crate) fn copy_barrier(
         CopyBarrier::Draw => barrier
             .src_stage_mask(vk::PipelineStageFlags2::COPY)
             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
+            .dst_stage_mask(stage)
             .dst_access_mask(reads),
         CopyBarrier::Release {
             src_family,
@@ -66,16 +72,20 @@ pub(crate) fn copy_barrier(
         } => barrier
             .src_stage_mask(vk::PipelineStageFlags2::NONE)
             .src_access_mask(vk::AccessFlags2::NONE)
-            .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
+            .dst_stage_mask(stage)
             .dst_access_mask(reads)
             .src_queue_family_index(src_family)
             .dst_queue_family_index(dst_family),
     }
 }
 
-/// The draw-side reads a mesh buffer feeds (interleaved vertices + indices).
-fn mesh_reads() -> vk::AccessFlags2 {
-    vk::AccessFlags2::VERTEX_ATTRIBUTE_READ | vk::AccessFlags2::INDEX_READ
+/// What a mesh buffer feeds: vertex/index fetch reading interleaved
+/// vertices and indices.
+fn mesh_consumer() -> CopyConsumer {
+    (
+        vk::PipelineStageFlags2::VERTEX_INPUT,
+        vk::AccessFlags2::VERTEX_ATTRIBUTE_READ | vk::AccessFlags2::INDEX_READ,
+    )
 }
 
 /// The stages at which uploaded mesh bytes (and the shared quad IBO) are
@@ -391,7 +401,7 @@ impl MeshResidency {
         let barriers = |role: CopyBarrier| -> Vec<vk::BufferMemoryBarrier2<'static>> {
             written
                 .iter()
-                .map(|r| copy_barrier(r.buffer, r.offset, r.size, mesh_reads(), role))
+                .map(|r| copy_barrier(r.buffer, r.offset, r.size, mesh_consumer(), role))
                 .collect()
         };
 
@@ -608,6 +618,147 @@ mod tests {
     use super::super::timeline::TimelineValue;
     use ash::vk;
     use ash::vk::Handle;
+
+    type BarrierFields = (
+        vk::PipelineStageFlags2,
+        vk::AccessFlags2,
+        vk::PipelineStageFlags2,
+        vk::AccessFlags2,
+        u32,
+        u32,
+        vk::Buffer,
+        u64,
+        u64,
+    );
+
+    fn fields(b: &vk::BufferMemoryBarrier2<'_>) -> BarrierFields {
+        assert!(b.p_next.is_null());
+        (
+            b.src_stage_mask,
+            b.src_access_mask,
+            b.dst_stage_mask,
+            b.dst_access_mask,
+            b.src_queue_family_index,
+            b.dst_queue_family_index,
+            b.buffer,
+            b.offset,
+            b.size,
+        )
+    }
+
+    /// `copy_barrier` before it took a consumer stage: vertex input only.
+    fn vertex_input_copy_barrier(
+        buffer: vk::Buffer,
+        offset: u64,
+        size: u64,
+        reads: vk::AccessFlags2,
+        role: super::CopyBarrier,
+    ) -> vk::BufferMemoryBarrier2<'static> {
+        use super::CopyBarrier;
+        let barrier = vk::BufferMemoryBarrier2::default()
+            .buffer(buffer)
+            .offset(offset)
+            .size(size);
+        match role {
+            CopyBarrier::Draw => barrier
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
+                .dst_access_mask(reads),
+            CopyBarrier::Release {
+                src_family,
+                dst_family,
+            } => barrier
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                .dst_access_mask(vk::AccessFlags2::NONE)
+                .src_queue_family_index(src_family)
+                .dst_queue_family_index(dst_family),
+            CopyBarrier::Acquire {
+                src_family,
+                dst_family,
+            } => barrier
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
+                .dst_access_mask(reads)
+                .src_queue_family_index(src_family)
+                .dst_queue_family_index(dst_family),
+        }
+    }
+
+    /// The material-table / far-map datum wrapper the consumer stage
+    /// replaced: the vertex-input barrier with a fragment storage-read
+    /// destination on the draw and acquire roles.
+    fn fragment_storage_copy_barrier(
+        buffer: vk::Buffer,
+        offset: u64,
+        size: u64,
+        role: super::CopyBarrier,
+    ) -> vk::BufferMemoryBarrier2<'static> {
+        use super::CopyBarrier;
+        let reads = vk::AccessFlags2::SHADER_STORAGE_READ;
+        let b = vertex_input_copy_barrier(buffer, offset, size, reads, role);
+        match role {
+            CopyBarrier::Draw | CopyBarrier::Acquire { .. } => b
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(reads),
+            CopyBarrier::Release { .. } => b,
+        }
+    }
+
+    #[test]
+    fn copy_barrier_consumers_match_the_per_uploader_barriers() {
+        use super::{CopyBarrier, copy_barrier, mesh_consumer};
+        let buffer = vk::Buffer::from_raw(7);
+        let roles = [
+            CopyBarrier::Draw,
+            CopyBarrier::Release {
+                src_family: 1,
+                dst_family: 0,
+            },
+            CopyBarrier::Acquire {
+                src_family: 1,
+                dst_family: 0,
+            },
+        ];
+        let index_reads = vk::AccessFlags2::INDEX_READ;
+        let storage = (
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_STORAGE_READ,
+        );
+        for role in roles {
+            let (_, mesh_reads) = mesh_consumer();
+            assert_eq!(
+                fields(&copy_barrier(buffer, 64, 128, mesh_consumer(), role)),
+                fields(&vertex_input_copy_barrier(
+                    buffer, 64, 128, mesh_reads, role
+                ))
+            );
+            assert_eq!(
+                fields(&copy_barrier(
+                    buffer,
+                    0,
+                    96,
+                    (vk::PipelineStageFlags2::VERTEX_INPUT, index_reads),
+                    role
+                )),
+                fields(&vertex_input_copy_barrier(buffer, 0, 96, index_reads, role))
+            );
+            assert_eq!(
+                fields(&copy_barrier(buffer, 16, 48, storage, role)),
+                fields(&fragment_storage_copy_barrier(buffer, 16, 48, role))
+            );
+        }
+        assert_eq!(
+            mesh_consumer(),
+            (
+                vk::PipelineStageFlags2::VERTEX_INPUT,
+                vk::AccessFlags2::VERTEX_ATTRIBUTE_READ | vk::AccessFlags2::INDEX_READ,
+            )
+        );
+    }
 
     #[test]
     fn coalesce_merges_touching_runs_per_buffer_only() {

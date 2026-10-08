@@ -17,6 +17,7 @@ use super::pipeline;
 use super::present::{HdrReadable, OverlayPresent};
 use super::scene_pass::RenderPass;
 use super::timeline::{RenderSubmit, acquire_next_image};
+use super::transfer::TransferCtx;
 use super::{Env, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, SceneDepthUse, scene_depth_use};
 
 pub(crate) use super::draw_prep::{DrawEntry, DrawRun, ImmOffsets};
@@ -43,6 +44,17 @@ pub(super) fn jittered_clip(
     );
     t * clean
 }
+
+/// Whether the sky pass draws this frame: the flag is on, the frame set a sky,
+/// and there is a 3D scene to draw it in (`Frame3D::set_sky` is the only
+/// writer of `lists.sky`, so a sky already implies the scene). The far table,
+/// the cloud LUT and `record_sky` run under this gate, and `RenderPass::begin`
+/// loads the colour attachment `DONT_CARE` only under it: the sky then covers
+/// every pixel the scene left at the far plane.
+pub(super) fn sky_drawn(flags: &crate::engine::RenderFlags, lists: &DrawLists) -> bool {
+    flags.sky && lists.sky.is_some() && lists.scene.is_some()
+}
+
 /// Project the sun to presented uv for the spill-pass godray march.
 fn project_godray(r: &Renderer, lists: &DrawLists) -> crate::camera::Godray {
     match lists.scene.as_ref() {
@@ -178,7 +190,7 @@ impl Renderer {
         // Far-body table (sky set 0 binding 2). Same slot fence as the UBO.
         // A sky with no bodies still uploads a zero count so the binding is live.
         // The pack also returns the horizon-dip sine the UBO stamps below.
-        let horizon_dip = if self.flags.sky && lists.sky.is_some() {
+        let horizon_dip = if sky_drawn(&self.flags, lists) {
             let view = lists.scene.as_ref().map(|scene| {
                 super::far_bodies::far_view(
                     scene.fovy_tan_half,
@@ -189,8 +201,9 @@ impl Renderer {
             });
             // Coarse tiles read the same sun and the same star gate the sky
             // shader does. `lit_uniforms` is the pre-debug-flat block: the
-            // debug-flat overwrite of `extras` never reaches a sky draw.
-            let coarse = if self.device.sky_coarse_ok(self.targets.samples) {
+            // debug-flat overwrite of `extras` never reaches a sky draw. The
+            // 2×2 pipelines' existence is the switch `record_sky` reads too.
+            let coarse = if self.pipelines.sky.has_coarse() {
                 lists.sky_for_pass().map(|desc| {
                     let u = lists.lit_uniforms();
                     let (sun_cos_rim, moon_cos_rim) =
@@ -218,12 +231,7 @@ impl Renderer {
                 lists.local_frame().up,
             )
         } else {
-            crate::profile::gauge(crate::profile::Gauge::FarBodies, 0);
-            crate::profile::gauge(crate::profile::Gauge::FarDrawn, 0);
-            crate::profile::gauge(crate::profile::Gauge::FarTiles, 0);
-            crate::profile::gauge(crate::profile::Gauge::SkyCoarse, 0);
-            crate::profile::gauge(crate::profile::Gauge::SkyCoarseFar, 0);
-            crate::profile::gauge(crate::profile::Gauge::SkyMapsolo, 0);
+            super::far_bodies::SkyDraw::zero_gauges();
             0.0
         };
         // Per-frame UBO (set 0, binding 2). A 3D scene always carries lighting
@@ -587,10 +595,7 @@ impl Renderer {
         let done_at = rs.value();
         let copies_pending;
         let grew;
-        let quad_wait_some;
-        let tex_wait_some;
-        let mat_wait_some;
-        let map_wait_some;
+        let lane_waits;
         unsafe {
             let device = &self.device.device;
             device
@@ -644,65 +649,39 @@ impl Renderer {
                 self.device.graphics_family,
                 done_at,
             );
-            let tex = self.block_textures.flush(
-                &self.instance.instance,
+            let mut ctx = TransferCtx {
+                instance: &self.instance.instance,
                 device,
-                self.device.physical,
-                &mut self.transfer_lane,
-                cmd,
-                self.device.graphics_queue,
-                self.device.graphics_family,
-                &self.timeline,
-                self.last_render_value,
+                physical: self.device.physical,
+                lane: &mut self.transfer_lane,
+                graphics_cmd: cmd,
+                graphics_queue: self.device.graphics_queue,
+                graphics_family: self.device.graphics_family,
+                graphics_timeline: &self.timeline,
+                last_render_value: self.last_render_value,
                 done_at,
-            );
+            };
+            let tex = self.block_textures.flush(&mut ctx);
             grew = tex.retire.is_some();
             if let Some((stamp, retired)) = tex.retire {
                 self.retired_textures.push(stamp, retired);
             }
-            let mat_wait = self.materials.flush(
-                &self.instance.instance,
-                device,
-                self.device.physical,
-                &mut self.transfer_lane,
-                cmd,
-                self.device.graphics_queue,
-                self.device.graphics_family,
-                &self.timeline,
-                self.last_render_value,
-                done_at,
-            );
-            let map_wait = self.far_maps.flush(
-                &self.instance.instance,
-                device,
-                self.device.physical,
-                &mut self.transfer_lane,
-                cmd,
-                self.device.graphics_queue,
-                self.device.graphics_family,
-                &self.timeline,
-                self.last_render_value,
-                done_at,
-            );
-            self.pending_transfer_wait = fold_transfer_wait(
-                fold_transfer_wait(
-                    fold_transfer_wait(
-                        match (deferred, quad_wait) {
-                            (Some(a), Some(b)) => Some((a.max(b), MESH_CONSUMER_STAGES)),
-                            (Some(v), None) | (None, Some(v)) => Some((v, MESH_CONSUMER_STAGES)),
-                            (None, None) => None,
-                        },
-                        tex.transfer_wait
-                            .map(|v| (v, BLOCK_TEXTURE_CONSUMER_STAGES)),
-                    ),
-                    mat_wait.map(|v| (v, MATERIAL_CONSUMER_STAGES)),
-                ),
-                map_wait.map(|v| (v, FAR_MAP_CONSUMER_STAGES)),
-            );
-            quad_wait_some = quad_wait.is_some();
-            tex_wait_some = tex.transfer_wait.is_some();
-            mat_wait_some = mat_wait.is_some();
-            map_wait_some = map_wait.is_some();
+            let mat_wait = self.materials.flush(&mut ctx);
+            let map_wait = self.far_maps.flush(&mut ctx);
+            // Lane values this frame's graphics submit waits on, each with
+            // the stages that first read what it copied.
+            let waits = [
+                (deferred, MESH_CONSUMER_STAGES),
+                (quad_wait, MESH_CONSUMER_STAGES),
+                (tex.transfer_wait, BLOCK_TEXTURE_CONSUMER_STAGES),
+                (mat_wait, MATERIAL_CONSUMER_STAGES),
+                (map_wait, FAR_MAP_CONSUMER_STAGES),
+            ];
+            self.pending_transfer_wait = waits.iter().fold(None, |acc, &(value, stages)| {
+                fold_transfer_wait(acc, value.map(|v| (v, stages)))
+            });
+            // `deferred` is only `Some` when `copies_pending` is set.
+            lane_waits = waits.iter().any(|(value, _)| value.is_some());
         }
 
         // Same-queue compute jobs: budgeted prefix before the scene.
@@ -712,14 +691,7 @@ impl Renderer {
 
         let minimap = unsafe { self.minimap.sync(&self.device.device, cmd, slot) };
         if profiling {
-            if copies_pending
-                || quad_wait_some
-                || tex_wait_some
-                || mat_wait_some
-                || map_wait_some
-                || grew
-                || minimap
-            {
+            if copies_pending || lane_waits || grew || minimap {
                 self.gpu_timer.recorded(slot);
             }
             unsafe {
@@ -811,7 +783,7 @@ impl Renderer {
 
         // Cloud LUT: march (or zero) before the scene pass so the sky fragment
         // has a sampled image. Skipped when there is no sky.
-        if self.flags.sky && lists.sky.is_some() && lists.scene.is_some() {
+        if sky_drawn(&self.flags, lists) {
             let u = lists.lit_uniforms();
             self.record_sky_cloud_lut(
                 cmd,
@@ -929,7 +901,7 @@ impl Renderer {
                         self.pipe_stats
                             .begin_pass(device, cmd, slot, PipeStatPass::Sky);
                     }
-                    if self.flags.sky {
+                    if sky_drawn(&self.flags, lists) {
                         pass.record_sky();
                     }
                     if profiling {

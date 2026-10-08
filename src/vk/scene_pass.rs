@@ -10,7 +10,7 @@ use crate::skeleton::FrameSlot;
 
 use super::buffers::{self, DrawIndexedIndirect};
 use super::cull;
-use super::frame_loop::{ImmOffsets, jittered_clip};
+use super::frame_loop::{ImmOffsets, jittered_clip, sky_drawn};
 use super::gpu_timer::{GpuPass, PipeStatPass};
 use super::pipeline;
 use super::{HdrReadable, Renderer, SceneDepthUse, color_range, depth_range};
@@ -199,7 +199,7 @@ impl<'a> RenderPass<'a> {
             let offscreen_view = r.targets.offscreen[slot].view();
             // Sky triangle covers every pixel left at reversed-Z far (depth 0).
             // Debug-flat (TerrainKey) frames carry `lists.sky == None` and still clear.
-            let color_load = if lists.scene.is_some() && r.flags.sky && lists.sky.is_some() {
+            let color_load = if sky_drawn(&r.flags, lists) {
                 vk::AttachmentLoadOp::DONT_CARE
             } else {
                 vk::AttachmentLoadOp::CLEAR
@@ -861,6 +861,8 @@ impl<'a> RenderPass<'a> {
     /// fixed-point mapped march. No tile classification keeps one fullscreen
     /// triangle on that same choice. No bodies use the base pipeline. The
     /// fullscreen triangle never binds mapsolo: it has no per-tile mask.
+    /// The runs, their order and their first tiles come from
+    /// [`SkyDraw::runs`](super::far_bodies::SkyDraw::runs).
     pub(super) unsafe fn record_sky(&self) {
         let Some(desc) = self.lists.sky_for_pass() else {
             return;
@@ -873,80 +875,27 @@ impl<'a> RenderPass<'a> {
         let jittered = self.scene_state.expect("a sky pass implies a 3D scene").0;
         let params = pipeline::SkyParams::compose(jittered.inverse(), &desc);
         let draw = self.r.far_ring.sky_draw(FrameSlot::new(self.slot));
-        let quads = draw.quads && (draw.n_base > 0 || draw.n_sphere > 0 || draw.n_heavy > 0);
-        let sky_full = self.r.pipelines.sky;
-        let sky_base = self.r.pipelines.sky_base;
-        let sky_nomap = self.r.pipelines.sky_nomap;
-        let sky_sphere = self.r.pipelines.sky_sphere;
-        let sky_tile_base = self.r.pipelines.sky_tile_base;
-        let sky_tile_base_coarse = self.r.pipelines.sky_tile_base_coarse;
-        let sky_tile_coarse = self.r.pipelines.sky_tile_coarse;
-        let sky_tile_mapsolo = self.r.pipelines.sky_tile_mapsolo;
-        let sky_tile_mapsolo_coarse = self.r.pipelines.sky_tile_mapsolo_coarse;
-        let sky_tile_sphere = self.r.pipelines.sky_tile_sphere;
-        let sky_tile_heavy = match draw.body {
-            super::far_bodies::SkyBodyPipe::Full => self.r.pipelines.sky_tile,
-            super::far_bodies::SkyBodyPipe::NoMap => self.r.pipelines.sky_tile_nomap,
-            super::far_bodies::SkyBodyPipe::Sphere => self.r.pipelines.sky_tile_sphere,
-        };
-        let fullscreen = if draw.base {
-            sky_base
-        } else {
-            match draw.body {
-                super::far_bodies::SkyBodyPipe::Full => sky_full,
-                super::far_bodies::SkyBodyPipe::NoMap => sky_nomap,
-                super::far_bodies::SkyBodyPipe::Sphere => sky_sphere,
-            }
-        };
-        // No coarse pipeline: draw that run at 1×1. The CPU only reorders a
-        // run when the pipeline exists for these samples. Mapsolo tiles are a
-        // prefix of the heavy run, and their interior is a prefix of that
-        // prefix. With mapsolo off the prefix is empty and the heavy run is
-        // the old coarse/full split.
-        let n_coarse = sky_tile_base_coarse.map_or(0, |_| draw.n_coarse.min(draw.n_base));
-        let n_fine = draw.n_base - n_coarse;
-        let n_mapsolo = draw.n_mapsolo.min(draw.n_heavy);
-        let n_mapsolo_coarse =
-            sky_tile_mapsolo_coarse.map_or(0, |_| draw.n_coarse_far.min(n_mapsolo));
-        let n_mapsolo_fine = n_mapsolo - n_mapsolo_coarse;
-        let n_full_coarse = sky_tile_coarse.map_or(0, |_| {
-            draw.n_coarse_far
-                .saturating_sub(n_mapsolo)
-                .min(draw.n_heavy - n_mapsolo)
-        });
-        let n_full_fine = draw.n_heavy - n_mapsolo - n_full_coarse;
-        let first = if quads {
-            if n_coarse > 0 {
-                sky_tile_base_coarse.unwrap_or(sky_tile_base)
-            } else if n_fine > 0 {
-                sky_tile_base
-            } else if draw.n_sphere > 0 {
-                sky_tile_sphere
-            } else if n_mapsolo_coarse > 0 {
-                sky_tile_mapsolo_coarse.unwrap_or(sky_tile_mapsolo)
-            } else if n_mapsolo_fine > 0 {
-                sky_tile_mapsolo
-            } else if n_full_coarse > 0 {
-                sky_tile_coarse.unwrap_or(sky_tile_heavy)
-            } else {
-                sky_tile_heavy
-            }
-        } else {
-            fullscreen
+        let sky = &self.r.pipelines.sky;
+        // The coarse switch is the one the CPU split read this frame. No runs
+        // means the fullscreen triangle.
+        let runs = draw.runs(sky.has_coarse());
+        let first = match runs.iter().flatten().next() {
+            Some(run) => sky.tile(run.frag, run.rate),
+            None => sky.fullscreen(draw.fullscreen_frag()),
         };
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, first);
             self.invalidate_mesh_desc();
             device.cmd_push_constants(
                 cmd,
-                self.r.pipelines.layout_sky,
+                sky.layout,
                 vk::ShaderStageFlags::FRAGMENT,
                 0,
                 bytemuck::bytes_of(&params),
             );
             let lut = &self.r.targets.sky_cloud[self.slot];
             let lut_infos = [vk::DescriptorImageInfo::default()
-                .sampler(self.r.pipelines.sky_lut_sampler)
+                .sampler(sky.lut_sampler)
                 .image_view(lut.view())
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let ubo = self.r.ubo_ring.buffer(FrameSlot::new(self.slot));
@@ -1006,85 +955,23 @@ impl<'a> RenderPass<'a> {
             self.r.device.push_descriptor.cmd_push_descriptor_set(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.r.pipelines.layout_sky,
+                sky.layout,
                 0,
                 &writes,
             );
-            if quads {
-                // Runs are coarse base, fine base, sphere, mapsolo coarse,
-                // mapsolo fine, full coarse, then the rest of the heavy run.
+            if runs.iter().any(Option::is_some) {
                 // firstInstance is the run start; the vertex shader's
-                // InstanceIndex includes it, so each prefix is the tiles the
-                // split wrote first. Each pipeline is bound once.
-                if n_coarse > 0 {
-                    device.cmd_draw(cmd, 6, n_coarse, 0, 0);
-                }
-                if n_fine > 0 {
-                    if n_coarse > 0 {
-                        device.cmd_bind_pipeline(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            sky_tile_base,
-                        );
+                // InstanceIndex includes it, so each run draws the tiles the
+                // CPU partition wrote there. A pipeline is rebound only when
+                // the run's pipeline differs from the bound one.
+                let mut bound = first;
+                for run in runs.iter().flatten() {
+                    let pipe = sky.tile(run.frag, run.rate);
+                    if pipe != bound {
+                        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipe);
+                        bound = pipe;
                     }
-                    device.cmd_draw(cmd, 6, n_fine, 0, n_coarse);
-                }
-                if draw.n_sphere > 0 {
-                    if draw.n_base > 0 {
-                        device.cmd_bind_pipeline(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            sky_tile_sphere,
-                        );
-                    }
-                    device.cmd_draw(cmd, 6, draw.n_sphere, 0, draw.n_base);
-                }
-                let heavy_start = draw.n_base + draw.n_sphere;
-                if n_mapsolo_coarse > 0 {
-                    if draw.n_base > 0 || draw.n_sphere > 0 {
-                        device.cmd_bind_pipeline(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            sky_tile_mapsolo_coarse.unwrap_or(sky_tile_mapsolo),
-                        );
-                    }
-                    device.cmd_draw(cmd, 6, n_mapsolo_coarse, 0, heavy_start);
-                }
-                if n_mapsolo_fine > 0 {
-                    if draw.n_base > 0 || draw.n_sphere > 0 || n_mapsolo_coarse > 0 {
-                        device.cmd_bind_pipeline(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            sky_tile_mapsolo,
-                        );
-                    }
-                    device.cmd_draw(cmd, 6, n_mapsolo_fine, 0, heavy_start + n_mapsolo_coarse);
-                }
-                if n_full_coarse > 0 {
-                    if draw.n_base > 0 || draw.n_sphere > 0 || n_mapsolo > 0 {
-                        device.cmd_bind_pipeline(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            sky_tile_coarse.unwrap_or(sky_tile_heavy),
-                        );
-                    }
-                    device.cmd_draw(cmd, 6, n_full_coarse, 0, heavy_start + n_mapsolo);
-                }
-                if n_full_fine > 0 {
-                    if draw.n_base > 0 || draw.n_sphere > 0 || n_mapsolo > 0 || n_full_coarse > 0 {
-                        device.cmd_bind_pipeline(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            sky_tile_heavy,
-                        );
-                    }
-                    device.cmd_draw(
-                        cmd,
-                        6,
-                        n_full_fine,
-                        0,
-                        heavy_start + n_mapsolo + n_full_coarse,
-                    );
+                    device.cmd_draw(cmd, 6, run.count, 0, run.first);
                 }
             } else {
                 device.cmd_draw(cmd, 3, 1, 0, 0);
