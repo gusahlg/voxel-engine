@@ -24,9 +24,9 @@ use ash::vk;
 use super::alloc::{create_buffer, create_filled_staging};
 use super::buffers::RetireQueue;
 use super::image::{allocate_and_bind_image, color_range};
-use super::mesh_residency::{CopyBarrier, CopyConsumer, copy_barrier};
+use super::mesh_residency::CopyConsumer;
 use super::timeline::TimelineValue;
-use super::transfer::{TransferCtx, UploadRetire};
+use super::transfer::{TransferCtx, UploadRetire, upload_buffer_range};
 use crate::far_body::{FarMapError, MAX_FAR_MAPS};
 
 /// Stages that first read the datum buffer and the albedo cubes (sky fragment).
@@ -726,7 +726,10 @@ impl FarMaps {
             }
             let targets_pending = slot.cubes.has_pending();
             let retired = slot.cubes.land_face(face.face);
-            let publish = !targets_pending || !slot.cubes.has_pending();
+            // Only the swap republishes (`pending_swap_is_recorded`). A face
+            // repeated after its cube swapped in lands a bit already set, and
+            // no `has_overwrite_pending` check orders its datum rewrite.
+            let publish = targets_pending && !slot.cubes.has_pending();
             (retired, publish)
         };
         if let Some(old) = retired {
@@ -831,144 +834,22 @@ impl FarMaps {
 
     unsafe fn upload_buffer(&mut self, ctx: &mut TransferCtx<'_>) -> Option<TimelineValue> {
         self.buffer_dirty = false;
-        let device = ctx.device;
-        let graphics_cmd = ctx.graphics_cmd;
-        let graphics_family = ctx.graphics_family;
-        let done_at = ctx.done_at;
         let bytes: &[u8] = bytemuck::cast_slice(&self.words);
-        let (staging, staging_mem) =
-            create_filled_staging(device, &ctx.memory_props(), bytes, "far-map staging");
-        let separate = ctx.lane.is_separate_queue();
-        let qfot = ctx.lane.needs_ownership_transfer();
-        let buffer = self.buffer;
-        let size = bytes.len() as u64;
-        let reads = vk::AccessFlags2::SHADER_STORAGE_READ;
-
-        let extra_wait = if qfot && self.buffer_on_graphics {
-            // Release the datum earlier frames read so the lane can acquire it.
-            let release = [vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)
-                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                .dst_access_mask(vk::AccessFlags2::NONE)
-                .src_queue_family_index(graphics_family)
-                .dst_queue_family_index(ctx.lane.family())
-                .buffer(buffer)
-                .size(size)];
-            Some(unsafe {
-                self.retire.submit_release(
-                    device,
-                    ctx.graphics_queue,
-                    done_at,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&release),
-                )
-            })
-        } else if separate && self.buffer_on_graphics {
-            Some((
-                ctx.graphics_timeline.semaphore(),
-                ctx.last_render_value,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            ))
-        } else {
-            None
-        };
-
-        let lane = &mut *ctx.lane;
-        let lane_batch = separate.then(|| unsafe { lane.begin(device) });
-        let record_cmd = lane_batch.as_ref().map_or(graphics_cmd, |b| b.cmd());
-        unsafe {
-            if !separate && self.buffer_on_graphics {
-                let to_copy = [vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                    .src_access_mask(reads)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .buffer(buffer)
-                    .size(size)];
-                device.cmd_pipeline_barrier2(
-                    record_cmd,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&to_copy),
-                );
-            } else if qfot && self.buffer_on_graphics {
-                let acquire = [vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .src_queue_family_index(graphics_family)
-                    .dst_queue_family_index(lane.family())
-                    .buffer(buffer)
-                    .size(size)];
-                device.cmd_pipeline_barrier2(
-                    record_cmd,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&acquire),
-                );
-            }
-            device.cmd_copy_buffer(
-                record_cmd,
+        let dst = (self.buffer, 0, bytes.len() as u64);
+        let staging =
+            create_filled_staging(ctx.device, &ctx.memory_props(), bytes, "far-map staging");
+        // After the first copy, frames read the datum: the frame loop has
+        // submitted them (`has_overwrite_pending`).
+        let overwrite = self.buffer_on_graphics;
+        let arrived = unsafe {
+            upload_buffer_range(
+                ctx,
+                &mut self.retire,
+                dst,
                 staging,
-                buffer,
-                &[vk::BufferCopy::default().size(size)],
-            );
-        }
-
-        let arrived = if let Some(lane_batch) = lane_batch {
-            if qfot {
-                let release = [copy_barrier(
-                    buffer,
-                    0,
-                    size,
-                    DATUM_CONSUMER,
-                    CopyBarrier::Release {
-                        src_family: lane.family(),
-                        dst_family: graphics_family,
-                    },
-                )];
-                unsafe {
-                    device.cmd_pipeline_barrier2(
-                        record_cmd,
-                        &vk::DependencyInfo::default().buffer_memory_barriers(&release),
-                    );
-                }
-            }
-            let value = unsafe { lane.submit_after(device, lane_batch, extra_wait) };
-            if qfot {
-                let acquire = [copy_barrier(
-                    buffer,
-                    0,
-                    size,
-                    DATUM_CONSUMER,
-                    CopyBarrier::Acquire {
-                        src_family: lane.family(),
-                        dst_family: graphics_family,
-                    },
-                )];
-                unsafe {
-                    device.cmd_pipeline_barrier2(
-                        graphics_cmd,
-                        &vk::DependencyInfo::default().buffer_memory_barriers(&acquire),
-                    );
-                }
-            }
-            self.retire.retire_on_lane(value, (staging, staging_mem));
-            Some(value)
-        } else {
-            let to_shader = [copy_barrier(
-                buffer,
-                0,
-                size,
                 DATUM_CONSUMER,
-                CopyBarrier::Draw,
-            )];
-            unsafe {
-                device.cmd_pipeline_barrier2(
-                    graphics_cmd,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&to_shader),
-                );
-            }
-            self.retire
-                .retire_on_graphics(done_at, (staging, staging_mem));
-            None
+                overwrite,
+            )
         };
         self.buffer_on_graphics = true;
         arrived
