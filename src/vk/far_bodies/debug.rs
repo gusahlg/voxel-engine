@@ -51,10 +51,9 @@ pub(super) fn log_sky_debug(
             hi = hi.max(*v);
         }
         let gpu = &table.body[kept_us];
-        let map_plus = gpu.seed[2];
-        let map = map_plus.saturating_sub(1);
-        let center = glam::Vec3::new(gpu.dir_rho[0], gpu.dir_rho[1], gpu.dir_rho[2]);
-        match forward.and_then(|dir| horizon_forward_sample(center, dir, bins)) {
+        // A published table always names a body with a map slot.
+        let map = gpu.map_index().unwrap_or(0);
+        match forward.and_then(|dir| horizon_forward_sample(gpu.dir(), dir, bins)) {
             Some((az, bin, sine)) => eprintln!(
                 "sky-debug horizon slot={slot} kept={kept} map={map} min={lo} max={hi} forward_az={az} bin={bin} sin={sine}"
             ),

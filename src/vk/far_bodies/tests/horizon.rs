@@ -346,7 +346,8 @@ fn upward_tiles_lose_the_bit_above_the_horizon_table() {
     );
     table.horizon_id[0] = 0;
     table.horizon_sin[..HORIZON_BINS].copy_from_slice(&bins);
-    assert!(clear_tiles_above_horizon(&mut table, &frames, &view));
+    let tiles = frames.view(&view).expect("the frames match the view");
+    assert!(clear_tiles_above_horizon(&mut table, &tiles).is_some());
     let basis = ViewBasis::from_view_proj(view.view_proj).expect("basis");
     let up_v = basis.to_view(up).normalize();
     let mut highest = 0usize;

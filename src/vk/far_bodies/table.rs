@@ -5,9 +5,10 @@
 use bytemuck::{Pod, Zeroable};
 
 use super::cones::cone_bound;
-use super::far_cull_enabled;
 use super::horizon::horizon_dip;
-use super::tiles::{TileFrames, stamp_tiles, used_tiles};
+#[cfg(test)]
+use super::tiles::TileFrames;
+use super::tiles::{TileRuns, TileView, stamp_tiles, used_tiles};
 use super::view::{FarView, body_meets_view};
 use crate::far_body::{FarBody, FarShape, MAX_FAR_BODIES, MAX_FAR_MAPS};
 
@@ -36,6 +37,95 @@ pub(super) struct FarBodyGpu {
     /// in radius units. The other `.w` lanes stay 0. `dir_rho.w` stays the
     /// reference `radius/distance`, not the datum hi radius.
     pub seed: [u32; 4],
+}
+
+/// The shape codes in `FarBodyGpu::atmosphere.w`, as `FarGpu` in
+/// `shaders/far_table.slang` lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ShapeCode {
+    Cube,
+    Sphere,
+    InnerSphere,
+    Rounded,
+    Mapped,
+}
+
+impl ShapeCode {
+    pub(super) const ALL: [Self; 5] = [
+        Self::Cube,
+        Self::Sphere,
+        Self::InnerSphere,
+        Self::Rounded,
+        Self::Mapped,
+    ];
+
+    /// The lane value [`pack_one`] writes.
+    pub(super) const fn lane(self) -> f32 {
+        match self {
+            Self::Cube => 0.0,
+            Self::Sphere => 1.0,
+            Self::InnerSphere => 2.0,
+            Self::Rounded => 3.0,
+            Self::Mapped => 4.0,
+        }
+    }
+}
+
+/// Named reads of the packed lanes. [`pack_one`] is the one writer.
+impl FarBodyGpu {
+    /// The code whose `[lane - 0.5, lane + 0.5)` holds `atmosphere.w`, or
+    /// `None` for any other value (NaN included). Such a body is heavy.
+    pub(super) fn shape(&self) -> Option<ShapeCode> {
+        let w = self.atmosphere[3];
+        ShapeCode::ALL
+            .into_iter()
+            .find(|code| ((code.lane() - 0.5)..(code.lane() + 0.5)).contains(&w))
+    }
+
+    pub(super) fn is_mapped(&self) -> bool {
+        self.shape() == Some(ShapeCode::Mapped)
+    }
+
+    /// A sphere or an inner sphere, the pair the sphere fragment draws.
+    pub(super) fn is_light(&self) -> bool {
+        matches!(
+            self.shape(),
+            Some(ShapeCode::Sphere | ShapeCode::InnerSphere)
+        )
+    }
+
+    /// Centre direction, `dir_rho.xyz`.
+    pub(super) fn dir(&self) -> glam::Vec3 {
+        glam::Vec3::new(self.dir_rho[0], self.dir_rho[1], self.dir_rho[2])
+    }
+
+    /// Reference `radius / distance`, `dir_rho.w`.
+    pub(super) fn rho(&self) -> f32 {
+        self.dir_rho[3]
+    }
+
+    /// Mapped horizon, `albedo0.w`. 0 for the other shapes.
+    pub(super) fn horizon(&self) -> f32 {
+        self.albedo0[3]
+    }
+
+    /// Mapped air-shell thickness in the unit of `radius`, `albedo1.w`. 0
+    /// for the other shapes.
+    pub(super) fn air(&self) -> f32 {
+        self.albedo1[3]
+    }
+
+    /// World distance, `albedo2.w`, every shape.
+    pub(super) fn distance(&self) -> f32 {
+        self.albedo2[3]
+    }
+
+    /// Far-map slot from `seed.z` (map id + 1). `None` when the body is not
+    /// mapped (0) or the id is past [`MAX_FAR_MAPS`].
+    pub(super) fn map_index(&self) -> Option<usize> {
+        let map_plus = self.seed[2] as usize;
+        (1..=MAX_FAR_MAPS).contains(&map_plus).then(|| map_plus - 1)
+    }
 }
 
 /// Mask words in the GPU table. `tile_mask` in `shaders/far_table.slang` is
@@ -94,6 +184,30 @@ pub(super) struct FarTableGpu {
 unsafe impl Zeroable for FarTableGpu {}
 unsafe impl Pod for FarTableGpu {}
 
+impl FarTableGpu {
+    /// Live body count: `header.x`, capped at [`MAX_FAR_BODIES`].
+    pub(super) fn kept(&self) -> usize {
+        (self.header[0] as usize).min(MAX_FAR_BODIES)
+    }
+
+    /// Bit `k` is set when kept body `k` passes `pred`.
+    pub(super) fn kept_bits(&self, pred: impl Fn(&FarBodyGpu) -> bool) -> u32 {
+        let mut bits = 0u32;
+        for (k, body) in self.body[..self.kept()].iter().enumerate() {
+            if pred(body) {
+                bits |= 1u32 << k;
+            }
+        }
+        bits
+    }
+
+    /// The cone direction of kept body `k`, `cone[k].xyz`.
+    pub(super) fn cone_dir(&self, k: usize) -> glam::Vec3 {
+        let cone = self.cone[k];
+        glam::Vec3::new(cone[0], cone[1], cone[2])
+    }
+}
+
 /// Bins in one azimuthal horizon table. `horizon_sin` in
 /// `shaders/far_table.slang` holds two tables, back to back, sized by the
 /// generated twin.
@@ -145,11 +259,14 @@ pub(super) fn pack_one(body: &FarBody) -> FarBodyGpu {
     let dir = body.dir;
     let q = body.rotation;
     let (shape, exponent, map_plus, horizon, air) = match body.shape {
-        FarShape::Cube => (0.0, 0.0, 0, 0.0, 0.0),
-        FarShape::Sphere => (1.0, 0.0, 0, 0.0, 0.0),
-        FarShape::InnerSphere => (2.0, 0.0, 0, 0.0, 0.0),
-        FarShape::Rounded { exponent } => (3.0, exponent, 0, 0.0, 0.0),
-        FarShape::Mapped { map, horizon, air } => (4.0, 0.0, u32::from(map.0) + 1, horizon, air),
+        FarShape::Cube => (ShapeCode::Cube, 0.0, 0, 0.0, 0.0),
+        FarShape::Sphere => (ShapeCode::Sphere, 0.0, 0, 0.0, 0.0),
+        FarShape::InnerSphere => (ShapeCode::InnerSphere, 0.0, 0, 0.0, 0.0),
+        FarShape::Rounded { exponent } => (ShapeCode::Rounded, exponent, 0, 0.0, 0.0),
+        FarShape::Mapped { map, horizon, air } => {
+            let map_plus = u32::from(map.0) + 1;
+            (ShapeCode::Mapped, 0.0, map_plus, horizon, air)
+        }
     };
     let mut albedo0 = rgb4(body.albedo[0]);
     let mut albedo1 = rgb4(body.albedo[1]);
@@ -171,7 +288,7 @@ pub(super) fn pack_one(body: &FarBody) -> FarBodyGpu {
             body.atmosphere.0[0],
             body.atmosphere.0[1],
             body.atmosphere.0[2],
-            shape,
+            shape.lane(),
         ],
         seed: [body.seed, exponent.to_bits(), map_plus, 0],
     }
@@ -202,14 +319,8 @@ pub(super) fn nonzero_tiles(table: &FarTableGpu) -> u64 {
         .count() as u64
 }
 
-/// Pack `bodies` in order. With culling on and a view, bodies whose cone cannot
-/// meet the frustum are dropped; the rest stay in their original relative order
-/// (the sky composite is order-dependent). `None` keeps every body. Each kept
-/// body then sets its bit in the screen tiles its drawable cone can reach.
-/// `map_max[i]` is map `i`'s maximum datum offset, used for a mapped body's
-/// per-pixel cone. That sine is the hi radius plus `air/distance` (`-1` when
-/// that reach is at least 0.99). A mapped body with `horizon < 1` paints tiles
-/// from the horizon cone instead, so the sentinel does not cover the sky.
+/// [`pack_table_cached`] with no tile frames and a zero minimum-offset table,
+/// keeping the table.
 #[cfg(test)]
 pub(super) fn pack_table(
     bodies: &[FarBody],
@@ -249,6 +360,9 @@ fn prime_horizon(table: &mut FarTableGpu) {
     table.horizon_sin.fill(1.0);
 }
 
+/// [`pack_table_into`] a fresh table with culling on. `frames` are used when
+/// they match `view`; otherwise the angular cones build their own.
+#[cfg(test)]
 pub(super) fn pack_table_cached(
     bodies: &[FarBody],
     view: Option<&FarView>,
@@ -258,20 +372,66 @@ pub(super) fn pack_table_cached(
     sky_up: glam::Vec3,
 ) -> (Box<FarTableGpu>, f32) {
     let mut table = zeroed_table();
-    prime_horizon(&mut table);
+    let tiles = view
+        .zip(frames)
+        .and_then(|(view, frames)| frames.view(view));
+    let (dip, _) = pack_table_into(
+        &mut table,
+        bodies,
+        view,
+        tiles.as_ref(),
+        map_max,
+        map_min,
+        sky_up,
+        true,
+    );
+    (table, dip)
+}
+
+/// Pack `bodies` in order into `table`, which is overwritten whole. With
+/// culling on and a view, bodies whose cone cannot meet the frustum are
+/// dropped; the rest stay in their original relative order (the sky
+/// composite is order-dependent). No view keeps every body. Each kept body
+/// then sets its bit in the screen tiles its drawable cone can reach.
+/// `map_max[i]` is map `i`'s maximum datum offset, used for a mapped body's
+/// per-pixel cone. That sine is the hi radius plus `air/distance` (`-1` when
+/// that reach is at least 0.99). A mapped body with `horizon < 1` paints tiles
+/// from the horizon cone instead, so the sentinel does not cover the sky.
+///
+/// `cull` off (`VOXEL_FAR_CULL=0`) keeps every body, stores the `-1` cone,
+/// and puts every kept body in every live tile. `tiles` are the ring's tile
+/// frames when they match `view`. Returns the horizon-dip sine and the runs
+/// the tile lists were filled with.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pack_table_into(
+    table: &mut FarTableGpu,
+    bodies: &[FarBody],
+    view: Option<&FarView>,
+    tiles: Option<&TileView>,
+    map_max: &[f32; MAX_FAR_MAPS],
+    map_min: &[f32; MAX_FAR_MAPS],
+    sky_up: glam::Vec3,
+    cull: bool,
+) -> (f32, TileRuns) {
+    // Every byte: a reused table must not carry the last frame's masks,
+    // bodies or index tail.
+    bytemuck::bytes_of_mut(table).fill(0);
+    prime_horizon(table);
     let n = bodies.len().min(MAX_FAR_BODIES);
     // Before the cull: see [`horizon_dip`].
     let dip = horizon_dip(&bodies[..n], sky_up, map_min);
-    let cull = far_cull_enabled();
     let mut kept = 0usize;
     for body in bodies.iter().take(n) {
-        let bound = cone_bound(body, map_max);
-        if cull {
-            if let Some(view) = view {
-                if !body_meets_view(body, bound, view) {
-                    continue;
-                }
-            }
+        let bound = if cull {
+            cone_bound(body, map_max)
+        } else {
+            -1.0
+        };
+        if cull
+            && let Some(view) = view
+            && !body_meets_view(body, bound, view)
+        {
+            continue;
         }
         let d = body.dir;
         table.cone[kept] = [d.x, d.y, d.z, bound];
@@ -279,6 +439,6 @@ pub(super) fn pack_table_cached(
         kept += 1;
     }
     table.header[0] = kept as u32;
-    stamp_tiles(&mut table, view, frames);
-    (table, dip)
+    let runs = stamp_tiles(table, view, tiles, cull);
+    (dip, runs)
 }

@@ -2,7 +2,6 @@
 //! with, and the half-angles of the mapped horizon, interior and lo-sphere
 //! discs that the cull, the tile mask and the coarse split share.
 
-use super::far_cull_enabled;
 use super::table::FarBodyGpu;
 use crate::far_body::{FarBody, FarShape, MAX_FAR_MAPS};
 
@@ -45,10 +44,9 @@ use crate::far_body::{FarBody, FarShape, MAX_FAR_MAPS};
 ///   cone ([`mapped_horizon_half`]) whenever `horizon < 1`, including when this
 ///   bound is `-1`, so sky tiles above the limb do not take the mapped march.
 ///   `horizon >= 1` disables that cone and keeps today's tile coverage.
+///
+/// Culling off (`VOXEL_FAR_CULL=0`) does not call this: the pack stores `-1`.
 pub(super) fn cone_bound(body: &FarBody, map_max: &[f32; MAX_FAR_MAPS]) -> f32 {
-    if !far_cull_enabled() {
-        return -1.0;
-    }
     let rho = body.radius / body.distance;
     match body.shape {
         FarShape::InnerSphere => -1.0,
@@ -242,20 +240,16 @@ pub(super) fn lo_disc_interior(rho_lo: f32, px_margin: f32) -> Option<(f32, f32)
 /// `radius/distance + min_offset/distance` for a mapped body. `None` when the
 /// record is not mapped or the distance is unusable.
 pub(super) fn mapped_rho_lo(gpu: &FarBodyGpu, map_min: &[f32; MAX_FAR_MAPS]) -> Option<f32> {
-    let shape = gpu.atmosphere[3];
-    if !(3.5..4.5).contains(&shape) {
+    if !gpu.is_mapped() {
         return None;
     }
-    let map_plus = gpu.seed[2];
-    if map_plus == 0 || map_plus as usize > MAX_FAR_MAPS {
-        return None;
-    }
-    let distance = gpu.albedo2[3];
-    let rho = gpu.dir_rho[3];
+    let map = gpu.map_index()?;
+    let distance = gpu.distance();
+    let rho = gpu.rho();
     if !(distance > 0.0) || !distance.is_finite() || !rho.is_finite() {
         return None;
     }
-    let min_off = map_min[(map_plus as usize) - 1];
+    let min_off = map_min[map];
     if !min_off.is_finite() {
         return None;
     }

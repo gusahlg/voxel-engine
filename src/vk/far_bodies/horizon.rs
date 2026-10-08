@@ -2,10 +2,8 @@
 //! against a published table, and the per-ring cache of built tables.
 
 use super::cones::{add_angles, unit_dir};
-use super::far_cull_enabled;
 use super::table::{FarTableGpu, HORIZON_BINS, HORIZON_TABLES};
-use super::tiles::{TileFrames, TileSample, fill_tile_lists, used_tiles};
-use super::view::{FarView, ViewBasis};
+use super::tiles::{TileRuns, TileSample, TileView, fill_tile_lists, used_tiles};
 use crate::far_body::{FarBody, FarShape, MAX_FAR_BODIES, MAX_FAR_MAPS};
 
 /// Index in `bodies` (the pre-frustum list [`horizon_dip`] walks) and the rho
@@ -162,7 +160,7 @@ pub(super) fn ray_above_horizon(
 /// The whole tile cone, widened by `px_margin` radians (2 px when that is
 /// [`FarView::px_max`]), lies strictly above every bin its azimuth range
 /// overlaps. The stored cone already carries the tile's angular radius.
-fn tile_above_horizon(
+pub(super) fn tile_above_horizon(
     tile: &TileSample,
     bins: &[f32; HORIZON_BINS],
     up: glam::Vec3,
@@ -210,19 +208,19 @@ fn tile_above_horizon(
 }
 
 /// Drop a published body's bit from every tile whose cone is above that
-/// body's table. Refills the tile lists when a bit changes. Culling off
-/// leaves the mask alone; the shader test still runs.
+/// body's table. Refills the tile lists when a bit changes and returns the
+/// new runs; `None` leaves the lists as they were. Culling off
+/// (`VOXEL_FAR_CULL=0`) does not call this and leaves the mask alone; the
+/// shader test still runs.
 pub(super) fn clear_tiles_above_horizon(
     table: &mut FarTableGpu,
-    frames: &TileFrames,
-    view: &FarView,
-) -> bool {
-    if !far_cull_enabled() || !frames.matches(view) {
-        return false;
-    }
-    let Some(basis) = ViewBasis::from_view_proj(view.view_proj) else {
-        return false;
-    };
+    tiles: &TileView,
+) -> Option<TileRuns> {
+    let TileView {
+        frames,
+        view,
+        basis,
+    } = tiles;
     let n = used_tiles(table).min(frames.samples.len());
     let mut changed = false;
     for slot in 0..HORIZON_TABLES {
@@ -230,12 +228,7 @@ pub(super) fn clear_tiles_above_horizon(
         if id == u32::MAX || id as usize >= MAX_FAR_BODIES {
             continue;
         }
-        let gpu = &table.body[id as usize];
-        let Some(dir) = unit_dir(glam::Vec3::new(
-            gpu.dir_rho[0],
-            gpu.dir_rho[1],
-            gpu.dir_rho[2],
-        )) else {
+        let Some(dir) = unit_dir(table.body[id as usize].dir()) else {
             continue;
         };
         let up = -dir;
@@ -272,10 +265,63 @@ pub(super) fn clear_tiles_above_horizon(
             }
         }
     }
-    if changed {
-        fill_tile_lists(table, view.width, view.height);
+    changed.then(|| fill_tile_lists(table, view.width, view.height))
+}
+
+/// A Mapped body whose hi+air ball holds the eye: its kept index, reference
+/// rho and far-map slot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct HorizonCand {
+    pub(super) index: usize,
+    pub(super) rho: f32,
+    pub(super) map: usize,
+}
+
+/// The bodies that get a horizon table, in table order: the kept Mapped
+/// bodies whose hi+air ball contains the eye, the largest reference rho
+/// first (ties in kept order), at most [`HORIZON_TABLES`]. `map_max[i]` is
+/// map `i`'s maximum datum offset. No allocation.
+pub(super) fn horizon_candidates(
+    table: &FarTableGpu,
+    map_max: &[f32; MAX_FAR_MAPS],
+) -> [Option<HorizonCand>; HORIZON_TABLES] {
+    let mut all = [HorizonCand {
+        index: 0,
+        rho: 0.0,
+        map: 0,
+    }; MAX_FAR_BODIES];
+    let mut n = 0usize;
+    for (k, gpu) in table.body[..table.kept()].iter().enumerate() {
+        if !gpu.is_mapped() {
+            continue;
+        }
+        let Some(map) = gpu.map_index() else {
+            continue;
+        };
+        let distance = gpu.distance();
+        let rho = gpu.rho();
+        let air = gpu.air();
+        let max_off = map_max[map];
+        if !(distance > 0.0)
+            || !distance.is_finite()
+            || !rho.is_finite()
+            || !air.is_finite()
+            || !max_off.is_finite()
+        {
+            continue;
+        }
+        let radius = rho * distance;
+        let reach = radius + max_off + air.max(0.0);
+        if !(distance <= reach + distance * 1.0e-5) {
+            continue;
+        }
+        all[n] = HorizonCand { index: k, rho, map };
+        n += 1;
     }
-    changed
+    // The kept indices are distinct, so the order is total and the unstable
+    // sort gives the stable one.
+    all[..n].sort_unstable_by(|a, b| b.rho.total_cmp(&a.rho).then(a.index.cmp(&b.index)));
+    std::array::from_fn(|slot| all[..n].get(slot).copied())
 }
 
 /// Eye motion that keeps a cached table, as a fraction of the altitude

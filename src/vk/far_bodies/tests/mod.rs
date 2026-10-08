@@ -7,7 +7,9 @@
 use super::horizon::horizon_dip;
 use super::table::pack_table;
 
+mod classify;
 mod cones;
+mod frozen;
 mod horizon;
 mod horizon_build;
 mod sky_draw;

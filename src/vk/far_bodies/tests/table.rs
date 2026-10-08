@@ -2,9 +2,9 @@ use glam::{Quat, Vec3};
 
 use super::support::{pack_table, placed, sample, view_along_neg_z};
 use crate::color::LinearRgb;
-use crate::far_body::{FarBody, FarMapId, FarShape, MAX_FAR_BODIES, store};
+use crate::far_body::{FarBody, FarMapId, FarShape, MAX_FAR_BODIES, MAX_FAR_MAPS, store};
 use crate::vk::far_bodies::table::{
-    FarBodyGpu, HORIZON_BINS, HORIZON_TABLES, MAX_FAR_TILES, pack_one, table_bytes,
+    FarBodyGpu, HORIZON_BINS, HORIZON_TABLES, MAX_FAR_TILES, ShapeCode, pack_one, table_bytes,
 };
 use crate::vk::far_bodies::tiles::used_tiles;
 
@@ -111,6 +111,69 @@ fn every_shape_packs_world_distance_in_albedo2_w() {
             "albedo2.w is the world distance"
         );
     }
+}
+
+/// The named shape codes are the ones `far_table.slang` lists, each packed
+/// shape decodes to its own code, and the named lanes read what
+/// `pack_one` wrote.
+#[test]
+fn shape_codes_and_lanes_match_the_packed_record() {
+    let src = include_str!("../../../../shaders/far_table.slang");
+    let listed = src
+        .split("atmosphere.a is the shape:")
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .expect("far_table.slang lists the shape codes");
+    let listed = listed.replace("//", " ");
+    let listed: Vec<&str> = listed.split_whitespace().collect();
+    let names = ["cube", "sphere", "inner sphere", "rounded", "mapped"];
+    let expect: Vec<String> = ShapeCode::ALL
+        .iter()
+        .zip(names)
+        .map(|(code, name)| format!("{} {name}", code.lane()))
+        .collect();
+    assert_eq!(listed.join(" "), expect.join(", "));
+
+    let mapped = FarShape::Mapped {
+        map: FarMapId(5),
+        horizon: -0.25,
+        air: 0.4,
+    };
+    let shapes = [
+        (FarShape::Cube, ShapeCode::Cube),
+        (FarShape::Sphere, ShapeCode::Sphere),
+        (FarShape::InnerSphere, ShapeCode::InnerSphere),
+        (FarShape::Rounded { exponent: 3.0 }, ShapeCode::Rounded),
+        (mapped, ShapeCode::Mapped),
+    ];
+    for (shape, code) in shapes {
+        let gpu = pack_one(&sample(shape, 4.0, 1.0));
+        assert_eq!(gpu.atmosphere[3].to_bits(), code.lane().to_bits());
+        assert_eq!(gpu.shape(), Some(code));
+        assert_eq!(gpu.is_mapped(), code == ShapeCode::Mapped);
+        let light = matches!(code, ShapeCode::Sphere | ShapeCode::InnerSphere);
+        assert_eq!(gpu.is_light(), light);
+        assert_eq!(gpu.dir(), Vec3::Z);
+        assert_eq!(gpu.rho().to_bits(), 0.25f32.to_bits());
+        assert_eq!(gpu.distance().to_bits(), 4.0f32.to_bits());
+        if code == ShapeCode::Mapped {
+            assert_eq!(gpu.horizon().to_bits(), (-0.25f32).to_bits());
+            assert_eq!(gpu.air().to_bits(), 0.4f32.to_bits());
+            assert_eq!(gpu.map_index(), Some(5));
+        } else {
+            assert_eq!((gpu.horizon(), gpu.air()), (0.0, 0.0));
+            assert_eq!(gpu.map_index(), None);
+        }
+    }
+    // Off-code lanes decode to nothing and stay heavy, as before the names.
+    let mut odd = pack_one(&sample(FarShape::Sphere, 4.0, 1.0));
+    for lane in [f32::NAN, -0.6, 4.5, 7.0] {
+        odd.atmosphere[3] = lane;
+        assert_eq!(odd.shape(), None, "{lane}");
+        assert!(!odd.is_mapped() && !odd.is_light(), "{lane}");
+    }
+    odd.seed[2] = MAX_FAR_MAPS as u32 + 1;
+    assert_eq!(odd.map_index(), None);
 }
 
 #[test]

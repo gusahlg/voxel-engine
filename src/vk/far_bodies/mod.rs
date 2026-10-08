@@ -48,20 +48,20 @@ pub(crate) use view::{FarView, far_view};
 
 use cones::unit_dir;
 use debug::log_sky_debug;
-use horizon::{
-    HorizonCache, HorizonSlot, cache_dest, clear_tiles_above_horizon, horizon_cache_hit,
-};
+use horizon::{HorizonCache, HorizonSlot, cache_dest, horizon_cache_hit, horizon_candidates};
 use horizon_build::build_horizon_bins;
-use sky_draw::{partition_mapsolo, publish_far_gauges, split_coarse_base, split_coarse_far};
+use sky_draw::{classify_tiles, publish_far_gauges};
 use table::{
-    FarTableGpu, HORIZON_BINS, HORIZON_TABLES, list_bytes, nonzero_tiles, pack_table_cached,
-    table_bytes,
+    FarTableGpu, HORIZON_BINS, HORIZON_TABLES, MAX_FAR_TILES, list_bytes, nonzero_tiles,
+    pack_table_into, table_bytes, zeroed_table,
 };
 use tiles::TileFrames;
 
 /// `VOXEL_FAR_CULL=0` disables the cone reject, the CPU frustum compaction, and
-/// the per-tile mask (every tile keeps every surviving body). Any other value,
-/// including unset, leaves culling on. Read once.
+/// the per-tile mask (every live tile keeps every surviving body, the mapped
+/// horizon cone and the horizon-table tile clear included). The shader's
+/// per-ray horizon-table skip still runs. Any other value, including unset,
+/// leaves culling on. Read once.
 fn far_cull_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| !std::env::var("VOXEL_FAR_CULL").is_ok_and(|v| v == "0"))
@@ -76,6 +76,25 @@ fn sky_mapsolo_enabled() -> bool {
     *ENABLED.get_or_init(|| !std::env::var("VOXEL_SKY_MAPSOLO").is_ok_and(|v| v == "0"))
 }
 
+/// The far-body A/B switches. [`FarBodyRing::write`] reads them and passes
+/// them down, so the host pipeline can be tested with either setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FarSwitches {
+    /// [`far_cull_enabled`].
+    pub(super) cull: bool,
+    /// [`sky_mapsolo_enabled`].
+    pub(super) mapsolo: bool,
+}
+
+impl FarSwitches {
+    fn from_env() -> Self {
+        Self {
+            cull: far_cull_enabled(),
+            mapsolo: sky_mapsolo_enabled(),
+        }
+    }
+}
+
 /// Per-slot far-body SSBO. Identical bytes skip the map write.
 /// `tiles` is the view-space tile cones, rebuilt when the projection, the
 /// render extent, or the tile size changes and reused across camera turns.
@@ -84,6 +103,9 @@ pub(crate) struct FarBodyRing {
     /// Previous upload. Boxed: three inline tables would add ~210 KB to
     /// `Renderer`, which lives on the render thread's default stack.
     last: PerSlot<Option<Box<FarTableGpu>>>,
+    /// The table the next write packs into: the one the last byte match
+    /// left unused, or the upload a slot just replaced.
+    spare: Option<Box<FarTableGpu>>,
     tiles: TileFrames,
     draw: PerSlot<SkyDraw>,
     /// Reused across frames. Rebuilt when the eye moves more than 0.1% of
@@ -91,6 +113,8 @@ pub(crate) struct FarBodyRing {
     /// air, pixel angle, or datum generation changes.
     horizon: HorizonCache,
     datum_scratch: Vec<f32>,
+    /// The tile-index partitions' scratch, sized for the longest run.
+    partition_scratch: Vec<u32>,
 }
 
 impl FarBodyRing {
@@ -108,159 +132,18 @@ impl FarBodyRing {
         Self {
             bufs: PerSlot::new(std::array::from_fn(|_| make())),
             last: PerSlot::new(std::array::from_fn(|_| None)),
+            spare: None,
             tiles: TileFrames::empty(),
             draw: PerSlot::new(std::array::from_fn(|_| SkyDraw::default())),
             horizon: HorizonCache::new(),
             datum_scratch: Vec::new(),
+            partition_scratch: Vec::with_capacity(MAX_FAR_TILES),
         }
     }
 
     /// Draw the sky recorded for `slot` after [`Self::write`].
     pub(crate) fn sky_draw(&self, slot: FrameSlot) -> SkyDraw {
         self.draw[slot]
-    }
-
-    /// Fill the two horizon tables from the datum and drop tiles that sit
-    /// entirely above them. At most two Mapped bodies, the ones with the
-    /// largest reference rho whose hi+air ball contains the eye. A cache hit
-    /// skips the cell walk.
-    fn publish_horizons(
-        &mut self,
-        table: &mut FarTableGpu,
-        view: Option<&FarView>,
-        maps: &super::far_maps::FarMaps,
-        map_max: &[f32; MAX_FAR_MAPS],
-        map_min: &[f32; MAX_FAR_MAPS],
-    ) {
-        let kept = (table.header[0] as usize).min(MAX_FAR_BODIES);
-        let px = view.map(|v| v.px_max).unwrap_or(0.0);
-        struct Cand {
-            index: usize,
-            rho: f32,
-            map: usize,
-        }
-        let mut cands = Vec::new();
-        for k in 0..kept {
-            let gpu = &table.body[k];
-            let shape = gpu.atmosphere[3];
-            if !(3.5..4.5).contains(&shape) {
-                continue;
-            }
-            let map_plus = gpu.seed[2];
-            if map_plus == 0 || map_plus as usize > MAX_FAR_MAPS {
-                continue;
-            }
-            let map = (map_plus as usize) - 1;
-            let distance = gpu.albedo2[3];
-            let rho = gpu.dir_rho[3];
-            let air = gpu.albedo1[3];
-            let max_off = map_max[map];
-            if !(distance > 0.0)
-                || !distance.is_finite()
-                || !rho.is_finite()
-                || !air.is_finite()
-                || !max_off.is_finite()
-            {
-                continue;
-            }
-            let radius = rho * distance;
-            let reach = radius + max_off + air.max(0.0);
-            if !(distance <= reach + distance * 1.0e-5) {
-                continue;
-            }
-            cands.push(Cand { index: k, rho, map });
-        }
-        cands.sort_by(|a, b| b.rho.total_cmp(&a.rho).then(a.index.cmp(&b.index)));
-        cands.truncate(HORIZON_TABLES);
-
-        let mut used = [false; HORIZON_TABLES];
-        for (out_slot, cand) in cands.iter().enumerate() {
-            let gpu = table.body[cand.index];
-            let distance = gpu.albedo2[3];
-            let radius = gpu.dir_rho[3] * distance;
-            let air = gpu.albedo1[3].max(0.0);
-            let min_off = map_min[cand.map];
-            let altitude = distance - (radius + min_off);
-            let Some(dir) = unit_dir(glam::Vec3::new(
-                gpu.dir_rho[0],
-                gpu.dir_rho[1],
-                gpu.dir_rho[2],
-            )) else {
-                continue;
-            };
-            let eye = -dir * distance;
-            let rot_bits = [
-                gpu.rot[0].to_bits(),
-                gpu.rot[1].to_bits(),
-                gpu.rot[2].to_bits(),
-                gpu.rot[3].to_bits(),
-            ];
-            let Some((g_stamp, generation)) = maps.map_stamp(cand.map) else {
-                continue;
-            };
-            if g_stamp < 2 {
-                continue;
-            }
-            let map_id = cand.map as u32;
-            let px_bits = px.to_bits();
-            let radius_bits = radius.to_bits();
-            let air_bits = air.to_bits();
-            let hit = self.horizon.slots.iter().position(|slot| {
-                horizon_cache_hit(
-                    slot,
-                    map_id,
-                    generation,
-                    radius_bits,
-                    air_bits,
-                    px_bits,
-                    rot_bits,
-                    eye,
-                )
-            });
-            let bins = if let Some(i) = hit {
-                used[i] = true;
-                self.horizon.slots[i].bins
-            } else {
-                let Some(g) = maps.copy_datum(cand.map, &mut self.datum_scratch) else {
-                    continue;
-                };
-                let rotation =
-                    glam::Quat::from_xyzw(gpu.rot[0], gpu.rot[1], gpu.rot[2], gpu.rot[3]);
-                let built = build_horizon_bins(
-                    g,
-                    &self.datum_scratch,
-                    rotation,
-                    -dir,
-                    radius,
-                    distance,
-                    air,
-                    px,
-                );
-                let dest = cache_dest(&self.horizon, &used, map_id);
-                self.horizon.slots[dest] = HorizonSlot {
-                    live: true,
-                    map: map_id,
-                    generation,
-                    radius_bits,
-                    air_bits,
-                    px_bits,
-                    rot_bits,
-                    eye,
-                    altitude,
-                    bins: built,
-                };
-                used[dest] = true;
-                built
-            };
-            table.horizon_id[out_slot] = cand.index as u32;
-            let start = out_slot * HORIZON_BINS;
-            table.horizon_sin[start..start + HORIZON_BINS].copy_from_slice(&bins);
-        }
-        if let Some(view) = view
-            && self.tiles.matches(view)
-        {
-            clear_tiles_above_horizon(table, &self.tiles, view);
-        }
     }
 
     /// Pack and upload. Returns the horizon-dip sine for `sky_bitangent.w`
@@ -276,20 +159,40 @@ impl FarBodyRing {
         coarse: Option<SkyCoarseQuery>,
         sky_up: glam::Vec3,
     ) -> f32 {
-        if let Some(view) = view.as_ref() {
-            self.tiles.rebuild_if_changed(view);
-        }
+        let switches = FarSwitches::from_env();
+        // The frame's one tile-frame match; every pass below reuses it.
+        let tiles = view.as_ref().and_then(|view| self.tiles.sync(view));
         let map_max = maps.max_offsets();
         let map_min = maps.min_offsets();
-        let (mut table, dip) = pack_table_cached(
+        let mut table = self.spare.take().unwrap_or_else(zeroed_table);
+        let (dip, runs) = pack_table_into(
+            &mut table,
             bodies,
             view.as_ref(),
-            Some(&self.tiles),
+            tiles.as_ref(),
             &map_max,
             &map_min,
             sky_up,
+            switches.cull,
         );
-        self.publish_horizons(&mut table, view.as_ref(), maps, &map_max, &map_min);
+        publish_horizons(
+            &mut self.horizon,
+            &mut self.datum_scratch,
+            &mut table,
+            view.as_ref().map_or(0.0, |view| view.px_max),
+            maps,
+            &map_max,
+            &map_min,
+        );
+        let draw = classify_tiles(
+            &mut table,
+            runs,
+            tiles.as_ref(),
+            coarse.as_ref(),
+            &map_min,
+            switches,
+            &mut self.partition_scratch,
+        );
         // `far.tiles` is the full-pipeline tile count (mask != 0).
         debug_assert_eq!(u64::from(table.list_header[1]), nonzero_tiles(&table));
         publish_far_gauges(
@@ -297,24 +200,6 @@ impl FarBodyRing {
             u64::from(table.header[0]),
             u64::from(table.list_header[1]),
         );
-        let mut draw = SkyDraw::from_table(&table, far_cull_enabled());
-        // Fullscreen sky (no tile grid) stays on the 1×1 triangle. The splits
-        // rewrite the uploaded index prefix, so they run before the byte match.
-        // Mapsolo comes first: the interior split then pulls its coarse prefix
-        // out of that single-Mapped run, and the full-shader tiles stay after it.
-        if draw.quads {
-            if sky_mapsolo_enabled() {
-                let n = partition_mapsolo(&mut table);
-                debug_assert_eq!(n, draw.n_mapsolo);
-                draw.n_mapsolo = n;
-            }
-            if let (Some(query), Some(view)) = (coarse.as_ref(), view.as_ref()) {
-                if self.tiles.matches(view) {
-                    draw.n_coarse = split_coarse_base(&mut table, &self.tiles, view, query);
-                    draw.n_coarse_far = split_coarse_far(&mut table, &self.tiles, view, &map_min);
-                }
-            }
-        }
         draw.publish_gauges();
         self.draw[slot] = draw;
         if super::uniforms::sky_debug_enabled() {
@@ -326,13 +211,14 @@ impl FarBodyRing {
             .as_ref()
             .is_some_and(|prev| table_bytes(prev) == bytes && list_bytes(prev) == lists)
         {
+            self.spare = Some(table);
             return dip;
         }
         unsafe {
             self.bufs[slot].write(0, bytes);
             self.bufs[slot].write(std::mem::offset_of!(FarTableGpu, list_header) as u64, lists);
         }
-        self.last[slot] = Some(table);
+        self.spare = self.last[slot].replace(table);
         dip
     }
 
@@ -346,6 +232,87 @@ impl FarBodyRing {
         for buf in self.bufs.iter_mut() {
             unsafe { buf.destroy(device) };
         }
+    }
+}
+
+/// Fill the two horizon tables from the datum: [`horizon_candidates`], each
+/// from the cache when it still holds, else built. `px` is the view's
+/// [`FarView::px_max`] (0 with no view). The tiles above a table lose that
+/// body's bit later, in [`classify_tiles`].
+fn publish_horizons(
+    cache: &mut HorizonCache,
+    datum_scratch: &mut Vec<f32>,
+    table: &mut FarTableGpu,
+    px: f32,
+    maps: &super::far_maps::FarMaps,
+    map_max: &[f32; MAX_FAR_MAPS],
+    map_min: &[f32; MAX_FAR_MAPS],
+) {
+    let cands = horizon_candidates(table, map_max);
+    let mut used = [false; HORIZON_TABLES];
+    for (out_slot, cand) in cands.iter().flatten().enumerate() {
+        let gpu = table.body[cand.index];
+        let distance = gpu.distance();
+        let radius = gpu.rho() * distance;
+        let air = gpu.air().max(0.0);
+        let min_off = map_min[cand.map];
+        let altitude = distance - (radius + min_off);
+        let Some(dir) = unit_dir(gpu.dir()) else {
+            continue;
+        };
+        let eye = -dir * distance;
+        let rot_bits = gpu.rot.map(f32::to_bits);
+        let Some((g_stamp, generation)) = maps.map_stamp(cand.map) else {
+            continue;
+        };
+        if g_stamp < 2 {
+            continue;
+        }
+        let map_id = cand.map as u32;
+        let px_bits = px.to_bits();
+        let radius_bits = radius.to_bits();
+        let air_bits = air.to_bits();
+        let hit = cache.slots.iter().position(|slot| {
+            horizon_cache_hit(
+                slot,
+                map_id,
+                generation,
+                radius_bits,
+                air_bits,
+                px_bits,
+                rot_bits,
+                eye,
+            )
+        });
+        let bins = if let Some(i) = hit {
+            used[i] = true;
+            cache.slots[i].bins
+        } else {
+            let Some(g) = maps.copy_datum(cand.map, datum_scratch) else {
+                continue;
+            };
+            let rotation = glam::Quat::from_xyzw(gpu.rot[0], gpu.rot[1], gpu.rot[2], gpu.rot[3]);
+            let built =
+                build_horizon_bins(g, datum_scratch, rotation, -dir, radius, distance, air, px);
+            let dest = cache_dest(cache, &used, map_id);
+            cache.slots[dest] = HorizonSlot {
+                live: true,
+                map: map_id,
+                generation,
+                radius_bits,
+                air_bits,
+                px_bits,
+                rot_bits,
+                eye,
+                altitude,
+                bins: built,
+            };
+            used[dest] = true;
+            built
+        };
+        table.horizon_id[out_slot] = cand.index as u32;
+        let start = out_slot * HORIZON_BINS;
+        table.horizon_sin[start..start + HORIZON_BINS].copy_from_slice(&bins);
     }
 }
 

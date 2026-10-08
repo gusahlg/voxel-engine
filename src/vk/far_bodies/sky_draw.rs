@@ -2,13 +2,13 @@
 //! splits of the tile-index runs, and [`SkyDraw`], the plan `record_sky`
 //! draws from.
 
+use super::FarSwitches;
 use super::cones::{add_angles, lo_disc_interior, mapped_interior_half, mapped_rho_lo, unit_dir};
-use super::sky_mapsolo_enabled;
+use super::horizon::clear_tiles_above_horizon;
 use super::table::FarTableGpu;
 use super::tiles::{
-    TileFrames, has_mapped, heavy_mask, tile_split, tile_strictly_inside, tile_within, used_tiles,
+    TileRuns, TileView, heavy_mask, mapped_mask, tile_strictly_inside, tile_within, used_tiles,
 };
-use super::view::{FarView, ViewBasis};
 use crate::far_body::{MAX_FAR_BODIES, MAX_FAR_MAPS};
 use crate::vk::pipeline::{SkyFrag, SkyRate};
 
@@ -50,10 +50,44 @@ fn widened_disc(cos_rim: f32, margin_rad: f32) -> Option<(f32, f32)> {
     Some((sin_w, cos_w))
 }
 
-/// Stably partition the base prefix into tiles neither disc can touch, then
+/// Stably move the tile indices `take` accepts to the front of `run` and the
+/// rest after them, each group in its old order. Returns the accepted count.
+/// Every index is classified before `run` is written, so a `None` from `take`
+/// (an index with no tile) leaves `run` untouched and returns `None`.
+/// `scratch` is the ring's: no allocation once it holds `run.len()` words.
+pub(super) fn stable_partition(
+    run: &mut [u32],
+    scratch: &mut Vec<u32>,
+    mut take: impl FnMut(u32) -> Option<bool>,
+) -> Option<u32> {
+    let n = run.len();
+    scratch.clear();
+    scratch.resize(n, 0);
+    // Accepted indices fill from the front, the rest from the back (so
+    // reversed), and the two meet.
+    let mut front = 0usize;
+    let mut back = n;
+    for &index in run.iter() {
+        if take(index)? {
+            scratch[front] = index;
+            front += 1;
+        } else {
+            back -= 1;
+            scratch[back] = index;
+        }
+    }
+    let (taken, rest) = scratch.split_at(front);
+    run[..front].copy_from_slice(taken);
+    for (slot, &index) in run[front..].iter_mut().zip(rest.iter().rev()) {
+        *slot = index;
+    }
+    Some(front as u32)
+}
+
+/// Stably partition the base run into tiles neither disc can touch, then
 /// the rest. Sphere and heavy runs are left where [`fill_tile_lists`] put
-/// them. Returns the coarse count. Stars, a missing frame, or an unusable
-/// disc leave the prefix unchanged and return 0.
+/// them. Returns the coarse count. Stars or an unusable disc leave the run
+/// unchanged and return 0.
 ///
 /// `px_max` is twice the larger-axis pixel angle, so the margin is 2 px on
 /// top of the tile cone (which already reaches 1 px past its corners).
@@ -61,62 +95,42 @@ fn widened_disc(cos_rim: f32, margin_rad: f32) -> Option<(f32, f32)> {
 /// [`fill_tile_lists`]: super::tiles::fill_tile_lists
 pub(super) fn split_coarse_base(
     table: &mut FarTableGpu,
-    frames: &TileFrames,
-    view: &FarView,
+    runs: TileRuns,
+    tiles: &TileView,
     query: &SkyCoarseQuery,
+    scratch: &mut Vec<u32>,
 ) -> u32 {
     if query.stars {
         return 0;
     }
-    let n_base = table.list_header[0] as usize;
-    if n_base == 0 || !frames.matches(view) {
+    let n_base = runs.base as usize;
+    if n_base == 0 {
         return 0;
     }
-    let Some(basis) = ViewBasis::from_view_proj(view.view_proj) else {
-        return 0;
-    };
     let Some(sun) = unit_dir(query.sun_dir) else {
         return 0;
     };
-    let Some(sun_view) = unit_dir(basis.to_view(sun)) else {
+    let Some(sun_view) = unit_dir(tiles.basis.to_view(sun)) else {
         return 0;
     };
-    let Some(moon_view) = unit_dir(basis.to_view(-sun)) else {
+    let Some(moon_view) = unit_dir(tiles.basis.to_view(-sun)) else {
         return 0;
     };
-    let Some((sun_sin, sun_cos)) = widened_disc(query.sun_cos_rim, view.px_max) else {
+    let px_max = tiles.view.px_max;
+    let Some((sun_sin, sun_cos)) = widened_disc(query.sun_cos_rim, px_max) else {
         return 0;
     };
-    let Some((moon_sin, moon_cos)) = widened_disc(query.moon_cos_rim, view.px_max) else {
+    let Some((moon_sin, moon_cos)) = widened_disc(query.moon_cos_rim, px_max) else {
         return 0;
     };
-    // Classify before writing, so a bad index leaves the run untouched.
-    let mut touch = Vec::with_capacity(n_base);
-    for slot in 0..n_base {
-        let index = table.tile_index[slot];
-        let Some(tile) = frames.samples.get(index as usize) else {
-            return 0;
-        };
-        touch.push(
-            tile_within(tile, sun_view, sun_sin, sun_cos)
-                || tile_within(tile, moon_view, moon_sin, moon_cos),
-        );
-    }
-    let mut coarse = Vec::with_capacity(n_base);
-    let mut fine = Vec::with_capacity(n_base);
-    for (slot, hit) in touch.into_iter().enumerate() {
-        let index = table.tile_index[slot];
-        if hit {
-            fine.push(index);
-        } else {
-            coarse.push(index);
-        }
-    }
-    let n_coarse = coarse.len();
-    for (slot, index) in coarse.into_iter().chain(fine).enumerate() {
-        table.tile_index[slot] = index;
-    }
-    n_coarse as u32
+    let samples = &tiles.frames.samples;
+    stable_partition(&mut table.tile_index[..n_base], scratch, |index| {
+        let tile = samples.get(index as usize)?;
+        let touch = tile_within(tile, sun_view, sun_sin, sun_cos)
+            || tile_within(tile, moon_view, moon_sin, moon_cos);
+        Some(!touch)
+    })
+    .unwrap_or(0)
 }
 
 /// Stably partition the heavy run into mapped-interior tiles, then the rest.
@@ -134,123 +148,88 @@ pub(super) fn split_coarse_base(
 /// Every pixel of that tile is a surface hit, and the hit replaces the sky
 /// colour. Stars and the sun/moon discs are composited before far bodies, so
 /// they do not keep the tile at 1×1 — that gate is only for empty base-sky
-/// tiles ([`split_coarse_base`]). A missing frame leaves the run unchanged
-/// and returns 0. `map_min[i]` is map `i`'s minimum datum offset.
+/// tiles ([`split_coarse_base`]). `map_min[i]` is map `i`'s minimum datum
+/// offset.
 pub(super) fn split_coarse_far(
     table: &mut FarTableGpu,
-    frames: &TileFrames,
-    view: &FarView,
+    runs: TileRuns,
+    tiles: &TileView,
     map_min: &[f32; MAX_FAR_MAPS],
+    scratch: &mut Vec<u32>,
 ) -> u32 {
-    let (n_base, n_sphere, n_heavy) = tile_split(table);
-    if n_heavy == 0 || !frames.matches(view) {
+    if runs.heavy == 0 {
         return 0;
     }
-    let Some(basis) = ViewBasis::from_view_proj(view.view_proj) else {
-        return 0;
-    };
-    let kept = (table.header[0] as usize).min(MAX_FAR_BODIES);
+    let px_max = tiles.view.px_max;
     // Horizon-disc cone, then lo-sphere disc. Either one admits the tile.
     let mut interior: [Option<(glam::Vec3, f32, f32)>; MAX_FAR_BODIES] = [None; MAX_FAR_BODIES];
     let mut lo_interior: [Option<(glam::Vec3, f32, f32)>; MAX_FAR_BODIES] = [None; MAX_FAR_BODIES];
-    for k in 0..kept {
+    for k in 0..table.kept() {
         let gpu = &table.body[k];
-        let shape = gpu.atmosphere[3];
-        if !(3.5..4.5).contains(&shape) {
+        if !gpu.is_mapped() {
             continue;
         }
-        let dir = glam::Vec3::new(table.cone[k][0], table.cone[k][1], table.cone[k][2]);
-        let Some(dir) = unit_dir(dir) else {
+        let Some(dir) = unit_dir(table.cone_dir(k)) else {
             continue;
         };
-        let Some(dir_view) = unit_dir(basis.to_view(dir)) else {
+        let Some(dir_view) = unit_dir(tiles.basis.to_view(dir)) else {
             continue;
         };
-        let horizon = gpu.albedo0[3];
+        let horizon = gpu.horizon();
         if horizon < 1.0
             && let Some((sin_b, cos_b)) =
-                mapped_interior_half(horizon, gpu.albedo1[3], gpu.albedo2[3], view.px_max)
+                mapped_interior_half(horizon, gpu.air(), gpu.distance(), px_max)
         {
             interior[k] = Some((dir_view, sin_b, cos_b));
         }
         // `px_max` is already two pixel-angles, the 2 px inset.
         if let Some(rho_lo) = mapped_rho_lo(gpu, map_min)
-            && let Some((sin_b, cos_b)) = lo_disc_interior(rho_lo, view.px_max)
+            && let Some((sin_b, cos_b)) = lo_disc_interior(rho_lo, px_max)
         {
             lo_interior[k] = Some((dir_view, sin_b, cos_b));
         }
     }
-    let start = (n_base + n_sphere) as usize;
-    let end = start + n_heavy as usize;
-    if end > table.tile_index.len() {
+    let slots = runs.heavy_slots();
+    if slots.end > table.tile_index.len() {
         return 0;
     }
-    // Classify before writing, so a bad index leaves the run untouched.
-    let mut take = Vec::with_capacity(n_heavy as usize);
-    for slot in start..end {
-        let index = table.tile_index[slot];
-        let Some(tile) = frames.samples.get(index as usize) else {
-            return 0;
-        };
-        let mask = table.tile_mask[index as usize];
-        let inside = mask.count_ones() == 1 && {
-            let k = mask.trailing_zeros() as usize;
-            let in_horizon = match interior[k] {
-                Some((dir_view, sin_b, cos_b)) => {
-                    tile_strictly_inside(tile, dir_view, sin_b, cos_b)
-                }
-                None => false,
-            };
-            let in_lo = match lo_interior[k] {
-                Some((dir_view, sin_b, cos_b)) => {
-                    tile_strictly_inside(tile, dir_view, sin_b, cos_b)
-                }
-                None => false,
-            };
-            in_horizon || in_lo
-        };
-        take.push(inside);
-    }
-    let mut coarse = Vec::with_capacity(n_heavy as usize);
-    let mut fine = Vec::with_capacity(n_heavy as usize);
-    for (offset, inside) in take.into_iter().enumerate() {
-        let index = table.tile_index[start + offset];
-        if inside {
-            coarse.push(index);
-        } else {
-            fine.push(index);
-        }
-    }
-    let n_coarse = coarse.len();
-    for (offset, index) in coarse.into_iter().chain(fine).enumerate() {
-        table.tile_index[start + offset] = index;
-    }
-    n_coarse as u32
+    let samples = &tiles.frames.samples;
+    let masks = &table.tile_mask;
+    let inside = |cone: Option<(glam::Vec3, f32, f32)>, tile| match cone {
+        Some((dir_view, sin_b, cos_b)) => tile_strictly_inside(tile, dir_view, sin_b, cos_b),
+        None => false,
+    };
+    stable_partition(&mut table.tile_index[slots], scratch, |index| {
+        let tile = samples.get(index as usize)?;
+        let mask = masks[index as usize];
+        Some(
+            mask.count_ones() == 1 && {
+                let k = mask.trailing_zeros() as usize;
+                inside(interior[k], tile) || inside(lo_interior[k], tile)
+            },
+        )
+    })
+    .unwrap_or(0)
 }
 
-/// One live mask bit, and that kept body is Mapped (shape lane in `(3.5, 4.5)`).
+/// One live mask bit, and that kept body is Mapped. `mapped` is
+/// [`mapped_mask`]: bits past the kept count are clear.
+fn is_mapsolo(mask: u32, mapped: u32) -> bool {
+    mask.count_ones() == 1 && mask & mapped != 0
+}
+
+/// One live mask bit, and that kept body is Mapped.
+#[cfg(test)]
 pub(super) fn mask_is_mapsolo(table: &FarTableGpu, mask: u32) -> bool {
-    if mask.count_ones() != 1 {
-        return false;
-    }
-    let k = mask.trailing_zeros() as usize;
-    let n = (table.header[0] as usize).min(MAX_FAR_BODIES);
-    if k >= n {
-        return false;
-    }
-    let shape = table.body[k].atmosphere[3];
-    (3.5..4.5).contains(&shape)
+    is_mapsolo(mask, mapped_mask(table))
 }
 
-/// Live tiles whose mask is exactly one Mapped body. Zero when mapsolo is off.
-/// Counts masks, not the index list: every such tile sits in the heavy run.
-fn count_mapsolo(table: &FarTableGpu) -> u32 {
-    if !sky_mapsolo_enabled() {
-        return 0;
-    }
+/// Live tiles whose mask is exactly one Mapped body. Counts masks, not the
+/// index list: every such tile sits in the heavy run.
+fn count_mapsolo(table: &FarTableGpu, mapped: u32) -> u32 {
     table.tile_mask[..used_tiles(table)]
         .iter()
-        .filter(|mask| mask_is_mapsolo(table, **mask))
+        .filter(|mask| is_mapsolo(**mask, mapped))
         .count() as u32
 }
 
@@ -261,32 +240,62 @@ fn count_mapsolo(table: &FarTableGpu) -> u32 {
 /// coarse mapsolo tiles.
 ///
 /// [`fill_tile_lists`]: super::tiles::fill_tile_lists
-pub(super) fn partition_mapsolo(table: &mut FarTableGpu) -> u32 {
-    let (n_base, n_sphere, n_heavy) = tile_split(table);
-    if n_heavy == 0 {
+pub(super) fn partition_mapsolo(
+    table: &mut FarTableGpu,
+    runs: TileRuns,
+    scratch: &mut Vec<u32>,
+) -> u32 {
+    if runs.heavy == 0 {
         return 0;
     }
-    let start = (n_base + n_sphere) as usize;
-    let end = start + n_heavy as usize;
-    if end > table.tile_index.len() {
+    let slots = runs.heavy_slots();
+    if slots.end > table.tile_index.len() {
         return 0;
     }
-    let mut solo = Vec::with_capacity(n_heavy as usize);
-    let mut rest = Vec::with_capacity(n_heavy as usize);
-    for slot in start..end {
-        let index = table.tile_index[slot];
-        let mask = table.tile_mask.get(index as usize).copied().unwrap_or(0);
-        if mask_is_mapsolo(table, mask) {
-            solo.push(index);
-        } else {
-            rest.push(index);
+    let mapped = mapped_mask(table);
+    let masks = &table.tile_mask;
+    stable_partition(&mut table.tile_index[slots], scratch, |index| {
+        let mask = masks.get(index as usize).copied().unwrap_or(0);
+        Some(is_mapsolo(mask, mapped))
+    })
+    .unwrap_or(0)
+}
+
+/// The per-frame tile classification after the pack and the horizon tables:
+/// with culling on, drop tiles above those tables; plan the draws; then
+/// stably reorder the index runs, mapsolo first, so the interior split pulls
+/// its coarse prefix out of that single-Mapped run and the full-shader tiles
+/// stay after it, then the two coarse splits. `runs` are the pack's.
+/// `tiles` are the ring's frames when they match the view. The splits only
+/// rewrite the index prefix, so this runs before the byte match. Host-only,
+/// and no allocation once `scratch` holds the longest run.
+pub(super) fn classify_tiles(
+    table: &mut FarTableGpu,
+    runs: TileRuns,
+    tiles: Option<&TileView>,
+    coarse: Option<&SkyCoarseQuery>,
+    map_min: &[f32; MAX_FAR_MAPS],
+    switches: FarSwitches,
+    scratch: &mut Vec<u32>,
+) -> SkyDraw {
+    let runs = match tiles {
+        Some(tiles) if switches.cull => clear_tiles_above_horizon(table, tiles).unwrap_or(runs),
+        _ => runs,
+    };
+    let mut draw = SkyDraw::from_runs(table, runs, switches.cull, switches.mapsolo);
+    // Fullscreen sky (no tile grid) stays on the 1×1 triangle.
+    if draw.quads {
+        if switches.mapsolo {
+            let n = partition_mapsolo(table, runs, scratch);
+            debug_assert_eq!(n, draw.n_mapsolo);
+            draw.n_mapsolo = n;
+        }
+        if let (Some(query), Some(tiles)) = (coarse, tiles) {
+            draw.n_coarse = split_coarse_base(table, runs, tiles, query, scratch);
+            draw.n_coarse_far = split_coarse_far(table, runs, tiles, map_min, scratch);
         }
     }
-    let n = solo.len();
-    for (offset, index) in solo.into_iter().chain(rest).enumerate() {
-        table.tile_index[start + offset] = index;
-    }
-    n as u32
+    draw
 }
 
 /// Which body fragment a draw needs. `Full` has every shape. `NoMap` drops the
@@ -433,22 +442,31 @@ impl SkyDraw {
         Self::default().publish_gauges();
     }
 
-    fn body_pipe(table: &FarTableGpu) -> SkyBodyPipe {
-        if has_mapped(table) {
+    fn body_pipe(heavy: u32, mapped: u32) -> SkyBodyPipe {
+        if mapped != 0 {
             SkyBodyPipe::Full
-        } else if heavy_mask(table) != 0 {
+        } else if heavy != 0 {
             SkyBodyPipe::NoMap
         } else {
             SkyBodyPipe::Sphere
         }
     }
 
-    pub(super) fn from_table(table: &FarTableGpu, cull: bool) -> Self {
+    /// The draw plan for a packed table whose tile lists hold `runs`.
+    /// `cull` and `mapsolo` are [`FarSwitches`]: culling off draws one
+    /// fullscreen triangle, mapsolo off counts no single-Mapped tile.
+    pub(super) fn from_runs(
+        table: &FarTableGpu,
+        runs: TileRuns,
+        cull: bool,
+        mapsolo: bool,
+    ) -> Self {
         let bodies = table.header[0];
         let tile_px = table.header[1];
         let tiles_x = table.header[2];
         let tiles_y = table.header[3];
-        let body = Self::body_pipe(table);
+        let mapped = mapped_mask(table);
+        let body = Self::body_pipe(heavy_mask(table), mapped);
         let tiled = cull && tile_px != 0 && tiles_x != 0 && tiles_y != 0 && bodies != 0;
         if !tiled {
             return Self {
@@ -457,16 +475,25 @@ impl SkyDraw {
                 ..Self::default()
             };
         }
-        let (n_base, n_sphere, n_heavy) = tile_split(table);
         Self {
             quads: true,
             body,
-            n_base,
-            n_sphere,
-            n_heavy,
-            n_mapsolo: count_mapsolo(table),
+            n_base: runs.base,
+            n_sphere: runs.sphere,
+            n_heavy: runs.heavy,
+            n_mapsolo: if mapsolo {
+                count_mapsolo(table, mapped)
+            } else {
+                0
+            },
             ..Self::default()
         }
+    }
+
+    /// [`Self::from_runs`] with the runs counted from the masks and mapsolo on.
+    #[cfg(test)]
+    pub(super) fn from_table(table: &FarTableGpu, cull: bool) -> Self {
+        Self::from_runs(table, TileRuns::count(table), cull, true)
     }
 }
 

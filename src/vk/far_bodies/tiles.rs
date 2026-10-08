@@ -2,8 +2,7 @@
 //! body masks, and the three tile-index runs the tile-quad draws read.
 
 use super::cones::{add_angles, mapped_horizon_half};
-use super::far_cull_enabled;
-use super::table::{FarTableGpu, MAX_FAR_TILES};
+use super::table::{FarBodyGpu, FarTableGpu, MAX_FAR_TILES};
 use super::view::{FarView, ViewBasis};
 use crate::far_body::MAX_FAR_BODIES;
 
@@ -112,7 +111,9 @@ impl TileFrames {
         }
     }
 
-    pub(super) fn matches(&self, view: &FarView) -> bool {
+    /// `view`'s basis when these frames were built for its projection,
+    /// render extent and tile size.
+    fn matched_basis(&self, view: &FarView) -> Option<ViewBasis> {
         let (tile_px, tiles_x, tiles_y) = tile_layout(view.width, view.height);
         let expect = tiles_x as usize * tiles_y as usize;
         if self.width != view.width
@@ -120,15 +121,49 @@ impl TileFrames {
             || self.tile_px != tile_px
             || self.samples.len() != expect
         {
-            return false;
+            return None;
         }
-        let Some(basis) = ViewBasis::from_view_proj(view.view_proj) else {
-            return false;
+        let basis = ViewBasis::from_view_proj(view.view_proj)?;
+        (focals_match(self.focal_x, basis.focal_x) && focals_match(self.focal_y, basis.focal_y))
+            .then_some(basis)
+    }
+
+    #[cfg(test)]
+    pub(super) fn matches(&self, view: &FarView) -> bool {
+        self.matched_basis(view).is_some()
+    }
+
+    /// These frames paired with `view`, when they match it.
+    #[cfg(test)]
+    pub(super) fn view<'a>(&'a self, view: &'a FarView) -> Option<TileView<'a>> {
+        let basis = self.matched_basis(view)?;
+        Some(TileView {
+            frames: self,
+            view,
+            basis,
+        })
+    }
+
+    /// Rebuild unless the frames match `view`, then pair them with it. While
+    /// the projection holds, this is the frame's one match test. `None`
+    /// when `view` has no basis (or the rebuild still does not match).
+    pub(super) fn sync<'a>(&'a mut self, view: &'a FarView) -> Option<TileView<'a>> {
+        let basis = match self.matched_basis(view) {
+            Some(basis) => basis,
+            None => {
+                *self = Self::build(view).unwrap_or_else(Self::empty);
+                self.matched_basis(view)?
+            }
         };
-        focals_match(self.focal_x, basis.focal_x) && focals_match(self.focal_y, basis.focal_y)
+        Some(TileView {
+            frames: self,
+            view,
+            basis,
+        })
     }
 
     /// `true` when the samples were derived again.
+    #[cfg(test)]
     pub(super) fn rebuild_if_changed(&mut self, view: &FarView) -> bool {
         if self.matches(view) {
             return false;
@@ -204,6 +239,15 @@ impl TileFrames {
     }
 }
 
+/// Tile frames that match one view, with that view's basis. Built once per
+/// frame by [`TileFrames::sync`], so the passes after the pack neither test
+/// the match again nor rebuild the basis.
+pub(super) struct TileView<'a> {
+    pub(super) frames: &'a TileFrames,
+    pub(super) view: &'a FarView,
+    pub(super) basis: ViewBasis,
+}
+
 /// `angle(tile centre, dir) <= a_body + a_tile`, compared in cosines.
 /// `sin_body` / `cos_body` are the body's drawable half-angle. `cos_body` is
 /// negative when the half-angle is wider than a hemisphere.
@@ -259,8 +303,7 @@ fn tile_cover(
     tiles_x: u32,
     tiles_y: u32,
 ) -> TileCover {
-    // `VOXEL_FAR_CULL=0` forces `cone_bound` to `-1`; either signal paints every tile.
-    if !far_cull_enabled() || !(bound >= 0.0) || !bound.is_finite() {
+    if !(bound >= 0.0) || !bound.is_finite() {
         return TileCover::All;
     }
     let len2 = dir.length_squared();
@@ -340,39 +383,45 @@ fn tile_cover(
     TileCover::Rect { tx0, ty0, tx1, ty1 }
 }
 
-/// Fill `header.yzw` and the live mask prefix. No view leaves the tile header
-/// at zero; the shader then walks every kept body. `cached` is the ring's
-/// view-space tile frames when they still match this projection.
+/// Fill `header.yzw`, the live mask prefix and the tile lists, and return
+/// the runs. No view leaves the tile header at zero; the shader then walks
+/// every kept body. `tiles` are the ring's view-space tile frames when they
+/// match this projection. `cull` off (`VOXEL_FAR_CULL=0`) sets every kept
+/// body in every live tile, the mapped horizon cone included.
 pub(super) fn stamp_tiles(
     table: &mut FarTableGpu,
     view: Option<&FarView>,
-    cached: Option<&TileFrames>,
-) {
+    tiles: Option<&TileView>,
+    cull: bool,
+) -> TileRuns {
     let Some(view) = view else {
-        return;
+        return TileRuns::default();
     };
     let (tile_px, tiles_x, tiles_y) = tile_layout(view.width, view.height);
     table.header[1] = tile_px;
     table.header[2] = tiles_x;
     table.header[3] = tiles_y;
     let tile_count = tiles_x as usize * tiles_y as usize;
-    let kept = (table.header[0] as usize).min(MAX_FAR_BODIES);
+    let kept = table.kept();
     let mut blanket = 0u32;
     // `(bit, dir, sin, cos)` of the drawable half-angle. `cos` may be negative.
     let mut angular = [(0u32, glam::Vec3::ZERO, 0.0f32, 0.0f32); MAX_FAR_BODIES];
     let mut n_angular = 0usize;
     for k in 0..kept {
         let bit = 1u32 << k;
-        let cone = table.cone[k];
-        let dir = glam::Vec3::new(cone[0], cone[1], cone[2]);
+        if !cull {
+            blanket |= bit;
+            continue;
+        }
+        let bound = table.cone[k][3];
+        let dir = table.cone_dir(k);
         let gpu = &table.body[k];
-        let shape = gpu.atmosphere[3];
-        let horizon = gpu.albedo0[3];
+        let horizon = gpu.horizon();
         // Mapped + a real horizon: the tile cone is the horizon gate, even
         // when `cone.w` is the per-pixel sentinel. `horizon >= 1` falls
         // through to that sentinel and paints every tile.
-        if (3.5..4.5).contains(&shape) && horizon < 1.0 {
-            match mapped_horizon_half(horizon, gpu.albedo1[3], gpu.albedo2[3], view.px_max) {
+        if gpu.is_mapped() && horizon < 1.0 {
+            match mapped_horizon_half(horizon, gpu.air(), gpu.distance(), view.px_max) {
                 None => blanket |= bit,
                 Some((sin_b, cos_b)) => {
                     angular[n_angular] = (bit, dir, sin_b, cos_b);
@@ -381,7 +430,7 @@ pub(super) fn stamp_tiles(
             }
             continue;
         }
-        match tile_cover(dir, cone[3], view, tile_px, tiles_x, tiles_y) {
+        match tile_cover(dir, bound, view, tile_px, tiles_x, tiles_y) {
             TileCover::All => blanket |= bit,
             TileCover::None => {}
             TileCover::Rect { tx0, ty0, tx1, ty1 } => {
@@ -393,7 +442,7 @@ pub(super) fn stamp_tiles(
                 }
             }
             TileCover::Angular => {
-                let sin_body = (cone[3] + 3.0 * view.px_max).clamp(0.0, 1.0);
+                let sin_body = (bound + 3.0 * view.px_max).clamp(0.0, 1.0);
                 if !sin_body.is_finite() {
                     blanket |= bit;
                 } else {
@@ -405,46 +454,40 @@ pub(super) fn stamp_tiles(
         }
     }
     if n_angular > 0 {
-        paint_angular(table, view, cached, &angular[..n_angular], &mut blanket);
+        paint_angular(table, view, tiles, &angular[..n_angular], &mut blanket);
     }
     if blanket != 0 {
         for mask in &mut table.tile_mask[..tile_count] {
             *mask |= blanket;
         }
     }
-    fill_tile_lists(table, view.width, view.height);
+    fill_tile_lists(table, view.width, view.height)
 }
 
 /// Set bit `k` on each tile whose view-space cone meets the body's half-angle
-/// `(sin, cos)`. `cos` is negative past 90°. A missing frame cache is built
-/// for this view; a projection that yields no basis paints the body into
-/// every tile.
+/// `(sin, cos)`. `cos` is negative past 90°. Without matching `tiles` the
+/// frames are built for this view; a projection that yields no basis paints
+/// the body into every tile.
 fn paint_angular(
     table: &mut FarTableGpu,
     view: &FarView,
-    cached: Option<&TileFrames>,
+    tiles: Option<&TileView>,
     angular: &[(u32, glam::Vec3, f32, f32)],
     blanket: &mut u32,
 ) {
-    let owned = if cached.is_some_and(|frames| frames.matches(view)) {
-        None
-    } else {
-        TileFrames::build(view)
-    };
-    let Some(frames) = cached
-        .filter(|frames| frames.matches(view))
-        .or(owned.as_ref())
-    else {
-        for (bit, _, _, _) in angular {
-            *blanket |= *bit;
+    let owned;
+    let (frames, basis) = match tiles {
+        Some(tiles) => (tiles.frames, &tiles.basis),
+        None => {
+            owned = TileFrames::build(view).zip(ViewBasis::from_view_proj(view.view_proj));
+            let Some((frames, basis)) = owned.as_ref() else {
+                for (bit, _, _, _) in angular {
+                    *blanket |= *bit;
+                }
+                return;
+            };
+            (frames, basis)
         }
-        return;
-    };
-    let Some(basis) = ViewBasis::from_view_proj(view.view_proj) else {
-        for (bit, _, _, _) in angular {
-            *blanket |= *bit;
-        }
-        return;
     };
     let n = frames.samples.len().min(table.tile_mask.len());
     for &(bit, dir, sin_body, cos_body) in angular {
@@ -512,55 +555,62 @@ pub(super) fn framebuffer_ndc(xf: f32, yf: f32, width: u32, height: u32) -> [f32
 /// Kept bodies whose shader is not the sphere/inner pair. Bit i is kept index i.
 /// Shape 0 is the cube. An unrecognised shape stays on the full march.
 pub(super) fn heavy_mask(table: &FarTableGpu) -> u32 {
-    let n = (table.header[0] as usize).min(MAX_FAR_BODIES);
-    let mut heavy = 0u32;
-    for i in 0..n {
-        let shape = table.body[i].atmosphere[3];
-        let light = (0.5..1.5).contains(&shape) || (1.5..2.5).contains(&shape);
-        if !light {
-            heavy |= 1u32 << i;
-        }
-    }
-    heavy
+    table.kept_bits(|body| !body.is_light())
 }
 
-pub(super) fn has_mapped(table: &FarTableGpu) -> bool {
-    let n = (table.header[0] as usize).min(MAX_FAR_BODIES);
-    (0..n).any(|i| {
-        let shape = table.body[i].atmosphere[3];
-        (3.5..4.5).contains(&shape)
-    })
+/// Kept Mapped bodies. Bit i is kept index i.
+pub(super) fn mapped_mask(table: &FarTableGpu) -> u32 {
+    table.kept_bits(FarBodyGpu::is_mapped)
 }
 
-/// `(n_base, n_sphere, n_heavy)` over the live tiles. Sphere tiles have a
-/// non-zero mask that misses every heavy body.
-pub(super) fn tile_split(table: &FarTableGpu) -> (u32, u32, u32) {
-    let heavy = heavy_mask(table);
-    let n = used_tiles(table);
-    let mut n_base = 0u32;
-    let mut n_sphere = 0u32;
-    let mut n_heavy = 0u32;
-    for mask in &table.tile_mask[..n] {
-        if *mask == 0 {
-            n_base += 1;
-        } else if mask & heavy == 0 {
-            n_sphere += 1;
-        } else {
-            n_heavy += 1;
-        }
+/// Lengths of the three tile-index runs [`fill_tile_lists`] writes, in
+/// upload order: mask == 0, then sphere-only (a non-zero mask that misses
+/// every heavy body), then heavy. The pack returns them, so one count serves
+/// the draw plan and every split of the frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct TileRuns {
+    pub(super) base: u32,
+    pub(super) sphere: u32,
+    pub(super) heavy: u32,
+}
+
+impl TileRuns {
+    /// Count the live masks.
+    #[cfg(test)]
+    pub(super) fn count(table: &FarTableGpu) -> Self {
+        Self::count_with(table, heavy_mask(table))
     }
-    (n_base, n_sphere, n_heavy)
+
+    fn count_with(table: &FarTableGpu, heavy: u32) -> Self {
+        let mut runs = Self::default();
+        for mask in &table.tile_mask[..used_tiles(table)] {
+            if *mask == 0 {
+                runs.base += 1;
+            } else if mask & heavy == 0 {
+                runs.sphere += 1;
+            } else {
+                runs.heavy += 1;
+            }
+        }
+        runs
+    }
+
+    /// The heavy run's slots in `tile_index`.
+    pub(super) fn heavy_slots(&self) -> std::ops::Range<usize> {
+        let start = (self.base + self.sphere) as usize;
+        start..start + self.heavy as usize
+    }
 }
 
 /// Partition the live tiles into mask == 0, then sphere-only, then heavy.
 /// Each run is ascending row-major. `list_header.y` is `n_sphere + n_heavy`.
-pub(super) fn fill_tile_lists(table: &mut FarTableGpu, width: u32, height: u32) {
+pub(super) fn fill_tile_lists(table: &mut FarTableGpu, width: u32, height: u32) -> TileRuns {
     let heavy = heavy_mask(table);
-    let (n_base, n_sphere, n_heavy) = tile_split(table);
+    let runs = TileRuns::count_with(table, heavy);
     let n = used_tiles(table);
     let mut base_i = 0u32;
-    let mut sphere_i = n_base;
-    let mut heavy_i = n_base + n_sphere;
+    let mut sphere_i = runs.base;
+    let mut heavy_i = runs.base + runs.sphere;
     for (i, mask) in table.tile_mask[..n].iter().copied().enumerate() {
         if mask == 0 {
             table.tile_index[base_i as usize] = i as u32;
@@ -573,5 +623,6 @@ pub(super) fn fill_tile_lists(table: &mut FarTableGpu, width: u32, height: u32) 
             heavy_i += 1;
         }
     }
-    table.list_header = [n_base, n_sphere + n_heavy, width, height];
+    table.list_header = [runs.base, runs.sphere + runs.heavy, width, height];
+    runs
 }

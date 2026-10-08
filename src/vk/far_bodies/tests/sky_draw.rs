@@ -8,16 +8,59 @@ use crate::far_body::mirror::{lowland_up, ray_mapped_fast};
 use crate::far_body::{FarShape, MAX_FAR_MAPS};
 use crate::vk::far_bodies::cones::{lo_disc_interior, mapped_interior_half};
 use crate::vk::far_bodies::sky_draw::{
-    SkyBodyPipe, SkyCoarseQuery, SkyDraw, SkyRun, mask_is_mapsolo, partition_mapsolo,
-    split_coarse_base, split_coarse_far, stars_drawn,
+    self as sky, SkyBodyPipe, SkyCoarseQuery, SkyDraw, SkyRun, mask_is_mapsolo, stars_drawn,
 };
 use crate::vk::far_bodies::table::{FarTableGpu, zeroed_table};
 use crate::vk::far_bodies::tiles::{
-    TileFrames, fill_tile_lists, heavy_mask, tile_layout, tile_rect, tile_split,
+    TileFrames, TileRuns, fill_tile_lists, heavy_mask, tile_layout, tile_rect,
     tile_strictly_inside, used_tiles,
 };
 use crate::vk::far_bodies::view::{FarView, ViewBasis};
 use crate::vk::pipeline::{SkyFrag, SkyRate};
+
+// The splits as these tests call them: runs counted from the masks, fresh
+// scratch, and `frames` matched against `view` here (0 when they do not
+// match, as the ring never splits then).
+
+fn partition_mapsolo(table: &mut FarTableGpu) -> u32 {
+    sky::partition_mapsolo(table, TileRuns::count(table), &mut Vec::new())
+}
+
+fn split_coarse_base(
+    table: &mut FarTableGpu,
+    frames: &TileFrames,
+    view: &FarView,
+    query: &SkyCoarseQuery,
+) -> u32 {
+    let Some(tiles) = frames.view(view) else {
+        return 0;
+    };
+    sky::split_coarse_base(
+        table,
+        TileRuns::count(table),
+        &tiles,
+        query,
+        &mut Vec::new(),
+    )
+}
+
+fn split_coarse_far(
+    table: &mut FarTableGpu,
+    frames: &TileFrames,
+    view: &FarView,
+    map_min: &[f32; MAX_FAR_MAPS],
+) -> u32 {
+    let Some(tiles) = frames.view(view) else {
+        return 0;
+    };
+    sky::split_coarse_far(
+        table,
+        TileRuns::count(table),
+        &tiles,
+        map_min,
+        &mut Vec::new(),
+    )
+}
 
 #[test]
 fn mapsolo_is_the_single_mapped_prefix_of_the_heavy_run() {
@@ -221,9 +264,8 @@ fn coarse_split_keeps_the_three_way_partition() {
 }
 
 fn heavy_run(table: &FarTableGpu) -> (usize, usize) {
-    let (n_base, n_sphere, n_heavy) = tile_split(table);
-    let start = (n_base + n_sphere) as usize;
-    (start, start + n_heavy as usize)
+    let slots = TileRuns::count(table).heavy_slots();
+    (slots.start, slots.end)
 }
 
 #[test]
