@@ -65,6 +65,7 @@ use ash::{khr, vk};
 
 use crate::mesh::Pass;
 use crate::skeleton::{FrameSlot, PerSlot};
+use crate::switches::{Switch, parse_or};
 use block_textures::BlockTextures;
 use buffers::{DrawIndexedIndirect, FRAMES_IN_FLIGHT, GpuResident, HostBuffer, MeshResidency};
 use compute::{ComputeLane, ComputeRuntime};
@@ -309,6 +310,7 @@ impl Renderer {
             flags,
         } = cfg;
         let render_scale = Scale::new(render_scale).as_f32();
+        crate::switches::log_non_default();
 
         let device = Device::new(
             &instance.entry,
@@ -1237,14 +1239,13 @@ impl Renderer {
 /// per-submission floor is per submit or per command buffer. Unset / `0` /
 /// non-integer disables. Read once at renderer creation. Not a public API.
 fn empty_submit_count() -> u32 {
-    static COUNT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *COUNT.get_or_init(|| {
-        let Ok(v) = std::env::var("VOXEL_BENCH_EMPTY") else {
-            return 0;
-        };
-        v.parse::<u32>().ok().filter(|&k| k >= 1).unwrap_or(0)
-    })
+    VOXEL_BENCH_EMPTY.get()
 }
+
+/// Read by [`empty_submit_count`]. A `u32` that does not parse is 0, and 0
+/// is off.
+pub(crate) static VOXEL_BENCH_EMPTY: Switch<u32> =
+    Switch::new("VOXEL_BENCH_EMPTY", |raw| parse_or(raw, 0));
 
 /// Clamp range for render-resolution scale (0.25x to 2.0x). Re-exported from
 /// crate root so settings UI and renderer stay in sync.

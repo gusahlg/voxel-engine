@@ -31,9 +31,11 @@
 //! Gated by `VOXEL_PROFILE`: disabled → every entry point is a cheap no-op.
 
 use std::cell::Cell;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use crate::switches::{Switch, on_if_set_nonzero, parse_or};
 
 /// A timed stage. Ordinal indexes the accumulator arrays; grouped by [`tier`].
 ///
@@ -620,9 +622,11 @@ static METERS: Meters = Meters {
     frames: AtomicU64::new(0),
 };
 
+/// `VOXEL_PROFILE`: on when set to anything but `0`.
+pub(crate) static VOXEL_PROFILE: Switch<bool> = Switch::new("VOXEL_PROFILE", on_if_set_nonzero);
+
 fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("VOXEL_PROFILE").is_ok_and(|v| v != "0"))
+    VOXEL_PROFILE.get()
 }
 
 /// Whether profiling is active. Lets a subsystem skip expensive collection (GPU
@@ -691,15 +695,14 @@ pub fn add_ms(meter: Meter, ms: f64) {
 /// forces a timely report while the badness is still on screen. Overridable
 /// via `VOXEL_PROFILE_FLUSH_MS`.
 fn flush_secs() -> f64 {
-    static SECS: OnceLock<f64> = OnceLock::new();
-    *SECS.get_or_init(|| {
-        std::env::var("VOXEL_PROFILE_FLUSH_MS")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .map(|ms| ms / 1000.0)
-            .unwrap_or(1.0)
-    })
+    VOXEL_PROFILE_FLUSH_MS.get()
 }
+
+/// `VOXEL_PROFILE_FLUSH_MS` in seconds. Unset or unparsable is 1 s.
+pub(crate) static VOXEL_PROFILE_FLUSH_MS: Switch<f64> =
+    Switch::new("VOXEL_PROFILE_FLUSH_MS", |raw| {
+        parse_or(raw, 1000.0) / 1000.0
+    });
 
 /// End of frame (main thread). Counts a frame, tracks the worst single-frame
 /// period, and flushes the report at whichever comes first: [`WINDOW`] frames or

@@ -32,6 +32,7 @@ use super::alloc::try_find_memory_type;
 use super::buffers::{HOST_BAR_BYTES, HOST_COHERENT};
 use super::timeline::TimelineValue;
 use crate::mesh::{FACE_UPLOAD_ORDER, MeshData, MeshVertex};
+use crate::switches::{Switch, mib_or};
 
 /// Acquires since the last [`take_acquire_count`] (profiler).
 static ACQUIRE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -59,22 +60,14 @@ const MESH_STAGING_ENV: &str = "VOXEL_MESH_STAGING_MB";
 
 /// Ring size used at renderer creation. Reads `VOXEL_MESH_STAGING_MB` once.
 pub(crate) fn mesh_staging_bytes() -> u64 {
-    match std::env::var(MESH_STAGING_ENV) {
-        Ok(s) => parse_mesh_staging_mb(&s).unwrap_or_else(|| {
-            log::warn!(
-                "invalid {MESH_STAGING_ENV}={s:?}; using {} MiB",
-                MESH_STAGING_BYTES / (1 << 20)
-            );
-            MESH_STAGING_BYTES
-        }),
-        Err(_) => MESH_STAGING_BYTES,
-    }
+    VOXEL_MESH_STAGING_MB.get()
 }
 
-fn parse_mesh_staging_mb(s: &str) -> Option<u64> {
-    let mb: u64 = s.trim().parse().ok()?;
-    Some(mb.saturating_mul(1 << 20))
-}
+/// Read by [`mesh_staging_bytes`]. An invalid value warns and keeps
+/// [`MESH_STAGING_BYTES`].
+pub(crate) static VOXEL_MESH_STAGING_MB: Switch<u64> = Switch::new(MESH_STAGING_ENV, |raw| {
+    mib_or(MESH_STAGING_ENV, raw, MESH_STAGING_BYTES)
+});
 
 /// Cached system memory for the transient staging ring: prefer
 /// `HOST_VISIBLE | HOST_COHERENT | HOST_CACHED` without `DEVICE_LOCAL` so
@@ -927,11 +920,13 @@ mod tests {
 
     #[test]
     fn parse_mesh_staging_mb_env() {
-        assert_eq!(parse_mesh_staging_mb("32"), Some(32 << 20));
-        assert_eq!(parse_mesh_staging_mb(" 0 "), Some(0));
-        assert_eq!(parse_mesh_staging_mb("1"), Some(1 << 20));
-        assert_eq!(parse_mesh_staging_mb(""), None);
-        assert_eq!(parse_mesh_staging_mb("nope"), None);
+        let mb = &VOXEL_MESH_STAGING_MB;
+        assert_eq!(mb.parse(None), MESH_STAGING_BYTES);
+        assert_eq!(mb.parse(Some("32")), 32 << 20);
+        assert_eq!(mb.parse(Some(" 0 ")), 0);
+        assert_eq!(mb.parse(Some("1")), 1 << 20);
+        assert_eq!(mb.parse(Some("")), MESH_STAGING_BYTES);
+        assert_eq!(mb.parse(Some("nope")), MESH_STAGING_BYTES);
     }
 
     fn memory_props(

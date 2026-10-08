@@ -32,6 +32,7 @@ use ash::vk;
 
 use crate::far_body::{FarBody, MAX_FAR_BODIES, MAX_FAR_MAPS};
 use crate::rev::{FrameSlot, PerSlot};
+use crate::switches::{Switch, on_unless_zero};
 use crate::vk::buffers::HostBuffer;
 
 mod cones;
@@ -63,18 +64,23 @@ use tiles::TileFrames;
 /// per-ray horizon-table skip still runs. Any other value, including unset,
 /// leaves culling on. Read once.
 fn far_cull_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| !std::env::var("VOXEL_FAR_CULL").is_ok_and(|v| v == "0"))
+    VOXEL_FAR_CULL.get()
 }
+
+/// Read by [`far_cull_enabled`].
+pub(crate) static VOXEL_FAR_CULL: Switch<bool> = Switch::new("VOXEL_FAR_CULL", on_unless_zero);
 
 /// `VOXEL_SKY_MAPSOLO=0` draws every heavy tile with the full fragment (or the
 /// no-mapped / sphere variant the frame already chose). Any other value,
 /// including unset, draws a heavy tile whose mask is exactly one Mapped body
 /// with the loop-free fragment. Read once.
 fn sky_mapsolo_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| !std::env::var("VOXEL_SKY_MAPSOLO").is_ok_and(|v| v == "0"))
+    VOXEL_SKY_MAPSOLO.get()
 }
+
+/// Read by [`sky_mapsolo_enabled`].
+pub(crate) static VOXEL_SKY_MAPSOLO: Switch<bool> =
+    Switch::new("VOXEL_SKY_MAPSOLO", on_unless_zero);
 
 /// The far-body A/B switches. [`FarBodyRing::write`] reads them and passes
 /// them down, so the host pipeline can be tested with either setting.
