@@ -2,7 +2,7 @@
 /// Font atlas and block textures use this; blocks until copy completes.
 use ash::{khr, vk};
 
-use super::alloc::find_memory_type;
+use super::alloc::{create_filled_staging, find_memory_type};
 use super::timeline::Timeline;
 use super::transfer::{LaneRecording, TransferLane};
 
@@ -69,7 +69,6 @@ pub fn upload_image(
     params: &ImageUpload,
 ) -> (vk::Image, vk::DeviceMemory, vk::ImageView) {
     let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
-    let size = params.bytes.len() as vk::DeviceSize;
 
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
@@ -114,38 +113,8 @@ pub fn upload_image(
             .expect("Failed to bind image memory");
     }
 
-    let staging_info = vk::BufferCreateInfo::default()
-        .size(size)
-        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let staging = unsafe {
-        device
-            .create_buffer(&staging_info, None)
-            .expect("Failed to create staging buffer")
-    };
-    let staging_req = unsafe { device.get_buffer_memory_requirements(staging) };
-    let staging_alloc = vk::MemoryAllocateInfo::default()
-        .allocation_size(staging_req.size)
-        .memory_type_index(find_memory_type(
-            &memory_props,
-            staging_req.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ));
-    let staging_memory = unsafe {
-        device
-            .allocate_memory(&staging_alloc, None)
-            .expect("Failed to allocate staging memory")
-    };
-    unsafe {
-        device
-            .bind_buffer_memory(staging, staging_memory, 0)
-            .expect("Failed to bind staging memory");
-        let ptr = device
-            .map_memory(staging_memory, 0, size, vk::MemoryMapFlags::empty())
-            .expect("Failed to map staging memory");
-        std::ptr::copy_nonoverlapping(params.bytes.as_ptr(), ptr as *mut u8, params.bytes.len());
-        device.unmap_memory(staging_memory);
-    }
+    let (staging, staging_memory) =
+        create_filled_staging(device, &memory_props, params.bytes, "image upload staging");
 
     // The sampled view spans every allocated array layer. Transition the
     // whole capacity (all mips) so unused headroom is SHADER_READ_ONLY rather

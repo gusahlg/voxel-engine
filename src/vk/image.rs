@@ -76,6 +76,23 @@ fn sample_count(samples: vk::SampleCountFlags) -> u32 {
     }
 }
 
+/// Colour aspect, `mips` levels from `base_mip`, `layers` array layers from
+/// `base_layer`.
+pub(crate) fn color_range(
+    base_mip: u32,
+    mips: u32,
+    base_layer: u32,
+    layers: u32,
+) -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: base_mip,
+        level_count: mips,
+        base_array_layer: base_layer,
+        layer_count: layers,
+    }
+}
+
 /// Device-local memory for `image`, named in any allocation error.
 pub(crate) fn allocate_and_bind_image(
     device: &ash::Device,

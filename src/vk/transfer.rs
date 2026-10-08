@@ -3,6 +3,7 @@
 /// Callers don't branch on availability; only sync behavior changes by tier.
 use ash::vk;
 
+use super::retire::RetireQueue;
 use super::timeline::{Timeline, TimelineValue};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -295,6 +296,176 @@ impl TransferLane {
                 device.destroy_command_pool(res.pool, None);
             }
         }
+    }
+}
+
+/// Per-frame arguments of the transfer-lane uploaders' `flush` (block
+/// textures, the material table, far maps). Built by the frame loop after it
+/// has submitted any batch an overwrite must follow and reserved this frame's
+/// render value.
+pub(crate) struct TransferCtx<'a> {
+    pub instance: &'a ash::Instance,
+    pub device: &'a ash::Device,
+    pub physical: vk::PhysicalDevice,
+    pub lane: &'a mut TransferLane,
+    /// This frame's command buffer, on the graphics queue.
+    pub graphics_cmd: vk::CommandBuffer,
+    pub graphics_queue: vk::Queue,
+    pub graphics_family: u32,
+    pub graphics_timeline: &'a Timeline,
+    /// Latest render value already submitted: a same-family lane overwrite
+    /// waits for it before writing data earlier frames may still read.
+    pub last_render_value: TimelineValue,
+    /// Render value this frame signals.
+    pub done_at: TimelineValue,
+}
+
+impl TransferCtx<'_> {
+    pub fn memory_props(&self) -> vk::PhysicalDeviceMemoryProperties {
+        unsafe {
+            self.instance
+                .get_physical_device_memory_properties(self.physical)
+        }
+    }
+}
+
+/// Staging buffers and ownership-release command buffers of one
+/// transfer-lane uploader, each retired on the timeline of its last use.
+pub(crate) struct UploadRetire {
+    /// Graphics pool the release command buffers come from.
+    command_pool: vk::CommandPool,
+    /// Names the uploader in panic messages.
+    label: &'static str,
+    /// Staging read by the frame command buffer: freed once the frame's
+    /// render value has signaled.
+    staging: RetireQueue<(vk::Buffer, vk::DeviceMemory)>,
+    /// Staging read by a separate-queue lane batch: freed on the lane's own
+    /// timeline value.
+    transfer: RetireQueue<(vk::Buffer, vk::DeviceMemory)>,
+    /// Dedicated-family overwrite release: throwaway graphics timeline + CB.
+    /// Not the render timeline — that would reserve a value after the frame
+    /// already reserved its signal and submit out of order. Freed at the
+    /// frame's render value.
+    release_cmds: RetireQueue<(Timeline, vk::CommandBuffer)>,
+}
+
+impl UploadRetire {
+    pub fn new(command_pool: vk::CommandPool, label: &'static str) -> Self {
+        Self {
+            command_pool,
+            label,
+            staging: RetireQueue::new(),
+            transfer: RetireQueue::new(),
+            release_cmds: RetireQueue::new(),
+        }
+    }
+
+    pub fn has_garbage(&self) -> bool {
+        !self.staging.is_empty() || !self.transfer.is_empty() || !self.release_cmds.is_empty()
+    }
+
+    /// Staging read by the frame command buffer that signals `done_at`.
+    pub fn retire_on_graphics(
+        &mut self,
+        done_at: TimelineValue,
+        staging: (vk::Buffer, vk::DeviceMemory),
+    ) {
+        self.staging.push(done_at, staging);
+    }
+
+    /// Staging read by the lane batch that signals `value` on the lane.
+    pub fn retire_on_lane(
+        &mut self,
+        value: TimelineValue,
+        staging: (vk::Buffer, vk::DeviceMemory),
+    ) {
+        self.transfer.push(value, staging);
+    }
+
+    /// Dedicated-family overwrite: record `release` (the graphics-side
+    /// release of data earlier frames read) into a one-off graphics command
+    /// buffer and submit it on a throwaway timeline, after the frames already
+    /// submitted to the graphics queue. No host wait. Returns the wait the
+    /// lane batch that acquires the data submits with. The command buffer
+    /// and its timeline are freed once `done_at` has signaled.
+    pub unsafe fn submit_release(
+        &mut self,
+        device: &ash::Device,
+        graphics_queue: vk::Queue,
+        done_at: TimelineValue,
+        release: &vk::DependencyInfo<'_>,
+    ) -> (vk::Semaphore, TimelineValue, vk::PipelineStageFlags2) {
+        let label = self.label;
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd = unsafe {
+            device
+                .allocate_command_buffers(&alloc)
+                .unwrap_or_else(|e| panic!("allocate {label} release command buffer: {e:?}"))[0]
+        };
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            device
+                .begin_command_buffer(cmd, &begin)
+                .unwrap_or_else(|e| panic!("begin {label} release command buffer: {e:?}"));
+            device.cmd_pipeline_barrier2(cmd, release);
+            device
+                .end_command_buffer(cmd)
+                .unwrap_or_else(|e| panic!("end {label} release command buffer: {e:?}"));
+        }
+        let mut tmp = unsafe { Timeline::new(device) };
+        let rs = tmp.begin_render(cmd);
+        let completion = unsafe { rs.submit(device, graphics_queue, &tmp, None) };
+        let sem = tmp.semaphore();
+        let value = completion.value();
+        self.release_cmds.push(done_at, (tmp, cmd));
+        (sem, value, vk::PipelineStageFlags2::COPY)
+    }
+
+    /// Free graphics-side staging and release command buffers up to the
+    /// completed render value `current`.
+    pub unsafe fn collect(&mut self, device: &ash::Device, current: TimelineValue) {
+        self.staging.collect(current, |staging| unsafe {
+            destroy_staging(device, staging)
+        });
+        let pool = self.command_pool;
+        self.release_cmds
+            .collect(current, |(timeline, cmd)| unsafe {
+                timeline.destroy(device);
+                device.free_command_buffers(pool, &[cmd]);
+            });
+    }
+
+    /// Free lane staging up to the lane's completed value `current`.
+    pub unsafe fn collect_transfer(&mut self, device: &ash::Device, current: TimelineValue) {
+        self.transfer.collect(current, |staging| unsafe {
+            destroy_staging(device, staging)
+        });
+    }
+
+    /// Free everything. The GPU must be idle.
+    pub unsafe fn destroy(&mut self, device: &ash::Device) {
+        unsafe {
+            self.staging
+                .collect_all(|staging| destroy_staging(device, staging));
+            self.transfer
+                .collect_all(|staging| destroy_staging(device, staging));
+            let pool = self.command_pool;
+            self.release_cmds.collect_all(|(timeline, cmd)| {
+                timeline.destroy(device);
+                device.free_command_buffers(pool, &[cmd]);
+            });
+        }
+    }
+}
+
+unsafe fn destroy_staging(device: &ash::Device, (buffer, memory): (vk::Buffer, vk::DeviceMemory)) {
+    unsafe {
+        device.destroy_buffer(buffer, None);
+        device.free_memory(memory, None);
     }
 }
 

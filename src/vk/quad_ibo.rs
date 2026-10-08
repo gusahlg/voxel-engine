@@ -1,10 +1,16 @@
 use ash::vk;
 
 use super::alloc::find_memory_type;
-use super::mesh_residency::{CopyBarrier, copy_barrier};
+use super::mesh_residency::{CopyBarrier, CopyConsumer, copy_barrier};
 use super::retire::RetireQueue;
 use super::timeline::TimelineValue;
 use super::transfer::TransferLane;
+
+/// What the shared quad IBO feeds: index fetch.
+const QUAD_IBO_CONSUMER: CopyConsumer = (
+    vk::PipelineStageFlags2::VERTEX_INPUT,
+    vk::AccessFlags2::INDEX_READ,
+);
 
 /// Engine-wide shared quad index buffer: the invariant per-quad pattern
 /// `[4q, 4q+1, 4q+2, 4q, 4q+2, 4q+3]` stored once and grown on demand.
@@ -130,7 +136,7 @@ impl QuadIbo {
                     buffer,
                     0,
                     size,
-                    vk::AccessFlags2::INDEX_READ,
+                    QUAD_IBO_CONSUMER,
                     CopyBarrier::Draw,
                 )];
                 device.cmd_pipeline_barrier2(
@@ -142,7 +148,7 @@ impl QuadIbo {
                     buffer,
                     0,
                     size,
-                    vk::AccessFlags2::INDEX_READ,
+                    QUAD_IBO_CONSUMER,
                     CopyBarrier::Release {
                         src_family: lane.family(),
                         dst_family: graphics_family,
@@ -163,7 +169,7 @@ impl QuadIbo {
                     buffer,
                     0,
                     size,
-                    vk::AccessFlags2::INDEX_READ,
+                    QUAD_IBO_CONSUMER,
                     CopyBarrier::Acquire {
                         src_family: lane.family(),
                         dst_family: graphics_family,

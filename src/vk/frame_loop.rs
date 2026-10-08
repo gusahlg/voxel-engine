@@ -17,6 +17,7 @@ use super::pipeline;
 use super::present::{HdrReadable, OverlayPresent};
 use super::scene_pass::RenderPass;
 use super::timeline::{RenderSubmit, acquire_next_image};
+use super::transfer::TransferCtx;
 use super::{Env, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, SceneDepthUse, scene_depth_use};
 
 pub(crate) use super::draw_prep::{DrawEntry, DrawRun, ImmOffsets};
@@ -587,10 +588,7 @@ impl Renderer {
         let done_at = rs.value();
         let copies_pending;
         let grew;
-        let quad_wait_some;
-        let tex_wait_some;
-        let mat_wait_some;
-        let map_wait_some;
+        let lane_waits;
         unsafe {
             let device = &self.device.device;
             device
@@ -644,65 +642,39 @@ impl Renderer {
                 self.device.graphics_family,
                 done_at,
             );
-            let tex = self.block_textures.flush(
-                &self.instance.instance,
+            let mut ctx = TransferCtx {
+                instance: &self.instance.instance,
                 device,
-                self.device.physical,
-                &mut self.transfer_lane,
-                cmd,
-                self.device.graphics_queue,
-                self.device.graphics_family,
-                &self.timeline,
-                self.last_render_value,
+                physical: self.device.physical,
+                lane: &mut self.transfer_lane,
+                graphics_cmd: cmd,
+                graphics_queue: self.device.graphics_queue,
+                graphics_family: self.device.graphics_family,
+                graphics_timeline: &self.timeline,
+                last_render_value: self.last_render_value,
                 done_at,
-            );
+            };
+            let tex = self.block_textures.flush(&mut ctx);
             grew = tex.retire.is_some();
             if let Some((stamp, retired)) = tex.retire {
                 self.retired_textures.push(stamp, retired);
             }
-            let mat_wait = self.materials.flush(
-                &self.instance.instance,
-                device,
-                self.device.physical,
-                &mut self.transfer_lane,
-                cmd,
-                self.device.graphics_queue,
-                self.device.graphics_family,
-                &self.timeline,
-                self.last_render_value,
-                done_at,
-            );
-            let map_wait = self.far_maps.flush(
-                &self.instance.instance,
-                device,
-                self.device.physical,
-                &mut self.transfer_lane,
-                cmd,
-                self.device.graphics_queue,
-                self.device.graphics_family,
-                &self.timeline,
-                self.last_render_value,
-                done_at,
-            );
-            self.pending_transfer_wait = fold_transfer_wait(
-                fold_transfer_wait(
-                    fold_transfer_wait(
-                        match (deferred, quad_wait) {
-                            (Some(a), Some(b)) => Some((a.max(b), MESH_CONSUMER_STAGES)),
-                            (Some(v), None) | (None, Some(v)) => Some((v, MESH_CONSUMER_STAGES)),
-                            (None, None) => None,
-                        },
-                        tex.transfer_wait
-                            .map(|v| (v, BLOCK_TEXTURE_CONSUMER_STAGES)),
-                    ),
-                    mat_wait.map(|v| (v, MATERIAL_CONSUMER_STAGES)),
-                ),
-                map_wait.map(|v| (v, FAR_MAP_CONSUMER_STAGES)),
-            );
-            quad_wait_some = quad_wait.is_some();
-            tex_wait_some = tex.transfer_wait.is_some();
-            mat_wait_some = mat_wait.is_some();
-            map_wait_some = map_wait.is_some();
+            let mat_wait = self.materials.flush(&mut ctx);
+            let map_wait = self.far_maps.flush(&mut ctx);
+            // Lane values this frame's graphics submit waits on, each with
+            // the stages that first read what it copied.
+            let waits = [
+                (deferred, MESH_CONSUMER_STAGES),
+                (quad_wait, MESH_CONSUMER_STAGES),
+                (tex.transfer_wait, BLOCK_TEXTURE_CONSUMER_STAGES),
+                (mat_wait, MATERIAL_CONSUMER_STAGES),
+                (map_wait, FAR_MAP_CONSUMER_STAGES),
+            ];
+            self.pending_transfer_wait = waits.iter().fold(None, |acc, &(value, stages)| {
+                fold_transfer_wait(acc, value.map(|v| (v, stages)))
+            });
+            // `deferred` is only `Some` when `copies_pending` is set.
+            lane_waits = waits.iter().any(|(value, _)| value.is_some());
         }
 
         // Same-queue compute jobs: budgeted prefix before the scene.
@@ -712,14 +684,7 @@ impl Renderer {
 
         let minimap = unsafe { self.minimap.sync(&self.device.device, cmd, slot) };
         if profiling {
-            if copies_pending
-                || quad_wait_some
-                || tex_wait_some
-                || mat_wait_some
-                || map_wait_some
-                || grew
-                || minimap
-            {
+            if copies_pending || lane_waits || grew || minimap {
                 self.gpu_timer.recorded(slot);
             }
             unsafe {
