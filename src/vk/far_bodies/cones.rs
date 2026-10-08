@@ -3,7 +3,7 @@
 //! discs that the cull, the tile mask and the coarse split share.
 
 use super::table::FarBodyGpu;
-use crate::far_body::{FarBody, FarShape, MAX_FAR_MAPS};
+use crate::far_body::{FarBody, FarShape, MAX_FAR_MAPS, rounded_bound};
 
 /// Sine of the angular radius the shader can draw (`s = ‖ray × center‖`), or
 /// `-1` when a ray facing away from the centre can still draw something.
@@ -26,8 +26,9 @@ use crate::far_body::{FarBody, FarShape, MAX_FAR_MAPS};
 /// * **Rounded.** No facing gate. `far_ray_rounded` can meet a bulge on a ray
 ///   aimed away from the centre while the camera is still outside the solid,
 ///   and the air rim tests `facing < bestT` rather than `facing > 0` (the cone's
-///   own `f <= 0` is what kills the antipodal ghost). Keep
-///   `1.05 * rhoB >= 0.99 → -1`.
+///   own `f <= 0` is what kills the antipodal ghost). `rhoB` is the padded
+///   [`rounded_bound`], at the clamped exponent the march and the rim also
+///   use. Keep `1.05 * rhoB >= 0.99 → -1`.
 /// * **Inner sphere.** The far wall is every direction (`far_ray_inner` has no
 ///   facing reject, and the branch runs before the facing gate). Always `-1`.
 /// * **Mapped.** No facing gate. The datum bulges out to the hi radius
@@ -69,8 +70,7 @@ pub(super) fn cone_bound(body: &FarBody, map_max: &[f32; MAX_FAR_MAPS]) -> f32 {
             }
         }
         FarShape::Rounded { exponent } => {
-            let p = exponent.clamp(2.0, 32.0);
-            let rho_b = rho * 3.0f32.powf(0.5 - 1.0 / p) * (1.0 + 2.0e-4);
+            let rho_b = rounded_bound(rho, exponent) * (1.0 + 2.0e-4);
             let bound = 1.05 * rho_b;
             if !bound.is_finite() || bound >= 0.99 {
                 -1.0
