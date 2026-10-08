@@ -1551,8 +1551,8 @@ pub(super) fn ray_mapped_limb_chord(
     sum_t * distance
 }
 
-/// `true` when [`ray_mapped_limb_chord`] is positive. `px` is unused: the
-/// limb is the air the ray crosses, not a pixel-widened sphere.
+/// `true` when [`ray_mapped_limb_chord`] is positive. The limb is the air the
+/// ray crosses, not a pixel-widened sphere.
 pub(crate) fn ray_mapped_limb(
     ray: Vec3,
     dir: Vec3,
@@ -1563,13 +1563,11 @@ pub(crate) fn ray_mapped_limb(
     datum: &[f32],
     max_off: f32,
     air: f32,
-    px: f32,
 ) -> bool {
-    let _ = px;
     ray_mapped_limb_chord(ray, dir, rho, distance, rotation, g, datum, max_off, air) > 0.0
 }
 
-// Fixtures shared by the tests in `tests.rs` and in `src/vk/far_bodies.rs`.
+// Fixtures shared by the tests in `tests.rs` and in `src/vk/far_bodies/tests/`.
 
 /// Home-planet radius, in blocks. Datum offsets sit in `[-278_000, 1_040_000]`.
 pub(crate) const HOME_RADIUS: f64 = 31_017_520.0;
@@ -1731,7 +1729,6 @@ pub(crate) fn mapped_limb_top_angle(
             datum,
             max_off,
             air,
-            0.0,
         )
     })
 }
