@@ -31,7 +31,7 @@ use ash::vk;
 use super::alloc::try_find_memory_type;
 use super::buffers::{HOST_BAR_BYTES, HOST_COHERENT};
 use super::timeline::TimelineValue;
-use crate::mesh::{FACE_UPLOAD_ORDER, MeshVertex};
+use crate::mesh::{FACE_UPLOAD_ORDER, MeshData, MeshVertex};
 
 /// Acquires since the last [`take_acquire_count`] (profiler).
 static ACQUIRE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -332,6 +332,21 @@ fn expand_aabb(aabb: &mut Option<([f32; 3], [f32; 3])>, verts: &[MeshVertex]) {
     }
 }
 
+/// Union the bounds `(lo, hi)` of a non-empty vertex set into `aabb`. Equal to
+/// [`expand_aabb`] over those vertices: min/max of exact small integers is
+/// order-independent, so folding their precomputed bounds gives the same bits.
+fn merge_aabb(aabb: &mut Option<([f32; 3], [f32; 3])>, (lo, hi): ([f32; 3], [f32; 3])) {
+    match aabb {
+        None => *aabb = Some((lo, hi)),
+        Some((min, max)) => {
+            for i in 0..3 {
+                min[i] = min[i].min(lo[i]);
+                max[i] = max[i].max(hi[i]);
+            }
+        }
+    }
+}
+
 /// Typed cursor over a staging region's mapped bytes.
 pub struct MeshVertexWriter<'a> {
     buf: &'a mut [u8],
@@ -390,12 +405,14 @@ impl MeshStager {
     }
 }
 
-/// A mapped staging region. Write with [`Self::bytes`], [`Self::write_vertices`],
-/// or [`Self::vertex_writer`]; [`Drop`] (and `Engine::release_mesh_staging`)
-/// returns it to the pool's reclaim list without a GPU wait.
+/// A mapped staging region. Write with [`Self::bytes`], [`Self::write_mesh`],
+/// [`Self::write_vertices`], or [`Self::vertex_writer`]; [`Drop`] (and
+/// `Engine::release_mesh_staging`) returns it to the pool's reclaim list
+/// without a GPU wait.
 ///
 /// [`Self::write_vertices`] and [`MeshVertexWriter::quad`] track the mesh AABB
-/// as they write. Callers that fill [`Self::bytes`] raw must call
+/// as they write, and [`Self::write_mesh`] records the one [`MeshData`]
+/// tracked. Callers that fill [`Self::bytes`] raw must call
 /// [`Self::set_aabb`] so install does not scan the region.
 #[must_use = "dropping a MeshStaging releases the region; pass it to upload_mesh_staged to keep the bytes"]
 pub struct MeshStaging {
@@ -441,6 +458,35 @@ impl MeshStaging {
         for slice in dir_slices {
             expand_aabb(&mut self.aabb, slice);
         }
+    }
+
+    /// Stage a whole [`MeshData`]: its vertices in GPU upload order (the
+    /// concatenation of [`MeshData::dir_slices`]) from the start of the
+    /// region, plus the AABB the mesh tracked while it was built.
+    ///
+    /// Same bytes, AABB, and return value as
+    /// `self.vertex_writer().write(&data.vertices())`, without the
+    /// intermediate `Vec` or the per-vertex AABB rescan. Returns `false`, and
+    /// writes nothing and leaves the AABB as it was, if the mesh needs more
+    /// than the requested bytes. Bytes past the mesh are not touched. Like
+    /// [`MeshVertexWriter::write`], the bounds merge into any AABB the region
+    /// already records (none after a fresh acquire), and an empty mesh adds
+    /// none. Does not allocate.
+    pub fn write_mesh(&mut self, data: &MeshData) -> bool {
+        let n = data.vertex_bytes();
+        let Some(dst) = self.bytes().get_mut(..n) else {
+            return false;
+        };
+        let written = write_dir_vertices(dst, std::array::from_fn(|i| data.vertices[i].as_slice()));
+        debug_assert_eq!(written, n, "write_mesh must cover every vertex");
+        // `MeshData::quad` folds the same `local_pos` decode with the same f32
+        // min/max as `expand_aabb`, so its bounds are what a rescan would give.
+        // Only an empty mesh differs: it keeps the ±inf sentinel, where the
+        // rescan records nothing, hence the guard.
+        if !data.is_empty() {
+            merge_aabb(&mut self.aabb, data.aabb());
+        }
+        true
     }
 
     /// Sequential typed writer over [`Self::bytes`].
@@ -1140,6 +1186,182 @@ mod tests {
         assert_eq!(n, data.vertex_bytes());
         let got: &[MeshVertex] = bytemuck::cast_slice(&buf);
         assert_eq!(got, want.as_slice());
+    }
+
+    /// xorshift64*: deterministic, dependency-free randomness for the
+    /// `write_mesh` equivalence sweep.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+    }
+
+    const NORMALS: [Normal; 6] = [
+        Normal::PosX,
+        Normal::NegX,
+        Normal::PosY,
+        Normal::NegY,
+        Normal::PosZ,
+        Normal::NegZ,
+    ];
+
+    /// Every packed field random, so a byte mismatch anywhere would show.
+    fn random_vertex(rng: &mut Rng, normal: Normal) -> MeshVertex {
+        let pos = [0; 3].map(|_: u8| rng.below(17) as u8);
+        let micro = [0; 3].map(|_: i8| rng.below(4) as i8 - 2);
+        MeshVertex::new(
+            pos,
+            normal,
+            rng.below(1 << 14) as u16,
+            Ao::new(rng.below(4) as u8),
+            Light::new(rng.below(16) as u8, rng.below(16) as u8),
+            rng.below(2) == 1,
+        )
+        .with_micro(micro)
+        .with_morph(rng.below(63) as i8 - 31)
+    }
+
+    /// Appends `quads` random quads, each facing a direction drawn from `dirs`.
+    fn add_random_quads(data: &mut MeshData, rng: &mut Rng, quads: usize, dirs: &[Normal]) {
+        for _ in 0..quads {
+            let normal = dirs[rng.below(dirs.len() as u64) as usize];
+            data.quad(std::array::from_fn(|_| random_vertex(rng, normal)));
+        }
+    }
+
+    fn aabb_bits(aabb: Option<([f32; 3], [f32; 3])>) -> Option<([u32; 3], [u32; 3])> {
+        aabb.map(|(lo, hi)| (lo.map(f32::to_bits), hi.map(f32::to_bits)))
+    }
+
+    /// Stages `data` through `vertex_writer().write(&data.vertices())` and
+    /// through `write_mesh` into two `region`-byte regions pre-filled with the
+    /// same pattern (and the same `prior` AABB), then requires identical
+    /// return values, region bytes (including any untouched tail), and AABB
+    /// bits. Returns whether the write fit.
+    fn assert_write_mesh_matches_writer(
+        data: &MeshData,
+        region: usize,
+        prior: Option<([u8; 3], [u8; 3])>,
+    ) -> bool {
+        let pool = MeshStagingPool::new_host(2 * region.next_multiple_of(VERTEX_STRIDE as usize));
+        let stager = pool.stager();
+        let mut old = stager.acquire(region).expect("old-path region");
+        let mut new = stager.acquire(region).expect("write_mesh region");
+        for (i, (a, b)) in old.bytes().iter_mut().zip(new.bytes()).enumerate() {
+            *a = (i as u8).wrapping_mul(31) ^ 0xA5;
+            *b = *a;
+        }
+        if let Some((min, max)) = prior {
+            old.set_aabb(min, max);
+            new.set_aabb(min, max);
+        }
+        let fit_old = old.vertex_writer().write(&data.vertices());
+        let fit_new = new.write_mesh(data);
+        assert_eq!(fit_new, fit_old, "return value, region {region}");
+        assert_eq!(new.as_bytes(), old.as_bytes(), "bytes, region {region}");
+        assert_eq!(
+            aabb_bits(new.recorded_aabb()),
+            aabb_bits(old.recorded_aabb()),
+            "AABB, region {region}"
+        );
+        assert_eq!(fit_new, data.vertex_bytes() <= region);
+        fit_new
+    }
+
+    #[test]
+    fn write_mesh_matches_vertex_writer_on_random_meshes() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+
+        // Empty: nothing written, no AABB recorded, a prior AABB kept.
+        let empty = MeshData::new(Pass::Opaque);
+        assert!(assert_write_mesh_matches_writer(&empty, 16, None));
+        assert!(assert_write_mesh_matches_writer(
+            &empty,
+            16,
+            Some(([1, 2, 3], [4, 5, 6]))
+        ));
+
+        // One quad, then many quads, in a single direction.
+        for normal in NORMALS {
+            for quads in [1, 2, 17, 300] {
+                let mut data = MeshData::new(Pass::Opaque);
+                add_random_quads(&mut data, &mut rng, quads, &[normal]);
+                assert!(data.dir_slices().iter().filter(|s| !s.is_empty()).count() == 1);
+                assert!(assert_write_mesh_matches_writer(
+                    &data,
+                    data.vertex_bytes(),
+                    None
+                ));
+            }
+        }
+
+        // Every direction, several sizes and seeds.
+        for quads in [6, 7, 33, 250, 2000] {
+            for _ in 0..4 {
+                let mut data = MeshData::new(Pass::Blend);
+                add_random_quads(&mut data, &mut rng, quads, &NORMALS);
+                let n = data.vertex_bytes();
+                // Fits exactly, fits with a tail (aligned and unaligned).
+                assert!(assert_write_mesh_matches_writer(&data, n, None));
+                assert!(assert_write_mesh_matches_writer(&data, n + 3, None));
+                assert!(assert_write_mesh_matches_writer(&data, n + 64, None));
+                // Overflow by one vertex, by one byte, and by a lot.
+                assert!(!assert_write_mesh_matches_writer(&data, n - 8, None));
+                assert!(!assert_write_mesh_matches_writer(&data, n - 1, None));
+                assert!(!assert_write_mesh_matches_writer(&data, 8, None));
+                // A prior AABB merges the same way (and survives an overflow).
+                let lo = [0; 3].map(|_: u8| rng.below(17) as u8);
+                let hi = lo.map(|c| c + rng.below(17 - u64::from(c)) as u8);
+                assert!(assert_write_mesh_matches_writer(&data, n, Some((lo, hi))));
+                assert!(!assert_write_mesh_matches_writer(
+                    &data,
+                    n - 8,
+                    Some((lo, hi))
+                ));
+            }
+        }
+
+        // A cleared, refilled scratch mesh tracks only its new geometry.
+        let mut scratch = MeshData::new(Pass::Opaque);
+        add_random_quads(&mut scratch, &mut rng, 500, &NORMALS);
+        scratch.clear();
+        assert!(assert_write_mesh_matches_writer(&scratch, 32, None));
+        add_random_quads(&mut scratch, &mut rng, 3, &[Normal::NegY, Normal::PosZ]);
+        assert!(assert_write_mesh_matches_writer(
+            &scratch,
+            scratch.vertex_bytes(),
+            None
+        ));
+    }
+
+    #[test]
+    fn write_mesh_records_meshdata_aabb_on_a_fresh_region() {
+        let mut data = MeshData::new(Pass::Opaque);
+        data.quad(tagged_quad(Normal::NegY, 1, [1, 2, 3]));
+        data.quad(tagged_quad(Normal::PosX, 2, [4, 5, 6]));
+        let pool = MeshStagingPool::new_host(2 * data.vertex_bytes());
+        let stager = pool.stager();
+        let mut staging = stager.acquire(data.vertex_bytes()).unwrap();
+        assert!(staging.write_mesh(&data));
+        assert_eq!(staging.recorded_aabb(), Some(data.aabb()));
+        let got: &[MeshVertex] = bytemuck::cast_slice(staging.as_bytes());
+        assert_eq!(got, data.dir_slices().concat().as_slice());
+
+        // Too small: nothing written, still no AABB.
+        let mut short = stager.acquire(data.vertex_bytes() - 8).unwrap();
+        short.bytes().fill(0xEE);
+        assert!(!short.write_mesh(&data));
+        assert!(short.recorded_aabb().is_none());
+        assert!(short.as_bytes().iter().all(|&b| b == 0xEE));
     }
 
     #[test]
