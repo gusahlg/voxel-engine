@@ -1720,17 +1720,12 @@ float4 far_mapped_solo(float3 ray, float px, float2 pix)
     if (!hit)
     {
         // Recomputed after the march. A copy from the horizon test would sit
-        // live across every datum sample.
+        // live across every datum sample. far_limb_mapped is zero when the
+        // ray crosses no air, so the chord is not tested here.
         float facing = dot(ray, far_body_dir(i).xyz);
-        if (facing > 0.0 && facing * distance < 1e30)
-        {
-            float airThick = farTable[0].body[i].albedo1.w;
-            float3 limbC = far_body_dir(i).xyz;
-            float4 rot = far_body_rot(i);
-            if (airThick > 0.0
-                && far_mapped_air_chord(ray, limbC, rho, distance, rot, map, airThick) > 0.0)
-                return float4(far_limb_mapped(ray, i), 0.0);
-        }
+        float airThick = farTable[0].body[i].albedo1.w;
+        if (facing > 0.0 && facing * distance < 1e30 && airThick > 0.0)
+            return float4(far_limb_mapped(ray, i), 0.0);
     }
     return float4(0.0, 0.0, 0.0, 0.0);
 }
@@ -1768,18 +1763,12 @@ float3 far_sky_debug_rgb(float3 ray, float px, float2 pix)
     if (!hit)
     {
         float facing = dot(ray, far_body_dir(i).xyz);
-        if (facing > 0.0 && facing * distance < 1e30)
+        float airThick = farTable[0].body[i].albedo1.w;
+        if (facing > 0.0 && facing * distance < 1e30 && airThick > 0.0)
         {
-            float airThick = farTable[0].body[i].albedo1.w;
-            float3 limbC = far_body_dir(i).xyz;
-            float4 rot = far_body_rot(i);
-            if (airThick > 0.0
-                && far_mapped_air_chord(ray, limbC, rho, distance, rot, map, airThick) > 0.0)
-            {
-                float3 limb = far_limb_mapped(ray, i);
-                if (max(limb.x, max(limb.y, limb.z)) > 1e-6)
-                    dbg.g = 1.0;
-            }
+            float3 limb = far_limb_mapped(ray, i);
+            if (max(limb.x, max(limb.y, limb.z)) > 1e-6)
+                dbg.g = 1.0;
         }
     }
     return dbg;
@@ -2105,6 +2094,10 @@ float3 far_bodies(float3 ray, float3 col, float px, float2 pix)
                 float airThick = farTable[0].body[i].albedo1.w;
                 // The colour is rebuilt in pass 2. The bit records that the
                 // ray crosses air and that crossing is in front of the hit.
+                // far_limb_mapped is already zero without a chord, so the
+                // chord here does not change the image. It stays: without
+                // it the full variant went from 152 registers to 128 plus
+                // 80-96 bytes of local memory (2026-10-08, RTX 3070).
                 float3 limbC = far_body_dir(i).xyz;
                 float4 rot = far_body_rot(i);
                 if (airThick > 0.0
@@ -2394,11 +2387,10 @@ float3 far_sky_debug_rgb(float3 ray, float px, float2 pix)
             }
             else if (!hit && facing > 0.0 && facing * distance < bestDepth)
             {
+                // No chord: the limb below is zero without one. far_bodies
+                // keeps its chord only for its register allocation.
                 float airThick = farTable[0].body[i].albedo1.w;
-                float3 limbC = far_body_dir(i).xyz;
-                float4 rot = far_body_rot(i);
-                if (airThick > 0.0
-                    && far_mapped_air_chord(ray, limbC, rho, distance, rot, map, airThick) > 0.0)
+                if (airThick > 0.0)
                     addMask |= 1u << i;
             }
         }
