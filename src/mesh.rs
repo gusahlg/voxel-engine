@@ -405,6 +405,21 @@ impl MeshData {
         out
     }
 
+    /// The six per-direction vertex buckets, borrowed in place, in GPU upload
+    /// order: +X, +Y, +Z, −X, −Y, −Z. Element `k` is upload-order face `k`,
+    /// **not** the bucket of the [`Normal`] whose discriminant is `k` (that is
+    /// the [`Self::quad_counts`] indexing). Concatenated, the slices are
+    /// exactly the vertices an upload writes, in the same order. Each slice
+    /// keeps [`Self::quad`]'s insertion order within its direction.
+    ///
+    /// No allocation and no copy. To stage a whole mesh, prefer
+    /// [`crate::MeshStaging::write_mesh`]; note that
+    /// [`crate::MeshStaging::write_vertices`] takes `Normal`-indexed slices,
+    /// so these must not be passed to it.
+    pub fn dir_slices(&self) -> [&[MeshVertex]; 6] {
+        FACE_UPLOAD_ORDER.map(|dir| self.vertices[dir].as_slice())
+    }
+
     /// Synthesizes the historical per-[`Normal`] index buckets over
     /// [`Self::vertices`] order: each quad becomes `[b, b+1, b+2, b, b+2, b+3]`
     /// so `vertices()[idx]` addressing stays consistent with the old layout.
@@ -763,6 +778,47 @@ mod tests {
         assert_eq!(&uploaded[..4], &pos_x_a);
         assert_eq!(&uploaded[4..8], &pos_x_b);
         assert_eq!(&uploaded[8..], &neg_z);
+    }
+
+    #[test]
+    fn dir_slices_borrow_buckets_in_upload_order() {
+        let upload_normals = [
+            Normal::PosX,
+            Normal::PosY,
+            Normal::PosZ,
+            Normal::NegX,
+            Normal::NegY,
+            Normal::NegZ,
+        ];
+        let empty = MeshData::new(Pass::Opaque);
+        assert!(empty.dir_slices().iter().all(|s| s.is_empty()));
+
+        // Insertion order deliberately differs from upload order, and +Z and
+        // −Y stay empty so the gaps between non-empty buckets are covered.
+        let mut data = MeshData::new(Pass::Opaque);
+        for (normal, quads) in [
+            (Normal::NegZ, 1),
+            (Normal::PosX, 3),
+            (Normal::NegX, 2),
+            (Normal::PosY, 1),
+        ] {
+            for _ in 0..quads {
+                data.quad(quad_for(normal));
+            }
+        }
+        let slices = data.dir_slices();
+        let counts = data.quad_counts();
+        for (k, slice) in slices.iter().enumerate() {
+            let dir = FACE_UPLOAD_ORDER[k];
+            assert_eq!(upload_normals[k] as usize, dir);
+            assert_eq!(slice.len(), counts[dir] as usize * 4, "face {k}");
+            assert!(slice.iter().all(|v| v.normal() == upload_normals[k]));
+            // Borrowed in place: the slice is the bucket itself, not a copy.
+            assert!(std::ptr::eq(*slice, data.vertices[dir].as_slice()));
+        }
+        assert_eq!(slices.concat(), data.vertices());
+        let lens: Vec<usize> = slices.iter().map(|s| s.len()).collect();
+        assert_eq!(lens, [12, 4, 0, 8, 0, 4]);
     }
 
     #[test]
