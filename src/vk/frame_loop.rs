@@ -43,6 +43,17 @@ pub(super) fn jittered_clip(
     );
     t * clean
 }
+
+/// Whether the sky pass draws this frame: the flag is on, the frame set a sky,
+/// and there is a 3D scene to draw it in (`Frame3D::set_sky` is the only
+/// writer of `lists.sky`, so a sky already implies the scene). The far table,
+/// the cloud LUT and `record_sky` run under this gate, and `RenderPass::begin`
+/// loads the colour attachment `DONT_CARE` only under it: the sky then covers
+/// every pixel the scene left at the far plane.
+pub(super) fn sky_drawn(flags: &crate::engine::RenderFlags, lists: &DrawLists) -> bool {
+    flags.sky && lists.sky.is_some() && lists.scene.is_some()
+}
+
 /// Project the sun to presented uv for the spill-pass godray march.
 fn project_godray(r: &Renderer, lists: &DrawLists) -> crate::camera::Godray {
     match lists.scene.as_ref() {
@@ -178,7 +189,7 @@ impl Renderer {
         // Far-body table (sky set 0 binding 2). Same slot fence as the UBO.
         // A sky with no bodies still uploads a zero count so the binding is live.
         // The pack also returns the horizon-dip sine the UBO stamps below.
-        let horizon_dip = if self.flags.sky && lists.sky.is_some() {
+        let horizon_dip = if sky_drawn(&self.flags, lists) {
             let view = lists.scene.as_ref().map(|scene| {
                 super::far_bodies::far_view(
                     scene.fovy_tan_half,
@@ -189,8 +200,9 @@ impl Renderer {
             });
             // Coarse tiles read the same sun and the same star gate the sky
             // shader does. `lit_uniforms` is the pre-debug-flat block: the
-            // debug-flat overwrite of `extras` never reaches a sky draw.
-            let coarse = if self.device.sky_coarse_ok(self.targets.samples) {
+            // debug-flat overwrite of `extras` never reaches a sky draw. The
+            // 2×2 pipelines' existence is the switch `record_sky` reads too.
+            let coarse = if self.pipelines.sky.has_coarse() {
                 lists.sky_for_pass().map(|desc| {
                     let u = lists.lit_uniforms();
                     let (sun_cos_rim, moon_cos_rim) =
@@ -218,12 +230,7 @@ impl Renderer {
                 lists.local_frame().up,
             )
         } else {
-            crate::profile::gauge(crate::profile::Gauge::FarBodies, 0);
-            crate::profile::gauge(crate::profile::Gauge::FarDrawn, 0);
-            crate::profile::gauge(crate::profile::Gauge::FarTiles, 0);
-            crate::profile::gauge(crate::profile::Gauge::SkyCoarse, 0);
-            crate::profile::gauge(crate::profile::Gauge::SkyCoarseFar, 0);
-            crate::profile::gauge(crate::profile::Gauge::SkyMapsolo, 0);
+            super::far_bodies::SkyDraw::zero_gauges();
             0.0
         };
         // Per-frame UBO (set 0, binding 2). A 3D scene always carries lighting
@@ -811,7 +818,7 @@ impl Renderer {
 
         // Cloud LUT: march (or zero) before the scene pass so the sky fragment
         // has a sampled image. Skipped when there is no sky.
-        if self.flags.sky && lists.sky.is_some() && lists.scene.is_some() {
+        if sky_drawn(&self.flags, lists) {
             let u = lists.lit_uniforms();
             self.record_sky_cloud_lut(
                 cmd,
@@ -929,7 +936,7 @@ impl Renderer {
                         self.pipe_stats
                             .begin_pass(device, cmd, slot, PipeStatPass::Sky);
                     }
-                    if self.flags.sky {
+                    if sky_drawn(&self.flags, lists) {
                         pass.record_sky();
                     }
                     if profiling {

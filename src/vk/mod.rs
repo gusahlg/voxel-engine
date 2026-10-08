@@ -459,20 +459,13 @@ impl Renderer {
         );
 
         let pipeline_cache = create_pipeline_cache(&device.device);
-        let pipelines = Pipelines::new(
-            &device.device,
+        let pipelines = Pipelines::for_targets(
+            &device,
             pipeline_cache,
-            targets.color_format,
+            &targets,
             swapchain.format,
-            targets.depth_format,
-            targets.samples,
             atlas.set_layout,
             mesh3d_set_layout,
-            device.fragment_shading_rate.as_ref(),
-            device.sky_coarse_ok(targets.samples),
-            device.independent_blend,
-            device.vrs_depth_ms_ok(targets.samples),
-            device.shader_stats.as_ref(),
         );
 
         // Per-slot command buffers plus one extra for the present copy.

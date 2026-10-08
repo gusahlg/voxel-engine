@@ -276,42 +276,9 @@ pub struct Pipelines {
     /// Unused in rectilinear mode (the overlay stays in the offscreen scene pass).
     pub tris2d_present: vk::Pipeline,
     pub tris2d_tex_present: vk::Pipeline,
-    /// Fullscreen background pass: fragment push constant + set 0 binding 0
-    /// (cloud LUT), binding 1 (the shared per-frame `FrameUniforms`), binding 2
-    /// (far-body storage buffer), binding 3 (datum storage) and binding 4
-    /// (eight albedo cubes). Depth-tests (read-only) at the reversed-Z far
-    /// plane so it shades only pixels the terrain left uncovered.
-    /// `sky` is the full fragment on one triangle. Its mapped intersection is
-    /// the five-sample fixed-point march. `sky_base` compiles the far-body
-    /// call out. `sky_nomap` drops the mapped march. `sky_sphere` keeps
-    /// spheres and inner spheres. The `sky_tile_*` pipelines are the same
-    /// fragments on instanced tile quads. `sky_tile_mapsolo` is the loop-free
-    /// single-Mapped fragment. All of them share `layout_sky`.
-    pub sky: vk::Pipeline,
-    pub sky_base: vk::Pipeline,
-    pub sky_nomap: vk::Pipeline,
-    pub sky_sphere: vk::Pipeline,
-    pub sky_tile: vk::Pipeline,
-    pub sky_tile_base: vk::Pipeline,
-    /// `sky_tile_base` at a 2×2 fragment size. `None` when this sample count
-    /// has no pipeline 2×2 rate, or `VOXEL_SKY_COARSE=0`.
-    pub sky_tile_base_coarse: Option<vk::Pipeline>,
-    /// Full sky fragment (the fixed-point mapped march included) at a 2×2
-    /// fragment size. Mapped-interior tiles bind this when mapsolo is off.
-    /// `None` under the same conditions as [`Self::sky_tile_base_coarse`].
-    pub sky_tile_coarse: Option<vk::Pipeline>,
-    /// Loop-free fragment for a tile whose mask is exactly one Mapped body.
-    pub sky_tile_mapsolo: vk::Pipeline,
-    /// `sky_tile_mapsolo` at a 2×2 fragment size. The lo-sphere interior of a
-    /// single-Mapped tile binds this. `None` under the same conditions as
-    /// [`Self::sky_tile_coarse`].
-    pub sky_tile_mapsolo_coarse: Option<vk::Pipeline>,
-    pub sky_tile_nomap: vk::Pipeline,
-    pub sky_tile_sphere: vk::Pipeline,
-    pub layout_sky: vk::PipelineLayout,
-    pub sky_set_layout: vk::DescriptorSetLayout,
-    /// Linear-clamp sampler pushed with the octahedral cloud LUT.
-    pub sky_lut_sampler: vk::Sampler,
+    /// Background pass pipelines by fragment, geometry and rate, plus their
+    /// shared layout and cloud-LUT sampler. See [`SkyPipelines`].
+    pub sky: SkyPipelines,
     /// Fullscreen tonemap: samples the HDR offscreen and the quarter-res spill
     /// (set 0 push descriptor, `tonemap_set_layout`) and writes the LDR swapchain.
     /// TAA-off path: one color attachment, no TAA ALU (`tonemap.frag` without
@@ -343,8 +310,37 @@ pub struct Pipelines {
 }
 
 impl Pipelines {
+    /// Every pipeline for `targets`. The device options that depend on the
+    /// sample count (the 2×2 sky rows, the multisampled VRS classifier) are
+    /// read here, so creation and a sample-count rebuild (`recreate.rs`)
+    /// cannot disagree.
+    pub fn for_targets(
+        device: &super::device::Device,
+        cache: vk::PipelineCache,
+        targets: &super::targets::RenderTargets,
+        present_format: vk::Format,
+        atlas_set_layout: vk::DescriptorSetLayout,
+        mesh3d_set_layout: vk::DescriptorSetLayout,
+    ) -> Self {
+        Self::new(
+            &device.device,
+            cache,
+            targets.color_format,
+            present_format,
+            targets.depth_format,
+            targets.samples,
+            atlas_set_layout,
+            mesh3d_set_layout,
+            device.fragment_shading_rate.as_ref(),
+            device.sky_coarse_ok(targets.samples),
+            device.independent_blend,
+            device.vrs_depth_ms_ok(targets.samples),
+            device.shader_stats.as_ref(),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn new(
         device: &ash::Device,
         cache: vk::PipelineCache,
         color_format: vk::Format,
@@ -389,49 +385,6 @@ impl Pipelines {
                 .create_pipeline_layout(&layout_debug_info, None)
                 .expect("Failed to create debug pipeline layout")
         };
-
-        // Sky layout: fragment push constant (inv VP + disc cosines) plus set 0
-        // binding 0 = cloud LUT, binding 1 = FrameUniforms, binding 2 = far-body
-        // table, binding 3 = mapped-body datum, binding 4 = eight albedo cubes.
-        // Dedicated rather than sharing mesh3d_set_layout: the LUT is a
-        // sampled image the mesh pass never touches. Push constants are full,
-        // so the bodies ride a storage buffer. Twelve descriptors in all
-        // (1+1+1+1+8); the device maxPushDescriptors limit is at least 32.
-        let sky_bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(4)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(crate::MAX_FAR_MAPS as u32)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-        ];
-        let (sky_set_layout, layout_sky) = pass::push_descriptor_layouts(
-            device,
-            &sky_bindings,
-            vk::ShaderStageFlags::FRAGMENT,
-            PUSH_BYTES_SKY,
-            "sky",
-        );
-        let sky_lut_sampler = pass::linear_clamp_sampler(device, "sky cloud LUT");
 
         let push_2d = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
@@ -531,14 +484,6 @@ impl Pipelines {
         let tri2d_vert = pass::shader_module(device, TRIS2D_VERT, "2d vertex");
         let tri2d_frag = pass::shader_module(device, TRIS2D_FRAG, "2d fragment");
         let tri2d_tex_frag = pass::shader_module(device, TRIS2D_TEX_FRAG, "textured 2d fragment");
-        let sky_vert = pass::shader_module(device, SKY_VERT, "sky vertex");
-        let sky_tile_vert = pass::shader_module(device, SKY_TILE_VERT, "sky tile vertex");
-        let sky_frag = pass::shader_module(device, SKY_FRAG, "sky fragment");
-        let sky_base_frag = pass::shader_module(device, SKY_BASE_FRAG, "sky base fragment");
-        let sky_nomap_frag = pass::shader_module(device, SKY_NOMAP_FRAG, "sky nomap fragment");
-        let sky_sphere_frag = pass::shader_module(device, SKY_SPHERE_FRAG, "sky sphere fragment");
-        let sky_mapsolo_frag =
-            pass::shader_module(device, SKY_MAPSOLO_FRAG, "sky mapsolo fragment");
 
         let builder = PipelineBuilder {
             device,
@@ -815,141 +760,7 @@ impl Pipelines {
             },
         );
 
-        // Sky: no vertex input (verts synthesised from SV_VertexID), depth
-        // read-only at the far plane, opaque, no cull. Same GREATER_OR_EQUAL
-        // compare as the scene, so it passes only where depth is still cleared.
-        // The sky pipelines share that state and `layout_sky`. Two optional
-        // pipelines are 2×2: the base-tile fragment, and the full fragment
-        // for interior tiles of a mapped body. Edge tiles stay at 1×1. Both
-        // rates use the fixed-point mapped march.
-        let sky_cfg = || PipelineConfig {
-            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-            depth: DepthMode::ReadOnly,
-            cull: vk::CullModeFlags::NONE,
-            blend: false,
-            vrs: true,
-            depth_bias: None,
-            coarse_2x2: false,
-        };
-        let sky = builder.build(sky_vert, sky_frag, &[], &[], layout_sky, "sky", sky_cfg());
-        let sky_base = builder.build(
-            sky_vert,
-            sky_base_frag,
-            &[],
-            &[],
-            layout_sky,
-            "sky_base",
-            sky_cfg(),
-        );
-        let sky_tile = builder.build(
-            sky_tile_vert,
-            sky_frag,
-            &[],
-            &[],
-            layout_sky,
-            "sky_tile",
-            sky_cfg(),
-        );
-        let sky_tile_base = builder.build(
-            sky_tile_vert,
-            sky_base_frag,
-            &[],
-            &[],
-            layout_sky,
-            "sky_tile_base",
-            sky_cfg(),
-        );
-        let sky_nomap = builder.build(
-            sky_vert,
-            sky_nomap_frag,
-            &[],
-            &[],
-            layout_sky,
-            "sky_nomap",
-            sky_cfg(),
-        );
-        let sky_sphere = builder.build(
-            sky_vert,
-            sky_sphere_frag,
-            &[],
-            &[],
-            layout_sky,
-            "sky_sphere",
-            sky_cfg(),
-        );
-        let sky_tile_nomap = builder.build(
-            sky_tile_vert,
-            sky_nomap_frag,
-            &[],
-            &[],
-            layout_sky,
-            "sky_tile_nomap",
-            sky_cfg(),
-        );
-        let sky_tile_sphere = builder.build(
-            sky_tile_vert,
-            sky_sphere_frag,
-            &[],
-            &[],
-            layout_sky,
-            "sky_tile_sphere",
-            sky_cfg(),
-        );
-        let coarse_cfg = || PipelineConfig {
-            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-            depth: DepthMode::ReadOnly,
-            cull: vk::CullModeFlags::NONE,
-            blend: false,
-            vrs: false,
-            depth_bias: None,
-            coarse_2x2: true,
-        };
-        // 2×2 only where the device lists that size for this sample count.
-        // `vrs: false` so the 1×1 REPLACE state is not also chained; `coarse_2x2`
-        // pushes KEEP/KEEP instead. The attachment create flag still follows
-        // `fsr_enabled`, so the pipeline stays valid in a VRS rendering.
-        let sky_tile_base_coarse = sky_coarse.then(|| {
-            builder.build(
-                sky_tile_vert,
-                sky_base_frag,
-                &[],
-                &[],
-                layout_sky,
-                "sky_tile_base_coarse",
-                coarse_cfg(),
-            )
-        });
-        let sky_tile_coarse = sky_coarse.then(|| {
-            builder.build(
-                sky_tile_vert,
-                sky_frag,
-                &[],
-                &[],
-                layout_sky,
-                "sky_tile_coarse",
-                coarse_cfg(),
-            )
-        });
-        let sky_tile_mapsolo = builder.build(
-            sky_tile_vert,
-            sky_mapsolo_frag,
-            &[],
-            &[],
-            layout_sky,
-            "sky_tile_mapsolo",
-            sky_cfg(),
-        );
-        let sky_tile_mapsolo_coarse = sky_coarse.then(|| {
-            builder.build(
-                sky_tile_vert,
-                sky_mapsolo_frag,
-                &[],
-                &[],
-                layout_sky,
-                "sky_tile_mapsolo_coarse",
-                coarse_cfg(),
-            )
-        });
+        let sky = SkyPipelines::new(&builder, sky_coarse);
 
         // Tonemap: its own builder — writes the present format at single-sample
         // with no depth attachment; never VRS.
@@ -1100,13 +911,6 @@ impl Pipelines {
             device.destroy_shader_module(tri2d_vert, None);
             device.destroy_shader_module(tri2d_frag, None);
             device.destroy_shader_module(tri2d_tex_frag, None);
-            device.destroy_shader_module(sky_vert, None);
-            device.destroy_shader_module(sky_tile_vert, None);
-            device.destroy_shader_module(sky_frag, None);
-            device.destroy_shader_module(sky_base_frag, None);
-            device.destroy_shader_module(sky_nomap_frag, None);
-            device.destroy_shader_module(sky_sphere_frag, None);
-            device.destroy_shader_module(sky_mapsolo_frag, None);
         }
 
         let vrs_compute = fsr.map(|_| create_vrs_compute(device, cache, vrs_depth_ms, stats));
@@ -1136,20 +940,6 @@ impl Pipelines {
             tris2d_present,
             tris2d_tex_present,
             sky,
-            sky_base,
-            sky_nomap,
-            sky_sphere,
-            sky_tile,
-            sky_tile_base,
-            sky_tile_base_coarse,
-            sky_tile_coarse,
-            sky_tile_mapsolo,
-            sky_tile_mapsolo_coarse,
-            sky_tile_nomap,
-            sky_tile_sphere,
-            layout_sky,
-            sky_set_layout,
-            sky_lut_sampler,
             tonemap,
             layout_tonemap,
             tonemap_set_layout,
@@ -1251,38 +1041,313 @@ impl Pipelines {
             if let Some(p) = self.tris2d_tex_present_taa {
                 device.destroy_pipeline(p, None);
             }
-            device.destroy_pipeline(self.sky, None);
-            device.destroy_pipeline(self.sky_base, None);
-            device.destroy_pipeline(self.sky_nomap, None);
-            device.destroy_pipeline(self.sky_sphere, None);
-            device.destroy_pipeline(self.sky_tile, None);
-            device.destroy_pipeline(self.sky_tile_base, None);
-            if let Some(p) = self.sky_tile_base_coarse {
-                device.destroy_pipeline(p, None);
-            }
-            if let Some(p) = self.sky_tile_coarse {
-                device.destroy_pipeline(p, None);
-            }
-            device.destroy_pipeline(self.sky_tile_mapsolo, None);
-            if let Some(p) = self.sky_tile_mapsolo_coarse {
-                device.destroy_pipeline(p, None);
-            }
-            device.destroy_pipeline(self.sky_tile_nomap, None);
-            device.destroy_pipeline(self.sky_tile_sphere, None);
+            self.sky.destroy(device);
             device.destroy_pipeline(self.tonemap, None);
             device.destroy_pipeline(self.tonemap_taa, None);
             device.destroy_pipeline_layout(self.layout_3d, None);
             device.destroy_pipeline_layout(self.layout_debug, None);
             device.destroy_pipeline_layout(self.layout_2d, None);
-            device.destroy_pipeline_layout(self.layout_sky, None);
-            device.destroy_descriptor_set_layout(self.sky_set_layout, None);
-            device.destroy_sampler(self.sky_lut_sampler, None);
             device.destroy_pipeline_layout(self.layout_tonemap, None);
             device.destroy_descriptor_set_layout(self.tonemap_set_layout, None);
             device.destroy_sampler(self.tonemap_sampler, None);
             device.destroy_pipeline_layout(self.layout_tonemap_taa, None);
             device.destroy_descriptor_set_layout(self.tonemap_taa_set_layout, None);
             device.destroy_sampler(self.tonemap_depth_sampler, None);
+        }
+    }
+}
+
+/// Sky fragment variant: one `sky.frag.slang` define set from `build.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkyFrag {
+    /// `sky_base.frag` (`SKY_BASE`): background and clouds, no far-body call.
+    Base,
+    /// `sky_sphere.frag`: spheres and inner spheres only.
+    Sphere,
+    /// `sky_nomap.frag` (`FAR_NO_MAPPED`): the body loop without the mapped march.
+    NoMap,
+    /// `sky.frag`: every shape. Its mapped intersection is the five-sample
+    /// fixed-point march.
+    Full,
+    /// `sky_mapsolo.frag` (`FAR_MAPPED_SOLO`): one Mapped body, no loop.
+    /// Tiles only; the fullscreen triangle has no per-tile mask.
+    MapSolo,
+}
+
+impl SkyFrag {
+    const COUNT: usize = 5;
+    const ALL: [Self; Self::COUNT] = [
+        Self::Base,
+        Self::Sphere,
+        Self::NoMap,
+        Self::Full,
+        Self::MapSolo,
+    ];
+
+    /// Embedded SPIR-V and the shader-module label.
+    fn module(self) -> (&'static [u8], &'static str) {
+        match self {
+            Self::Base => (SKY_BASE_FRAG, "sky base fragment"),
+            Self::Sphere => (SKY_SPHERE_FRAG, "sky sphere fragment"),
+            Self::NoMap => (SKY_NOMAP_FRAG, "sky nomap fragment"),
+            Self::Full => (SKY_FRAG, "sky fragment"),
+            Self::MapSolo => (SKY_MAPSOLO_FRAG, "sky mapsolo fragment"),
+        }
+    }
+}
+
+/// Sky geometry: one fullscreen triangle (`sky.vert`), or instanced quads over
+/// the far-body tile lists (`sky_tile.vert`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkyPrim {
+    Fullscreen,
+    Tile,
+}
+
+impl SkyPrim {
+    const ALL: [Self; 2] = [Self::Fullscreen, Self::Tile];
+
+    /// Embedded SPIR-V and the shader-module label.
+    fn module(self) -> (&'static [u8], &'static str) {
+        match self {
+            Self::Fullscreen => (SKY_VERT, "sky vertex"),
+            Self::Tile => (SKY_TILE_VERT, "sky tile vertex"),
+        }
+    }
+}
+
+/// Sky shading rate. `Fine` is 1×1 and takes the VRS attachment's rate when
+/// one is bound. `Coarse` is a 2×2 pipeline fragment size, edge tiles stay
+/// `Fine`. Both rates use the fixed-point mapped march.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkyRate {
+    Fine,
+    Coarse,
+}
+
+impl SkyRate {
+    /// No vertex input (verts synthesised from SV_VertexID), depth read-only
+    /// at the far plane, opaque, no cull. Same GREATER_OR_EQUAL compare as the
+    /// scene, so the sky passes only where depth is still cleared.
+    fn config(self) -> PipelineConfig {
+        let coarse = self == Self::Coarse;
+        // 2×2 only where the device lists that size for this sample count.
+        // `vrs: false` so the 1×1 REPLACE state is not also chained; `coarse_2x2`
+        // pushes KEEP/KEEP instead. The attachment create flag still follows
+        // `fsr_enabled`, so the pipeline stays valid in a VRS rendering.
+        PipelineConfig {
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            depth: DepthMode::ReadOnly,
+            cull: vk::CullModeFlags::NONE,
+            blend: false,
+            vrs: !coarse,
+            depth_bias: None,
+            coarse_2x2: coarse,
+        }
+    }
+}
+
+/// Every sky pipeline in creation order, with the name `VOXEL_SHADER_STATS`
+/// prints. Coarse rows are built only when the device lists a 2×2 fragment
+/// size for the sample count and `VOXEL_SKY_COARSE` is not `0`.
+const SKY_PIPELINES: [(SkyFrag, SkyPrim, SkyRate, &str); 12] = [
+    (SkyFrag::Full, SkyPrim::Fullscreen, SkyRate::Fine, "sky"),
+    (
+        SkyFrag::Base,
+        SkyPrim::Fullscreen,
+        SkyRate::Fine,
+        "sky_base",
+    ),
+    (SkyFrag::Full, SkyPrim::Tile, SkyRate::Fine, "sky_tile"),
+    (SkyFrag::Base, SkyPrim::Tile, SkyRate::Fine, "sky_tile_base"),
+    (
+        SkyFrag::NoMap,
+        SkyPrim::Fullscreen,
+        SkyRate::Fine,
+        "sky_nomap",
+    ),
+    (
+        SkyFrag::Sphere,
+        SkyPrim::Fullscreen,
+        SkyRate::Fine,
+        "sky_sphere",
+    ),
+    (
+        SkyFrag::NoMap,
+        SkyPrim::Tile,
+        SkyRate::Fine,
+        "sky_tile_nomap",
+    ),
+    (
+        SkyFrag::Sphere,
+        SkyPrim::Tile,
+        SkyRate::Fine,
+        "sky_tile_sphere",
+    ),
+    (
+        SkyFrag::Base,
+        SkyPrim::Tile,
+        SkyRate::Coarse,
+        "sky_tile_base_coarse",
+    ),
+    (
+        SkyFrag::Full,
+        SkyPrim::Tile,
+        SkyRate::Coarse,
+        "sky_tile_coarse",
+    ),
+    (
+        SkyFrag::MapSolo,
+        SkyPrim::Tile,
+        SkyRate::Fine,
+        "sky_tile_mapsolo",
+    ),
+    (
+        SkyFrag::MapSolo,
+        SkyPrim::Tile,
+        SkyRate::Coarse,
+        "sky_tile_mapsolo_coarse",
+    ),
+];
+
+/// The background pass pipelines, indexed by fragment, geometry and rate.
+/// All share `layout`: a fragment push constant ([`SkyParams`]) plus set 0
+/// binding 0 (cloud LUT), binding 1 (the shared per-frame `FrameUniforms`),
+/// binding 2 (far-body storage buffer), binding 3 (datum storage) and binding
+/// 4 (eight albedo cubes). They depth-test (read-only) at the reversed-Z far
+/// plane so they shade only pixels the terrain left uncovered.
+pub struct SkyPipelines {
+    /// `[frag][prim][rate]`. `None` for a combination [`SKY_PIPELINES`] does
+    /// not list, and for every coarse row when `coarse` is false.
+    table: [[[Option<vk::Pipeline>; 2]; 2]; SkyFrag::COUNT],
+    coarse: bool,
+    pub layout: vk::PipelineLayout,
+    set_layout: vk::DescriptorSetLayout,
+    /// Linear-clamp sampler pushed with the octahedral cloud LUT.
+    pub lut_sampler: vk::Sampler,
+}
+
+impl SkyPipelines {
+    /// `coarse` is [`Device::sky_coarse_ok`] for the builder's sample count.
+    ///
+    /// [`Device::sky_coarse_ok`]: super::device::Device::sky_coarse_ok
+    fn new(builder: &PipelineBuilder, coarse: bool) -> Self {
+        let device = builder.device;
+        // Set 0: binding 0 = cloud LUT, binding 1 = FrameUniforms, binding 2 =
+        // far-body table, binding 3 = mapped-body datum, binding 4 = eight
+        // albedo cubes. Dedicated rather than sharing mesh3d_set_layout: the
+        // LUT is a sampled image the mesh pass never touches. Push constants
+        // are full, so the bodies ride a storage buffer. Twelve descriptors in
+        // all (1+1+1+1+8); the device maxPushDescriptors limit is at least 32.
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(crate::MAX_FAR_MAPS as u32)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let (set_layout, layout) = pass::push_descriptor_layouts(
+            device,
+            &bindings,
+            vk::ShaderStageFlags::FRAGMENT,
+            PUSH_BYTES_SKY,
+            "sky",
+        );
+        let lut_sampler = pass::linear_clamp_sampler(device, "sky cloud LUT");
+
+        let verts = SkyPrim::ALL.map(|prim| {
+            let (code, label) = prim.module();
+            pass::shader_module(device, code, label)
+        });
+        let frags = SkyFrag::ALL.map(|frag| {
+            let (code, label) = frag.module();
+            pass::shader_module(device, code, label)
+        });
+        let mut table = [[[None; 2]; 2]; SkyFrag::COUNT];
+        for (frag, prim, rate, name) in SKY_PIPELINES {
+            if rate == SkyRate::Coarse && !coarse {
+                continue;
+            }
+            table[frag as usize][prim as usize][rate as usize] = Some(builder.build(
+                verts[prim as usize],
+                frags[frag as usize],
+                &[],
+                &[],
+                layout,
+                name,
+                rate.config(),
+            ));
+        }
+        unsafe {
+            for module in verts.into_iter().chain(frags) {
+                device.destroy_shader_module(module, None);
+            }
+        }
+        Self {
+            table,
+            coarse,
+            layout,
+            set_layout,
+            lut_sampler,
+        }
+    }
+
+    pub(crate) fn get(&self, frag: SkyFrag, prim: SkyPrim, rate: SkyRate) -> Option<vk::Pipeline> {
+        self.table[frag as usize][prim as usize][rate as usize]
+    }
+
+    /// Whether the 2×2 rows exist. The one source for coarse sky tiles: the
+    /// CPU split asks it before reordering a run, and `record_sky` before
+    /// drawing one at 2×2. It is rebuilt with these pipelines when the sample
+    /// count changes.
+    pub(crate) fn has_coarse(&self) -> bool {
+        self.coarse
+    }
+
+    /// The tile pipeline for a run. A coarse row that was not built falls back
+    /// to the same fragment at 1×1. `SkyDraw::runs` emits no coarse run then,
+    /// so the fallback only keeps a stray coarse request drawable.
+    pub(crate) fn tile(&self, frag: SkyFrag, rate: SkyRate) -> vk::Pipeline {
+        self.get(frag, SkyPrim::Tile, rate)
+            .or_else(|| self.get(frag, SkyPrim::Tile, SkyRate::Fine))
+            .expect("every sky fragment has a 1×1 tile pipeline")
+    }
+
+    /// The fullscreen-triangle pipeline. There is no mapsolo triangle.
+    pub(crate) fn fullscreen(&self, frag: SkyFrag) -> vk::Pipeline {
+        self.get(frag, SkyPrim::Fullscreen, SkyRate::Fine)
+            .expect("the fullscreen sky triangle has no mapsolo pipeline")
+    }
+
+    /// Every pipeline, then the layout, set layout and sampler they share.
+    unsafe fn destroy(&mut self, device: &ash::Device) {
+        unsafe {
+            for pipeline in self.table.iter().flatten().flatten().flatten() {
+                device.destroy_pipeline(*pipeline, None);
+            }
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+            device.destroy_sampler(self.lut_sampler, None);
         }
     }
 }
@@ -1738,6 +1803,55 @@ mod tests {
             spirv_has_binding(super::MESH3D_CAGED_VERT, binding),
             "caged mesh3d.vert must declare the cage SSBO at binding {binding}"
         );
+    }
+
+    /// The stats and debug names stay the twelve pre-table names, each key is
+    /// built once, and the coarse rows are the three `SkyDraw::runs` draws.
+    #[test]
+    fn sky_pipeline_table_keeps_the_twelve_names() {
+        use super::{SKY_PIPELINES, SkyFrag, SkyPrim, SkyRate};
+        let names: Vec<&str> = SKY_PIPELINES.iter().map(|row| row.3).collect();
+        assert_eq!(
+            names,
+            [
+                "sky",
+                "sky_base",
+                "sky_tile",
+                "sky_tile_base",
+                "sky_nomap",
+                "sky_sphere",
+                "sky_tile_nomap",
+                "sky_tile_sphere",
+                "sky_tile_base_coarse",
+                "sky_tile_coarse",
+                "sky_tile_mapsolo",
+                "sky_tile_mapsolo_coarse",
+            ]
+        );
+        for (i, a) in SKY_PIPELINES.iter().enumerate() {
+            for b in &SKY_PIPELINES[i + 1..] {
+                assert!((a.0, a.1, a.2) != (b.0, b.1, b.2), "{} twice", a.3);
+            }
+        }
+        for frag in SkyFrag::ALL {
+            let has = |prim: SkyPrim, rate: SkyRate| {
+                SKY_PIPELINES
+                    .iter()
+                    .any(|row| row.0 == frag && row.1 == prim && row.2 == rate)
+            };
+            assert!(has(SkyPrim::Tile, SkyRate::Fine), "{frag:?} tile");
+            assert_eq!(
+                has(SkyPrim::Fullscreen, SkyRate::Fine),
+                frag != SkyFrag::MapSolo,
+                "{frag:?} fullscreen"
+            );
+            assert!(!has(SkyPrim::Fullscreen, SkyRate::Coarse));
+            assert_eq!(
+                has(SkyPrim::Tile, SkyRate::Coarse),
+                matches!(frag, SkyFrag::Base | SkyFrag::Full | SkyFrag::MapSolo),
+                "{frag:?} coarse"
+            );
+        }
     }
 
     #[test]
