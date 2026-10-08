@@ -1513,6 +1513,127 @@ float far_mapped_air_chord(
         return 0.0;
     return sumT * distance;
 }
+
+// Shade of mapped body `i`'s winning hit at normalised `t` on cube face
+// `face`: the loop's kind-4 arm and the single-mapped variant. One shade
+// without the fresnel air rim, then the terrain fog in place of
+// far_through_air, then the air shell along the view chord above the hit.
+// Runs after the march, so the chart derivative is not live inside a datum
+// fetch, and the normal runs before air, inscatter and the body point exist.
+float3 far_shade_mapped(float3 ray, float px, uint i, float t, uint face)
+{
+    float rho = farTable[0].body[i].dir_rho.w;
+    uint mapPlus = farTable[0].body[i].seed.z;
+    float distance = farTable[0].body[i].albedo2.w;
+    float4 rot = farTable[0].body[i].rot;
+    float3 uN;
+    {
+        float3 center = farTable[0].body[i].dir_rho.xyz;
+        float3 bodyP = far_inv_rotate(rot, ray * t - center);
+        float radN = length(bodyP);
+        uN = radN > 1e-8 ? bodyP / radN : float3(0.0, 1.0, 0.0);
+    }
+    uint mapN = (mapPlus >= 1u && mapPlus <= MAX_FAR_MAPS) ? mapPlus - 1u : 0u;
+    float3 bestN = far_mapped_normal(rot, uN, rho, distance, mapN);
+    float3 center = farTable[0].body[i].dir_rho.xyz;
+    float3 bodyP = far_inv_rotate(rot, ray * t - center);
+    float3 air = farTable[0].body[i].atmosphere.rgb;
+    float3 inscatter = sky_radiance(ray, frame);
+    float3 alb = far_face(i, face);
+    if (mapPlus >= 1u && mapPlus <= MAX_FAR_MAPS)
+    {
+        uint map = mapPlus - 1u;
+        uint landed = farMaps[map * FAR_MAP_HEADER_STRIDE + 4u];
+        uint albedoSize = farMaps[map * FAR_MAP_HEADER_STRIDE + 5u];
+        if (albedoSize != 0u && (landed & (1u << face)) != 0u)
+        {
+            float rad = length(bodyP);
+            float3 bodyDir = rad > 1e-8 ? bodyP / rad : float3(0.0, 1.0, 0.0);
+            // Footprint of this pixel on the surface. A graze stretches
+            // it by 1/|ray·n|; the floor keeps a silhouette finite.
+            // Texel is the face-centre size, (π/2 R) / albedo edge.
+            float ndot = abs(dot(ray, bestN));
+            if (ndot < 0.05)
+                ndot = 0.05;
+            float footprint = px * t * distance / ndot;
+            float texel = (1.5707963267948966 * rho * distance) / float(albedoSize);
+            float lod = 0.0;
+            if (texel > 1e-20)
+                lod = log2(max(footprint / texel, 1e-20));
+            float mipMax = log2(float(albedoSize));
+            alb = far_cube(map, bodyDir, clamp(lod, 0.0, mipMax));
+        }
+    }
+    float3 lit = far_lit(alb, bestN, ray, air, rho, false, false);
+    float3 shaded = lit;
+    // Terrain fog, the same factor mesh3d applies.
+    if (frame.horizon.w > 0.0)
+    {
+        float fog = 1.0 - exp(-t * distance * frame.horizon.w);
+        shaded = lerp(lit, inscatter, fog);
+    }
+    // Air shell on the sphere of radius r_s(hit) + air. The chord is the
+    // view segment inside that shell, in world units (0 when the ray never
+    // enters). Daylight matches far_limb_mapped.
+    float airThick = farTable[0].body[i].albedo1.w;
+    float trans = 1.0;
+    float facing = dot(ray, center);
+    if (airThick > 0.0 && distance > 0.0)
+    {
+        float rSurf = length(ray * t - center);
+        float outer = rSurf + airThick / distance;
+        float tEnter;
+        float tExit;
+        if (far_sphere_roots(facing, outer, tEnter, tExit))
+        {
+            float chord = (t - max(tEnter, 0.0)) * distance;
+            if (chord > 0.0)
+                trans = exp(-FAR_AIR_K * chord / airThick);
+        }
+    }
+    float3 col = shaded;
+    if (trans < 1.0)
+    {
+        float flip = frame.light.w * 2.0 - 1.0;
+        float3 approach = ray * facing - center;
+        float3 radial = ray * t - center;
+        float3 limbN = dot(approach, approach) > 1e-16
+            ? normalize(approach)
+            : (dot(radial, radial) > 1e-16 ? normalize(radial) : -ray);
+        float daylight = saturate(dot(limbN, frame.sun_dir_elev.xyz) * flip);
+        col = shaded * trans + air * (1.0 - trans) * daylight;
+    }
+    return col;
+}
+
+// Miss-ray limb of mapped body `i`, for far_add_rgb and the single-mapped
+// variant: the air `ray` crosses, in world units. Not a pixel-widened
+// sphere: the denominator is the shell thickness. Daylight follows far_lit.
+// Zero for a bad map or distance, or when the ray crosses no air.
+float3 far_limb_mapped(float3 ray, uint i)
+{
+    float4 dirRho = farTable[0].body[i].dir_rho;
+    float rho = dirRho.w;
+    float3 center = dirRho.xyz;
+    float3 air = farTable[0].body[i].atmosphere.rgb;
+    float distance = farTable[0].body[i].albedo2.w;
+    float facing = dot(ray, center);
+    uint mapPlus = farTable[0].body[i].seed.z;
+    float airThick = farTable[0].body[i].albedo1.w;
+    if (far_map_bad(mapPlus, distance))
+        return float3(0.0, 0.0, 0.0);
+    uint map = mapPlus - 1u;
+    float4 rot = farTable[0].body[i].rot;
+    float chord = far_mapped_air_chord(ray, center, rho, distance, rot, map, airThick);
+    if (!(chord > 0.0))
+        return float3(0.0, 0.0, 0.0);
+    float trans = exp(-FAR_AIR_K * chord / airThick);
+    float3 approach = ray * facing - center;
+    float3 limbN = dot(approach, approach) > 1e-16 ? normalize(approach) : -ray;
+    float flip = frame.light.w * 2.0 - 1.0;
+    float daylight = saturate(dot(limbN, frame.sun_dir_elev.xyz) * flip);
+    return air * ((1.0 - trans) * frame.light.rgb * daylight);
+}
 #endif
 
 // Cone reject for kept body `i`, before its 160-byte record is read: runs
@@ -1558,114 +1679,6 @@ uint far_solo_mask(float2 pix)
     uint tx = min(uint(p.x) / tilePx, tilesX - 1u);
     uint ty = min(uint(p.y) / tilePx, tilesY - 1u);
     return farTable[0].tile_mask[ty * tilesX + tx] & live;
-}
-
-// Mapped surface shade. Same sequence as far_bodies' kind-4 arm. Runs after
-// the march, so the chart derivative is not live inside a datum fetch.
-float3 far_shade_mapped(float3 ray, float px, uint i, float t, uint face)
-{
-    float rho = farTable[0].body[i].dir_rho.w;
-    uint mapPlus = farTable[0].body[i].seed.z;
-    float distance = farTable[0].body[i].albedo2.w;
-    float4 rot = farTable[0].body[i].rot;
-    float3 uN;
-    {
-        float3 center = farTable[0].body[i].dir_rho.xyz;
-        float3 bodyP = far_inv_rotate(rot, ray * t - center);
-        float radN = length(bodyP);
-        uN = radN > 1e-8 ? bodyP / radN : float3(0.0, 1.0, 0.0);
-    }
-    uint mapN = (mapPlus >= 1u && mapPlus <= MAX_FAR_MAPS) ? mapPlus - 1u : 0u;
-    float3 bestN = far_mapped_normal(rot, uN, rho, distance, mapN);
-    float3 center = farTable[0].body[i].dir_rho.xyz;
-    float3 bodyP = far_inv_rotate(rot, ray * t - center);
-    float3 air = farTable[0].body[i].atmosphere.rgb;
-    float3 inscatter = sky_radiance(ray, frame);
-    float3 alb = far_face(i, face);
-    if (mapPlus >= 1u && mapPlus <= MAX_FAR_MAPS)
-    {
-        uint map = mapPlus - 1u;
-        uint landed = farMaps[map * FAR_MAP_HEADER_STRIDE + 4u];
-        uint albedoSize = farMaps[map * FAR_MAP_HEADER_STRIDE + 5u];
-        if (albedoSize != 0u && (landed & (1u << face)) != 0u)
-        {
-            float rad = length(bodyP);
-            float3 bodyDir = rad > 1e-8 ? bodyP / rad : float3(0.0, 1.0, 0.0);
-            float ndot = abs(dot(ray, bestN));
-            if (ndot < 0.05)
-                ndot = 0.05;
-            float footprint = px * t * distance / ndot;
-            float texel = (1.5707963267948966 * rho * distance) / float(albedoSize);
-            float lod = 0.0;
-            if (texel > 1e-20)
-                lod = log2(max(footprint / texel, 1e-20));
-            float mipMax = log2(float(albedoSize));
-            alb = far_cube(map, bodyDir, clamp(lod, 0.0, mipMax));
-        }
-    }
-    float3 lit = far_lit(alb, bestN, ray, air, rho, false, false);
-    float3 shaded = lit;
-    if (frame.horizon.w > 0.0)
-    {
-        float fog = 1.0 - exp(-t * distance * frame.horizon.w);
-        shaded = lerp(lit, inscatter, fog);
-    }
-    float airThick = farTable[0].body[i].albedo1.w;
-    float trans = 1.0;
-    float facing = dot(ray, center);
-    if (airThick > 0.0 && distance > 0.0)
-    {
-        float rSurf = length(ray * t - center);
-        float outer = rSurf + airThick / distance;
-        float tEnter;
-        float tExit;
-        if (far_sphere_roots(facing, outer, tEnter, tExit))
-        {
-            float chord = (t - max(tEnter, 0.0)) * distance;
-            if (chord > 0.0)
-                trans = exp(-FAR_AIR_K * chord / airThick);
-        }
-    }
-    float3 col = shaded;
-    if (trans < 1.0)
-    {
-        float flip = frame.light.w * 2.0 - 1.0;
-        float3 approach = ray * facing - center;
-        float3 radial = ray * t - center;
-        float3 limbN = dot(approach, approach) > 1e-16
-            ? normalize(approach)
-            : (dot(radial, radial) > 1e-16 ? normalize(radial) : -ray);
-        float daylight = saturate(dot(limbN, frame.sun_dir_elev.xyz) * flip);
-        col = shaded * trans + air * (1.0 - trans) * daylight;
-    }
-    return col;
-}
-
-// Mapped miss-ray limb. Same formula as the mapped arm of far_add_rgb,
-// including a second chord after the gate chord in the caller.
-float3 far_limb_mapped(float3 ray, uint i)
-{
-    float4 dirRho = farTable[0].body[i].dir_rho;
-    float rho = dirRho.w;
-    float3 center = dirRho.xyz;
-    float3 air = farTable[0].body[i].atmosphere.rgb;
-    float distance = farTable[0].body[i].albedo2.w;
-    float facing = dot(ray, center);
-    uint mapPlus = farTable[0].body[i].seed.z;
-    float airThick = farTable[0].body[i].albedo1.w;
-    if (far_map_bad(mapPlus, distance))
-        return float3(0.0, 0.0, 0.0);
-    uint map = mapPlus - 1u;
-    float4 rot = farTable[0].body[i].rot;
-    float chord = far_mapped_air_chord(ray, center, rho, distance, rot, map, airThick);
-    if (!(chord > 0.0))
-        return float3(0.0, 0.0, 0.0);
-    float trans = exp(-FAR_AIR_K * chord / airThick);
-    float3 approach = ray * facing - center;
-    float3 limbN = dot(approach, approach) > 1e-16 ? normalize(approach) : -ray;
-    float flip = frame.light.w * 2.0 - 1.0;
-    float daylight = saturate(dot(limbN, frame.sun_dir_elev.xyz) * flip);
-    return air * ((1.0 - trans) * frame.light.rgb * daylight);
 }
 
 // xyz is the shaded surface, or the limb (zero when the ray misses the air).
@@ -1857,25 +1870,7 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
 #endif
 #ifndef FAR_NO_MAPPED
     if (mapped)
-    {
-        uint mapPlus = farTable[0].body[i].seed.z;
-        float airThick = farTable[0].body[i].albedo1.w;
-        if (far_map_bad(mapPlus, distance))
-            return float3(0.0, 0.0, 0.0);
-        uint map = mapPlus - 1u;
-        float4 rot = farTable[0].body[i].rot;
-        // Air the ray actually crosses, in world units. Not a pixel-widened
-        // sphere: the denominator is the shell thickness. Daylight follows
-        // far_lit.
-        float chord = far_mapped_air_chord(ray, center, rho, distance, rot, map, airThick);
-        if (!(chord > 0.0))
-            return float3(0.0, 0.0, 0.0);
-        float trans = exp(-FAR_AIR_K * chord / airThick);
-        float3 approach = ray * facing - center;
-        float3 limbN = dot(approach, approach) > 1e-16 ? normalize(approach) : -ray;
-        float daylight = saturate(dot(limbN, frame.sun_dir_elev.xyz) * flip);
-        return air * ((1.0 - trans) * frame.light.rgb * daylight);
-    }
+        return far_limb_mapped(ray, i);
 #endif
 #ifndef FAR_NO_CUBE
     float rhoRim = rho * 1.035 + px * 0.5;
@@ -1902,10 +1897,9 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
 // world depth `t * distance` and rims and point blobs by `facing * distance`;
 // the normalised `t` is kept for shading. The inner sphere's far wall is the
 // background; anything with a smaller world depth composites over it. A mapped
-// body is kind 4: one shade without the fresnel air rim, then the terrain fog
-// in place of far_through_air, then the air shell along the view chord above
-// the hit. Its miss-ray limb is the air that ray crosses, and nothing when
-// the eye is already inside that air. Not the hi sphere.
+// body is kind 4, shaded by far_shade_mapped. Its miss-ray limb is
+// far_limb_mapped: the air that ray crosses, and nothing when the eye is
+// already inside that air. Not the hi sphere.
 //
 // Pass 2 accumulates those additive rims and blobs. Each body emits at most
 // one term. Pass 1 sets the body's `addMask` bit when the term passes its
@@ -2174,92 +2168,12 @@ float3 far_bodies(float3 ray, float3 col, float px, float2 pix)
         if (bestKind == 4u)
         {
 #ifndef FAR_NO_MAPPED
-            // Terrain fog, the same factor mesh3d applies, replaces far_through_air.
-            uint mapPlus = farTable[0].body[bestI].seed.z;
-            float distance = farTable[0].body[bestI].albedo2.w;
-            // The normal runs before air, inscatter and the kept body point
-            // exist, so those vectors are not live inside the chart derivative.
-            float4 rot = farTable[0].body[bestI].rot;
-            float3 uN;
-            {
-                float3 center = farTable[0].body[bestI].dir_rho.xyz;
-                float3 bodyP = far_inv_rotate(rot, ray * bestT - center);
-                float radN = length(bodyP);
-                uN = radN > 1e-8 ? bodyP / radN : float3(0.0, 1.0, 0.0);
-            }
-            uint mapN = (mapPlus >= 1u && mapPlus <= MAX_FAR_MAPS) ? mapPlus - 1u : 0u;
-            bestN = far_mapped_normal(rot, uN, rho, distance, mapN);
-            float3 center = farTable[0].body[bestI].dir_rho.xyz;
-            float3 bodyP = far_inv_rotate(rot, ray * bestT - center);
-            float3 air = farTable[0].body[bestI].atmosphere.rgb;
-            float3 inscatter = sky_radiance(ray, frame);
-            float3 alb = far_face(bestI, bestFace);
-            if (mapPlus >= 1u && mapPlus <= MAX_FAR_MAPS)
-            {
-                uint map = mapPlus - 1u;
-                uint landed = farMaps[map * FAR_MAP_HEADER_STRIDE + 4u];
-                uint albedoSize = farMaps[map * FAR_MAP_HEADER_STRIDE + 5u];
-                if (albedoSize != 0u && (landed & (1u << bestFace)) != 0u)
-                {
-                    float rad = length(bodyP);
-                    float3 bodyDir = rad > 1e-8 ? bodyP / rad : float3(0.0, 1.0, 0.0);
-                    // Footprint of this pixel on the surface. A graze stretches
-                    // it by 1/|ray·n|; the floor keeps a silhouette finite.
-                    // Texel is the face-centre size, (π/2 R) / albedo edge.
-                    float ndot = abs(dot(ray, bestN));
-                    if (ndot < 0.05)
-                        ndot = 0.05;
-                    float footprint = px * bestT * distance / ndot;
-                    float texel = (1.5707963267948966 * rho * distance) / float(albedoSize);
-                    float lod = 0.0;
-                    if (texel > 1e-20)
-                        lod = log2(max(footprint / texel, 1e-20));
-                    float mipMax = log2(float(albedoSize));
-                    alb = far_cube(map, bodyDir, clamp(lod, 0.0, mipMax));
-                }
-            }
-            float3 lit = far_lit(alb, bestN, ray, air, rho, false, false);
-            float3 shaded = lit;
-            if (frame.horizon.w > 0.0)
-            {
-                float fog = 1.0 - exp(-bestT * distance * frame.horizon.w);
-                shaded = lerp(lit, inscatter, fog);
-            }
-            // Air shell on the sphere of radius r_s(hit) + air. The chord is
-            // the view segment inside that shell, in world units (0 when the
-            // ray never enters). Daylight matches the mapped limb.
-            float airThick = farTable[0].body[bestI].albedo1.w;
-            float trans = 1.0;
-            float facing = dot(ray, center);
-            if (airThick > 0.0 && distance > 0.0)
-            {
-                float rSurf = length(ray * bestT - center);
-                float outer = rSurf + airThick / distance;
-                float tEnter;
-                float tExit;
-                if (far_sphere_roots(facing, outer, tEnter, tExit))
-                {
-                    float chord = (bestT - max(tEnter, 0.0)) * distance;
-                    if (chord > 0.0)
-                        trans = exp(-FAR_AIR_K * chord / airThick);
-                }
-            }
-            col = shaded;
-            if (trans < 1.0)
-            {
-                float3 approach = ray * facing - center;
-                float3 radial = ray * bestT - center;
-                float3 limbN = dot(approach, approach) > 1e-16
-                    ? normalize(approach)
-                    : (dot(radial, radial) > 1e-16 ? normalize(radial) : -ray);
-                float daylight = saturate(dot(limbN, frame.sun_dir_elev.xyz) * flip);
-                col = shaded * trans + air * (1.0 - trans) * daylight;
-            }
+            col = far_shade_mapped(ray, px, bestI, bestT, bestFace);
 #endif
         }
         else
         {
-            // Reloaded here so the mapped normal above does not carry them.
+            // Reloaded here so the mapped shade above does not carry them.
             float3 center = farTable[0].body[bestI].dir_rho.xyz;
             float4 rot = farTable[0].body[bestI].rot;
             float3 air = farTable[0].body[bestI].atmosphere.rgb;
