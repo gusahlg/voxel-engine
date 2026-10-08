@@ -4,6 +4,7 @@ use super::buffers::MESH_FLAG_FACE_RUNS;
 use super::buffers::{DrawIndexedIndirect, MeshRecord};
 use super::pipeline::EyeSplit;
 use crate::camera::Frustum;
+use crate::switches::{Switch, parse_or};
 
 /// Camera emission groups, in partition-table order. Mirrored by cull.comp.slang.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,11 +114,12 @@ fn lod_aabb_inside_box(mn: [f32; 3], mx: [f32; 3], centre: [f32; 3], half: [f32;
 /// `VOXEL_LOD_BUCKET_SCALE` when it parses as a finite positive float,
 /// otherwise [`DEFAULT_LOD_BUCKET_SCALE`]. Read once.
 pub(crate) fn lod_bucket_scale() -> f32 {
-    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *SCALE.get_or_init(|| {
-        parse_lod_bucket_scale(std::env::var("VOXEL_LOD_BUCKET_SCALE").ok().as_deref())
-    })
+    VOXEL_LOD_BUCKET_SCALE.get()
 }
+
+/// Read by [`lod_bucket_scale`].
+pub(crate) static VOXEL_LOD_BUCKET_SCALE: Switch<f32> =
+    Switch::new("VOXEL_LOD_BUCKET_SCALE", parse_lod_bucket_scale);
 
 fn parse_lod_bucket_scale(raw: Option<&str>) -> f32 {
     raw.and_then(|s| s.parse().ok())
@@ -186,12 +188,17 @@ fn distance_bucket_sq(d2: f32, edge_sq: [f32; 3]) -> u32 {
     u32::from(d2 >= edge_sq[0]) + u32::from(d2 >= edge_sq[1]) + u32::from(d2 >= edge_sq[2])
 }
 
+/// `VOXEL_CPU_CULL_MAX` when it parses as a `u32`, otherwise
+/// [`CPU_CULL_MAX`]. Read once; [`FaceCull::resolve`] calls this every frame.
+///
+/// [`FaceCull::resolve`]: super::cull::FaceCull::resolve
 pub(crate) fn cpu_cull_max() -> u32 {
-    std::env::var("VOXEL_CPU_CULL_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(CPU_CULL_MAX)
+    VOXEL_CPU_CULL_MAX.get()
 }
+
+/// Read by [`cpu_cull_max`].
+pub(crate) static VOXEL_CPU_CULL_MAX: Switch<u32> =
+    Switch::new("VOXEL_CPU_CULL_MAX", |raw| parse_or(raw, CPU_CULL_MAX));
 
 /// P-vertex test matching `outside_plane` in `cull.comp.slang` and
 /// [`Frustum::intersects_aabb`]. Branch-free: `max(n·mn, n·mx)` selects the

@@ -44,6 +44,7 @@ use super::mesh_staging::{StagingRegion, StagingRing, Stamp, sysmem_staging_type
 use super::pass;
 use super::timeline::{Timeline, TimelineValue};
 use super::transfer::{BatchRing, LaneRecording, Tier};
+use crate::switches::{Switch, mib_or};
 
 /// In-flight GPU job cap on the dedicated / second-queue tiers.
 pub(crate) const MAX_IN_FLIGHT: usize = 32;
@@ -197,27 +198,22 @@ impl ComputeDesc<'_> {
     }
 }
 
-pub(crate) fn parse_mb(s: &str) -> Option<u64> {
-    let mb: u64 = s.trim().parse().ok()?;
-    Some(mb.saturating_mul(1 << 20))
-}
-
-fn ring_bytes(env: &str, default: u64) -> u64 {
-    match std::env::var(env) {
-        Ok(s) => parse_mb(&s).unwrap_or_else(|| {
-            log::warn!("invalid {env}={s:?}; using {} MiB", default / (1 << 20));
-            default
-        }),
-        Err(_) => default,
-    }
-}
+/// Read by [`compute_input_bytes`]. An invalid value warns and keeps
+/// [`COMPUTE_INPUT_BYTES`].
+pub(crate) static VOXEL_COMPUTE_INPUT_MB: Switch<u64> =
+    Switch::new(INPUT_ENV, |raw| mib_or(INPUT_ENV, raw, COMPUTE_INPUT_BYTES));
+/// Read by [`compute_readback_bytes`]. An invalid value warns and keeps
+/// [`COMPUTE_READBACK_BYTES`].
+pub(crate) static VOXEL_COMPUTE_READBACK_MB: Switch<u64> = Switch::new(READBACK_ENV, |raw| {
+    mib_or(READBACK_ENV, raw, COMPUTE_READBACK_BYTES)
+});
 
 pub(crate) fn compute_input_bytes() -> u64 {
-    ring_bytes(INPUT_ENV, COMPUTE_INPUT_BYTES)
+    VOXEL_COMPUTE_INPUT_MB.get()
 }
 
 pub(crate) fn compute_readback_bytes() -> u64 {
-    ring_bytes(READBACK_ENV, COMPUTE_READBACK_BYTES)
+    VOXEL_COMPUTE_READBACK_MB.get()
 }
 
 /// How many of `costs_us` (queue order) fit in `budget_us`.
@@ -1828,11 +1824,15 @@ mod tests {
 
     #[test]
     fn parse_compute_mb_env() {
-        assert_eq!(parse_mb("16"), Some(16 << 20));
-        assert_eq!(parse_mb(" 32 "), Some(32 << 20));
-        assert_eq!(parse_mb("0"), Some(0));
-        assert_eq!(parse_mb(""), None);
-        assert_eq!(parse_mb("nope"), None);
+        let input = &VOXEL_COMPUTE_INPUT_MB;
+        let readback = &VOXEL_COMPUTE_READBACK_MB;
+        assert_eq!(input.parse(None), COMPUTE_INPUT_BYTES);
+        assert_eq!(input.parse(Some("16")), 16 << 20);
+        assert_eq!(input.parse(Some(" 32 ")), 32 << 20);
+        assert_eq!(input.parse(Some("0")), 0);
+        assert_eq!(input.parse(Some("")), COMPUTE_INPUT_BYTES);
+        assert_eq!(readback.parse(None), COMPUTE_READBACK_BYTES);
+        assert_eq!(readback.parse(Some("nope")), COMPUTE_READBACK_BYTES);
     }
 
     #[test]

@@ -33,6 +33,8 @@
 use ash::vk;
 use glam::{DMat4, DVec3, Mat4, Vec2};
 
+use crate::switches::{Switch, parse_or};
+
 use super::image::{
     AllocError, ImageDesc, ImageResource, LayoutUse, create_image_array, image_purpose,
 };
@@ -103,13 +105,15 @@ const DEFAULT_MOTION_BOOST: f32 = 1.0;
 /// Override with `VOXEL_TAA_MOTION_PX`.
 const DEFAULT_MOTION_PX: f32 = 8.0;
 
-fn parse_f32_or(raw: Option<&str>, default: f32) -> f32 {
-    raw.and_then(|s| s.parse().ok()).unwrap_or(default)
-}
-
-fn env_f32(name: &str, default: f32) -> f32 {
-    parse_f32_or(std::env::var(name).ok().as_deref(), default)
-}
+/// [`DEFAULT_MOTION_BOOST`] unless set to an `f32`.
+pub(crate) static VOXEL_TAA_MOTION_BOOST: Switch<f32> =
+    Switch::new("VOXEL_TAA_MOTION_BOOST", |raw| {
+        parse_or(raw, DEFAULT_MOTION_BOOST)
+    });
+/// [`DEFAULT_MOTION_PX`] unless set to an `f32`.
+pub(crate) static VOXEL_TAA_MOTION_PX: Switch<f32> = Switch::new("VOXEL_TAA_MOTION_PX", |raw| {
+    parse_or(raw, DEFAULT_MOTION_PX)
+});
 
 /// Camera of the frame being presented, used to compose the reprojection
 /// matrix against the previously *presented* camera.
@@ -222,8 +226,8 @@ impl TaaState {
             extent: swapchain_extent,
             valid: false,
             prev: None,
-            motion_boost: env_f32("VOXEL_TAA_MOTION_BOOST", DEFAULT_MOTION_BOOST),
-            motion_px: env_f32("VOXEL_TAA_MOTION_PX", DEFAULT_MOTION_PX),
+            motion_boost: VOXEL_TAA_MOTION_BOOST.get(),
+            motion_px: VOXEL_TAA_MOTION_PX.get(),
         })
     }
 
@@ -521,11 +525,14 @@ mod tests {
 
     #[test]
     fn motion_env_parse_f32_ignores_invalid() {
-        assert_eq!(parse_f32_or(None, 1.0), 1.0);
-        assert_eq!(parse_f32_or(Some("4.0"), 1.0), 4.0);
-        assert_eq!(parse_f32_or(Some("8"), 1.0), 8.0);
-        assert_eq!(parse_f32_or(Some("nope"), 1.0), 1.0);
-        assert_eq!(parse_f32_or(Some(""), 8.0), 8.0);
-        assert_eq!(parse_f32_or(Some("  "), 8.0), 8.0);
+        let boost = &VOXEL_TAA_MOTION_BOOST;
+        let px = &VOXEL_TAA_MOTION_PX;
+        assert_eq!(boost.parse(None), 1.0);
+        assert_eq!(boost.parse(Some("4.0")), 4.0);
+        assert_eq!(boost.parse(Some("8")), 8.0);
+        assert_eq!(boost.parse(Some("nope")), 1.0);
+        assert_eq!(px.parse(None), 8.0);
+        assert_eq!(px.parse(Some("")), 8.0);
+        assert_eq!(px.parse(Some("  ")), 8.0);
     }
 }

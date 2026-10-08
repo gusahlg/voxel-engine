@@ -4,6 +4,7 @@
 use ash::vk;
 
 use crate::skeleton::FrameSlot;
+use crate::switches::{Switch, parse_or};
 
 use super::Renderer;
 use super::buffers::{FRAMES_IN_FLIGHT, SUBMIT_BATCH_MAX};
@@ -113,28 +114,25 @@ impl GpuBoundState {
 /// to `1..=FRAMES_IN_FLIGHT-1` so the ring always has a free slot. Read once
 /// at renderer creation.
 pub(crate) fn submit_batch_limit() -> usize {
-    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        let parsed = std::env::var("VOXEL_SUBMIT_BATCH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(SUBMIT_BATCH_MAX);
-        parsed.clamp(1, FRAMES_IN_FLIGHT as usize - 1)
-    })
+    VOXEL_SUBMIT_BATCH.get()
 }
+
+/// Read by [`submit_batch_limit`].
+pub(crate) static VOXEL_SUBMIT_BATCH: Switch<usize> = Switch::new("VOXEL_SUBMIT_BATCH", |raw| {
+    parse_or(raw, SUBMIT_BATCH_MAX).clamp(1, FRAMES_IN_FLIGHT as usize - 1)
+});
 
 /// Slot-wait duration that enables eager flush. `VOXEL_EAGER_FLUSH_US` if
 /// set and parseable, otherwise [`EAGER_FLUSH_WAIT_US`]. Read once.
 fn eager_flush_wait() -> std::time::Duration {
-    static THRESHOLD: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        let us = std::env::var("VOXEL_EAGER_FLUSH_US")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(EAGER_FLUSH_WAIT_US);
-        std::time::Duration::from_micros(us)
-    })
+    VOXEL_EAGER_FLUSH_US.get()
 }
+
+/// Read by [`eager_flush_wait`].
+pub(crate) static VOXEL_EAGER_FLUSH_US: Switch<std::time::Duration> =
+    Switch::new("VOXEL_EAGER_FLUSH_US", |raw| {
+        std::time::Duration::from_micros(parse_or(raw, EAGER_FLUSH_WAIT_US))
+    });
 
 impl Renderer {
     /// Empty command-buffer submit used by `VOXEL_BENCH_EMPTY=K`: wait the slot,
