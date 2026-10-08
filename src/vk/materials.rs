@@ -7,11 +7,10 @@
 
 use ash::vk;
 
-use super::alloc::create_buffer;
-use super::buffers::RetireQueue;
-use super::mesh_residency::{CopyBarrier, copy_barrier};
+use super::alloc::{create_buffer, create_filled_staging};
+use super::mesh_residency::{CopyBarrier, CopyConsumer, copy_barrier};
 use super::timeline::{Timeline, TimelineValue};
-use super::transfer::TransferLane;
+use super::transfer::{TransferCtx, TransferLane, UploadRetire};
 use crate::material::{
     MATERIAL_DESC_CAPACITY, MaterialDesc, default_material_table, write_material_append,
     write_material_set,
@@ -21,29 +20,14 @@ use crate::material::{
 pub(crate) const MATERIAL_CONSUMER_STAGES: vk::PipelineStageFlags2 =
     vk::PipelineStageFlags2::FRAGMENT_SHADER;
 
+/// Copy-barrier consumer of the table: fragment-shader storage reads.
+const MATERIAL_CONSUMER: CopyConsumer = (
+    MATERIAL_CONSUMER_STAGES,
+    vk::AccessFlags2::SHADER_STORAGE_READ,
+);
+
 const ENTRY_BYTES: u64 = size_of::<MaterialDesc>() as u64;
 const TABLE_BYTES: u64 = MATERIAL_DESC_CAPACITY as u64 * ENTRY_BYTES;
-
-fn material_reads() -> vk::AccessFlags2 {
-    vk::AccessFlags2::SHADER_STORAGE_READ
-}
-
-/// Shader-storage copy barrier: same pairings as [`copy_barrier`] but the
-/// consumer is the fragment shader, not vertex input.
-fn material_copy_barrier(
-    buffer: vk::Buffer,
-    offset: u64,
-    size: u64,
-    role: CopyBarrier,
-) -> vk::BufferMemoryBarrier2<'static> {
-    let b = copy_barrier(buffer, offset, size, material_reads(), role);
-    match role {
-        CopyBarrier::Draw | CopyBarrier::Acquire { .. } => b
-            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .dst_access_mask(material_reads()),
-        CopyBarrier::Release { .. } => b,
-    }
-}
 
 pub(crate) struct MaterialTable {
     buffer: vk::Buffer,
@@ -52,10 +36,7 @@ pub(crate) struct MaterialTable {
     used: usize,
     pending_lo: u32,
     pending_hi: u32,
-    command_pool: vk::CommandPool,
-    staging_retire: RetireQueue<(vk::Buffer, vk::DeviceMemory)>,
-    transfer_retire: RetireQueue<(vk::Buffer, vk::DeviceMemory)>,
-    release_cmds: RetireQueue<(Timeline, vk::CommandBuffer)>,
+    retire: UploadRetire,
 }
 
 impl MaterialTable {
@@ -89,10 +70,7 @@ impl MaterialTable {
             used: 0,
             pending_lo: 0,
             pending_hi: MATERIAL_DESC_CAPACITY as u32,
-            command_pool,
-            staging_retire: RetireQueue::new(),
-            transfer_retire: RetireQueue::new(),
-            release_cmds: RetireQueue::new(),
+            retire: UploadRetire::new(command_pool, "material-desc"),
         };
         unsafe {
             table.upload_blocking(
@@ -124,9 +102,7 @@ impl MaterialTable {
     }
 
     pub fn has_garbage(&self) -> bool {
-        !self.staging_retire.is_empty()
-            || !self.transfer_retire.is_empty()
-            || !self.release_cmds.is_empty()
+        self.retire.has_garbage()
     }
 
     /// Replace the whole table (index = layer id). Unused tail returns to
@@ -176,20 +152,7 @@ impl MaterialTable {
 
     /// Record a pending range copy on the transfer lane (or the frame
     /// command buffer on `SameQueueFallback`). No host wait.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn flush(
-        &mut self,
-        instance: &ash::Instance,
-        device: &ash::Device,
-        physical: vk::PhysicalDevice,
-        lane: &mut TransferLane,
-        graphics_cmd: vk::CommandBuffer,
-        graphics_queue: vk::Queue,
-        graphics_family: u32,
-        graphics_timeline: &Timeline,
-        last_render_value: TimelineValue,
-        done_at: TimelineValue,
-    ) -> Option<TimelineValue> {
+    pub unsafe fn flush(&mut self, ctx: &mut TransferCtx<'_>) -> Option<TimelineValue> {
         if self.pending_lo >= self.pending_hi {
             return None;
         }
@@ -198,38 +161,50 @@ impl MaterialTable {
         self.pending_lo = 0;
         self.pending_hi = 0;
 
+        let device = ctx.device;
+        let graphics_cmd = ctx.graphics_cmd;
+        let graphics_family = ctx.graphics_family;
         let offset = u64::from(lo) * ENTRY_BYTES;
         let size = u64::from(hi - lo) * ENTRY_BYTES;
         let bytes = bytemuck::cast_slice(&self.cpu[lo as usize..hi as usize]);
-        let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
-        let (staging, staging_mem) = fill_staging(device, &memory_props, bytes);
+        let (staging, staging_mem) =
+            create_filled_staging(device, &ctx.memory_props(), bytes, "material desc staging");
 
-        let separate_queue = lane.is_separate_queue();
-        let needs_qfot = lane.needs_ownership_transfer();
+        let separate_queue = ctx.lane.is_separate_queue();
+        let needs_qfot = ctx.lane.needs_ownership_transfer();
         let buffer = self.buffer;
 
         let extra_wait = if needs_qfot {
+            // Release the range earlier frames read so the lane can acquire it.
+            let release = [vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)
+                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                .dst_access_mask(vk::AccessFlags2::NONE)
+                .src_queue_family_index(graphics_family)
+                .dst_queue_family_index(ctx.lane.family())
+                .buffer(buffer)
+                .offset(offset)
+                .size(size)];
             Some(unsafe {
-                self.submit_overwrite_release(
+                self.retire.submit_release(
                     device,
-                    graphics_queue,
-                    graphics_family,
-                    lane.family(),
-                    done_at,
-                    offset,
-                    size,
+                    ctx.graphics_queue,
+                    ctx.done_at,
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&release),
                 )
             })
         } else if separate_queue {
             Some((
-                graphics_timeline.semaphore(),
-                last_render_value,
+                ctx.graphics_timeline.semaphore(),
+                ctx.last_render_value,
                 vk::PipelineStageFlags2::FRAGMENT_SHADER,
             ))
         } else {
             None
         };
 
+        let lane = &mut *ctx.lane;
         let lane_batch = separate_queue.then(|| unsafe { lane.begin(device) });
         let record_cmd = lane_batch.as_ref().map_or(graphics_cmd, |b| b.cmd());
 
@@ -272,10 +247,11 @@ impl MaterialTable {
 
         if let Some(lane_batch) = lane_batch {
             let release = needs_qfot.then(|| {
-                material_copy_barrier(
+                copy_barrier(
                     buffer,
                     offset,
                     size,
+                    MATERIAL_CONSUMER,
                     CopyBarrier::Release {
                         src_family: lane.family(),
                         dst_family: graphics_family,
@@ -293,10 +269,11 @@ impl MaterialTable {
             }
             let value = unsafe { lane.submit_after(device, lane_batch, extra_wait) };
             if needs_qfot {
-                let acquire = [material_copy_barrier(
+                let acquire = [copy_barrier(
                     buffer,
                     offset,
                     size,
+                    MATERIAL_CONSUMER,
                     CopyBarrier::Acquire {
                         src_family: lane.family(),
                         dst_family: graphics_family,
@@ -309,13 +286,14 @@ impl MaterialTable {
                     );
                 }
             }
-            self.transfer_retire.push(value, (staging, staging_mem));
+            self.retire.retire_on_lane(value, (staging, staging_mem));
             Some(value)
         } else {
-            let to_shader = [material_copy_barrier(
+            let to_shader = [copy_barrier(
                 buffer,
                 offset,
                 size,
+                MATERIAL_CONSUMER,
                 CopyBarrier::Draw,
             )];
             unsafe {
@@ -324,65 +302,10 @@ impl MaterialTable {
                     &vk::DependencyInfo::default().buffer_memory_barriers(&to_shader),
                 );
             }
-            self.staging_retire.push(done_at, (staging, staging_mem));
+            self.retire
+                .retire_on_graphics(ctx.done_at, (staging, staging_mem));
             None
         }
-    }
-
-    /// Dedicated-family overwrite: release the sampled range on graphics so
-    /// the transfer queue can acquire it. Submitted (not host-waited) after
-    /// in-flight frames that read the table.
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn submit_overwrite_release(
-        &mut self,
-        device: &ash::Device,
-        graphics_queue: vk::Queue,
-        graphics_family: u32,
-        transfer_family: u32,
-        done_at: TimelineValue,
-        offset: u64,
-        size: u64,
-    ) -> (vk::Semaphore, TimelineValue, vk::PipelineStageFlags2) {
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmd = unsafe {
-            device
-                .allocate_command_buffers(&alloc)
-                .expect("Failed to allocate material-desc release command buffer")[0]
-        };
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe {
-            device
-                .begin_command_buffer(cmd, &begin)
-                .expect("Failed to begin material-desc release command buffer");
-            let release = [vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)
-                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                .dst_access_mask(vk::AccessFlags2::NONE)
-                .src_queue_family_index(graphics_family)
-                .dst_queue_family_index(transfer_family)
-                .buffer(self.buffer)
-                .offset(offset)
-                .size(size)];
-            device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().buffer_memory_barriers(&release),
-            );
-            device
-                .end_command_buffer(cmd)
-                .expect("Failed to end material-desc release command buffer");
-        }
-        let mut tmp = unsafe { Timeline::new(device) };
-        let rs = tmp.begin_render(cmd);
-        let completion = unsafe { rs.submit(device, graphics_queue, &tmp, None) };
-        let sem = tmp.semaphore();
-        let value = completion.value();
-        self.release_cmds.push(done_at, (tmp, cmd));
-        (sem, value, vk::PipelineStageFlags2::COPY)
     }
 
     /// Init-time full-table copy; host-waits the transfer (OnceBeforeUse).
@@ -399,7 +322,8 @@ impl MaterialTable {
     ) {
         let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
         let bytes: &[u8] = bytemuck::cast_slice(&self.cpu);
-        let (staging, staging_mem) = fill_staging(device, &memory_props, bytes);
+        let (staging, staging_mem) =
+            create_filled_staging(device, &memory_props, bytes, "material desc staging");
         let separate_queue = lane.is_separate_queue();
         let needs_qfot = lane.needs_ownership_transfer();
         let buffer = self.buffer;
@@ -442,10 +366,11 @@ impl MaterialTable {
             let region = vk::BufferCopy::default().size(TABLE_BYTES);
             device.cmd_copy_buffer(copy_cmd, staging, buffer, &[region]);
             if needs_qfot {
-                let release = [material_copy_barrier(
+                let release = [copy_barrier(
                     buffer,
                     0,
                     TABLE_BYTES,
+                    MATERIAL_CONSUMER,
                     CopyBarrier::Release {
                         src_family: lane.family(),
                         dst_family: graphics_family,
@@ -456,10 +381,11 @@ impl MaterialTable {
                     &vk::DependencyInfo::default().buffer_memory_barriers(&release),
                 );
             } else if !separate_queue {
-                let to_shader = [material_copy_barrier(
+                let to_shader = [copy_barrier(
                     buffer,
                     0,
                     TABLE_BYTES,
+                    MATERIAL_CONSUMER,
                     CopyBarrier::Draw,
                 )];
                 device.cmd_pipeline_barrier2(
@@ -487,10 +413,11 @@ impl MaterialTable {
                         device
                             .begin_command_buffer(acquire_cmd, &begin)
                             .expect("Failed to begin material-desc acquire command buffer");
-                        let acquire = [material_copy_barrier(
+                        let acquire = [copy_barrier(
                             buffer,
                             0,
                             TABLE_BYTES,
+                            MATERIAL_CONSUMER,
                             CopyBarrier::Acquire {
                                 src_family: lane.family(),
                                 dst_family: graphics_family,
@@ -544,76 +471,37 @@ impl MaterialTable {
     }
 
     pub unsafe fn collect(&mut self, device: &ash::Device, current: TimelineValue) {
-        self.staging_retire
-            .collect(current, |(buffer, memory)| unsafe {
-                device.destroy_buffer(buffer, None);
-                device.free_memory(memory, None);
-            });
-        let pool = self.command_pool;
-        self.release_cmds
-            .collect(current, |(timeline, cmd)| unsafe {
-                timeline.destroy(device);
-                device.free_command_buffers(pool, &[cmd]);
-            });
+        unsafe { self.retire.collect(device, current) };
     }
 
     pub unsafe fn collect_transfer(&mut self, device: &ash::Device, current: TimelineValue) {
-        self.transfer_retire
-            .collect(current, |(buffer, memory)| unsafe {
-                device.destroy_buffer(buffer, None);
-                device.free_memory(memory, None);
-            });
+        unsafe { self.retire.collect_transfer(device, current) };
     }
 
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe {
-            self.staging_retire.collect_all(|(buffer, memory)| {
-                device.destroy_buffer(buffer, None);
-                device.free_memory(memory, None);
-            });
-            self.transfer_retire.collect_all(|(buffer, memory)| {
-                device.destroy_buffer(buffer, None);
-                device.free_memory(memory, None);
-            });
-            let pool = self.command_pool;
-            self.release_cmds.collect_all(|(timeline, cmd)| {
-                timeline.destroy(device);
-                device.free_command_buffers(pool, &[cmd]);
-            });
+            self.retire.destroy(device);
             device.destroy_buffer(self.buffer, None);
             device.free_memory(self.memory, None);
         }
     }
 }
 
-fn fill_staging(
-    device: &ash::Device,
-    memory_props: &vk::PhysicalDeviceMemoryProperties,
-    bytes: &[u8],
-) -> (vk::Buffer, vk::DeviceMemory) {
-    let size = (bytes.len() as u64).max(1);
-    let (staging, memory) = create_buffer(
-        device,
-        memory_props,
-        size,
-        vk::BufferUsageFlags::TRANSFER_SRC,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        "material desc staging",
-    );
-    unsafe {
-        let ptr = device
-            .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-            .expect("Failed to map material-desc staging memory");
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
-        device.unmap_memory(memory);
-    }
-    (staging, memory)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::material::MATERIAL_FLAG_PROCEDURAL;
+
+    #[test]
+    fn copy_consumer_is_fragment_storage_reads() {
+        assert_eq!(
+            MATERIAL_CONSUMER,
+            (
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_STORAGE_READ,
+            )
+        );
+    }
 
     #[test]
     fn table_bytes_are_256_kib() {

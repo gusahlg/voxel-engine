@@ -816,6 +816,36 @@ pub(crate) fn create_buffer(
     })
 }
 
+/// One-off `TRANSFER_SRC` staging buffer in host-visible, host-coherent
+/// memory holding `bytes`. Never zero-sized: empty `bytes` get a 1-byte
+/// buffer that is left unwritten. The caller destroys it once the copy that
+/// reads it has completed.
+pub(crate) fn create_filled_staging(
+    device: &ash::Device,
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    bytes: &[u8],
+    purpose: &str,
+) -> (vk::Buffer, vk::DeviceMemory) {
+    let (buffer, memory) = create_buffer(
+        device,
+        memory_props,
+        (bytes.len() as u64).max(1),
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        purpose,
+    );
+    if !bytes.is_empty() {
+        unsafe {
+            let ptr = device
+                .map_memory(memory, 0, bytes.len() as u64, vk::MemoryMapFlags::empty())
+                .unwrap_or_else(|e| panic!("map {purpose}: {e:?}"));
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+            device.unmap_memory(memory);
+        }
+    }
+    (buffer, memory)
+}
+
 pub(crate) fn create_mapped_buffer<T>(
     device: &ash::Device,
     memory_props: &vk::PhysicalDeviceMemoryProperties,
