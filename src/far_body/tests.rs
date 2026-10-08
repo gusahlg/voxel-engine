@@ -1,9 +1,6 @@
 use super::mirror::*;
 use super::*;
 
-/// The `src/vk/far_bodies.rs` tests import these fixtures through this path.
-pub(crate) use super::mirror::{home_datum, lowland_foot, mapped_limb_top_angle, ray_from_nadir};
-
 fn sphere_at(dir: Vec3, distance: f32, radius: f32, seed: u32) -> FarBody {
     FarBody {
         dir,
