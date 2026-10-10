@@ -11,20 +11,7 @@
 #include "common.slang"
 #include "cage.slang"
 
-// Mirrors vk::buffers::MeshRecord exactly (std430, 80 bytes).
-struct MeshRecord
-{
-    int3 block;
-    uint detail_pass; // [0:5] detail+bias, [5:7] pass
-    float3 local_off;
-    uint cage; // 0 = flat; else index into the cage table
-    float3 aabb_min;
-    uint index_count;
-    float3 aabb_max;
-    int vertex_offset;
-    uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
-    uint flags; // bit 0 = packed face-runs valid; clear → whole-mesh draw
-};
+#include "mesh_record.slang"
 
 // Mirrors vk::cull::PartitionGpu (std430).
 struct Partition

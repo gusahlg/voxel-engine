@@ -7,21 +7,7 @@ ConstantBuffer<FrameUniforms> frame;
 
 #include "lod_morph.slang"
 
-// Per-mesh record: mirrors mesh3d's MeshRecord exactly (std430, 80 bytes).
-// Changing the struct stride breaks instance offset calculation.
-struct MeshRecord
-{
-    int3 block;       // world-space origin
-    uint detail_pass; // [0:5] detail+bias, [5:7] pass
-    float3 local_off; // mover offset; zero for terrain
-    uint cage;        // 0 = flat; else index into the cage table
-    float3 aabb_min;
-    uint index_count;
-    float3 aabb_max;
-    int vertex_offset;
-    uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
-    uint flags; // bit 0 = packed face-runs valid (cull.comp)
-};
+#include "mesh_record.slang"
 
 [[vk::binding(0, 0)]]
 StructuredBuffer<MeshRecord> mesh_records;

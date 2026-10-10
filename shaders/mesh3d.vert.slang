@@ -17,20 +17,7 @@
 #include "cage.slang"
 #endif
 
-// Per-mesh placement record (std430, mirrors vk::buffers::MeshRecord, 80 bytes).
-struct MeshRecord
-{
-    int3 block;       // world-space origin
-    uint detail_pass; // [0:5] detail+bias, [5:7] pass
-    float3 local_off; // mover offset; zero for terrain
-    uint cage;        // 0 = flat; else index into the cage table
-    float3 aabb_min;
-    uint index_count;
-    float3 aabb_max;
-    int vertex_offset;
-    uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
-    uint flags; // bit 0 = packed face-runs valid (cull.comp)
-};
+#include "mesh_record.slang"
 
 // Per-mesh dynamic style (std430, mirrors vk::buffers::DrawDyn).
 struct DrawDyn
