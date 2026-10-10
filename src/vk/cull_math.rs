@@ -1,7 +1,7 @@
 use super::arena::ArenaDirectory;
 #[cfg(test)]
-use super::buffers::MESH_FLAG_FACE_RUNS;
-use super::buffers::{DrawIndexedIndirect, MeshRecord};
+use super::buffers::MeshRecord;
+use super::buffers::{DrawIndexedIndirect, MESH_FLAG_FACE_RUNS};
 use super::pipeline::EyeSplit;
 use crate::camera::Frustum;
 use crate::switches::{Switch, parse_or};
@@ -59,7 +59,10 @@ pub(crate) const WORKGROUP: u32 = crate::genconst::CULL_WORKGROUP;
 /// Profiling-only geometry histogram: per camera group `[draws, index_count]`.
 pub(crate) const STATS_COUNT: usize = CAMERA_GROUPS * 2;
 pub(crate) const STATS_BYTES: u64 = (STATS_COUNT * size_of::<u32>()) as u64;
-pub(crate) const FLAG_STATS: u32 = 1;
+/// Push-constant flag: fill the stats histogram.
+pub(crate) const FLAG_STATS: u32 = crate::genconst::CULL_FLAG_STATS;
+/// `CullParams.flags` bit: emit face runs.
+pub(crate) const FLAG_FACE_RUNS: u32 = crate::genconst::CULL_FLAG_FACE_RUNS;
 /// Live camera-group records at or below this count skip the GPU cull and
 /// emit the same commands on the CPU. Overridable via `VOXEL_CPU_CULL_MAX`.
 ///
@@ -70,10 +73,12 @@ const CPU_CULL_MAX: u32 = 1024;
 
 const _: () = assert!(crate::genconst::CULL_DISTANCE_BUCKETS == 4);
 const _: () = assert!(crate::genconst::CULL_CAMERA_GROUPS == CAMERA_GROUPS as u32);
+const _: () = assert!(Group::OpaqueLod as u32 == crate::genconst::CULL_OPAQUE_LOD_GROUP);
 const _: () = assert!(Group::Caged as u32 == crate::genconst::CULL_CAGED_GROUP);
 const _: () = assert!(Group::CagedLod as u32 == crate::genconst::CULL_CAGED_LOD_GROUP);
 const _: () = assert!(GROUPS == CAMERA_GROUPS + SHADOW_GROUPS);
 const _: () = assert!(Group::CagedLod as usize + 1 == CAMERA_GROUPS);
+const _: () = assert!(MESH_FLAG_FACE_RUNS == crate::genconst::MESH_FLAG_FACE_RUNS);
 
 /// Camera-group index. Caged draws take their own groups so the flat pipelines
 /// stay free of the bent varying.
@@ -275,10 +280,11 @@ fn flatten_part_cmds(
 #[cfg(test)]
 fn cam_relative_aabb(rec: &MeshRecord, eye: EyeSplit) -> ([f32; 3], [f32; 3], f32) {
     let scale = rec.detail_scale();
+    let r = eye.rel(rec.block);
     let offset = [
-        rec.block[0].wrapping_sub(eye.block[0]) as f32 - eye.frac[0] + rec.local_off[0],
-        rec.block[1].wrapping_sub(eye.block[1]) as f32 - eye.frac[1] + rec.local_off[1],
-        rec.block[2].wrapping_sub(eye.block[2]) as f32 - eye.frac[2] + rec.local_off[2],
+        r[0] + rec.local_off[0],
+        r[1] + rec.local_off[1],
+        r[2] + rec.local_off[2],
     ];
     (
         [
@@ -308,13 +314,6 @@ fn face_vis(mn: [f32; 3], mx: [f32; 3]) -> [bool; 6] {
         mx[2] > 0.0,
     ]
 }
-
-/// `|det|` at or below this fraction of the edge-length product (or of 1,
-/// when that product is smaller) is a singular frame: draw the mesh whole.
-/// `cage_direction_mask` in `cull.comp.slang` uses the same cutoff.
-const CAGE_DET_REL: f32 = 1e-8;
-/// Added to `2 * d`. Same literal as the cull shader.
-const CAGE_VIS_BIAS: f32 = 1e-3;
 
 /// The cull reads `vis` only; tests assert the rest.
 #[derive(Clone, Copy, Debug)]
@@ -364,17 +363,8 @@ fn len3(a: [f32; 3]) -> f32 {
 /// Camera-relative cage corners. `corners` are anchor-relative; the offset is
 /// the vertex shader's `(anchor − cam_block) − cam_frac`.
 #[inline(always)]
-fn cam_relative_corners(
-    corners: [[f32; 3]; 8],
-    anchor: [i32; 3],
-    eye_block: [i32; 3],
-    eye_frac: [f32; 3],
-) -> [[f32; 3]; 8] {
-    let d = [
-        anchor[0].wrapping_sub(eye_block[0]) as f32 - eye_frac[0],
-        anchor[1].wrapping_sub(eye_block[1]) as f32 - eye_frac[1],
-        anchor[2].wrapping_sub(eye_block[2]) as f32 - eye_frac[2],
-    ];
+fn cam_relative_corners(corners: [[f32; 3]; 8], anchor: [i32; 3], eye: EyeSplit) -> [[f32; 3]; 8] {
+    let d = eye.rel(anchor);
     std::array::from_fn(|i| {
         [
             corners[i][0] + d[0],
@@ -386,7 +376,8 @@ fn cam_relative_corners(
 
 /// Per-direction visibility of a caged mesh, or `None` when the affine frame
 /// is singular (draw the mesh whole). `corners` are camera-relative.
-/// Mirrors `cage_direction_mask` in `cull.comp.slang`.
+/// Mirrors `cage_direction_mask` in `cull.comp.slang`, with the same generated
+/// cutoff (`CULL_CAGE_DET_REL`) and margin bias (`CULL_CAGE_VIS_BIAS`).
 ///
 /// `E = [P1−P0, P2−P0, P4−P0]`, `t_cam = E⁻¹(−P0)`. A local +X face is
 /// front-facing when `t_cam.x` is past that face's parameter; testing the
@@ -403,7 +394,7 @@ fn cage_direction_vis(p: [[f32; 3]; 8]) -> Option<CageFaceVis> {
     let l1 = len3(e1);
     let l2 = len3(e2);
     let vol = l0 * l1 * l2;
-    if !(det.abs() > CAGE_DET_REL * vol.max(1.0)) {
+    if !(det.abs() > crate::genconst::CULL_CAGE_DET_REL * vol.max(1.0)) {
         return None;
     }
     let b = [-p[0][0], -p[0][1], -p[0][2]];
@@ -418,7 +409,7 @@ fn cage_direction_vis(p: [[f32; 3]; 8]) -> Option<CageFaceVis> {
         .max(err(6, add3(add3(p[0], e1), e2)))
         .max(err(7, add3(add3(p01, e1), e2)));
     let d = dev / min_edge;
-    let eps = 2.0 * d + CAGE_VIS_BIAS;
+    let eps = 2.0 * d + crate::genconst::CULL_CAGE_VIS_BIAS;
     Some(CageFaceVis {
         vis: [
             t_cam[0] > -eps,
@@ -446,7 +437,7 @@ fn packed_face_bounds(face_quads: [u32; 3]) -> [u32; 7] {
     b
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FaceRun {
     first_index: u32,
     index_count: u32,
@@ -482,21 +473,30 @@ fn merge_face_runs(vis: [bool; 6], bounds: [u32; 7], out: &mut [FaceRun; 3]) -> 
     n
 }
 
-#[cfg(test)]
-fn emit_cmd(
-    part: usize,
-    cmd: DrawIndexedIndirect,
-    partitions: &[PartitionGpu],
-    cmds: &mut [DrawIndexedIndirect],
-    counts: &mut [u32],
-) {
-    let i = counts[part];
-    counts[part] += 1;
-    if i < partitions[part].capacity {
-        cmds[(partitions[part].offset + i) as usize] = cmd;
+/// Where the cull appends a partition's commands. Counts every command, as
+/// the shader's atomic does, and stores those within the partition's
+/// capacity.
+trait CmdSink {
+    fn emit(&mut self, part: usize, cmd: DrawIndexedIndirect);
+}
+
+/// [`cpu_cull_into`]'s sink: one list per partition.
+struct PartLists<'a> {
+    partitions: &'a [PartitionGpu],
+    part_cmds: &'a mut [Vec<DrawIndexedIndirect>],
+    counts: &'a mut [u32],
+}
+
+impl CmdSink for PartLists<'_> {
+    #[inline(always)]
+    fn emit(&mut self, part: usize, cmd: DrawIndexedIndirect) {
+        emit_part(part, cmd, self.partitions, self.part_cmds, self.counts);
     }
 }
 
+/// [`PartLists::emit`] on loose slices. [`cull_solid`] calls it directly:
+/// there a sink struct held across the loop measured about 1 ns per slot
+/// slower.
 #[inline(always)]
 fn emit_part(
     part: usize,
@@ -512,6 +512,26 @@ fn emit_part(
     }
 }
 
+/// The legacy mirror's sink: one array, each partition at its offset.
+#[cfg(test)]
+struct FlatCmds<'a> {
+    partitions: &'a [PartitionGpu],
+    cmds: &'a mut [DrawIndexedIndirect],
+    counts: &'a mut [u32],
+}
+
+#[cfg(test)]
+impl CmdSink for FlatCmds<'_> {
+    #[inline(always)]
+    fn emit(&mut self, part: usize, cmd: DrawIndexedIndirect) {
+        let i = self.counts[part];
+        self.counts[part] += 1;
+        if i < self.partitions[part].capacity {
+            self.cmds[(self.partitions[part].offset + i) as usize] = cmd;
+        }
+    }
+}
+
 /// Camera-relative box of one SoA slot, rounded as `cull.comp.slang` does:
 /// `offset = (block - cam_block) - cam_frac + local_off`, then
 /// `aabb * scale + offset` (`aabb` is stored scaled; the scale is a power of
@@ -524,15 +544,17 @@ fn cam_relative_soa(
     aabb: [f32; 6],
     local_off: [f32; 3],
     block: [i32; 3],
-    eye_block: [i32; 3],
-    eye_frac: [f32; 3],
+    eye: EyeSplit,
 ) -> ([f32; 3], [f32; 3]) {
-    let dx = block[0].wrapping_sub(eye_block[0]) as f32 - eye_frac[0] + local_off[0];
-    let dy = block[1].wrapping_sub(eye_block[1]) as f32 - eye_frac[1] + local_off[1];
-    let dz = block[2].wrapping_sub(eye_block[2]) as f32 - eye_frac[2] + local_off[2];
+    let r = eye.rel(block);
+    let d = [
+        r[0] + local_off[0],
+        r[1] + local_off[1],
+        r[2] + local_off[2],
+    ];
     (
-        [aabb[0] + dx, aabb[1] + dy, aabb[2] + dz],
-        [aabb[3] + dx, aabb[4] + dy, aabb[5] + dz],
+        [aabb[0] + d[0], aabb[1] + d[1], aabb[2] + d[2]],
+        [aabb[3] + d[0], aabb[4] + d[1], aabb[5] + d[2]],
     )
 }
 
@@ -566,23 +588,149 @@ fn build_live_vis(
     }
 }
 
-/// Host re-implementation of `computeMain` in `cull.comp.slang`. Writes
-/// `DrawCmd`s at partition offsets and per-partition counts into `scratch`
-/// (capacity retained across frames).
-#[allow(clippy::too_many_arguments)]
+/// One frame's cull inputs besides the slot tables: what `CullParams` carries
+/// to the shader.
+#[derive(Clone, Copy)]
+pub(crate) struct CullView<'a> {
+    pub camera: &'a Frustum,
+    /// The two cascade frusta, on frames that regenerate shadows.
+    pub shadow: Option<&'a [Frustum; 2]>,
+    pub eye: EyeSplit,
+    /// Slots `0..slot_count` are culled.
+    pub slot_count: u32,
+    /// Full-res coverage box: a coarse-LOD box strictly inside it is not
+    /// drawn. A non-positive half covers nothing.
+    pub half: [f32; 3],
+    pub centre: [f32; 3],
+    /// Emit face runs for meshes that carry them.
+    pub face_cull: bool,
+}
+
+fn frustum_planes(frustum: &Frustum) -> [[f32; 4]; 5] {
+    frustum.planes().map(|p| p.to_array())
+}
+
+/// Camera-partition inputs, fixed for one cull.
+#[derive(Clone, Copy)]
+struct CameraBuckets {
+    half: [f32; 3],
+    centre: [f32; 3],
+    /// Squared coarse-LOD edges, [`bucket_edge_sq`] of [`lod_bucket_scale`].
+    lod_sq: [f32; 3],
+    arena_count: usize,
+}
+
+impl CameraBuckets {
+    fn new(view: &CullView, arena_count: usize) -> Self {
+        Self {
+            half: view.half,
+            centre: view.centre,
+            lod_sq: bucket_edge_sq(lod_bucket_scale()),
+            arena_count,
+        }
+    }
+
+    /// Camera partition of a box that passed the frustum, or `None` for a
+    /// coarse-LOD box the clip would discard whole. Buckets on the box
+    /// centre's squared distance against the group's edges.
+    #[inline(always)]
+    fn partition(&self, group: u32, arena: u32, mn: [f32; 3], mx: [f32; 3]) -> Option<usize> {
+        let lod = is_lod_group(group);
+        if lod && lod_aabb_inside_box(mn, mx, self.centre, self.half) {
+            return None;
+        }
+        let cx = 0.5 * (mn[0] + mx[0]);
+        let cy = 0.5 * (mn[1] + mx[1]);
+        let cz = 0.5 * (mn[2] + mx[2]);
+        let edges = if lod {
+            self.lod_sq
+        } else {
+            FULL_BUCKET_EDGE_SQ
+        };
+        let bucket = distance_bucket_sq(cx * cx + cy * cy + cz * cz, edges);
+        // `camera_part` in u32, as the shader computes it.
+        let part = (group * self.arena_count as u32 + arena) * BUCKETS as u32 + bucket;
+        debug_assert_eq!(
+            part as usize,
+            camera_part(
+                group as usize,
+                arena as usize,
+                bucket as usize,
+                self.arena_count
+            )
+        );
+        Some(part as usize)
+    }
+}
+
+/// Face-run directions of a camera draw, or `None` to draw it whole. A caged
+/// slot (`corners` anchor-relative, `block` its anchor) tests the cage's
+/// affine frame and is `None` when that frame is singular. A flat slot tests
+/// its camera-relative box per axis and never reads `corners`.
+#[inline(always)]
+fn direction_vis(
+    caged: bool,
+    corners: &[[f32; 3]; 8],
+    block: [i32; 3],
+    eye: EyeSplit,
+    mn: [f32; 3],
+    mx: [f32; 3],
+) -> Option<[bool; 6]> {
+    if caged {
+        cage_direction_vis(cam_relative_corners(*corners, block, eye)).map(|v| v.vis)
+    } else {
+        Some(face_vis(mn, mx))
+    }
+}
+
+/// Emits one camera draw into `part` and counts each command in `group`'s
+/// stats: the merged runs of the visible directions when `runs` carries them
+/// with the slot's packed face-quad counts, else the whole mesh.
+#[inline(always)]
+fn emit_camera(
+    out: &mut impl CmdSink,
+    part: usize,
+    cmd: DrawIndexedIndirect,
+    runs: Option<([bool; 6], [u32; 3])>,
+    group: u32,
+    stats: &mut [u32; STATS_COUNT],
+) {
+    let Some((vis, face_quads)) = runs else {
+        out.emit(part, cmd);
+        count_draw(stats, group, cmd.index_count);
+        return;
+    };
+    let mut merged = [FaceRun::default(); MAX_FACE_RUNS as usize];
+    let n = merge_face_runs(vis, packed_face_bounds(face_quads), &mut merged);
+    for run in merged.iter().take(n) {
+        out.emit(
+            part,
+            DrawIndexedIndirect {
+                first_index: run.first_index,
+                index_count: run.index_count,
+                ..cmd
+            },
+        );
+        count_draw(stats, group, run.index_count);
+    }
+}
+
+#[inline(always)]
+fn count_draw(stats: &mut [u32; STATS_COUNT], group: u32, index_count: u32) {
+    stats[group as usize * 2] += 1;
+    stats[group as usize * 2 + 1] += index_count;
+}
+
+/// Host re-implementation of `computeMain` in `cull.comp.slang`. Appends each
+/// partition's `DrawCmd`s to its own `scratch.part_cmds` list and counts them
+/// in `scratch.counts`, past capacity included as the shader's atomics do
+/// (both keep their allocations across frames).
 pub(crate) fn cpu_cull_into(
-    _records: &[MeshRecord],
     dir: &ArenaDirectory,
     is_arrived: impl Fn(u32) -> bool,
     visible: &[u32],
     partitions: &[PartitionGpu],
-    camera: &Frustum,
-    shadow: Option<&[Frustum; 2]>,
-    eye: EyeSplit,
-    slot_count: u32,
-    half: [f32; 3],
-    centre: [f32; 3],
-    face_cull: bool,
+    view: &CullView,
     scratch: &mut CpuCullScratch,
 ) -> [u32; STATS_COUNT] {
     let npart = partitions.len();
@@ -595,120 +743,51 @@ pub(crate) fn cpu_cull_into(
     scratch.counts.clear();
     scratch.counts.resize(npart, 0);
 
-    let shadow_on = shadow.is_some();
+    let shadow_on = view.shadow.is_some();
     build_live_vis(
         dir.live_bits(),
         visible,
-        slot_count,
+        view.slot_count,
         shadow_on,
         &mut scratch.live_vis,
     );
 
-    let cam_planes = camera.planes().map(|p| p.to_array());
-    let shadow_planes = shadow.map(|frusta| {
-        [
-            frusta[0].planes().map(|p| p.to_array()),
-            frusta[1].planes().map(|p| p.to_array()),
-        ]
-    });
-
-    match (face_cull, shadow_on) {
-        (false, false) => cull_fast_solid(
-            dir,
-            is_arrived,
-            partitions,
-            &cam_planes,
-            half,
-            centre,
-            slot_count,
-            &scratch.live_vis,
-            &mut scratch.part_cmds,
-            &mut scratch.counts,
-            eye.block,
-            eye.frac,
-        ),
-        (false, true) => cull_slots::<false, true>(
-            dir,
-            is_arrived,
-            partitions,
-            &cam_planes,
-            shadow_planes.as_ref(),
-            visible,
-            eye,
-            half,
-            centre,
-            slot_count,
-            &scratch.live_vis,
-            &mut scratch.part_cmds,
-            &mut scratch.counts,
-        ),
-        (true, false) => cull_slots::<true, false>(
-            dir,
-            is_arrived,
-            partitions,
-            &cam_planes,
-            None,
-            visible,
-            eye,
-            half,
-            centre,
-            slot_count,
-            &scratch.live_vis,
-            &mut scratch.part_cmds,
-            &mut scratch.counts,
-        ),
-        (true, true) => cull_slots::<true, true>(
-            dir,
-            is_arrived,
-            partitions,
-            &cam_planes,
-            shadow_planes.as_ref(),
-            visible,
-            eye,
-            half,
-            centre,
-            slot_count,
-            &scratch.live_vis,
-            &mut scratch.part_cmds,
-            &mut scratch.counts,
-        ),
+    let frame = SlotFrame {
+        dir,
+        visible,
+        live_vis: &scratch.live_vis,
+        cam_planes: frustum_planes(view.camera),
+        shadow_planes: view
+            .shadow
+            .map(|f| [frustum_planes(&f[0]), frustum_planes(&f[1])]),
+        eye: view.eye,
+        slot_count: view.slot_count,
+        buckets: CameraBuckets::new(view, dir.arena_count()),
+    };
+    let out = PartLists {
+        partitions,
+        part_cmds: &mut scratch.part_cmds,
+        counts: &mut scratch.counts,
+    };
+    match (view.face_cull, shadow_on) {
+        (false, false) => cull_solid(&frame, is_arrived, out),
+        (false, true) => cull_slots::<false, true>(&frame, is_arrived, out),
+        (true, false) => cull_slots::<true, false>(&frame, is_arrived, out),
+        (true, true) => cull_slots::<true, true>(&frame, is_arrived, out),
     }
 }
 
-/// Host re-implementation of `computeMain` in `cull.comp.slang`. Writes
-/// `DrawCmd`s at partition offsets and per-partition counts.
+/// [`cpu_cull_into`] with the commands placed at their partition offsets.
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn cpu_cull(
-    records: &[MeshRecord],
     dir: &ArenaDirectory,
     is_arrived: impl Fn(u32) -> bool,
     visible: &[u32],
     partitions: &[PartitionGpu],
-    camera: &Frustum,
-    shadow: Option<&[Frustum; 2]>,
-    eye: EyeSplit,
-    slot_count: u32,
-    half: [f32; 3],
-    centre: [f32; 3],
-    face_cull: bool,
+    view: &CullView,
 ) -> (Vec<DrawIndexedIndirect>, Vec<u32>, [u32; STATS_COUNT]) {
     let mut scratch = CpuCullScratch::default();
-    let stats = cpu_cull_into(
-        records,
-        dir,
-        is_arrived,
-        visible,
-        partitions,
-        camera,
-        shadow,
-        eye,
-        slot_count,
-        half,
-        centre,
-        face_cull,
-        &mut scratch,
-    );
+    let stats = cpu_cull_into(dir, is_arrived, visible, partitions, view, &mut scratch);
     (
         flatten_part_cmds(&scratch.part_cmds, partitions),
         scratch.counts,
@@ -716,40 +795,35 @@ pub(crate) fn cpu_cull(
     )
 }
 
-/// Record-walking mirror of `computeMain`: the shader's `?:` p-vertex, and
-/// the same caged face-run rule as [`cull_slots`]. Kept as the emission
-/// reference for the old-vs-new test.
+/// Record-walking mirror of `computeMain`: the records' own boxes and fields
+/// and the shader's `?:` p-vertex, with [`cull_slots`]'s partition, direction
+/// and emission steps. The emission reference for the old-vs-new test.
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 fn cpu_cull_legacy(
     records: &[MeshRecord],
     dir: &ArenaDirectory,
     is_arrived: impl Fn(u32) -> bool,
     visible: &[u32],
     partitions: &[PartitionGpu],
-    camera: &Frustum,
-    shadow: Option<&[Frustum; 2]>,
-    eye: EyeSplit,
-    slot_count: u32,
-    half: [f32; 3],
-    centre: [f32; 3],
-    face_cull: bool,
+    view: &CullView,
 ) -> (Vec<DrawIndexedIndirect>, Vec<u32>, [u32; STATS_COUNT]) {
     let total: usize = partitions.iter().map(|p| p.capacity as usize).sum();
     let mut cmds = vec![bytemuck::Zeroable::zeroed(); total];
     let mut counts = vec![0u32; partitions.len()];
     let mut stats = [0u32; STATS_COUNT];
-    let cam_planes = camera.planes().map(|p| p.to_array());
-    let shadow_planes = shadow.map(|frusta| {
-        [
-            frusta[0].planes().map(|p| p.to_array()),
-            frusta[1].planes().map(|p| p.to_array()),
-        ]
-    });
-    let arena_count = dir.arena_count() as u32;
-    let lod_sq = bucket_edge_sq(lod_bucket_scale());
+    let cam_planes = frustum_planes(view.camera);
+    let shadow_planes = view
+        .shadow
+        .map(|f| [frustum_planes(&f[0]), frustum_planes(&f[1])]);
+    let buckets = CameraBuckets::new(view, dir.arena_count());
+    let eye = view.eye;
+    let mut out = FlatCmds {
+        partitions,
+        cmds: &mut cmds,
+        counts: &mut counts,
+    };
 
-    for slot in 0..slot_count {
+    for slot in 0..view.slot_count {
         if !is_arrived(slot) {
             continue;
         }
@@ -758,7 +832,7 @@ fn cpu_cull_legacy(
             continue;
         }
         let cam_visible = slot_visible(visible, slot);
-        if !cam_visible && shadow.is_none() {
+        if !cam_visible && view.shadow.is_none() {
             continue;
         }
         let Some(rec) = records.get(slot as usize) else {
@@ -768,20 +842,13 @@ fn cpu_cull_legacy(
         if pass > 1 {
             continue;
         }
-        let bits = dir.cull_bits().get(slot as usize).copied().unwrap_or(0);
+        let i = slot as usize;
+        let bits = dir.cull_bits().get(i).copied().unwrap_or(0);
         let caged = super::arena::cull_bits_caged(bits);
+        let block = dir.cull_blocks().get(i).copied().unwrap_or([0; 3]);
         let (mn, mx, scale) = if caged {
-            let aabb = dir
-                .cull_aabbs()
-                .get(slot as usize)
-                .copied()
-                .unwrap_or([0.0; 6]);
-            let block = dir
-                .cull_blocks()
-                .get(slot as usize)
-                .copied()
-                .unwrap_or([0; 3]);
-            let (mn, mx) = cam_relative_soa(aabb, [0.0; 3], block, eye.block, eye.frac);
+            let aabb = dir.cull_aabbs().get(i).copied().unwrap_or([0.0; 6]);
+            let (mn, mx) = cam_relative_soa(aabb, [0.0; 3], block, eye);
             (mn, mx, rec.detail_scale())
         } else {
             cam_relative_aabb(rec, eye)
@@ -797,60 +864,15 @@ fn cpu_cull_legacy(
 
         if cam_visible && aabb_in_planes_select(&cam_planes, mn, mx) {
             let group = camera_group(pass, scale > 1.0, caged);
-            if !is_lod_group(group) || !lod_aabb_inside_box(mn, mx, centre, half) {
-                let cx = 0.5 * (mn[0] + mx[0]);
-                let cy = 0.5 * (mn[1] + mx[1]);
-                let cz = 0.5 * (mn[2] + mx[2]);
-                let edges = if is_lod_group(group) {
-                    lod_sq
-                } else {
-                    FULL_BUCKET_EDGE_SQ
-                };
-                let bucket = distance_bucket_sq(cx * cx + cy * cy + cz * cz, edges);
-                let part = ((group * arena_count + arena) * crate::genconst::CULL_DISTANCE_BUCKETS
-                    + bucket) as usize;
-                let vis = if face_cull && (rec.flags & MESH_FLAG_FACE_RUNS) != 0 {
-                    if caged {
-                        let corners = dir
-                            .cull_corners()
-                            .get(slot as usize)
-                            .copied()
-                            .unwrap_or([[0.0; 3]; 8]);
-                        let block = dir
-                            .cull_blocks()
-                            .get(slot as usize)
-                            .copied()
-                            .unwrap_or([0; 3]);
-                        cage_direction_vis(cam_relative_corners(
-                            corners, block, eye.block, eye.frac,
-                        ))
-                        .map(|v| v.vis)
-                    } else {
-                        Some(face_vis(mn, mx))
-                    }
+            if let Some(part) = buckets.partition(group, arena, mn, mx) {
+                let runs = if view.face_cull && (rec.flags & MESH_FLAG_FACE_RUNS) != 0 {
+                    let corners = dir.cull_corners().get(i).unwrap_or(&[[0.0; 3]; 8]);
+                    direction_vis(caged, corners, block, eye, mn, mx)
+                        .map(|vis| (vis, rec.face_quads))
                 } else {
                     None
                 };
-                if let Some(vis) = vis {
-                    let bounds = packed_face_bounds(rec.face_quads);
-                    let mut runs = [FaceRun {
-                        first_index: 0,
-                        index_count: 0,
-                    }; 3];
-                    let n = merge_face_runs(vis, bounds, &mut runs);
-                    for run in runs.iter().take(n) {
-                        let mut drawn = cmd;
-                        drawn.first_index = run.first_index;
-                        drawn.index_count = run.index_count;
-                        emit_cmd(part, drawn, partitions, &mut cmds, &mut counts);
-                        stats[group as usize * 2] += 1;
-                        stats[group as usize * 2 + 1] += drawn.index_count;
-                    }
-                } else {
-                    emit_cmd(part, cmd, partitions, &mut cmds, &mut counts);
-                    stats[group as usize * 2] += 1;
-                    stats[group as usize * 2 + 1] += cmd.index_count;
-                }
+                emit_camera(&mut out, part, cmd, runs, group, &mut stats);
             }
         }
 
@@ -858,17 +880,9 @@ fn cpu_cull_legacy(
             && scale <= 1.0
             && let Some(planes) = &shadow_planes
         {
-            let shadow_base =
-                CAMERA_GROUPS as u32 * arena_count * crate::genconst::CULL_DISTANCE_BUCKETS;
             for (c, plane) in planes.iter().enumerate() {
                 if aabb_in_planes_select(plane, mn, mx) {
-                    emit_cmd(
-                        (shadow_base + c as u32 * arena_count + arena) as usize,
-                        cmd,
-                        partitions,
-                        &mut cmds,
-                        &mut counts,
-                    );
+                    out.emit(shadow_part(c, arena as usize, buckets.arena_count), cmd);
                 }
             }
         }
@@ -876,34 +890,48 @@ fn cpu_cull_legacy(
     (cmds, counts, stats)
 }
 
-/// Solid (no face-runs, no shadows) hot path: no per-slot Option, no MeshRecord.
-#[allow(clippy::too_many_arguments)]
-fn cull_fast_solid(
-    dir: &ArenaDirectory,
-    is_arrived: impl Fn(u32) -> bool,
-    partitions: &[PartitionGpu],
-    cam_planes: &[[f32; 4]; 5],
-    half: [f32; 3],
-    centre: [f32; 3],
+/// What the slot loop reads besides the directory's SoA, built once per cull.
+struct SlotFrame<'a> {
+    dir: &'a ArenaDirectory,
+    /// Camera visibility. Read per slot only when shadows are on.
+    visible: &'a [u32],
+    /// [`build_live_vis`]: live ∩ (visible ∨ shadows).
+    live_vis: &'a [u32],
+    cam_planes: [[f32; 4]; 5],
+    shadow_planes: Option<[[[f32; 4]; 5]; 2]>,
+    eye: EyeSplit,
     slot_count: u32,
-    live_vis: &[u32],
-    part_cmds: &mut [Vec<DrawIndexedIndirect>],
-    counts: &mut [u32],
-    eye_block: [i32; 3],
-    eye_frac: [f32; 3],
+    buckets: CameraBuckets,
+}
+
+/// `cull_slots::<false, false>` written for the Fast/Minimum path: the
+/// frustum test runs before any cull bit is decoded, a camera reject ends the
+/// slot, and commands go straight to [`emit_part`]. The generic loop measured
+/// about 6 % slower per slot here.
+fn cull_solid(
+    frame: &SlotFrame,
+    is_arrived: impl Fn(u32) -> bool,
+    out: PartLists,
 ) -> [u32; STATS_COUNT] {
+    let PartLists {
+        partitions,
+        part_cmds,
+        counts,
+    } = out;
     let mut stats = [0u32; STATS_COUNT];
+    let dir = frame.dir;
     let aabbs = dir.cull_aabbs();
     let local_offs = dir.cull_local_offs();
     let blocks = dir.cull_blocks();
     let bits_soa = dir.cull_bits();
     let index_counts = dir.cull_index_counts();
     let vertex_offsets = dir.cull_vertex_offsets();
-    let arena_count = dir.arena_count() as u32;
-    let buckets = crate::genconst::CULL_DISTANCE_BUCKETS;
-    let lod_sq = bucket_edge_sq(lod_bucket_scale());
+    let live_vis = frame.live_vis;
+    let cam_planes = &frame.cam_planes;
+    let eye = frame.eye;
+    let buckets = frame.buckets;
 
-    for slot in 0..slot_count {
+    for slot in 0..frame.slot_count {
         let w = (slot >> 5) as usize;
         if unsafe { *live_vis.get_unchecked(w) } & (1u32 << (slot & 31)) == 0 {
             continue;
@@ -919,27 +947,19 @@ fn cull_fast_solid(
         let aabb = unsafe { *aabbs.get_unchecked(i) };
         let local_off = unsafe { *local_offs.get_unchecked(i) };
         let block = unsafe { *blocks.get_unchecked(i) };
-        let (mn, mx) = cam_relative_soa(aabb, local_off, block, eye_block, eye_frac);
+        let (mn, mx) = cam_relative_soa(aabb, local_off, block, eye);
         if !aabb_in_planes(cam_planes, mn, mx) {
             continue;
         }
-        let pass = super::arena::cull_bits_pass(bits);
-        let lod = super::arena::cull_bits_lod(bits);
-        let group = camera_group(pass, lod, super::arena::cull_bits_caged(bits));
-        if is_lod_group(group) && lod_aabb_inside_box(mn, mx, centre, half) {
-            continue;
-        }
-        let cx = 0.5 * (mn[0] + mx[0]);
-        let cy = 0.5 * (mn[1] + mx[1]);
-        let cz = 0.5 * (mn[2] + mx[2]);
-        let edges = if is_lod_group(group) {
-            lod_sq
-        } else {
-            FULL_BUCKET_EDGE_SQ
-        };
-        let bucket = distance_bucket_sq(cx * cx + cy * cy + cz * cz, edges);
+        let group = camera_group(
+            super::arena::cull_bits_pass(bits),
+            super::arena::cull_bits_lod(bits),
+            super::arena::cull_bits_caged(bits),
+        );
         let arena = super::arena::cull_bits_arena(bits) - 1;
-        let part = ((group * arena_count + arena) * buckets + bucket) as usize;
+        let Some(part) = buckets.partition(group, arena, mn, mx) else {
+            continue;
+        };
         let cmd = DrawIndexedIndirect {
             index_count: unsafe { *index_counts.get_unchecked(i) },
             instance_count: 1,
@@ -948,29 +968,20 @@ fn cull_fast_solid(
             first_instance: slot,
         };
         emit_part(part, cmd, partitions, part_cmds, counts);
-        stats[group as usize * 2] += 1;
-        stats[group as usize * 2 + 1] += cmd.index_count;
+        count_draw(&mut stats, group, cmd.index_count);
     }
     stats
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The SoA slot loop, one instance per face-run/shadow pair (the pair with
+/// neither runs [`cull_solid`]).
 fn cull_slots<const FACE: bool, const SHADOW: bool>(
-    dir: &ArenaDirectory,
+    frame: &SlotFrame,
     is_arrived: impl Fn(u32) -> bool,
-    partitions: &[PartitionGpu],
-    cam_planes: &[[f32; 4]; 5],
-    shadow_planes: Option<&[[[f32; 4]; 5]; 2]>,
-    visible: &[u32],
-    eye: EyeSplit,
-    half: [f32; 3],
-    centre: [f32; 3],
-    slot_count: u32,
-    live_vis: &[u32],
-    part_cmds: &mut [Vec<DrawIndexedIndirect>],
-    counts: &mut [u32],
+    mut out: PartLists,
 ) -> [u32; STATS_COUNT] {
     let mut stats = [0u32; STATS_COUNT];
+    let dir = frame.dir;
     let aabbs = dir.cull_aabbs();
     let local_offs = dir.cull_local_offs();
     let blocks = dir.cull_blocks();
@@ -979,17 +990,16 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
     let vertex_offsets = dir.cull_vertex_offsets();
     let face_quads = dir.cull_face_quads();
     let corners_soa = dir.cull_corners();
-    let eye_block = eye.block;
-    let eye_frac = eye.frac;
-    let arena_count = dir.arena_count() as u32;
-    let buckets = crate::genconst::CULL_DISTANCE_BUCKETS;
-    let shadow_base = CAMERA_GROUPS as u32 * arena_count * buckets;
-    let lod_sq = bucket_edge_sq(lod_bucket_scale());
+    let live_vis = frame.live_vis;
+    let visible = frame.visible;
+    let cam_planes = frame.cam_planes;
+    let shadow_planes = frame.shadow_planes;
+    let eye = frame.eye;
+    let buckets = frame.buckets;
 
-    for slot in 0..slot_count {
+    for slot in 0..frame.slot_count {
         let w = (slot >> 5) as usize;
-        let bit = 1u32 << (slot & 31);
-        if unsafe { live_vis.get_unchecked(w) } & bit == 0 {
+        if unsafe { *live_vis.get_unchecked(w) } & (1u32 << (slot & 31)) == 0 {
             continue;
         }
         if !is_arrived(slot) {
@@ -1003,42 +1013,32 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
         let aabb = unsafe { *aabbs.get_unchecked(i) };
         let local_off = unsafe { *local_offs.get_unchecked(i) };
         let block = unsafe { *blocks.get_unchecked(i) };
-        let (mn, mx) = cam_relative_soa(aabb, local_off, block, eye_block, eye_frac);
+        let (mn, mx) = cam_relative_soa(aabb, local_off, block, eye);
         let pass = super::arena::cull_bits_pass(bits);
         let lod = super::arena::cull_bits_lod(bits);
+        let caged = super::arena::cull_bits_caged(bits);
         let arena = super::arena::cull_bits_arena(bits) - 1;
-        let cam_visible = !SHADOW || slot_visible(visible, slot);
 
-        let mut cam_ok = false;
-        let mut group = 0u32;
-        let mut part = 0usize;
-        if cam_visible && aabb_in_planes(cam_planes, mn, mx) {
-            group = camera_group(pass, lod, super::arena::cull_bits_caged(bits));
-            if !is_lod_group(group) || !lod_aabb_inside_box(mn, mx, centre, half) {
-                let cx = 0.5 * (mn[0] + mx[0]);
-                let cy = 0.5 * (mn[1] + mx[1]);
-                let cz = 0.5 * (mn[2] + mx[2]);
-                let edges = if is_lod_group(group) {
-                    lod_sq
-                } else {
-                    FULL_BUCKET_EDGE_SQ
-                };
-                let bucket = distance_bucket_sq(cx * cx + cy * cy + cz * cz, edges);
-                part = ((group * arena_count + arena) * buckets + bucket) as usize;
-                cam_ok = true;
-            }
+        // Without shadows `live_vis` already holds the camera visibility.
+        let mut camera = None;
+        if (!SHADOW || slot_visible(visible, slot)) && aabb_in_planes(&cam_planes, mn, mx) {
+            let group = camera_group(pass, lod, caged);
+            camera = buckets
+                .partition(group, arena, mn, mx)
+                .map(|part| (group, part));
         }
+        // Shadow casters: full-res Opaque only, always whole.
         let mut sh0 = false;
         let mut sh1 = false;
         if SHADOW
             && pass == 0
             && !lod
-            && let Some(planes) = shadow_planes
+            && let Some(planes) = &shadow_planes
         {
             sh0 = aabb_in_planes(&planes[0], mn, mx);
             sh1 = aabb_in_planes(&planes[1], mn, mx);
         }
-        if !cam_ok && !sh0 && !sh1 {
+        if camera.is_none() && !sh0 && !sh1 {
             continue;
         }
 
@@ -1050,64 +1050,29 @@ fn cull_slots<const FACE: bool, const SHADOW: bool>(
             first_instance: slot,
         };
 
-        if cam_ok {
+        if let Some((group, part)) = camera {
             // `None` draws the mesh whole: face runs off, or a singular cage.
-            let vis = if FACE && super::arena::cull_bits_face(bits) {
-                if super::arena::cull_bits_caged(bits) {
-                    let raw = unsafe { *corners_soa.get_unchecked(i) };
-                    cage_direction_vis(cam_relative_corners(raw, block, eye_block, eye_frac))
-                        .map(|v| v.vis)
-                } else {
-                    Some(face_vis(mn, mx))
-                }
+            let runs = if FACE && super::arena::cull_bits_face(bits) {
+                let corners = unsafe { corners_soa.get_unchecked(i) };
+                direction_vis(caged, corners, block, eye, mn, mx)
+                    .map(|vis| (vis, unsafe { *face_quads.get_unchecked(i) }))
             } else {
                 None
             };
-            if let Some(vis) = vis {
-                let bounds = packed_face_bounds(unsafe { *face_quads.get_unchecked(i) });
-                let mut runs = [FaceRun {
-                    first_index: 0,
-                    index_count: 0,
-                }; 3];
-                let n_runs = merge_face_runs(vis, bounds, &mut runs);
-                for run in runs.iter().take(n_runs) {
-                    let mut drawn = cmd;
-                    drawn.first_index = run.first_index;
-                    drawn.index_count = run.index_count;
-                    emit_part(part, drawn, partitions, part_cmds, counts);
-                    stats[group as usize * 2] += 1;
-                    stats[group as usize * 2 + 1] += drawn.index_count;
-                }
-            } else {
-                emit_part(part, cmd, partitions, part_cmds, counts);
-                stats[group as usize * 2] += 1;
-                stats[group as usize * 2 + 1] += cmd.index_count;
-            }
+            emit_camera(&mut out, part, cmd, runs, group, &mut stats);
         }
-
         if sh0 {
-            emit_part(
-                (shadow_base + arena) as usize,
-                cmd,
-                partitions,
-                part_cmds,
-                counts,
-            );
+            out.emit(shadow_part(0, arena as usize, buckets.arena_count), cmd);
         }
         if sh1 {
-            emit_part(
-                (shadow_base + arena_count + arena) as usize,
-                cmd,
-                partitions,
-                part_cmds,
-                counts,
-            );
+            out.emit(shadow_part(1, arena as usize, buckets.arena_count), cmd);
         }
     }
     stats
 }
 
-/// Partition index for a camera (pass, arena, bucket) triple.
+/// Partition index for a camera (group, arena, bucket) triple.
+#[inline]
 pub(crate) fn camera_part(group: usize, arena: usize, bucket: usize, arena_count: usize) -> usize {
     debug_assert!(group < CAMERA_GROUPS);
     debug_assert!(bucket < BUCKETS);
@@ -1115,6 +1080,7 @@ pub(crate) fn camera_part(group: usize, arena: usize, bucket: usize, arena_count
 }
 
 /// Partition index for a shadow (cascade, arena) pair. Cascades are unbucketed.
+#[inline]
 pub(crate) fn shadow_part(cascade: usize, arena: usize, arena_count: usize) -> usize {
     debug_assert!(cascade < SHADOW_GROUPS);
     CAMERA_GROUPS * arena_count * BUCKETS + cascade * arena_count + arena
@@ -1128,7 +1094,7 @@ pub(crate) fn partition_count(arena_count: usize) -> usize {
 /// Indirect-count draw calls a recorder would issue for `group`: partitions
 /// with `capacity > 0`. Zero-capacity buckets (unreachable distance, empty
 /// live lane) are skipped — including those the GPU still writes a 0 count
-/// into. Matches [`super::scene_pass`] `record_group_indirect_count`.
+/// into. Matches the calls `record_groups` in [`super::scene_pass`] issues.
 pub(crate) fn group_indirect_calls(
     partitions: &[PartitionGpu],
     group: Group,
@@ -1196,6 +1162,25 @@ mod tests {
             _pad0: 0,
             frac: [0.0; 3],
             _pad1: 0.0,
+        }
+    }
+
+    /// The tests' view: eye at the origin, clip box centred on it.
+    fn view<'a>(
+        camera: &'a Frustum,
+        shadow: Option<&'a [Frustum; 2]>,
+        slot_count: u32,
+        half: [f32; 3],
+        face_cull: bool,
+    ) -> CullView<'a> {
+        CullView {
+            camera,
+            shadow,
+            eye: origin_eye(),
+            slot_count,
+            half,
+            centre: [0.0; 3],
+            face_cull,
         }
     }
 
@@ -1433,20 +1418,8 @@ mod tests {
         let mut parts = Vec::new();
         let runs = if face_cull { MAX_FACE_RUNS } else { 1 };
         dir.partitions_into(&mut parts, runs, Some(eye));
-        let (cmds, counts, stats) = cpu_cull(
-            records,
-            dir,
-            |_| true,
-            visible,
-            &parts,
-            camera,
-            None,
-            eye,
-            dir.live_end(),
-            half,
-            [0.0; 3],
-            face_cull,
-        );
+        let view = view(camera, None, dir.live_end(), half, face_cull);
+        let (cmds, counts, stats) = cpu_cull(dir, |_| true, visible, &parts, &view);
         (parts, cmds, counts, stats)
     }
 
@@ -1981,34 +1954,11 @@ mod tests {
                     let runs = if face_cull { MAX_FACE_RUNS } else { 1 };
                     dir.partitions_into(&mut parts, runs, Some(eye));
                     let shadow = with_shadow.then_some(&shadow_frusta);
-                    let (old_cmds, old_counts, old_stats) = cpu_cull_legacy(
-                        &records,
-                        &dir,
-                        is_arrived,
-                        &visible,
-                        &parts,
-                        &camera,
-                        shadow,
-                        eye,
-                        dir.live_end(),
-                        half,
-                        [0.0; 3],
-                        face_cull,
-                    );
-                    let (new_cmds, new_counts, new_stats) = cpu_cull(
-                        &records,
-                        &dir,
-                        is_arrived,
-                        &visible,
-                        &parts,
-                        &camera,
-                        shadow,
-                        eye,
-                        dir.live_end(),
-                        half,
-                        [0.0; 3],
-                        face_cull,
-                    );
+                    let view = view(&camera, shadow, dir.live_end(), half, face_cull);
+                    let (old_cmds, old_counts, old_stats) =
+                        cpu_cull_legacy(&records, &dir, is_arrived, &visible, &parts, &view);
+                    let (new_cmds, new_counts, new_stats) =
+                        cpu_cull(&dir, is_arrived, &visible, &parts, &view);
                     assert_same_emission(
                         &parts,
                         &old_cmds,
@@ -2051,7 +2001,7 @@ mod tests {
         let visible = vec![u32::MAX; N.div_ceil(32)];
         let mut parts = Vec::new();
         dir.partitions_into(&mut parts, 1, Some(eye));
-        let slot_count = dir.live_end();
+        let view = view(&camera, None, dir.live_end(), [0.0; 3], false);
         let mut scratch = CpuCullScratch::default();
 
         fn time_ns(iters: u32, mut body: impl FnMut()) -> f64 {
@@ -2063,35 +2013,8 @@ mod tests {
         }
 
         for _ in 0..WARMUP {
-            let _ = cpu_cull_legacy(
-                &records,
-                &dir,
-                |_| true,
-                &visible,
-                &parts,
-                &camera,
-                None,
-                eye,
-                slot_count,
-                [0.0; 3],
-                [0.0; 3],
-                false,
-            );
-            let _ = cpu_cull_into(
-                &records,
-                &dir,
-                |_| true,
-                &visible,
-                &parts,
-                &camera,
-                None,
-                eye,
-                slot_count,
-                [0.0; 3],
-                [0.0; 3],
-                false,
-                &mut scratch,
-            );
+            let _ = cpu_cull_legacy(&records, &dir, |_| true, &visible, &parts, &view);
+            let _ = cpu_cull_into(&dir, |_| true, &visible, &parts, &view, &mut scratch);
         }
 
         // Include the host-visible fill: old path memcpy'd the whole sparse
@@ -2102,20 +2025,8 @@ mod tests {
         let mut wc_counts = vec![0u8; parts.len() * 4];
 
         let old_ns = time_ns(ITERS, || {
-            let (cmds, counts, stats) = cpu_cull_legacy(
-                &records,
-                &dir,
-                |_| true,
-                &visible,
-                &parts,
-                &camera,
-                None,
-                eye,
-                slot_count,
-                [0.0; 3],
-                [0.0; 3],
-                false,
-            );
+            let (cmds, counts, stats) =
+                cpu_cull_legacy(&records, &dir, |_| true, &visible, &parts, &view);
             let cmd_bytes: &[u8] = bytemuck::cast_slice(&cmds);
             wc_cmds[..cmd_bytes.len()].copy_from_slice(cmd_bytes);
             let count_bytes: &[u8] = bytemuck::cast_slice(&counts);
@@ -2123,21 +2034,7 @@ mod tests {
             std::hint::black_box((&wc_cmds, &wc_counts, stats));
         });
         let new_ns = time_ns(ITERS, || {
-            let stats = cpu_cull_into(
-                &records,
-                &dir,
-                |_| true,
-                &visible,
-                &parts,
-                &camera,
-                None,
-                eye,
-                slot_count,
-                [0.0; 3],
-                [0.0; 3],
-                false,
-                &mut scratch,
-            );
+            let stats = cpu_cull_into(&dir, |_| true, &visible, &parts, &view, &mut scratch);
             for (i, p) in parts.iter().enumerate() {
                 let src = &scratch.part_cmds[i];
                 if src.is_empty() {
@@ -2163,7 +2060,7 @@ mod tests {
     }
 
     #[test]
-    fn caged_slot_culls_by_its_corner_box_and_skips_face_runs() {
+    fn caged_slot_culls_by_its_corner_box_and_draws_whole_with_the_flag_clear() {
         let camera = look_neg_z();
         let front = MeshAabb {
             block: [0; 3],
@@ -2217,6 +2114,9 @@ mod tests {
         let mut kept = opaque_rec(behind.min, behind.max);
         kept.cage = 1;
         kept.face_quads = [1 | (1 << 16), 1 | (1 << 16), 1 | (1 << 16)];
+        // Face runs are on for this cull, but a clear MESH_FLAG_FACE_RUNS
+        // draws a caged mesh whole like a flat one. A set flag would split it
+        // by cage direction (caged_face_runs_agree_between_paths_...).
         kept.flags = 0;
         let mut hidden = opaque_rec(front.min, front.max);
         hidden.cage = 2;
@@ -2247,7 +2147,7 @@ mod tests {
         );
         assert_eq!(caged.len(), 1, "corner box in front is kept");
         assert_eq!(caged[0].first_instance, 1);
-        assert_eq!(caged[0].first_index, 0, "face runs stay off");
+        assert_eq!(caged[0].first_index, 0, "flag clear: drawn whole");
         assert_eq!(caged[0].index_count, 36);
         assert!(
             cmds.iter().all(|c| c.first_instance != 2),
@@ -2700,34 +2600,16 @@ mod tests {
         let mut parts = Vec::new();
         dir.partitions_into(&mut parts, MAX_FACE_RUNS, Some(eye));
         let visible = [0b111u32];
-        let (new_cmds, new_counts, new_stats) = cpu_cull(
-            &records,
-            &dir,
-            |_| true,
-            &visible,
-            &parts,
+        let view = view(
             &camera,
             Some(&shadow_frusta),
-            eye,
             dir.live_end(),
-            [0.0; 3],
             [0.0; 3],
             true,
         );
-        let (old_cmds, old_counts, old_stats) = cpu_cull_legacy(
-            &records,
-            &dir,
-            |_| true,
-            &visible,
-            &parts,
-            &camera,
-            Some(&shadow_frusta),
-            eye,
-            dir.live_end(),
-            [0.0; 3],
-            [0.0; 3],
-            true,
-        );
+        let (new_cmds, new_counts, new_stats) = cpu_cull(&dir, |_| true, &visible, &parts, &view);
+        let (old_cmds, old_counts, old_stats) =
+            cpu_cull_legacy(&records, &dir, |_| true, &visible, &parts, &view);
         assert_same_emission(
             &parts,
             &old_cmds,

@@ -135,11 +135,7 @@ impl ArenaUnion {
     /// possible AABB centre). Matches the shader's `(block - cam_block) - frac`
     /// placement so a single-mesh union agrees with `distance_bucket`.
     fn cam_dist_range(&self, eye: EyeSplit) -> (f32, f32) {
-        let off = [
-            self.origin[0].wrapping_sub(eye.block[0]) as f32 - eye.frac[0],
-            self.origin[1].wrapping_sub(eye.block[1]) as f32 - eye.frac[1],
-            self.origin[2].wrapping_sub(eye.block[2]) as f32 - eye.frac[2],
-        ];
+        let off = eye.rel(self.origin);
         aabb_center_dist_range(
             [
                 self.min[0] + off[0],

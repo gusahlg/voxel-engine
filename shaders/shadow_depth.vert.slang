@@ -7,21 +7,7 @@ ConstantBuffer<FrameUniforms> frame;
 
 #include "lod_morph.slang"
 
-// Per-mesh record: mirrors mesh3d's MeshRecord exactly (std430, 80 bytes).
-// Changing the struct stride breaks instance offset calculation.
-struct MeshRecord
-{
-    int3 block;       // world-space origin
-    uint detail_pass; // [0:5] detail+bias, [5:7] pass
-    float3 local_off; // mover offset; zero for terrain
-    uint cage;        // 0 = flat; else index into the cage table
-    float3 aabb_min;
-    uint index_count;
-    float3 aabb_max;
-    int vertex_offset;
-    uint3 face_quads; // u16 pairs: upload slots 0|1, 2|3, 4|5
-    uint flags; // bit 0 = packed face-runs valid (cull.comp)
-};
+#include "mesh_record.slang"
 
 [[vk::binding(0, 0)]]
 StructuredBuffer<MeshRecord> mesh_records;
@@ -57,15 +43,16 @@ ConstantBuffer<PushConstants> pc;
 [shader("vertex")]
 float4 vertexMain(VertexInput input) : SV_Position
 {
-    // Micro stays off the occluder while morphing is off: the depth bias dwarfs
-    // ±MICRO_STEP, and that path must stay bit-identical. While the flag is set,
-    // q includes micro the way mesh3d.vert does, so the unmorphed world, `d`,
-    // and the morph delta match the color pass (one placement; the caged slide
-    // is (a*dy/16)*cage_dty, not a second trilinear).
+    // Micro (the w1 SHIFT_MICRO_* bits) stays off the occluder while morphing
+    // is off: the depth bias dwarfs ±MICRO_STEP, and that path must stay
+    // bit-identical. While the flag is set, q includes micro the way mesh3d.vert
+    // does, so the unmorphed world, `d`, and the morph delta match the color
+    // pass (one placement; the caged slide is (a*dy/16)*cage_dty, not a second
+    // trilinear).
     uint w0 = input.packed.x;
-    float x = float((w0 >> 0) & 0x1F);
-    float y = float((w0 >> 5) & 0x1F);
-    float z = float((w0 >> 10) & 0x1F);
+    float x = float((w0 >> SHIFT_X) & MASK_COORD);
+    float y = float((w0 >> SHIFT_Y) & MASK_COORD);
+    float z = float((w0 >> SHIFT_Z) & MASK_COORD);
 
     MeshRecord rec = mesh_records[input.instance];
     float scale = detail_scale(rec.detail_pass);
@@ -76,9 +63,9 @@ float4 vertexMain(VertexInput input) : SV_Position
     if (frame.morph_flag.x != 0)
     {
         uint w1 = input.packed.y;
-        int mx = int(w1 << 19) >> 30;
-        int my = int(w1 << 17) >> 30;
-        int mz = int(w1 << 15) >> 30;
+        int mx = int(w1 << (30 - SHIFT_MICRO_X)) >> 30;
+        int my = int(w1 << (30 - SHIFT_MICRO_Y)) >> 30;
+        int mz = int(w1 << (30 - SHIFT_MICRO_Z)) >> 30;
         float3 micro = float3(float(mx), float(my), float(mz)) * MICRO_STEP;
         q = (float3(x, y, z) + micro) * scale;
         dy = lod_morph_dy(w1);

@@ -11,11 +11,12 @@
 #ifndef VOXEL_LOD_MORPH_SLANG
 #define VOXEL_LOD_MORPH_SLANG
 
-// Bits [17:25) of w1, 8-bit two's complement. Twin of MeshVertex::morph:
-// `<< 7` parks bit 24 on the sign, `>> 24` brings bit 17 down to bit 0.
+// Bits [17:25) of w1, 8-bit two's complement (SHIFT_MORPH, MASK_MORPH).
+// Twin of MeshVertex::morph: `<< (24 - SHIFT_MORPH)` parks bit 24 on the
+// sign, `>> 24` brings bit 17 down to bit 0.
 int lod_morph_dy(uint w1)
 {
-    return int(w1 << 7) >> 24;
+    return int(w1 << (24 - SHIFT_MORPH)) >> 24;
 }
 
 // True when the band can produce a non-zero blend. !(end > start) covers

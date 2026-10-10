@@ -22,10 +22,10 @@
 use ash::vk;
 
 use super::alloc::{GpuCpuReadback, find_memory_type};
-use super::buffers::{FRAMES_IN_FLIGHT, HostBuffer, MeshRecord, RecordBuffers};
+use super::buffers::{FRAMES_IN_FLIGHT, HostBuffer, RecordBuffers};
 use super::cull_math::{
-    CpuCullScratch, FLAG_STATS, STATS_BYTES, STATS_COUNT, WORKGROUP, cpu_cull_into, cpu_cull_max,
-    lod_bucket_scale,
+    CpuCullScratch, CullView, FLAG_FACE_RUNS, FLAG_STATS, STATS_BYTES, STATS_COUNT, WORKGROUP,
+    cpu_cull_into, cpu_cull_max, lod_bucket_scale,
 };
 use super::pass;
 use crate::camera::Frustum;
@@ -403,7 +403,6 @@ impl CullState {
         physical: vk::PhysicalDevice,
         dir: &mut ArenaDirectory,
         records: RecordBuffers,
-        host_records: &[MeshRecord],
         is_arrived: impl Fn(u32) -> bool,
         slot_count: u32,
         camera: &Frustum,
@@ -431,12 +430,7 @@ impl CullState {
             return None;
         }
         if resolved.cpu_path {
-            let stats_hist = cpu_cull_into(
-                host_records,
-                dir,
-                is_arrived,
-                visible,
-                &partitions,
+            let view = CullView {
                 camera,
                 shadow,
                 eye,
@@ -444,6 +438,13 @@ impl CullState {
                 half,
                 centre,
                 face_cull,
+            };
+            let stats_hist = cpu_cull_into(
+                dir,
+                is_arrived,
+                visible,
+                &partitions,
+                &view,
                 &mut self.cpu_scratch,
             );
             unsafe {
@@ -484,7 +485,7 @@ impl CullState {
             cam_frac: eye.frac,
             arena_count: dir.arena_count() as u32,
             shadow_enabled: shadow.is_some() as u32,
-            flags: u32::from(face_cull),
+            flags: if face_cull { FLAG_FACE_RUNS } else { 0 },
             half_x: half[0],
             half_y: half[1],
             half_z: half[2],
@@ -642,27 +643,8 @@ impl CullState {
                 &vk::DependencyInfo::default().memory_barriers(&to_draws),
             );
             if stats {
-                device.cmd_copy_buffer(
-                    cmd,
-                    self.stats[slot].gpu,
-                    self.stats[slot].cpu,
-                    &[vk::BufferCopy {
-                        src_offset: 0,
-                        dst_offset: 0,
-                        size: STATS_BYTES,
-                    }],
-                );
-                // COPY / TRANSFER_WRITE → HOST / HOST_READ. Mapped read is after
-                // this slot's timeline wait (one cycle later).
-                let copy_to_host = [vk::MemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-                    .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-                device.cmd_pipeline_barrier2(
-                    cmd,
-                    &vk::DependencyInfo::default().memory_barriers(&copy_to_host),
-                );
+                // Mapped read is after this slot's timeline wait (one cycle later).
+                self.stats[slot].record_copy_to_host(device, cmd, STATS_BYTES);
             }
         }
         true

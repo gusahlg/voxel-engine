@@ -765,7 +765,9 @@ pub(crate) fn host_mapped_memory_type(
         .unwrap_or_else(|| find_memory_type(memory_props, type_filter, plain))
 }
 
-fn create_bound_buffer(
+/// An `EXCLUSIVE` buffer bound at offset 0 to its own allocation in the
+/// memory type `pick_type` chooses from the buffer's `memory_type_bits`.
+pub(crate) fn create_bound_buffer(
     device: &ash::Device,
     size: u64,
     usage: vk::BufferUsageFlags,
@@ -914,6 +916,21 @@ impl GpuCpuReadback {
         }
     }
 
+    /// [`cmd_copy_to_host`] of the first `bytes` of `gpu` into `cpu`.
+    pub(crate) unsafe fn record_copy_to_host(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        bytes: u64,
+    ) {
+        let region = vk::BufferCopy {
+            src_offset: 0,
+            dst_offset: 0,
+            size: bytes,
+        };
+        unsafe { cmd_copy_to_host(device, cmd, self.gpu, self.cpu, region) };
+    }
+
     pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
         unsafe {
             device.unmap_memory(self.cpu_memory);
@@ -922,6 +939,32 @@ impl GpuCpuReadback {
             device.destroy_buffer(self.gpu, None);
             device.free_memory(self.gpu_memory, None);
         }
+    }
+}
+
+/// Readback tail: copy `region` of `src` into the host-visible `dst`, then
+/// COPY / TRANSFER_WRITE → HOST / HOST_READ so a mapped read after the
+/// submission's timeline wait sees the bytes. The caller orders the writes
+/// of `src` before the copy (… → COPY / TRANSFER_READ), often folded into a
+/// barrier it records anyway.
+pub(crate) unsafe fn cmd_copy_to_host(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    src: vk::Buffer,
+    dst: vk::Buffer,
+    region: vk::BufferCopy,
+) {
+    let copy_to_host = [vk::MemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COPY)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+        .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+    unsafe {
+        device.cmd_copy_buffer(cmd, src, dst, &[region]);
+        device.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().memory_barriers(&copy_to_host),
+        );
     }
 }
 

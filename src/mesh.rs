@@ -2,7 +2,9 @@
 ///
 /// 8-byte vertex: two u32s packing position, normal, layer (w0) and baked light (w1).
 /// Shader derives UV from position+normal; per-face lighting from normal.
-/// See bit shifts below (SHIFT_*/MASK_*); mirrored by Slang unpack in mesh3d.vert.
+/// Bit shifts and masks (SHIFT_*/MASK_*) are generated from `build.rs`
+/// `build_table()` into [`crate::genconst`] and `shader_constants.slang`, so
+/// pack/unpack here and the Slang unpack in mesh3d.vert share one layout.
 ///
 /// Word 0: x[0:5] y[5:10] z[10:15] normal[15:18] layer[18:32]
 /// Word 1: ao[0:2] skylight[2:6] blocklight[6:10] water[10] micro[11:17) morph[17:25)
@@ -12,39 +14,13 @@
 /// Immediate debug geometry uses the separate unpacked [`DebugVertex`].
 use crate::vk::vertex_input::vertex_struct;
 
-// Bit shifts, mirrored by the Slang unpack in mesh3d.vert.slang.
-pub const SHIFT_X: u32 = 0;
-pub const SHIFT_Y: u32 = 5;
-pub const SHIFT_Z: u32 = 10;
-pub const SHIFT_NORMAL: u32 = 15;
-pub const SHIFT_LAYER: u32 = 18;
-/// AO level in w1[0:2], 0..=3; 3=no occlusion (diffuse multiplier).
-pub const SHIFT_AO: u32 = 0;
-/// Skylight and blocklight in w1[2:6] and [6:10] respectively, 0..=15 each.
-pub const SHIFT_SKY: u32 = 2;
-pub const SHIFT_BLOCK: u32 = 6;
-/// Water material bit in `w1` (bit 10). Set by mesher for liquid blocks;
-/// read by mesh3d.frag to select animated water shading in transparent pass.
-pub const SHIFT_WATER: u32 = 10;
-/// Per-axis micro-offsets in `w1` (bits 11-17): -2..=1 values that nudge vertices
-/// on double-covered LOD borders to break z-fighting. Default zero (no offset).
-pub const SHIFT_MICRO_X: u32 = 11;
-pub const SHIFT_MICRO_Y: u32 = 13;
-pub const SHIFT_MICRO_Z: u32 = 15;
-/// Two-bit mask for one micro-offset axis.
-pub const MASK_MICRO: u32 = 0x3;
-/// Morph target in w1[17:25): 8-bit two's complement, full i8 range, cells along local +Y.
-pub const SHIFT_MORPH: u32 = 17;
-/// Eight-bit mask for [`SHIFT_MORPH`].
-pub const MASK_MORPH: u32 = 0xFF;
-
-// Field masks (applied on pack so a debug-only out-of-range value can never
-// corrupt an adjacent field; the typed API keeps values in range anyway).
-const MASK_COORD: u32 = 0x1F; // 5 bits, holds 0..=16
-const MASK_NORMAL: u32 = 0x7; // 3 bits
-const MASK_LAYER: u32 = 0x3FFF; // 14 bits — word 0's remaining span, 16384 layers
-const MASK_AO: u32 = 0x3; // 2 bits
-const MASK_LIGHT: u32 = 0xF; // 4 bits
+// Field masks are applied on pack too, so a debug-only out-of-range value can
+// never corrupt an adjacent field; the typed API keeps values in range anyway.
+use crate::genconst::{
+    MASK_AO, MASK_COORD, MASK_LAYER, MASK_LIGHT, MASK_MICRO, MASK_MORPH, MASK_NORMAL, SHIFT_AO,
+    SHIFT_BLOCK, SHIFT_LAYER, SHIFT_MICRO_X, SHIFT_MICRO_Y, SHIFT_MICRO_Z, SHIFT_MORPH,
+    SHIFT_NORMAL, SHIFT_SKY, SHIFT_WATER, SHIFT_X, SHIFT_Y, SHIFT_Z,
+};
 
 /// Face normal. The discriminant IS the 3-bit index stored in the vertex and
 /// decoded by the shader: `0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z`.
@@ -215,11 +191,12 @@ impl MeshVertex {
 
     /// The morph target stored by [`Self::with_morph`], sign-extended from w1 bits [17:25).
     ///
-    /// The shift is the shader's: `int(w1 << 7) >> 24` moves bit 24 onto the sign and bit 17
-    /// down to bit 0. `as` binds tighter than the shifts, so the cast is parenthesized.
+    /// The shift is the shader's: `int(w1 << (24 - SHIFT_MORPH)) >> 24` moves bit 24 onto the
+    /// sign and bit 17 down to bit 0. `as` binds tighter than the shifts, so the cast is
+    /// parenthesized.
     pub const fn morph(&self) -> i8 {
         let w1 = self.packed[1];
-        (((w1 << 7) as i32) >> 24) as i8
+        (((w1 << (24 - SHIFT_MORPH)) as i32) >> 24) as i8
     }
 
     /// Decodes the chunk-local integer position as floats (for CPU-side AABBs).
@@ -626,10 +603,10 @@ mod tests {
         assert_eq!(plain.micro(), [0, 0, 0]);
     }
 
-    /// Shader decode of w1 bits [17:25). Twin of `int(w1 << 7) >> 24` in
-    /// `shaders/lod_morph.slang`. `as` binds tighter than `<<` / `>>`.
+    /// Shader decode of w1 bits [17:25). Twin of `int(w1 << (24 - SHIFT_MORPH)) >> 24`
+    /// in `shaders/lod_morph.slang`. `as` binds tighter than `<<` / `>>`.
     fn shader_morph(w1: u32) -> i8 {
-        (((w1 << 7) as i32) >> 24) as i8
+        (((w1 << (24 - SHIFT_MORPH)) as i32) >> 24) as i8
     }
 
     #[test]
