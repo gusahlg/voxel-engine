@@ -518,8 +518,8 @@ fn lint_slang_constants() {
     }
 }
 
-/// Packed-vertex names each unpacking shader must reference, so the bit
-/// layout cannot quietly go back to inline literals in one of them.
+/// Packed-vertex (and AO curve) names each unpacking shader must reference,
+/// so the layout cannot quietly go back to inline literals in one of them.
 const PACKING_CONST_USES: &[(&str, &[&str])] = &[
     (
         "shaders/mesh3d.vert.slang",
@@ -540,6 +540,8 @@ const PACKING_CONST_USES: &[(&str, &[&str])] = &[
             "MASK_LAYER",
             "MASK_AO",
             "MASK_LIGHT",
+            "AO_MIN",
+            "AO_STEP",
         ],
     ),
     (
@@ -892,6 +894,16 @@ fn build_table() -> Vec<Def> {
             name: "MASK_MORPH",
             doc: "Packed vertex morph-target mask (6 bits). lod_morph.slang sign-extends with\n`int(w1 << (26 - SHIFT_MORPH)) >> 26`; 26 = 32 - 6.",
             val: Val::UInt(0x3F),
+        },
+        Def {
+            name: "AO_MIN",
+            doc: "Baked AO level-0 diffuse multiplier: ao_factor = AO_MIN + level * AO_STEP,\nlevels 0..=3 -> 0.4..=1.0 (3 = no occlusion). Read by mesh3d.vert.",
+            val: Val::Scalar(0.4),
+        },
+        Def {
+            name: "AO_STEP",
+            doc: "Baked AO multiplier step per level. See AO_MIN.",
+            val: Val::Scalar(0.2),
         },
         // Sun disc core/rim radii, tuned to match the sun's real angular size.
         Def {

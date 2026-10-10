@@ -127,11 +127,12 @@ VertexOutput vertexMain(VertexInput input)
     else
         uv = float2(x, y);
 
-    // Baked AO: level 0..3 → diffuse multiplier 0.4..1.0. The field sits at
-    // bit 0 (SHIFT_AO == 0, pinned in genconst's tests): a `>> SHIFT_AO`
-    // here would lower to a no-op bitcast and change the module's bytes.
+    // Baked AO: level 0..3 → diffuse multiplier AO_MIN..AO_MIN + 3·AO_STEP
+    // (0.4..1.0). The field sits at bit 0 (SHIFT_AO == 0, pinned in genconst's
+    // tests): a `>> SHIFT_AO` here would lower to a no-op bitcast and change
+    // the module's bytes.
     uint ao_level = w1 & MASK_AO;
-    float ao_factor = 0.4 + float(ao_level) * 0.2;
+    float ao_factor = AO_MIN + float(ao_level) * AO_STEP;
     // Baked light levels: skylight [2:6], blocklight [6:10], 4-bit each.
     uint sky = (w1 >> SHIFT_SKY) & MASK_LIGHT;
     uint block = (w1 >> SHIFT_BLOCK) & MASK_LIGHT;

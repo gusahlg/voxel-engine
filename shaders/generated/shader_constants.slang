@@ -156,6 +156,13 @@ static const uint MASK_MICRO = 3;
 // `int(w1 << (26 - SHIFT_MORPH)) >> 26`; 26 = 32 - 6.
 static const uint MASK_MORPH = 63;
 
+// Baked AO level-0 diffuse multiplier: ao_factor = AO_MIN + level * AO_STEP,
+// levels 0..=3 -> 0.4..=1.0 (3 = no occlusion). Read by mesh3d.vert.
+static const float AO_MIN = 0.4f;
+
+// Baked AO multiplier step per level. See AO_MIN.
+static const float AO_STEP = 0.2f;
+
 // Sun-disc solid core as a multiple of the sun angular radius.
 // Larger core keeps sun defined against brighter night sky. Complements SUN_DISC_RIM tightening.
 static const float SUN_DISC_CORE = 1.12f;

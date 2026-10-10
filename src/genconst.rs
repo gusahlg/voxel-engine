@@ -109,6 +109,9 @@ mod tests {
         assert_eq!(MASK_MORPH.count_ones(), 6);
         // mesh3d.vert reads the AO level as `w1 & MASK_AO`, with no shift.
         assert_eq!(SHIFT_AO, 0);
+        // AO levels 0..=3 map to 0.4..=1.0; level 3 is unoccluded.
+        assert_eq!(AO_MIN, 0.4);
+        assert_eq!(AO_MIN + MASK_AO as f32 * AO_STEP, 1.0);
         // Light levels are 0..=15 (mesh3d.vert divides by 15).
         assert_eq!(MASK_LIGHT, 15);
     }
