@@ -16,7 +16,10 @@
 /// finite `p >= 2`; unset keeps 4), so a capture can cover `p` above the
 /// shader's cap. `VOXEL_DEMO_ROUNDED_P=cube` draws that body as a
 /// `FarShape::Cube` of the same size, rotation and colours, the shape a large
-/// `p` converges to.
+/// `p` converges to. `VOXEL_DEMO_ROUNDED_RHO=<rho>` (finite, in `(0, 1)`; unset
+/// keeps 0.06) sets that body's radius/distance, as if the camera had moved
+/// toward it: around 0.6 it fills sky tiles of its own, the close-up a
+/// near-cube twin world shows from orbit.
 use voxel_engine::{
     Ao, Camera3D, Color, Config, Detail, FarBody, FarMapDesc, FarMapId, FarShape, Key, Light,
     LinearRgb, MATERIAL_FLAG_PROCEDURAL, MaterialDesc, MeshData, MeshVertex, Normal, Pass, Quat,
@@ -206,6 +209,8 @@ const FAR_ALBEDO_SIZE: u32 = 64;
 const FAR_MAPPED_RHO: f32 = 0.12;
 /// Exponent of the showcase rounded body.
 const FAR_ROUNDED_P: f32 = 4.0;
+/// Reference radius fraction for the rounded body (`rho`).
+const FAR_ROUNDED_RHO: f32 = 0.06;
 
 /// Next non-colliding `screenshots/watt-<utc-secs>.png`. Autoshot cannot use
 /// [`Engine::screenshot`](voxel_engine::Engine::screenshot): that encode is
@@ -246,6 +251,16 @@ fn demo_rounded_p() -> f32 {
         .and_then(|text| text.parse::<f32>().ok())
         .filter(|p| p.is_finite() && *p >= voxel_engine::genconst::FAR_ROUNDED_P_MIN)
         .unwrap_or(FAR_ROUNDED_P)
+}
+
+/// Showcase rounded rho: `VOXEL_DEMO_ROUNDED_RHO` when it parses as a finite
+/// value in `(0, 1)`, else [`FAR_ROUNDED_RHO`].
+fn demo_rounded_rho() -> f32 {
+    std::env::var("VOXEL_DEMO_ROUNDED_RHO")
+        .ok()
+        .and_then(|text| text.parse::<f32>().ok())
+        .filter(|rho| rho.is_finite() && *rho > 0.0 && *rho < 1.0)
+        .unwrap_or(FAR_ROUNDED_RHO)
 }
 
 /// Shape of the showcase rounded body: a cube for `VOXEL_DEMO_ROUNDED_P=cube`,
@@ -469,7 +484,7 @@ fn far_showcase_bodies() -> [FarBody; 5] {
         ),
         at(
             2,
-            0.06,
+            demo_rounded_rho(),
             demo_rounded_shape(),
             Quat::IDENTITY,
             rounded_alb,
@@ -1036,7 +1051,7 @@ fn far_showcase_fits_the_upper_half() {
 #[test]
 fn far_showcase_matches_the_shape_contract() {
     let bodies = far_showcase_bodies();
-    let expect_rho = [0.08f32, 0.05, 0.06, FAR_MAPPED_RHO, 1.0e-4];
+    let expect_rho = [0.08f32, 0.05, FAR_ROUNDED_RHO, FAR_MAPPED_RHO, 1.0e-4];
     for (body, rho) in bodies.iter().zip(expect_rho) {
         assert!((body.distance - FAR_DEMO_DISTANCE).abs() < 1e-3);
         assert!((body.radius / body.distance - rho).abs() < 1e-6);

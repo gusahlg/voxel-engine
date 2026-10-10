@@ -6,7 +6,8 @@
 //! body with only that change. The geometry they call (`cone_bound` behind
 //! its old switch, `body_meets_view`, `horizon_dip`, the tile and horizon
 //! tests, `TileFrames`) was not changed by the cleanup, so the production
-//! copies are used. Delete this file and the comparison once the cleanup
+//! copies are used. The roundsolo split postdates this copy; `classify.rs`
+//! adds it on top. Delete this file and the comparison once the cleanup
 //! has shipped.
 
 use crate::far_body::{FarBody, FarShape, MAX_FAR_BODIES, MAX_FAR_MAPS};

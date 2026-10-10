@@ -1,13 +1,14 @@
-//! Which tiles draw with which sky pipeline: the coarse and single-Mapped
-//! splits of the tile-index runs, and [`SkyDraw`], the plan `record_sky`
-//! draws from.
+//! Which tiles draw with which sky pipeline: the coarse, single-Mapped and
+//! single-Rounded splits of the tile-index runs, and [`SkyDraw`], the plan
+//! `record_sky` draws from.
 
 use super::FarSwitches;
 use super::cones::{add_angles, lo_disc_interior, mapped_interior_half, mapped_rho_lo, unit_dir};
 use super::horizon::clear_tiles_above_horizon;
 use super::table::FarTableGpu;
 use super::tiles::{
-    TileRuns, TileView, heavy_mask, mapped_mask, tile_strictly_inside, tile_within, used_tiles,
+    TileRuns, TileView, heavy_mask, mapped_mask, rounded_mask, tile_strictly_inside, tile_within,
+    used_tiles,
 };
 use crate::far_body::{MAX_FAR_BODIES, MAX_FAR_MAPS};
 use crate::vk::pipeline::{SkyFrag, SkyRate};
@@ -233,6 +234,27 @@ fn count_mapsolo(table: &FarTableGpu, mapped: u32) -> u32 {
         .count() as u32
 }
 
+/// One live mask bit, and that kept body is Rounded. `rounded` is
+/// [`rounded_mask`]: bits past the kept count are clear.
+fn is_roundsolo(mask: u32, rounded: u32) -> bool {
+    mask.count_ones() == 1 && mask & rounded != 0
+}
+
+/// One live mask bit, and that kept body is Rounded.
+#[cfg(test)]
+pub(super) fn mask_is_roundsolo(table: &FarTableGpu, mask: u32) -> bool {
+    is_roundsolo(mask, rounded_mask(table))
+}
+
+/// Live tiles whose mask is exactly one Rounded body. Like
+/// [`count_mapsolo`], every such tile sits in the heavy run.
+fn count_roundsolo(table: &FarTableGpu, rounded: u32) -> u32 {
+    table.tile_mask[..used_tiles(table)]
+        .iter()
+        .filter(|mask| is_roundsolo(**mask, rounded))
+        .count() as u32
+}
+
 /// Stably partition the heavy run into single-Mapped tiles, then the rest.
 /// Returns that count. Base and sphere runs stay where [`fill_tile_lists`]
 /// put them. Called only while quads are on and mapsolo is enabled, and only
@@ -261,11 +283,38 @@ pub(super) fn partition_mapsolo(
     .unwrap_or(0)
 }
 
+/// Stably partition the heavy run into the rest, then the single-Rounded
+/// tiles, and return how many those are. A suffix: the mapsolo prefix stays
+/// where [`partition_mapsolo`] put it, and [`split_coarse_far`], which takes
+/// only single-Mapped tiles, keeps this a suffix. Base and sphere runs stay.
+/// Called only while quads are on and roundsolo is enabled.
+pub(super) fn partition_roundsolo(
+    table: &mut FarTableGpu,
+    runs: TileRuns,
+    scratch: &mut Vec<u32>,
+) -> u32 {
+    if runs.heavy == 0 {
+        return 0;
+    }
+    let slots = runs.heavy_slots();
+    if slots.end > table.tile_index.len() {
+        return 0;
+    }
+    let rounded = rounded_mask(table);
+    let masks = &table.tile_mask;
+    stable_partition(&mut table.tile_index[slots], scratch, |index| {
+        let mask = masks.get(index as usize).copied().unwrap_or(0);
+        Some(!is_roundsolo(mask, rounded))
+    })
+    .map_or(0, |rest| runs.heavy - rest)
+}
+
 /// The per-frame tile classification after the pack and the horizon tables:
 /// with culling on, drop tiles above those tables; plan the draws; then
 /// stably reorder the index runs, mapsolo first, so the interior split pulls
 /// its coarse prefix out of that single-Mapped run and the full-shader tiles
-/// stay after it, then the two coarse splits. `runs` are the pack's.
+/// stay after it, and roundsolo last in the heavy run; then the two coarse
+/// splits. `runs` are the pack's.
 /// `tiles` are the ring's frames when they match the view. The splits only
 /// rewrite the index prefix, so this runs before the byte match. Host-only,
 /// and no allocation once `scratch` holds the longest run.
@@ -282,13 +331,18 @@ pub(super) fn classify_tiles(
         Some(tiles) if switches.cull => clear_tiles_above_horizon(table, tiles).unwrap_or(runs),
         _ => runs,
     };
-    let mut draw = SkyDraw::from_runs(table, runs, switches.cull, switches.mapsolo);
+    let mut draw = SkyDraw::from_runs(table, runs, switches);
     // Fullscreen sky (no tile grid) stays on the 1×1 triangle.
     if draw.quads {
         if switches.mapsolo {
             let n = partition_mapsolo(table, runs, scratch);
             debug_assert_eq!(n, draw.n_mapsolo);
             draw.n_mapsolo = n;
+        }
+        if switches.roundsolo {
+            let n = partition_roundsolo(table, runs, scratch);
+            debug_assert_eq!(n, draw.n_roundsolo);
+            draw.n_roundsolo = n;
         }
         if let (Some(query), Some(tiles)) = (coarse, tiles) {
             draw.n_coarse = split_coarse_base(table, runs, tiles, query, scratch);
@@ -356,38 +410,41 @@ pub(crate) struct SkyDraw {
     /// the 2×2 interior prefix. `sky.mapsolo`. Zero when mapsolo is off or the
     /// sky is one fullscreen triangle.
     pub n_mapsolo: u32,
+    /// Heavy tiles drawn with the loop-free single-Rounded fragment: the
+    /// suffix of the heavy run, all at 1×1. `sky.roundsolo`. Zero when
+    /// roundsolo is off or the sky is one fullscreen triangle.
+    pub n_roundsolo: u32,
 }
 
 impl SkyDraw {
     /// Tile-quad draws in upload order: base coarse, base fine, sphere,
-    /// mapsolo coarse, mapsolo fine, heavy coarse, heavy fine. Each `first`
-    /// is the sum of the counts before it, which is where [`fill_tile_lists`],
-    /// [`partition_mapsolo`] and the `split_coarse_*` pair put those tiles.
-    /// Empty runs are `None`; all are `None` when the sky is one fullscreen
-    /// triangle.
+    /// mapsolo coarse, mapsolo fine, heavy coarse, heavy fine, roundsolo.
+    /// Each `first` is the sum of the counts before it, which is where
+    /// [`fill_tile_lists`], [`partition_mapsolo`], [`partition_roundsolo`]
+    /// and the `split_coarse_*` pair put those tiles. Empty runs are `None`;
+    /// all are `None` when the sky is one fullscreen triangle.
     ///
     /// `coarse` is [`SkyPipelines::has_coarse`], the same switch the CPU
     /// split read. Without the 2×2 pipelines a coarse prefix stays at the
     /// head of its fine run. With mapsolo on, the heavy interior is a prefix
     /// of the mapsolo run, so the heavy coarse run is empty. With it off,
     /// mapped-interior tiles are a prefix of the whole heavy run and draw on
-    /// the full fragment at 2×2.
+    /// the full fragment at 2×2. The roundsolo suffix is never coarse: the
+    /// interior split takes only single-Mapped tiles.
     ///
     /// [`fill_tile_lists`]: super::tiles::fill_tile_lists
     /// [`SkyPipelines::has_coarse`]: crate::vk::pipeline::SkyPipelines::has_coarse
-    pub(crate) fn runs(&self, coarse: bool) -> [Option<SkyRun>; 7] {
+    pub(crate) fn runs(&self, coarse: bool) -> [Option<SkyRun>; 8] {
         if !self.quads {
-            return [None; 7];
+            return [None; 8];
         }
         let if_coarse = |n: u32| if coarse { n } else { 0 };
         let base_coarse = if_coarse(self.n_coarse.min(self.n_base));
         let mapsolo = self.n_mapsolo.min(self.n_heavy);
+        let roundsolo = self.n_roundsolo.min(self.n_heavy - mapsolo);
+        let rest = self.n_heavy - mapsolo - roundsolo;
         let mapsolo_coarse = if_coarse(self.n_coarse_far.min(mapsolo));
-        let heavy_coarse = if_coarse(
-            self.n_coarse_far
-                .saturating_sub(mapsolo)
-                .min(self.n_heavy - mapsolo),
-        );
+        let heavy_coarse = if_coarse(self.n_coarse_far.saturating_sub(mapsolo).min(rest));
         let mut first = 0u32;
         [
             (SkyFrag::Base, SkyRate::Coarse, base_coarse),
@@ -396,11 +453,8 @@ impl SkyDraw {
             (SkyFrag::MapSolo, SkyRate::Coarse, mapsolo_coarse),
             (SkyFrag::MapSolo, SkyRate::Fine, mapsolo - mapsolo_coarse),
             (SkyFrag::Full, SkyRate::Coarse, heavy_coarse),
-            (
-                self.body.frag(),
-                SkyRate::Fine,
-                self.n_heavy - mapsolo - heavy_coarse,
-            ),
+            (self.body.frag(), SkyRate::Fine, rest - heavy_coarse),
+            (SkyFrag::RoundSolo, SkyRate::Fine, roundsolo),
         ]
         .map(|(frag, rate, count)| {
             let run = (count > 0).then_some(SkyRun {
@@ -424,7 +478,7 @@ impl SkyDraw {
         }
     }
 
-    /// `sky.coarse`, `sky.coarse_far` and `sky.mapsolo`.
+    /// `sky.coarse`, `sky.coarse_far`, `sky.mapsolo` and `sky.roundsolo`.
     pub(super) fn publish_gauges(&self) {
         crate::profile::gauge(crate::profile::Gauge::SkyCoarse, u64::from(self.n_coarse));
         crate::profile::gauge(
@@ -432,6 +486,10 @@ impl SkyDraw {
             u64::from(self.n_coarse_far),
         );
         crate::profile::gauge(crate::profile::Gauge::SkyMapsolo, u64::from(self.n_mapsolo));
+        crate::profile::gauge(
+            crate::profile::Gauge::SkyRoundsolo,
+            u64::from(self.n_roundsolo),
+        );
     }
 
     /// Zeroes every gauge [`FarBodyRing::write`] publishes: a frame with no sky.
@@ -453,21 +511,16 @@ impl SkyDraw {
     }
 
     /// The draw plan for a packed table whose tile lists hold `runs`.
-    /// `cull` and `mapsolo` are [`FarSwitches`]: culling off draws one
-    /// fullscreen triangle, mapsolo off counts no single-Mapped tile.
-    pub(super) fn from_runs(
-        table: &FarTableGpu,
-        runs: TileRuns,
-        cull: bool,
-        mapsolo: bool,
-    ) -> Self {
+    /// [`FarSwitches`]: culling off draws one fullscreen triangle, mapsolo
+    /// off counts no single-Mapped tile, roundsolo off no single-Rounded one.
+    pub(super) fn from_runs(table: &FarTableGpu, runs: TileRuns, switches: FarSwitches) -> Self {
         let bodies = table.header[0];
         let tile_px = table.header[1];
         let tiles_x = table.header[2];
         let tiles_y = table.header[3];
         let mapped = mapped_mask(table);
         let body = Self::body_pipe(heavy_mask(table), mapped);
-        let tiled = cull && tile_px != 0 && tiles_x != 0 && tiles_y != 0 && bodies != 0;
+        let tiled = switches.cull && tile_px != 0 && tiles_x != 0 && tiles_y != 0 && bodies != 0;
         if !tiled {
             return Self {
                 base: bodies == 0,
@@ -481,8 +534,13 @@ impl SkyDraw {
             n_base: runs.base,
             n_sphere: runs.sphere,
             n_heavy: runs.heavy,
-            n_mapsolo: if mapsolo {
+            n_mapsolo: if switches.mapsolo {
                 count_mapsolo(table, mapped)
+            } else {
+                0
+            },
+            n_roundsolo: if switches.roundsolo {
+                count_roundsolo(table, rounded_mask(table))
             } else {
                 0
             },
@@ -490,10 +548,16 @@ impl SkyDraw {
         }
     }
 
-    /// [`Self::from_runs`] with the runs counted from the masks and mapsolo on.
+    /// [`Self::from_runs`] with the runs counted from the masks, mapsolo and
+    /// roundsolo on.
     #[cfg(test)]
     pub(super) fn from_table(table: &FarTableGpu, cull: bool) -> Self {
-        Self::from_runs(table, TileRuns::count(table), cull, true)
+        let switches = FarSwitches {
+            cull,
+            mapsolo: true,
+            roundsolo: true,
+        };
+        Self::from_runs(table, TileRuns::count(table), switches)
     }
 }
 

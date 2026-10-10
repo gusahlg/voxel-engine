@@ -1833,6 +1833,92 @@ float3 far_add_rgb(uint i, float3 ray, float px, float flip)
     return float3(0.0, 0.0, 0.0);
 }
 
+#ifdef FAR_ROUNDED_SOLO
+// One rounded body, the lowest set bit of the tile mask. The CPU draws this
+// variant only when that bit is the mask and the body is FarShape::Rounded.
+// far_bodies for that one body, in its order and with its math: the cone
+// reject, the point blob, the march, the kind-5 shade, the air rim. The
+// loop's start depth 1e30 stands in for `bestDepth`, and the blob and the rim
+// are far_add_rgb. No body loop, no shape dispatch, no best-hit bookkeeping.
+// Same return as far_mapped_solo: when w is 1, xyz is the shaded surface and
+// replaces the background; when w is 0, xyz is the blob or rim (or zero) the
+// caller adds onto the background it builds after this returns.
+float4 far_rounded_solo(float3 ray, float px, float2 pix)
+{
+    uint n = min(farTable[0].header.x, MAX_FAR_BODIES);
+    if (n == 0u)
+        return float4(0.0, 0.0, 0.0, 0.0);
+    uint mask = far_tile_mask(n, pix);
+    if (mask == 0u)
+        return float4(0.0, 0.0, 0.0, 0.0);
+    uint i = firstbitlow(mask);
+    FAR_CONE_REJECT(i, ray, px, return float4(0.0, 0.0, 0.0, 0.0));
+
+    float t = 0.0;
+    uint face = 0u;
+    bool hit;
+    {
+        float4 dirRho = farTable[0].body[i].dir_rho;
+        float rho = dirRho.w;
+        if (!(rho > 0.0 && rho < 1.0))
+            return float4(0.0, 0.0, 0.0, 0.0);
+        float3 center = dirRho.xyz;
+        float facing = dot(ray, center);
+        float distance = farTable[0].body[i].albedo2.w;
+        float ang = (rho * 2.0) / px;
+        [branch]
+        if (ang < 0.7 && facing > 0.0)
+        {
+            // Pass 1 gates on the point depth, pass 2 on the stored depth.
+            float tPoint = 1.0 - rho;
+            if (tPoint * distance < 1e30 && facing * distance < 1e30)
+                return float4(far_add_rgb(i, ray, px, frame.light.w * 2.0 - 1.0), 0.0);
+            return float4(0.0, 0.0, 0.0, 0.0);
+        }
+        float pExp = asfloat(farTable[0].body[i].seed.y);
+        float4 rot = farTable[0].body[i].rot;
+        hit = far_ray_rounded(ray, center, rho, rot, pExp, facing, t, face);
+    }
+
+    // Reloaded after the march, so none of it is live across the steps.
+    float4 dirRho = farTable[0].body[i].dir_rho;
+    float rho = dirRho.w;
+    float3 center = dirRho.xyz;
+    float distance = farTable[0].body[i].albedo2.w;
+    float pExp = asfloat(farTable[0].body[i].seed.y);
+    float4 atmo = farTable[0].body[i].atmosphere;
+    if (hit && t * distance < 1e30)
+    {
+        // The loop's kind-5 shade, in its order. The normal is far_lp at the
+        // hit.
+        float4 rot = farTable[0].body[i].rot;
+        float3 bodyP = far_inv_rotate(rot, ray * t - center);
+        float3 inscatter = sky_radiance(ray, frame);
+        float3 nrm = float3(0.0, 0.0, 0.0);
+        float3 o = far_inv_rotate(rot, -center);
+        float3 d = far_inv_rotate(rot, ray);
+        float sLp;
+        float3 gLp;
+        far_lp(o + d * t, far_round_p(pExp), sLp, gLp);
+        float glen = length(gLp);
+        if (glen > 1e-8)
+            nrm = far_rotate(rot, gLp / glen);
+        float3 alb = far_albedo(i, bodyP, face, false, rho);
+        float3 lit = far_lit(alb, nrm, ray, atmo.rgb, rho, false, true);
+        return float4(far_through_air(lit, inscatter, rho), 1.0);
+    }
+    if (!hit && dot(atmo.rgb, atmo.rgb) > 0.0)
+    {
+        float rhoB = far_round_bound(rho, pExp);
+        float s = length(cross(ray, center));
+        float width = max(rhoB * 0.05, px * 1.25);
+        // Pass 1's rim gate. Pass 2's stored depth is the same facing depth.
+        if (s > rhoB && s < rhoB + width && dot(ray, center) * distance < 1e30)
+            return float4(far_add_rgb(i, ray, px, frame.light.w * 2.0 - 1.0), 0.0);
+    }
+    return float4(0.0, 0.0, 0.0, 0.0);
+}
+#else
 // `px` is the pixel angle, from fwidth in the entry point (uniform flow).
 // `pix` is SV_Position.xy (framebuffer pixels, origin top-left).
 // The viewer's sky radiance is recomputed at shade time. Carrying that
@@ -2390,5 +2476,6 @@ float3 far_sky_debug_rgb(float3 ray, float px, float2 pix)
 }
 #endif
 
+#endif // FAR_ROUNDED_SOLO
 #endif // FAR_MAPPED_SOLO
 #endif

@@ -95,7 +95,7 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     float4 far = mul(pc.inv_view_proj, float4(input.ndc, 0.0, 1.0));
     float3 ray = normalize(far.xyz);
 
-#ifdef FAR_MAPPED_SOLO
+#if defined(FAR_MAPPED_SOLO) || defined(FAR_ROUNDED_SOLO)
     // fwidth before any mask branch, same as the full entry. Pixel position
     // is consumed before the march (the debug key returns here) so FragCoord
     // is not live across a datum fetch. The background is built only on a
@@ -105,14 +105,23 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     [branch]
     if (frame.sky_tangent.w != 0.0)
     {
+#ifdef FAR_MAPPED_SOLO
         float3 dbg = far_sky_debug_rgb(ray, px, pix);
+#else
+        // A rounded body keys nothing: no mapped surface, limb or skip.
+        float3 dbg = float3(0.25, 0.25, 0.25);
+#endif
         float yLocal = sky_local(ray, frame).y;
         float sDip = frame.sky_bitangent.w;
         if (yLocal >= -sDip && yLocal <= 0.0)
             dbg += 0.5;
         return float4(dbg, 1.0);
     }
+#ifdef FAR_MAPPED_SOLO
     float4 body = far_mapped_solo(ray, px, pix);
+#else
+    float4 body = far_rounded_solo(ray, px, pix);
+#endif
     float3 col;
     if (body.w != 0.0)
         col = body.xyz;
@@ -176,15 +185,15 @@ float4 fragmentMain(FragmentInput input) : SV_Target
     }
     col = col * (1.0 - cover) + cloud_lit;
 
-#ifndef FAR_MAPPED_SOLO
+#if !defined(FAR_MAPPED_SOLO) && !defined(FAR_ROUNDED_SOLO)
     // VOXEL_SKY_DEBUG. sky_tangent.w is 1 for the frame or 0. One uniform
     // branch: when it is 0 the colour above is what the pixel returns, and
     // far_sky_debug_rgb is not called. A non-zero lane replaces the colour
     // with the source key. R/G/B mark a mapped surface, a mapped air limb,
     // and a horizon skip; base sky (no far bodies) stays 0.25 grey. The steep
     // part of sky_radiance's elevation remap, -s <= y_local <= 0, adds 0.5.
-    // The solo variant returns this key before the march so FragCoord is not
-    // live across a datum fetch.
+    // The solo variants return this key before the march so FragCoord is not
+    // live across it.
     [branch]
     if (frame.sky_tangent.w != 0.0)
     {

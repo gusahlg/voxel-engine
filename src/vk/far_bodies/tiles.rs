@@ -563,6 +563,11 @@ pub(super) fn mapped_mask(table: &FarTableGpu) -> u32 {
     table.kept_bits(FarBodyGpu::is_mapped)
 }
 
+/// Kept Rounded bodies. Bit i is kept index i.
+pub(super) fn rounded_mask(table: &FarTableGpu) -> u32 {
+    table.kept_bits(FarBodyGpu::is_rounded)
+}
+
 /// Lengths of the three tile-index runs [`fill_tile_lists`] writes, in
 /// upload order: mask == 0, then sphere-only (a non-zero mask that misses
 /// every heavy body), then heavy. The pack returns them, so one count serves

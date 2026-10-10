@@ -327,6 +327,22 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             "sky_mapsolo.frag.spv",
         )
     });
+    // One rounded body: the lowest set bit of the tile mask. No shape loop.
+    // Its blob and rim go through far_add_rgb, so the mapped limb and the
+    // cube rim are compiled out of that.
+    jobs.push(ShaderJob {
+        defines: &[
+            ("FAR_ROUNDED_SOLO", None),
+            ("FAR_NO_MAPPED", None),
+            ("FAR_NO_CUBE", None),
+        ],
+        ..job(
+            "shaders/sky.frag.slang",
+            Stage::Fragment,
+            "fragmentMain",
+            "sky_roundsolo.frag.spv",
+        )
+    });
     // Present-time TAA tonemap fragment (`-DTAA_FUSED`).
     jobs.push(ShaderJob {
         defines: &[("TAA_FUSED", None)],
