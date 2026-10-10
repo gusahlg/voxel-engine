@@ -147,10 +147,6 @@ impl Vrs {
         self.mix[slot].gpu
     }
 
-    pub fn mix_cpu(&self, slot: usize) -> vk::Buffer {
-        self.mix[slot].cpu
-    }
-
     /// Last completed histogram for `slot`: `[1x1, 2x2, 4x4]`.
     pub fn mix(&self, slot: usize) -> [u32; MIX_COUNT] {
         unsafe {
@@ -465,27 +461,9 @@ impl super::Renderer {
                     cmd,
                     &vk::DependencyInfo::default().memory_barriers(&mix_to_copy),
                 );
-                device.cmd_copy_buffer(
-                    cmd,
-                    vrs.mix_gpu(slot),
-                    vrs.mix_cpu(slot),
-                    &[vk::BufferCopy {
-                        src_offset: 0,
-                        dst_offset: 0,
-                        size: MIX_BYTES,
-                    }],
-                );
-                // COPY / TRANSFER_WRITE → HOST / HOST_READ. The mapped read
-                // happens after this slot's timeline wait (one cycle later).
-                let copy_to_host = [vk::MemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-                    .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-                device.cmd_pipeline_barrier2(
-                    cmd,
-                    &vk::DependencyInfo::default().memory_barriers(&copy_to_host),
-                );
+                // The mapped read happens after this slot's timeline wait
+                // (one cycle later).
+                vrs.mix[slot].record_copy_to_host(device, cmd, MIX_BYTES);
             }
         }
     }

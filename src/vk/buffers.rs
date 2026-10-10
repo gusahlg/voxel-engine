@@ -16,7 +16,7 @@ pub use super::retire::RetireQueue;
 pub use crate::rev::{FRAMES_IN_FLIGHT, SUBMIT_BATCH_MAX};
 
 pub(crate) use super::handles::{MeshHandles, MeshMeta, PlacementState};
-pub(crate) use super::host_buffer::{HOST_BAR_BYTES, HOST_COHERENT};
+pub(crate) use super::host_buffer::HOST_COHERENT;
 pub(crate) use super::mesh_residency::{MESH_CONSUMER_STAGES, MeshResidency};
 pub(crate) use super::mesh_resident::{
     GpuResident, build_mesh_resident, build_mesh_resident_staged,
