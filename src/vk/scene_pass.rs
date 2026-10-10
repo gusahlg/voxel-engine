@@ -10,10 +10,168 @@ use crate::skeleton::FrameSlot;
 
 use super::buffers::{self, DrawIndexedIndirect};
 use super::cull;
-use super::frame_loop::{ImmOffsets, jittered_clip, sky_drawn};
+use super::frame_loop::{ImmOffsets, jittered_clip};
 use super::gpu_timer::{GpuPass, PipeStatPass};
 use super::pipeline;
-use super::{HdrReadable, Renderer, SceneDepthUse, color_range, depth_range};
+use super::{HdrReadable, Renderer, SceneDepthUse, color_range, depth_range, scene_depth_use};
+
+/// What this frame's VRS does with the slot's rate and history images.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SceneVrs {
+    /// No classify and no rate attachment: VRS off, no 3D scene, or no rate
+    /// images on this device.
+    Off,
+    /// First use of the slot since create/recreate: no rate attachment, and
+    /// the classifier writes the rate and history images from UNDEFINED.
+    Prime,
+    /// The pass binds the rate image this slot's last classify wrote
+    /// (`FRAMES_IN_FLIGHT` frames ago, the staleness the old begin-of-frame
+    /// classify accepted), then the classifier rewrites it.
+    Bound,
+}
+
+impl SceneVrs {
+    /// The pass binds the rate image as its shading-rate attachment.
+    pub(super) fn binds_rate(self) -> bool {
+        self == Self::Bound
+    }
+
+    /// The classifier runs at the end of the pass, priming the next use of
+    /// the slot.
+    pub(super) fn classifies(self) -> bool {
+        self != Self::Off
+    }
+}
+
+/// Who moves the HDR offscreen to `SHADER_READ_ONLY_OPTIMAL` for the
+/// tonemap present copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HdrFinalize {
+    /// Exposure metering writes the offscreen after the pass and owns the
+    /// transition (presented 3D frames with exposure on).
+    Exposure,
+    /// [`RenderPass::end`] does, in its post-scene barrier (presented, no
+    /// exposure).
+    Pass,
+    /// Nobody: the frame is not presented, and the next begin discards the
+    /// offscreen from UNDEFINED.
+    Skip,
+}
+
+/// Every per-frame decision of the scene pass and the work recorded right
+/// after it in the same command buffer. Made once per frame by
+/// [`scene_plan`] in `draw_frame`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ScenePlan {
+    /// The frame presents. HDR colour is read only by bloom, exposure, spill
+    /// and the tonemap, all present-only, so colour is stored (MSAA: resolved)
+    /// only then. Minimap is a separate texture, screenshots copy the
+    /// swapchain after tonemap, and VRS classify reads depth, not colour.
+    pub(super) present: bool,
+    pub(super) hdr: HdrFinalize,
+    /// The sky pass draws: the colour attachment loads `DONT_CARE`, and the
+    /// far table and cloud LUT are written ([`super::frame_loop::sky_drawn`]).
+    pub(super) sky: bool,
+    pub(super) vrs: SceneVrs,
+    /// What later passes this frame read of the depth.
+    pub(super) depth_use: SceneDepthUse,
+    /// Source stages of the depth attachment's begin barrier: the reads of
+    /// this slot's depth since its last pass. `FRAGMENT_SHADER` when a later
+    /// frame's water absorption sampled its stored depth, `COMPUTE_SHADER`
+    /// when its last classify read the stored MS depth, else `NONE`.
+    pub(super) depth_src: vk::PipelineStageFlags2,
+    /// Water-absorption Blend draws: binding 5 is the previous slot's
+    /// sampleable depth, or the dummy when that depth is invalid.
+    pub(super) absorb: bool,
+    /// The previous slot stored sampleable depth at this render extent.
+    pub(super) prev_depth_valid: bool,
+    /// Lean opaque/LOD fragment pipelines: every optional lighting lane is
+    /// off and fog is off.
+    pub(super) mesh_lean: bool,
+    /// The quarter-res spill has work on presented frames: bloom, or a live
+    /// godray march.
+    pub(super) spill_live: bool,
+}
+
+/// Inputs to [`scene_plan`], plain values so every combination is
+/// host-testable.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct SceneInputs {
+    /// The frame has a 3D scene.
+    pub(super) scene: bool,
+    /// `decide_present` acquired a swapchain image.
+    pub(super) present: bool,
+    /// [`super::frame_loop::sky_drawn`].
+    pub(super) sky: bool,
+    /// `RenderFlags::vrs`, and the targets have rate images.
+    pub(super) vrs: bool,
+    /// This slot's last classify left its rate image in GENERAL.
+    pub(super) classified: bool,
+    /// MSAA with the sample-0 `vrs_ms` classifier.
+    pub(super) classify_ms: bool,
+    pub(super) taa: bool,
+    pub(super) exposure: bool,
+    /// Bloom on, or the godray march has strength.
+    pub(super) spill_live: bool,
+    /// The absorb Blend pipeline exists and a Blend run is drawn.
+    pub(super) absorb: bool,
+    pub(super) mesh_lean: bool,
+    pub(super) prev_depth_valid: bool,
+    /// A later frame's water absorption sampled this slot's stored depth.
+    pub(super) depth_sampled: bool,
+    /// This slot's last classify read its stored MS depth.
+    pub(super) ms_depth_read: bool,
+}
+
+/// This frame's [`ScenePlan`].
+pub(super) fn scene_plan(i: SceneInputs) -> ScenePlan {
+    // First scene pass of a slot after create/recreate skips VRS and still
+    // classifies at the end, so the next use is primed.
+    let vrs = if !(i.scene && i.vrs) {
+        SceneVrs::Off
+    } else if i.classified {
+        SceneVrs::Bound
+    } else {
+        SceneVrs::Prime
+    };
+    let depth_use = scene_depth_use(
+        i.classify_ms,
+        i.present,
+        i.taa,
+        i.spill_live,
+        vrs.classifies(),
+        i.absorb,
+    );
+    // Exposure metering (like bloom) feeds only the tonemap present copy, so
+    // it runs solely on frames that will present (`decide_present` already
+    // ran; a forced capture always presents).
+    let hdr = if !i.present {
+        HdrFinalize::Skip
+    } else if i.scene && i.exposure {
+        HdrFinalize::Exposure
+    } else {
+        HdrFinalize::Pass
+    };
+    let mut depth_src = vk::PipelineStageFlags2::NONE;
+    if i.depth_sampled {
+        depth_src |= vk::PipelineStageFlags2::FRAGMENT_SHADER;
+    }
+    if i.ms_depth_read {
+        depth_src |= vk::PipelineStageFlags2::COMPUTE_SHADER;
+    }
+    ScenePlan {
+        present: i.present,
+        hdr,
+        sky: i.sky,
+        vrs,
+        depth_use,
+        depth_src,
+        absorb: i.absorb,
+        prev_depth_valid: i.prev_depth_valid,
+        mesh_lean: i.mesh_lean,
+        spill_live: i.spill_live,
+    }
+}
 
 /// Manages dynamic rendering for one frame. Must call `end()` explicitly.
 pub(super) struct RenderPass<'a> {
@@ -32,36 +190,20 @@ pub(super) struct RenderPass<'a> {
     scene_state: Option<(glam::Mat4, pipeline::EyeSplit)>,
     mesh_push_bound: std::cell::Cell<bool>,
     index_bound: std::cell::Cell<bool>,
-    /// What later passes this frame read of the depth: the sampleable depth
-    /// (VRS / spill / TAA / next-frame water absorb), the stored MS depth
-    /// (VRS classify alone), or nothing.
-    depth_use: SceneDepthUse,
-    /// Water-absorption Blend draws this frame: binding 5 is the previous
-    /// slot's sampleable depth (or the dummy when that depth is invalid).
-    absorb_this_frame: bool,
-    /// Previous slot stored sampleable depth at this render extent.
-    prev_depth_valid: bool,
-    /// Lean opaque/LOD fragment pipelines this frame: every optional lighting
-    /// lane is off and fog is off. Chosen once per frame from `RenderFlags`.
-    mesh_lean: bool,
+    /// This frame's decisions: depth use, water absorption and its previous
+    /// depth, lean pipelines, VRS, and who finalizes the HDR.
+    plan: ScenePlan,
 }
 
 impl<'a> RenderPass<'a> {
     /// Records attachment layout transitions and begins dynamic rendering.
-    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn begin(
         r: &'a Renderer,
         cmd: vk::CommandBuffer,
         slot: usize,
         lists: &'a DrawLists,
         offsets: ImmOffsets,
-        do_vrs: bool,
-        depth_use: SceneDepthUse,
-        store_color: bool,
-        absorb_this_frame: bool,
-        depth_sampled: bool,
-        ms_depth_read: bool,
-        mesh_lean: bool,
+        plan: ScenePlan,
     ) -> RenderPass<'a> {
         let device = &r.device.device;
         let extent = r.render_extent;
@@ -69,11 +211,11 @@ impl<'a> RenderPass<'a> {
         let profiling = crate::profile::is_enabled();
         unsafe {
             // Bind last-use's rate image if this slot has already classified
-            // (`vrs_ready`). The classifier ran at the END of that previous use
-            // and left the image in GENERAL; the begin batch below transitions
-            // it to FRAGMENT_SHADING_RATE_ATTACHMENT. First use after
-            // create/recreate skips VRS (`vrs_ready` is false).
-            let rate = do_vrs.then(|| r.vrs_rate_attachment(slot));
+            // (`SceneVrs::Bound`). The classifier ran at the END of that
+            // previous use and left the image in GENERAL; the begin batch
+            // below transitions it to FRAGMENT_SHADING_RATE_ATTACHMENT. First
+            // use after create/recreate skips VRS (`SceneVrs::Prime`).
+            let rate = plan.vrs.binds_rate().then(|| r.vrs_rate_attachment(slot));
 
             // One vkCmdPipelineBarrier2 for every image the pass writes, plus
             // the rate image when VRS is bound. Sampleable depth always begins
@@ -87,7 +229,7 @@ impl<'a> RenderPass<'a> {
             // Old UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
             // MSAA: this image is the AVERAGE resolve target; skip the barrier
             // when colour is not stored (no resolve this frame).
-            if store_color || r.targets.msaa.is_none() {
+            if plan.present || r.targets.msaa.is_none() {
                 image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::NONE)
                     .src_access_mask(vk::AccessFlags2::NONE)
@@ -105,19 +247,12 @@ impl<'a> RenderPass<'a> {
             // later frame sampled this slot's stored depth (WAR: that sample
             // is a different command buffer still in flight); plus
             // COMPUTE_SHADER when the VRS classifier read this slot's stored
-            // MS depth at the end of its previous use (`ms_depth_read`). Dst
+            // MS depth at the end of its previous use (`plan.depth_src`). Dst
             // EARLY|LATE_FRAGMENT_TESTS / DEPTH_STENCIL_ATTACHMENT_{READ,WRITE}.
             // Old UNDEFINED → DEPTH_ATTACHMENT_OPTIMAL. Contents are cleared
             // every frame.
-            let mut depth_src = vk::PipelineStageFlags2::NONE;
-            if depth_sampled {
-                depth_src |= vk::PipelineStageFlags2::FRAGMENT_SHADER;
-            }
-            if ms_depth_read {
-                depth_src |= vk::PipelineStageFlags2::COMPUTE_SHADER;
-            }
             image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(depth_src)
+                .src_stage_mask(plan.depth_src)
                 .src_access_mask(vk::AccessFlags2::NONE)
                 .dst_stage_mask(
                     vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
@@ -139,7 +274,7 @@ impl<'a> RenderPass<'a> {
             // This image rests in SAMPLEABLE_DEPTH_REST_LAYOUT after `end` only
             // for `Sampleable`. Skip the resolve-target barrier otherwise: no
             // consumer, or the classifier alone reads the stored MS `depth`.
-            if depth_use == SceneDepthUse::Sampleable
+            if plan.depth_use == SceneDepthUse::Sampleable
                 && let Some(resolved) = &r.targets.resolved_depth[slot]
             {
                 image_barriers[barrier_count] = vk::ImageMemoryBarrier2::default()
@@ -174,7 +309,7 @@ impl<'a> RenderPass<'a> {
                     .subresource_range(color_range());
                 barrier_count += 1;
             }
-            if do_vrs {
+            if plan.vrs.binds_rate() {
                 image_barriers[barrier_count] = r.vrs_rate_to_attachment_barrier(slot);
                 barrier_count += 1;
             }
@@ -199,7 +334,7 @@ impl<'a> RenderPass<'a> {
             let offscreen_view = r.targets.offscreen[slot].view();
             // Sky triangle covers every pixel left at reversed-Z far (depth 0).
             // Debug-flat (TerrainKey) frames carry `lists.sky == None` and still clear.
-            let color_load = if sky_drawn(&r.flags, lists) {
+            let color_load = if plan.sky {
                 vk::AttachmentLoadOp::DONT_CARE
             } else {
                 vk::AttachmentLoadOp::CLEAR
@@ -216,7 +351,7 @@ impl<'a> RenderPass<'a> {
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .load_op(color_load)
                     .store_op(vk::AttachmentStoreOp::DONT_CARE);
-                if store_color {
+                if plan.present {
                     att = att
                         .resolve_mode(vk::ResolveModeFlags::AVERAGE)
                         .resolve_image_view(offscreen_view)
@@ -230,7 +365,7 @@ impl<'a> RenderPass<'a> {
                     .image_view(offscreen_view)
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .load_op(color_load)
-                    .store_op(if store_color {
+                    .store_op(if plan.present {
                         vk::AttachmentStoreOp::STORE
                     } else {
                         vk::AttachmentStoreOp::DONT_CARE
@@ -249,7 +384,7 @@ impl<'a> RenderPass<'a> {
             // classifier loads sample 0 directly. When nothing samples depth
             // this frame, DONT_CARE the store and skip the resolve; the next
             // begin discards from UNDEFINED.
-            let depth_store = if depth_use.stores_attachment(r.targets.msaa.is_some()) {
+            let depth_store = if plan.depth_use.stores_attachment(r.targets.msaa.is_some()) {
                 vk::AttachmentStoreOp::STORE
             } else {
                 vk::AttachmentStoreOp::DONT_CARE
@@ -265,7 +400,7 @@ impl<'a> RenderPass<'a> {
                         stencil: 0,
                     },
                 });
-            if depth_use == SceneDepthUse::Sampleable
+            if plan.depth_use == SceneDepthUse::Sampleable
                 && let Some(resolved) = &r.targets.resolved_depth[slot]
             {
                 depth_attachment = depth_attachment
@@ -346,10 +481,7 @@ impl<'a> RenderPass<'a> {
             scene_state,
             mesh_push_bound: std::cell::Cell::new(false),
             index_bound: std::cell::Cell::new(false),
-            depth_use,
-            absorb_this_frame,
-            prev_depth_valid: r.prev_depth.valid(slot, r.render_extent),
-            mesh_lean,
+            plan,
         }
     }
 
@@ -431,7 +563,7 @@ impl<'a> RenderPass<'a> {
         let r = self.r;
         let (view_proj, eye) = self.scene_state.expect("a mesh pass implies a 3D scene");
         let extent = r.render_extent;
-        let inv_render_extent = if self.prev_depth_valid {
+        let inv_render_extent = if self.plan.prev_depth_valid {
             [1.0 / extent.width as f32, 1.0 / extent.height as f32]
         } else {
             [0.0, 0.0]
@@ -487,9 +619,9 @@ impl<'a> RenderPass<'a> {
         // when the absorb pipeline is active, and consumed only inside the
         // water branch. Dummy 1×1 when that depth is invalid (shader falls
         // back to WATER_BODY_MIX).
-        if self.absorb_this_frame {
+        if self.plan.absorb {
             let layout = self.r.pipelines.layout_3d;
-            let depth_view = if self.prev_depth_valid {
+            let depth_view = if self.plan.prev_depth_valid {
                 self.r
                     .targets
                     .sampleable_depth(super::PrevDepthTrack::prev_slot(self.slot))
@@ -579,8 +711,8 @@ impl<'a> RenderPass<'a> {
     unsafe fn record_mesh_indirect_count(&self, pass: Pass) {
         match pass {
             Pass::Opaque => {
-                let (full, lod) = self.r.pipelines.opaque_pipelines(self.mesh_lean);
-                let (caged, caged_lod) = self.r.pipelines.caged_opaque(self.mesh_lean);
+                let (full, lod) = self.r.pipelines.opaque_pipelines(self.plan.mesh_lean);
+                let (caged, caged_lod) = self.r.pipelines.caged_opaque(self.plan.mesh_lean);
                 // Flat then caged, full-res before LOD. Each pair shares one
                 // timestamp: caged calls add into the flat group's gauge.
                 unsafe {
@@ -981,31 +1113,21 @@ impl<'a> RenderPass<'a> {
         }
     }
 
-    /// Ends dynamic rendering, transitions the offscreen image to
-    /// `SHADER_READ_ONLY_OPTIMAL`, and returns the [`HdrReadable`] proof. The
-    /// timeline orders later submits; this barrier owns layout and visibility.
-    /// Use when no later pass writes the offscreen, so this pass owns the final
-    /// transition for tonemapping. Sampleable depth (or, classify-only under
-    /// MSAA, the MS depth) rests here when a later pass samples it (see
-    /// [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]); `classify_vrs` joins the rate
-    /// and history images into the same barrier.
-    pub(super) unsafe fn end_sampled(self, classify_vrs: bool) -> HdrReadable {
-        let slot = self.slot;
-        unsafe { self.end(true, classify_vrs) };
-        HdrReadable::new(slot)
-    }
-
-    /// Ends dynamic rendering WITHOUT the offscreen sampled transition: a later
-    /// offscreen writer (exposure metering) runs after this and owns the
-    /// finalization instead (its barrier would otherwise race the write).
-    /// Sampleable (or classify-only MS) depth still rests in
-    /// [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`] when a later pass samples it.
-    /// Yields no proof — the deferred finalizer produces it.
-    pub(super) unsafe fn end_deferred(self, classify_vrs: bool) {
-        unsafe { self.end(false, classify_vrs) };
-    }
-
-    unsafe fn end(mut self, transition_offscreen: bool, classify_vrs: bool) {
+    /// Ends dynamic rendering and records the post-scene barrier. The timeline
+    /// orders later submits; this barrier owns layout and visibility.
+    ///
+    /// [`HdrFinalize::Pass`]: no later pass writes the offscreen, so this
+    /// barrier moves it to `SHADER_READ_ONLY_OPTIMAL` for tonemapping and
+    /// the [`HdrReadable`] proof is returned. Otherwise there is no offscreen
+    /// transition and no proof: exposure metering writes the offscreen after
+    /// this and owns the finalization (its barrier would otherwise race the
+    /// write), or the frame is not presented. Sampleable depth (or,
+    /// classify-only under MSAA, the MS depth) rests here when a later pass
+    /// samples it (see [`super::SAMPLEABLE_DEPTH_REST_LAYOUT`]); a classifying
+    /// frame joins the rate and history images into the same barrier.
+    pub(super) unsafe fn end(mut self) -> Option<HdrReadable> {
+        let transition_offscreen = self.plan.hdr == HdrFinalize::Pass;
+        let classify_vrs = self.plan.vrs.classifies();
         let device = &self.r.device.device;
         let cmd = self.cmd;
         unsafe {
@@ -1044,7 +1166,7 @@ impl<'a> RenderPass<'a> {
             // Depth rest: see `sampleable_depth_rest_barrier` and
             // `ms_depth_classify_barrier`. Skipped when nothing samples; the
             // next begin is UNDEFINED.
-            match self.depth_use {
+            match self.plan.depth_use {
                 SceneDepthUse::Sampleable => {
                     images[n] = self.r.sampleable_depth_rest_barrier(self.slot);
                     n += 1;
@@ -1073,11 +1195,198 @@ impl<'a> RenderPass<'a> {
                 );
             }
         }
+        transition_offscreen.then(|| HdrReadable::new(self.slot))
     }
 }
 
 impl Drop for RenderPass<'_> {
     fn drop(&mut self) {
         debug_assert!(self.ended, "RenderPass dropped without calling end()");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use SceneDepthUse::{ClassifyMs, Discard, Sampleable};
+
+    const FRAGMENT: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::FRAGMENT_SHADER;
+    const COMPUTE: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::COMPUTE_SHADER;
+
+    /// Every combination of the 14 inputs.
+    fn all_inputs() -> impl Iterator<Item = SceneInputs> {
+        (0u32..1 << 14).map(|bits| {
+            let b = |i: u32| bits & (1 << i) != 0;
+            SceneInputs {
+                scene: b(0),
+                present: b(1),
+                sky: b(2),
+                vrs: b(3),
+                classified: b(4),
+                classify_ms: b(5),
+                taa: b(6),
+                exposure: b(7),
+                spill_live: b(8),
+                absorb: b(9),
+                mesh_lean: b(10),
+                prev_depth_valid: b(11),
+                depth_sampled: b(12),
+                ms_depth_read: b(13),
+            }
+        })
+    }
+
+    /// What `record_render` passed to `RenderPass::begin` (and branched on
+    /// at the end of the pass) before the plan, from the same inputs.
+    struct Old {
+        do_vrs: bool,
+        classify_vrs: bool,
+        depth_use: SceneDepthUse,
+        store_color: bool,
+        absorb_this_frame: bool,
+        depth_sampled: bool,
+        ms_depth_read: bool,
+        mesh_lean: bool,
+        sky_drawn: bool,
+        run_exposure: bool,
+        will_present: bool,
+    }
+
+    fn old(i: SceneInputs) -> Old {
+        let vrs_on = i.scene && i.vrs;
+        Old {
+            do_vrs: vrs_on && i.classified,
+            classify_vrs: vrs_on,
+            depth_use: scene_depth_use(
+                i.classify_ms,
+                i.present,
+                i.taa,
+                i.spill_live,
+                vrs_on,
+                i.absorb,
+            ),
+            store_color: i.present,
+            absorb_this_frame: i.absorb,
+            depth_sampled: i.depth_sampled,
+            ms_depth_read: i.ms_depth_read,
+            mesh_lean: i.mesh_lean,
+            sky_drawn: i.sky,
+            run_exposure: i.scene && i.exposure && i.present,
+            will_present: i.present,
+        }
+    }
+
+    #[test]
+    fn scene_plan_matches_the_booleans_it_replaced() {
+        for i in all_inputs() {
+            let plan = scene_plan(i);
+            let old = old(i);
+            assert_eq!(plan.vrs.binds_rate(), old.do_vrs, "{i:?}");
+            assert_eq!(plan.vrs.classifies(), old.classify_vrs, "{i:?}");
+            assert_eq!(plan.depth_use, old.depth_use, "{i:?}");
+            assert_eq!(plan.present, old.store_color, "{i:?}");
+            assert_eq!(plan.absorb, old.absorb_this_frame, "{i:?}");
+            assert_eq!(plan.mesh_lean, old.mesh_lean, "{i:?}");
+            assert_eq!(plan.sky, old.sky_drawn, "{i:?}");
+            assert_eq!(plan.prev_depth_valid, i.prev_depth_valid, "{i:?}");
+            assert_eq!(plan.spill_live, i.spill_live, "{i:?}");
+            // The begin barrier's depth source, as `begin` built it.
+            let mut depth_src = vk::PipelineStageFlags2::NONE;
+            if old.depth_sampled {
+                depth_src |= FRAGMENT;
+            }
+            if old.ms_depth_read {
+                depth_src |= COMPUTE;
+            }
+            assert_eq!(plan.depth_src, depth_src, "{i:?}");
+            // The end branches: exposure, else presenting, else unpresented.
+            let hdr = if old.run_exposure {
+                HdrFinalize::Exposure
+            } else if old.will_present {
+                HdrFinalize::Pass
+            } else {
+                HdrFinalize::Skip
+            };
+            assert_eq!(plan.hdr, hdr, "{i:?}");
+        }
+    }
+
+    #[test]
+    fn scene_plan_combinations_stay_consistent() {
+        for i in all_inputs() {
+            let plan = scene_plan(i);
+            // VRS needs a 3D scene, and a bound rate image is always
+            // returned to GENERAL by a classify at the end of the pass.
+            assert!(plan.vrs == SceneVrs::Off || i.scene, "{i:?}");
+            assert!(!plan.vrs.binds_rate() || plan.vrs.classifies(), "{i:?}");
+            // The MS depth is stored only for the sample-0 classifier.
+            if plan.depth_use == ClassifyMs {
+                assert!(plan.vrs.classifies() && i.classify_ms, "{i:?}");
+                assert!(!i.absorb && !(i.present && (i.taa || i.spill_live)));
+            }
+            // Water absorption stores the sampleable depth for the next frame.
+            if i.absorb {
+                assert_eq!(plan.depth_use, Sampleable, "{i:?}");
+            }
+            // Only presented frames finalize the HDR; exposure only in 3D.
+            assert_eq!(plan.hdr == HdrFinalize::Skip, !plan.present, "{i:?}");
+            if plan.hdr == HdrFinalize::Exposure {
+                assert!(i.scene && i.exposure, "{i:?}");
+            }
+            // The depth source is NONE or the two read stages, nothing else.
+            assert!((FRAGMENT | COMPUTE).contains(plan.depth_src), "{i:?}");
+        }
+    }
+
+    #[test]
+    fn scene_plan_cases() {
+        let first = SceneInputs {
+            scene: true,
+            present: true,
+            vrs: true,
+            ..SceneInputs::default()
+        };
+        // First VRS frame of a slot classifies without binding a rate image.
+        assert_eq!(scene_plan(first).vrs, SceneVrs::Prime);
+        let next = SceneInputs {
+            classified: true,
+            ..first
+        };
+        assert_eq!(scene_plan(next).vrs, SceneVrs::Bound);
+        // No 3D scene: no VRS, and the pass finalizes even with exposure on.
+        let flat = SceneInputs {
+            scene: false,
+            exposure: true,
+            ..next
+        };
+        let plan = scene_plan(flat);
+        assert_eq!(
+            (plan.vrs, plan.hdr, plan.depth_use),
+            (SceneVrs::Off, HdrFinalize::Pass, Discard)
+        );
+        // Unpresented MSAA frame whose only depth reader is the classifier,
+        // after a frame that ended the same way.
+        let ms = SceneInputs {
+            present: false,
+            classify_ms: true,
+            ms_depth_read: true,
+            ..next
+        };
+        let plan = scene_plan(ms);
+        assert_eq!(
+            (plan.depth_use, plan.hdr, plan.depth_src),
+            (ClassifyMs, HdrFinalize::Skip, COMPUTE)
+        );
+        // Presented with exposure: metering owns the HDR finalize.
+        let lit = SceneInputs {
+            exposure: true,
+            depth_sampled: true,
+            ..next
+        };
+        let plan = scene_plan(lit);
+        assert_eq!(
+            (plan.hdr, plan.depth_src),
+            (HdrFinalize::Exposure, FRAGMENT)
+        );
     }
 }
