@@ -185,18 +185,12 @@ impl Renderer {
                     continue;
                 };
                 let aabb = super::arena::MeshAabb::from_cage(&entry);
-                let dx = aabb.block[0].wrapping_sub(eye.block[0]) as f32 - eye.frac[0];
-                let dy = aabb.block[1].wrapping_sub(eye.block[1]) as f32 - eye.frac[1];
-                let dz = aabb.block[2].wrapping_sub(eye.block[2]) as f32 - eye.frac[2];
-                let mn = glam::Vec3::new(aabb.min[0] + dx, aabb.min[1] + dy, aabb.min[2] + dz);
-                let mx = glam::Vec3::new(aabb.max[0] + dx, aabb.max[1] + dy, aabb.max[2] + dz);
+                let d = glam::Vec3::from(eye.rel(aabb.block));
+                let mn = glam::Vec3::from(aabb.min) + d;
+                let mx = glam::Vec3::from(aabb.max) + d;
                 (mn, mx, (mn + mx) * 0.5)
             } else {
-                let offset = glam::Vec3::new(
-                    rec.block[0].wrapping_sub(eye.block[0]) as f32 - eye.frac[0] + rec.local_off[0],
-                    rec.block[1].wrapping_sub(eye.block[1]) as f32 - eye.frac[1] + rec.local_off[1],
-                    rec.block[2].wrapping_sub(eye.block[2]) as f32 - eye.frac[2] + rec.local_off[2],
-                );
+                let offset = glam::Vec3::from(eye.rel(rec.block)) + glam::Vec3::from(rec.local_off);
                 let amin = glam::Vec3::from(rec.aabb_min);
                 let amax = glam::Vec3::from(rec.aabb_max);
                 (
@@ -353,7 +347,6 @@ impl Renderer {
                         self.device.physical,
                         &mut self.arena_dir,
                         records,
-                        self.records.records(),
                         |s| self.mesh_res.is_arrived(s),
                         slot_count,
                         camera,

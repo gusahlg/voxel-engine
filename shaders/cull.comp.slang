@@ -40,7 +40,7 @@ struct CullParams
     float3 cam_frac;
     uint arena_count;
     uint shadow_enabled;
-    uint flags; // bit 0 = per-direction face-run culling
+    uint flags; // CULL_FLAG_FACE_RUNS = per-direction face-run culling
     float half_x; // full-res box half-extents; a non-positive component covers nothing
     float half_y;
     float half_z;
@@ -90,7 +90,7 @@ RWStructuredBuffer<uint> stats;
 
 struct Push
 {
-    uint flags; // bit0 = accumulate geometry stats
+    uint flags; // CULL_FLAG_STATS = accumulate geometry stats
 };
 [[vk::push_constant]] Push pc;
 
@@ -140,7 +140,7 @@ bool lod_aabb_inside_box(float3 mn, float3 mx, float3 centre, float half_x, floa
 // P_i = corners[i] + (anchor − cam_block) − cam_frac, the vertex shader's
 // placement of corner i. E = [P1−P0, P2−P0, P4−P0], t_cam = E⁻¹(−P0).
 // d is the max error of corners 3,5,6,7 against that frame, over the min
-// edge; eps = 2d + 1e-3. Full cage range [0,1] (not the mesh's local
+// edge; eps = 2d + CULL_CAGE_VIS_BIAS. Full cage range [0,1] (not the mesh's local
 // bounds) is conservative. Host mirror: `cage_direction_vis` in
 // vk/cull_math.rs. Shadows do not call this.
 uint cage_direction_mask(Cage c)
@@ -165,8 +165,7 @@ uint cage_direction_mask(Cage c)
     float l1 = length(e1);
     float l2 = length(e2);
     float vol = l0 * l1 * l2;
-    // Same cutoff as CAGE_DET_REL in vk/cull_math.rs.
-    if (!(abs(det) > 1.0e-8 * max(vol, 1.0)))
+    if (!(abs(det) > CULL_CAGE_DET_REL * max(vol, 1.0)))
         return 0u;
     float3 b = -P0;
     float inv = 1.0 / det;
@@ -176,7 +175,7 @@ uint cage_direction_mask(Cage c)
     dev = max(dev, length(P5 - (P0 + e0 + e2)));
     dev = max(dev, length(P6 - (P0 + e1 + e2)));
     dev = max(dev, length(P7 - (P0 + e0 + e1 + e2)));
-    float eps = 2.0 * (dev / min_edge) + 1.0e-3;
+    float eps = 2.0 * (dev / min_edge) + CULL_CAGE_VIS_BIAS;
     uint mask = 0x40u;
     if (t_cam.x > -eps)
         mask |= 1u;
@@ -285,9 +284,9 @@ void computeMain(uint3 id: SV_DispatchThreadID)
             // Caged: group 3, or group 4 when scale > 1 (cutout included).
             uint group = caged
                 ? ((scale > 1.0) ? CULL_CAGED_LOD_GROUP : CULL_CAGED_GROUP)
-                : ((pass == 0u && scale > 1.0) ? 2u : pass);
+                : ((pass == 0u && scale > 1.0) ? CULL_OPAQUE_LOD_GROUP : pass);
             // LOD groups fully inside the slab would discard every fragment.
-            bool lod_group = group == 2u || group == CULL_CAGED_LOD_GROUP;
+            bool lod_group = group == CULL_OPAQUE_LOD_GROUP || group == CULL_CAGED_LOD_GROUP;
             float3 lod_centre = float3(params.centre_x, params.centre_y, params.centre_z);
             if (!lod_group || !lod_aabb_inside_box(mn, mx, lod_centre, params.half_x, params.half_y, params.half_z))
             {
@@ -295,7 +294,7 @@ void computeMain(uint3 id: SV_DispatchThreadID)
                 float bucket_scale = lod_group ? params.lod_bucket_scale : 1.0;
                 uint bucket = distance_bucket(dist, bucket_scale);
                 uint part = (group * params.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
-                bool face_runs = (params.flags & 1u) != 0u && (rec.flags & 1u) != 0u;
+                bool face_runs = (params.flags & CULL_FLAG_FACE_RUNS) != 0u && (rec.flags & MESH_FLAG_FACE_RUNS) != 0u;
                 bool vis[6];
                 if (face_runs && caged)
                 {
@@ -323,7 +322,7 @@ void computeMain(uint3 id: SV_DispatchThreadID)
                 if (!face_runs)
                 {
                     emit(part, cmd);
-                    if ((pc.flags & 1u) != 0)
+                    if ((pc.flags & CULL_FLAG_STATS) != 0)
                     {
                         uint unused;
                         InterlockedAdd(stats[group * 2u], 1u, unused);
@@ -359,7 +358,7 @@ void computeMain(uint3 id: SV_DispatchThreadID)
                             run.first_index = b[start];
                             run.index_count = b[k] - b[start];
                             emit(part, run);
-                            if ((pc.flags & 1u) != 0)
+                            if ((pc.flags & CULL_FLAG_STATS) != 0)
                             {
                                 uint unused;
                                 InterlockedAdd(stats[group * 2u], 1u, unused);
@@ -374,7 +373,7 @@ void computeMain(uint3 id: SV_DispatchThreadID)
                         run.first_index = b[start];
                         run.index_count = b[6] - b[start];
                         emit(part, run);
-                        if ((pc.flags & 1u) != 0)
+                        if ((pc.flags & CULL_FLAG_STATS) != 0)
                         {
                             uint unused;
                             InterlockedAdd(stats[group * 2u], 1u, unused);

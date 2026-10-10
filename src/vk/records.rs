@@ -209,12 +209,6 @@ impl RecordTable {
         self.records.get(slot as usize)
     }
 
-    /// Host mirror of every slot's [`MeshRecord`], indexed by slot. The CPU
-    /// cull reads this; dead slots are skipped via the directory's arena word.
-    pub fn records(&self) -> &[MeshRecord] {
-        &self.records
-    }
-
     /// Replaces a mover's record (recomposed main-side); the dyn lane is
     /// untouched so a mover keeps its style.
     pub fn set_record(&mut self, slot: u32, record: MeshRecord) {

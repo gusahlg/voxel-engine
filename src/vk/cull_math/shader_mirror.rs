@@ -20,10 +20,10 @@ use super::super::arena::{ArenaDirectory, MeshAabb};
 use super::super::buffers::{DrawIndexedIndirect, MESH_FLAG_FACE_RUNS, MeshRecord};
 use super::super::pipeline::EyeSplit;
 use super::{
-    CAGE_DET_REL, CAGE_VIS_BIAS, CULL_BUCKET_SPLITS, CpuCullScratch, FLAG_STATS,
-    FULL_BUCKET_EDGE_SQ, Group, MAX_FACE_RUNS, PartitionGpu, SHADOW_GROUPS, STATS_COUNT,
-    bucket_edge_sq, bucket_splits, cage_direction_vis, cam_relative_corners, cam_relative_soa,
-    cpu_cull_into, distance_bucket_sq, flatten_part_cmds, lod_bucket_scale, sqrt_ge_threshold,
+    CULL_BUCKET_SPLITS, CpuCullScratch, CullView, FLAG_FACE_RUNS, FLAG_STATS, FULL_BUCKET_EDGE_SQ,
+    Group, MAX_FACE_RUNS, PartitionGpu, SHADOW_GROUPS, STATS_COUNT, bucket_edge_sq, bucket_splits,
+    cage_direction_vis, cam_relative_corners, cam_relative_soa, cpu_cull_into, distance_bucket_sq,
+    flatten_part_cmds, lod_bucket_scale, sqrt_ge_threshold,
 };
 use crate::cage::CageGpu;
 use crate::camera::{Camera3D, Frustum, Lens};
@@ -37,23 +37,17 @@ mod slang {
     use super::super::{PartitionGpu, STATS_COUNT};
     use crate::cage::CageGpu;
     use crate::genconst::{
-        CULL_BUCKET_SPLIT_0, CULL_BUCKET_SPLIT_1, CULL_BUCKET_SPLIT_2, CULL_CAGED_GROUP,
-        CULL_CAGED_LOD_GROUP, CULL_CAMERA_GROUPS, CULL_DISTANCE_BUCKETS, CULL_WORKGROUP,
-        DETAIL_GPU_BIAS, DETAIL_GPU_BITS,
+        CULL_BUCKET_SPLIT_0, CULL_BUCKET_SPLIT_1, CULL_BUCKET_SPLIT_2, CULL_CAGE_DET_REL,
+        CULL_CAGE_VIS_BIAS, CULL_CAGED_GROUP, CULL_CAGED_LOD_GROUP, CULL_CAMERA_GROUPS,
+        CULL_DISTANCE_BUCKETS, CULL_FLAG_FACE_RUNS, CULL_FLAG_STATS, CULL_OPAQUE_LOD_GROUP,
+        CULL_WORKGROUP, DETAIL_GPU_BIAS, DETAIL_GPU_BITS, MESH_FLAG_FACE_RUNS,
     };
 
     // Literals the shader writes inline. `mirror_literals_match_the_shader`
-    // reads each one back out of the source.
-    /// `cage_direction_mask`: `abs(det) > 1.0e-8 * max(vol, 1.0)`.
-    pub(super) const CAGE_DET_REL: f32 = 1.0e-8;
-    /// `cage_direction_mask`: `eps = 2.0 * (dev / min_edge) + 1.0e-3`.
-    pub(super) const CAGE_VIS_BIAS: f32 = 1.0e-3;
+    // reads each one back out of the source, and checks that the shader
+    // reads the generated constants above where this mirror does.
     /// `cage_direction_mask`: `uint mask = 0x40u`, the usable-mask bit.
     pub(super) const CAGE_MASK_USABLE: u32 = 0x40;
-    /// `computeMain`: the coarse-LOD opaque group, written `2u`.
-    pub(super) const OPAQUE_LOD_GROUP: u32 = 2;
-    /// `params.flags & 1u`, `rec.flags & 1u` and `pc.flags & 1u`.
-    pub(super) const FLAG_BIT: u32 = 1;
     /// Shadow cascades (`c < 2`) and planes per frustum (`p < 5`).
     pub(super) const CASCADES: usize = 2;
     pub(super) const PLANES: usize = 5;
@@ -202,7 +196,7 @@ mod slang {
         let l1 = length(e1);
         let l2 = length(e2);
         let vol = l0 * l1 * l2;
-        if !(det.abs() > CAGE_DET_REL * vol.max(1.0)) {
+        if !(det.abs() > CULL_CAGE_DET_REL * vol.max(1.0)) {
             return None;
         }
         let b = -p0;
@@ -213,7 +207,7 @@ mod slang {
         dev = dev.max(length(p5 - (p0 + e0 + e2)));
         dev = dev.max(length(p6 - (p0 + e1 + e2)));
         dev = dev.max(length(p7 - (p0 + e0 + e1 + e2)));
-        let eps = 2.0 * (dev / min_edge) + CAGE_VIS_BIAS;
+        let eps = 2.0 * (dev / min_edge) + CULL_CAGE_VIS_BIAS;
         Some((t_cam, eps))
     }
 
@@ -274,7 +268,7 @@ mod slang {
     }
 
     fn count_stats(b: &mut Bindings, group: u32, index_count: u32) {
-        if (b.pc_flags & FLAG_BIT) != 0 {
+        if (b.pc_flags & CULL_FLAG_STATS) != 0 {
             b.stats[(group * 2) as usize] += 1;
             b.stats[(group * 2 + 1) as usize] += index_count;
         }
@@ -326,11 +320,11 @@ mod slang {
                         CULL_CAGED_GROUP
                     }
                 } else if pass == 0 && scale > 1.0 {
-                    OPAQUE_LOD_GROUP
+                    CULL_OPAQUE_LOD_GROUP
                 } else {
                     pass
                 };
-                let lod_group = group == OPAQUE_LOD_GROUP || group == CULL_CAGED_LOD_GROUP;
+                let lod_group = group == CULL_OPAQUE_LOD_GROUP || group == CULL_CAGED_LOD_GROUP;
                 let p = b.params;
                 let lod_centre = Vec3::new(p.centre_x, p.centre_y, p.centre_z);
                 if !lod_group
@@ -340,7 +334,8 @@ mod slang {
                     let bucket_scale = if lod_group { p.lod_bucket_scale } else { 1.0 };
                     let bucket = distance_bucket(dist, bucket_scale);
                     let part = (group * p.arena_count + arena) * CULL_DISTANCE_BUCKETS + bucket;
-                    let mut face_runs = (p.flags & FLAG_BIT) != 0 && (rec.flags & FLAG_BIT) != 0;
+                    let mut face_runs = (p.flags & CULL_FLAG_FACE_RUNS) != 0
+                        && (rec.flags & MESH_FLAG_FACE_RUNS) != 0;
                     let mut vis = [false; 6];
                     if face_runs && caged {
                         // Singular frame (mask 0) draws whole. Otherwise bits 0..5.
@@ -539,7 +534,7 @@ impl Scene {
             cam_frac: Vec3::from_array(self.eye.frac),
             arena_count: self.dir.arena_count() as u32,
             shadow_enabled: u32::from(shadow_on),
-            flags: u32::from(face_cull),
+            flags: if face_cull { FLAG_FACE_RUNS } else { 0 },
             half_x: self.half[0],
             half_y: self.half[1],
             half_z: self.half[2],
@@ -879,8 +874,7 @@ fn assert_slot_math_matches(scene: &Scene, seed: u64) {
             scene.dir.cull_aabbs()[i],
             scene.dir.cull_local_offs()[i],
             scene.dir.cull_blocks()[i],
-            eye.block,
-            eye.frac,
+            eye,
         );
         let bits = |v: [f32; 3]| v.map(f32::to_bits);
         assert_eq!(
@@ -910,12 +904,8 @@ fn assert_slot_math_matches(scene: &Scene, seed: u64) {
         }
 
         if rec.cage != 0 {
-            let corners = cam_relative_corners(
-                scene.dir.cull_corners()[i],
-                scene.dir.cull_blocks()[i],
-                eye.block,
-                eye.frac,
-            );
+            let corners =
+                cam_relative_corners(scene.dir.cull_corners()[i], scene.dir.cull_blocks()[i], eye);
             let cage = &scene.cages[rec.cage as usize];
             let cpu = cage_direction_vis(corners);
             let shader = slang::cage_direction_frame(cage, &b.params);
@@ -980,19 +970,21 @@ fn assert_emission_matches(scene: &mut Scene, seed: u64) {
             let mut parts = Vec::new();
             let runs = if face_cull { MAX_FACE_RUNS } else { 1 };
             scene.dir.partitions_into(&mut parts, runs, Some(scene.eye));
+            let view = CullView {
+                camera: &scene.camera,
+                shadow: shadow_on.then_some(&scene.shadow),
+                eye: scene.eye,
+                slot_count: scene.slot_count(),
+                half: scene.half,
+                centre: scene.centre,
+                face_cull,
+            };
             let stats = cpu_cull_into(
-                &scene.records,
                 &scene.dir,
                 |s| scene.arrived[s as usize],
                 &scene.visible,
                 &parts,
-                &scene.camera,
-                shadow_on.then_some(&scene.shadow),
-                scene.eye,
-                scene.slot_count(),
-                scene.half,
-                scene.centre,
-                face_cull,
+                &view,
                 &mut scratch,
             );
             let cmds = flatten_part_cmds(&scratch.part_cmds, &parts);
@@ -1047,8 +1039,7 @@ fn a_moved_mesh_box_rounds_like_the_shader() {
         dir.cull_aabbs()[0],
         dir.cull_local_offs()[0],
         dir.cull_blocks()[0],
-        eye.block,
-        eye.frac,
+        eye,
     );
     let rel = |k: usize| (rec.block[k] - eye.block[k]) as f32 - eye.frac[k];
     let shader: [f32; 3] = std::array::from_fn(|k| rec.aabb_min[k] + (rel(k) + rec.local_off[k]));
@@ -1119,26 +1110,20 @@ fn shader_fn<'a>(src: &'a str, head: &str) -> &'a str {
     panic!("`{head}` has no closing brace")
 }
 
-/// The literal after each `marker` in `text`. At least one.
+/// The literal or identifier after each `marker` in `text`. At least one.
 fn literals_after<'a>(text: &'a str, marker: &str) -> Vec<&'a str> {
     let found: Vec<&str> = text
         .match_indices(marker)
         .map(|(at, _)| {
             let rest = &text[at + marker.len()..];
             let end = rest
-                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')))
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '+')))
                 .unwrap_or(rest.len());
             &rest[..end]
         })
         .collect();
     assert!(!found.is_empty(), "cull.comp.slang has no `{marker}`");
     found
-}
-
-fn float_bits(lit: &str) -> u32 {
-    lit.parse::<f32>()
-        .unwrap_or_else(|_| panic!("`{lit}` is not a float"))
-        .to_bits()
 }
 
 fn uint(lit: &str) -> u32 {
@@ -1151,18 +1136,18 @@ fn uint(lit: &str) -> u32 {
 }
 
 /// Every literal the mirror copies by hand, read back out of the shader, and
-/// the CPU cull's copies of the cage cutoffs.
+/// every generated constant the mirror and the CPU cull share with it, found
+/// by name where the shader uses it.
 #[test]
 fn mirror_literals_match_the_shader() {
     let src = include_str!("../../../shaders/cull.comp.slang");
 
     let cage = shader_fn(src, "uint cage_direction_mask(Cage c)");
-    let det = literals_after(cage, "abs(det) > ");
-    assert_eq!(det.len(), 1);
-    assert_eq!(float_bits(det[0]), slang::CAGE_DET_REL.to_bits());
-    let bias = literals_after(cage, "(dev / min_edge) + ");
-    assert_eq!(bias.len(), 1);
-    assert_eq!(float_bits(bias[0]), slang::CAGE_VIS_BIAS.to_bits());
+    assert_eq!(literals_after(cage, "abs(det) > "), ["CULL_CAGE_DET_REL"]);
+    assert_eq!(
+        literals_after(cage, "(dev / min_edge) + "),
+        ["CULL_CAGE_VIS_BIAS"]
+    );
     assert_eq!(
         literals_after(cage, "uint mask = ")
             .into_iter()
@@ -1170,26 +1155,34 @@ fn mirror_literals_match_the_shader() {
             .collect::<Vec<_>>(),
         [slang::CAGE_MASK_USABLE]
     );
-    assert_eq!(CAGE_DET_REL.to_bits(), slang::CAGE_DET_REL.to_bits());
-    assert_eq!(CAGE_VIS_BIAS.to_bits(), slang::CAGE_VIS_BIAS.to_bits());
 
     let main = shader_fn(src, "void computeMain(");
+    assert_eq!(
+        literals_after(main, "(pass == 0u && scale > 1.0) ? "),
+        ["CULL_OPAQUE_LOD_GROUP"]
+    );
+    assert_eq!(
+        literals_after(main, "bool lod_group = group == "),
+        ["CULL_OPAQUE_LOD_GROUP"]
+    );
+    assert_eq!(
+        Group::OpaqueLod as u32,
+        crate::genconst::CULL_OPAQUE_LOD_GROUP
+    );
+    assert_eq!(
+        literals_after(main, "(params.flags & "),
+        ["CULL_FLAG_FACE_RUNS"]
+    );
+    assert_eq!(FLAG_FACE_RUNS, crate::genconst::CULL_FLAG_FACE_RUNS);
+    assert_eq!(
+        literals_after(main, "(rec.flags & "),
+        ["MESH_FLAG_FACE_RUNS"]
+    );
+    assert_eq!(MESH_FLAG_FACE_RUNS, crate::genconst::MESH_FLAG_FACE_RUNS);
+    assert_eq!(literals_after(main, "(pc.flags & "), ["CULL_FLAG_STATS"; 3]);
+    assert_eq!(FLAG_STATS, crate::genconst::CULL_FLAG_STATS);
     let uints =
         |marker: &str| -> Vec<u32> { literals_after(main, marker).into_iter().map(uint).collect() };
-    assert_eq!(
-        uints("(pass == 0u && scale > 1.0) ? "),
-        [slang::OPAQUE_LOD_GROUP]
-    );
-    assert_eq!(
-        uints("bool lod_group = group == "),
-        [slang::OPAQUE_LOD_GROUP]
-    );
-    assert_eq!(slang::OPAQUE_LOD_GROUP, Group::OpaqueLod as u32);
-    assert_eq!(uints("(params.flags & "), [slang::FLAG_BIT]);
-    assert_eq!(uints("(rec.flags & "), [slang::FLAG_BIT]);
-    assert_eq!(slang::FLAG_BIT, MESH_FLAG_FACE_RUNS);
-    assert_eq!(uints("(pc.flags & "), [slang::FLAG_BIT; 3]);
-    assert_eq!(slang::FLAG_BIT, FLAG_STATS);
     assert_eq!(uints("for (int c = 0; c < "), [slang::CASCADES as u32]);
     assert_eq!(slang::CASCADES, SHADOW_GROUPS);
     assert_eq!(uints("for (int p = 0; p < "), [slang::PLANES as u32; 2]);

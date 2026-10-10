@@ -229,6 +229,30 @@ static const float CULL_BUCKET_SPLIT_1 = 64.0f;
 // Camera-distance edge (metres) between cull buckets 2 and 3 (farthest).
 static const float CULL_BUCKET_SPLIT_2 = 256.0f;
 
+// Camera cull group for a coarse-LOD (scale > 1) Opaque mesh. Must match
+// vk::cull::Group::OpaqueLod.
+static const uint CULL_OPAQUE_LOD_GROUP = 2;
+
+// Singular cage frame cutoff: |det| at or below this fraction of the
+// edge-length product (or of 1, when that is smaller) draws the mesh whole.
+static const float CULL_CAGE_DET_REL = 1e-8f;
+
+// Added to twice the cage's non-affinity error to form the margin on each
+// camera-in-cage-frame test of the caged face-run cull.
+static const float CULL_CAGE_VIS_BIAS = 0.001f;
+
+// CullParams.flags bit: emit per-direction face runs (meshes whose
+// MESH_FLAG_FACE_RUNS is set). Clear draws every mesh whole.
+static const uint CULL_FLAG_FACE_RUNS = 1;
+
+// Cull push-constant flags bit: accumulate the per-camera-group
+// [draws, index_count] histogram (profiling only).
+static const uint CULL_FLAG_STATS = 1;
+
+// MeshRecord.flags bit: face_quads holds valid u16 quad counts per upload
+// direction. Clear makes the cull draw the mesh whole.
+static const uint MESH_FLAG_FACE_RUNS = 1;
+
 // Exposure metering tile edge in HDR texels. The CPU-side tile-grid dimensions
 // (vk/exposure.rs) are ceil(hdr_dim / EXPOSURE_TILE) and must agree.
 static const uint EXPOSURE_TILE = 16;
