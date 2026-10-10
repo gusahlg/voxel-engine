@@ -530,6 +530,21 @@ impl Renderer {
                     rb.buffer,
                     &region,
                 );
+                // Make the copy available to the host: `finish_screenshot`
+                // maps and reads the buffer after a timeline wait, which alone
+                // orders only device accesses.
+                let to_host = [vk::BufferMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                    .dst_access_mask(vk::AccessFlags2::HOST_READ)
+                    .buffer(rb.buffer)
+                    .offset(0)
+                    .size(rb.size)];
+                device.cmd_pipeline_barrier2(
+                    self.copy_cmd,
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&to_host),
+                );
             }
 
             let (old_layout, src_stage, src_access) = if readback.is_some() {
