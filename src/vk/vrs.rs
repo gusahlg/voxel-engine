@@ -15,6 +15,22 @@ pub(crate) const FLAG_ALLOW_4X4: u32 = 1 << 0;
 pub(crate) const FLAG_USE_HISTORY: u32 = 1 << 1;
 pub(crate) const FLAG_WRITE_MIX: u32 = 1 << 2;
 
+/// `VrsPush::flags` for one classify dispatch: the bits `vrs.comp.slang`
+/// tests in `pc.flags`.
+fn classify_flags(allow_4x4: bool, use_history: bool, write_mix: bool) -> u32 {
+    let mut flags = 0u32;
+    if allow_4x4 {
+        flags |= FLAG_ALLOW_4X4;
+    }
+    if use_history {
+        flags |= FLAG_USE_HISTORY;
+    }
+    if write_mix {
+        flags |= FLAG_WRITE_MIX;
+    }
+    flags
+}
+
 const MIX_COUNT: usize = 3;
 pub(crate) const MIX_BYTES: u64 = (MIX_COUNT * size_of::<u32>()) as u64;
 
@@ -376,16 +392,7 @@ impl super::Renderer {
             .as_ref()
             .is_some_and(|f| f.allow_4x4(self.targets.samples));
         let write_mix = crate::profile::is_enabled();
-        let mut flags = 0u32;
-        if allow_4x4 {
-            flags |= FLAG_ALLOW_4X4;
-        }
-        if use_history {
-            flags |= FLAG_USE_HISTORY;
-        }
-        if write_mix {
-            flags |= FLAG_WRITE_MIX;
-        }
+        let flags = classify_flags(allow_4x4, use_history, write_mix);
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             let depth_info = [vk::DescriptorImageInfo::default()
@@ -486,77 +493,373 @@ impl super::Renderer {
 
 #[cfg(test)]
 mod tests {
+    //! The classifier only runs on the GPU, so these tests run it as
+    //! `vrs.comp.slang` spells it. [`Shader::read`] matches the shader's
+    //! `classify` and the rate / history / mix tail of `computeMain` against
+    //! fixed templates, so any change to that logic fails here, and takes
+    //! every literal (sky depth, flatness factor, rate codes, flag bits) from
+    //! the source. The host side the shader reads ([`classify_flags`],
+    //! [`VrsPush`], the mix lane order) is checked against the same text.
+
     use super::*;
 
-    const SKY_DEPTH: f32 = 1.0e-6;
-    const RATE_1X1: u32 = 0;
-    const RATE_2X2: u32 = (1 << 2) | 1;
-    const RATE_4X4: u32 = (2 << 2) | 2;
+    const SHADER: &str = include_str!("../../shaders/vrs.comp.slang");
 
-    fn classify_tile(dmin: f32, dmax: f32, d_threshold: f32, allow_4x4: bool) -> u32 {
-        if dmax < SKY_DEPTH {
-            return if allow_4x4 { RATE_4X4 } else { RATE_2X2 };
+    /// `classify(dmin, dmax)`; each `{}` is a literal [`Shader::read`] takes.
+    const CLASSIFY: &str = "
+        if (dmax < {}) {
+            return ((pc.flags & {}) != 0) ? uint({}) : uint({});
         }
-        let far = dmax < d_threshold;
-        let flat = (dmax - dmin) < (d_threshold * 0.5);
-        if far && flat { RATE_2X2 } else { RATE_1X1 }
+        bool farTile = dmax < pc.dThreshold;
+        bool flat = (dmax - dmin) < (pc.dThreshold * {});
+        return (farTile && flat) ? uint({}) : {};";
+
+    /// `computeMain` from the tile's own class to the end: one-tile dilation,
+    /// history, the written rate, and the mix histogram.
+    const TILE: &str = "
+        uint raw = classify(dmin, dmax);
+        bool neighborFull = false;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0)
+                    continue;
+                uint n = uint(ly + 1 + dy) * 10u + uint(lx + 1 + dx);
+                if (classify(s_dmin[n], s_dmax[n]) == {})
+                    neighborFull = true;
+            }
+        }
+        uint prev = uint({});
+        if ((pc.flags & {}) != 0) {
+            prev = history[gid.xy];
+        }
+        uint rate = raw;
+        if (raw == {} || prev == {} || neighborFull) {
+            rate = {};
+        }
+        rateOut[gid.xy] = rate;
+        history[gid.xy] = raw;
+        if ((pc.flags & {}) != 0) {
+            uint mixIdx = rate == {} ? 0u : (rate == uint({}) ? 1u : 2u);
+            uint unused;
+            InterlockedAdd(mixCounts[mixIdx], 1, unused);
+        }";
+
+    /// Whitespace-normalised source without `//` comments.
+    fn squash(src: &str) -> String {
+        src.lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
-    fn conservative_rate(raw: u32, prev_raw: u32, neighbor_full: bool) -> u32 {
-        if raw == RATE_1X1 || prev_raw == RATE_1X1 || neighbor_full {
-            RATE_1X1
-        } else {
-            raw
+    /// Matches `src` against `template` (both squashed). Each `{}` captures
+    /// the text up to the next fixed part; every fixed part must match.
+    fn captures(src: &str, template: &str) -> Vec<String> {
+        let src = squash(src);
+        let template = squash(template);
+        let mut parts = template.split("{}");
+        let head = parts.next().unwrap_or("");
+        let mut rest = src
+            .strip_prefix(head)
+            .unwrap_or_else(|| panic!("vrs.comp.slang drifted: `{src}` does not start `{head}`"));
+        let mut out = Vec::new();
+        for part in parts {
+            if part.is_empty() {
+                out.push(rest.to_string());
+                rest = "";
+                continue;
+            }
+            let at = rest
+                .find(part)
+                .unwrap_or_else(|| panic!("vrs.comp.slang drifted: no `{part}` in `{rest}`"));
+            out.push(rest[..at].to_string());
+            rest = &rest[at + part.len()..];
+        }
+        assert!(rest.is_empty(), "vrs.comp.slang drifted: trailing `{rest}`");
+        out
+    }
+
+    /// Body of the function `signature` opens, braces balanced.
+    fn body(signature: &str) -> &'static str {
+        let start = SHADER
+            .find(signature)
+            .unwrap_or_else(|| panic!("vrs.comp.slang has no `{signature}`"));
+        let open = start + SHADER[start..].find('{').expect("a function body");
+        let mut depth = 0usize;
+        for (i, c) in SHADER[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &SHADER[open + 1..open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`{signature}` has an unbalanced body");
+    }
+
+    fn uint(lit: &str) -> u32 {
+        lit.trim_end_matches('u')
+            .parse()
+            .unwrap_or_else(|_| panic!("`{lit}` is not a uint literal"))
+    }
+
+    fn float(lit: &str) -> f32 {
+        lit.parse()
+            .unwrap_or_else(|_| panic!("`{lit}` is not a float literal"))
+    }
+
+    /// A rate code as the shader writes it: `0u` or `(Wu << S) | Hu`.
+    fn rate_code(expr: &str) -> u32 {
+        let Some((wide, high)) = expr.split_once(" | ") else {
+            return uint(expr);
+        };
+        let (w, shift) = wide
+            .strip_prefix('(')
+            .and_then(|e| e.strip_suffix(')'))
+            .and_then(|e| e.split_once(" << "))
+            .unwrap_or_else(|| panic!("`{expr}` is not a rate code"));
+        (uint(w) << uint(shift)) | uint(high)
+    }
+
+    /// Vulkan's shading-rate attachment texel for a `w`×`h` fragment:
+    /// `(log2(w) << 2) | log2(h)`.
+    fn vk_rate(w: u32, h: u32) -> u32 {
+        (w.ilog2() << 2) | h.ilog2()
+    }
+
+    /// The classifier as `vrs.comp.slang` has it, every literal read from it.
+    struct Shader {
+        sky_depth: f32,
+        allow_4x4: u32,
+        sky_wide: u32,
+        sky_narrow: u32,
+        flat: f32,
+        far_flat: u32,
+        near: u32,
+        neighbor_full: u32,
+        no_history: u32,
+        use_history: u32,
+        raw_full: u32,
+        prev_full: u32,
+        full: u32,
+        write_mix: u32,
+        mix_full: u32,
+        mix_2x2: u32,
+    }
+
+    impl Shader {
+        fn read() -> Self {
+            let c = captures(body("uint classify(float dmin, float dmax)"), CLASSIFY);
+            let main = body("void computeMain(");
+            let tail = &main[main
+                .find("uint raw = classify")
+                .expect("computeMain classifies its tile")..];
+            let t = captures(tail, TILE);
+            Shader {
+                sky_depth: float(&c[0]),
+                allow_4x4: uint(&c[1]),
+                sky_wide: rate_code(&c[2]),
+                sky_narrow: rate_code(&c[3]),
+                flat: float(&c[4]),
+                far_flat: rate_code(&c[5]),
+                near: rate_code(&c[6]),
+                neighbor_full: rate_code(&t[0]),
+                no_history: rate_code(&t[1]),
+                use_history: uint(&t[2]),
+                raw_full: rate_code(&t[3]),
+                prev_full: rate_code(&t[4]),
+                full: rate_code(&t[5]),
+                write_mix: uint(&t[6]),
+                mix_full: rate_code(&t[7]),
+                mix_2x2: rate_code(&t[8]),
+            }
+        }
+
+        /// `classify(dmin, dmax)` with `pc.dThreshold` and `pc.flags`.
+        fn classify(&self, dmin: f32, dmax: f32, d_threshold: f32, flags: u32) -> u32 {
+            if dmax < self.sky_depth {
+                return if flags & self.allow_4x4 != 0 {
+                    self.sky_wide
+                } else {
+                    self.sky_narrow
+                };
+            }
+            let far_tile = dmax < d_threshold;
+            let flat = (dmax - dmin) < (d_threshold * self.flat);
+            if far_tile && flat {
+                self.far_flat
+            } else {
+                self.near
+            }
+        }
+
+        /// The rate `computeMain` writes for a tile of class `raw` with these
+        /// neighbour classes and history texel.
+        fn rate(&self, raw: u32, neighbors: [u32; 8], history: u32, flags: u32) -> u32 {
+            let neighbor_full = neighbors.contains(&self.neighbor_full);
+            let prev = if flags & self.use_history != 0 {
+                history
+            } else {
+                self.no_history
+            };
+            if raw == self.raw_full || prev == self.prev_full || neighbor_full {
+                self.full
+            } else {
+                raw
+            }
+        }
+
+        /// The `mixCounts` lane `computeMain` counts `rate` in.
+        fn mix_lane(&self, rate: u32) -> usize {
+            if rate == self.mix_full {
+                0
+            } else if rate == self.mix_2x2 {
+                1
+            } else {
+                2
+            }
         }
     }
+
+    const D_THRESHOLD: f32 = 0.01;
 
     #[test]
     fn sky_is_coarse_and_uses_4x4_when_advertised() {
-        assert_eq!(classify_tile(0.0, 0.0, 0.01, false), RATE_2X2);
-        assert_eq!(classify_tile(0.0, 0.0, 0.01, true), RATE_4X4);
-        assert_eq!(classify_tile(0.0, SKY_DEPTH * 0.5, 0.01, true), RATE_4X4);
+        let s = Shader::read();
+        let narrow = classify_flags(false, false, false);
+        let wide = classify_flags(true, false, false);
+        assert_eq!(s.classify(0.0, 0.0, D_THRESHOLD, narrow), vk_rate(2, 2));
+        assert_eq!(s.classify(0.0, 0.0, D_THRESHOLD, wide), vk_rate(4, 4));
+        assert_eq!(
+            s.classify(0.0, s.sky_depth * 0.5, D_THRESHOLD, wide),
+            vk_rate(4, 4)
+        );
     }
 
     #[test]
     fn far_flat_terrain_stays_2x2_even_when_4x4_exists() {
-        assert_eq!(classify_tile(0.001, 0.002, 0.01, true), RATE_2X2);
-        assert_eq!(classify_tile(0.001, 0.002, 0.01, false), RATE_2X2);
+        let s = Shader::read();
+        for allow_4x4 in [false, true] {
+            let flags = classify_flags(allow_4x4, false, false);
+            assert_eq!(s.classify(0.001, 0.002, D_THRESHOLD, flags), vk_rate(2, 2));
+        }
     }
 
     #[test]
     fn near_or_discontinuous_tiles_are_full_rate() {
-        assert_eq!(classify_tile(0.5, 0.6, 0.01, true), RATE_1X1);
+        let s = Shader::read();
+        let flags = classify_flags(true, false, false);
+        assert_eq!(s.classify(0.5, 0.6, D_THRESHOLD, flags), vk_rate(1, 1));
         // Far but a silhouette crosses the tile (range > half the threshold).
-        assert_eq!(classify_tile(0.0, 0.009, 0.01, true), RATE_1X1);
+        assert_eq!(s.classify(0.0, 0.009, D_THRESHOLD, flags), vk_rate(1, 1));
     }
 
     #[test]
     fn conservative_holds_last_near_and_dilates_full_rate() {
-        assert_eq!(conservative_rate(RATE_4X4, RATE_1X1, false), RATE_1X1);
-        assert_eq!(conservative_rate(RATE_2X2, RATE_2X2, true), RATE_1X1);
-        assert_eq!(conservative_rate(RATE_4X4, RATE_2X2, false), RATE_4X4);
-        assert_eq!(conservative_rate(RATE_2X2, RATE_4X4, false), RATE_2X2);
+        let s = Shader::read();
+        let (r1, r2, r4) = (vk_rate(1, 1), vk_rate(2, 2), vk_rate(4, 4));
+        let history = classify_flags(true, true, false);
+        let coarse = [r4; 8];
+        // A tile that was near at the last classify is not coarsened.
+        assert_eq!(s.rate(r4, coarse, r1, history), r1);
+        // A full-rate neighbour dilates into the tile.
+        let mut one_near = [r2; 8];
+        one_near[3] = r1;
+        assert_eq!(s.rate(r2, one_near, r2, history), r1);
+        assert_eq!(s.rate(r4, coarse, r2, history), r4);
+        assert_eq!(s.rate(r2, coarse, r4, history), r2);
         // Finer is always allowed.
-        assert_eq!(conservative_rate(RATE_1X1, RATE_4X4, false), RATE_1X1);
+        assert_eq!(s.rate(r1, coarse, r4, history), r1);
+        // First classify after create/recreate: the history texel is not read.
+        assert_eq!(
+            s.rate(r4, coarse, r1, classify_flags(true, false, false)),
+            r4
+        );
     }
 
     #[test]
     fn rate_encoding_matches_vk_fragment_size_pack() {
-        assert_eq!(RATE_1X1, 0);
-        assert_eq!(RATE_2X2, 0b0101);
-        assert_eq!(RATE_4X4, 0b1010);
+        let s = Shader::read();
+        assert_eq!(
+            (s.sky_wide, s.sky_narrow, s.far_flat, s.near),
+            (vk_rate(4, 4), vk_rate(2, 2), vk_rate(2, 2), vk_rate(1, 1)),
+        );
+        // Dilation, history hold and the written rate all mean 1x1.
+        for code in [s.neighbor_full, s.raw_full, s.prev_full, s.full] {
+            assert_eq!(code, vk_rate(1, 1));
+        }
+        assert_eq!(s.no_history, vk_rate(2, 2), "no history holds nothing");
+        assert_eq!(
+            (vk_rate(1, 1), vk_rate(2, 2), vk_rate(4, 4)),
+            (0, 0b0101, 0b1010)
+        );
+    }
+
+    #[test]
+    fn mix_lanes_are_1x1_2x2_4x4() {
+        // `Vrs::mix` and the Vrs1x1 / Vrs2x2 / Vrs4x4 gauges read this order.
+        let s = Shader::read();
+        let lanes = [vk_rate(1, 1), vk_rate(2, 2), vk_rate(4, 4)].map(|r| s.mix_lane(r));
+        assert_eq!(lanes, [0, 1, 2]);
+        assert_eq!(MIX_BYTES, (lanes.len() * size_of::<u32>()) as u64);
     }
 
     #[test]
     fn push_layout_is_tight_u32s() {
-        assert_eq!(size_of::<VrsPush>(), 32);
+        // The shader's `Push` block, in order, against the Rust field each
+        // member lands in.
+        let block = squash(SHADER);
+        let block = block
+            .split_once("struct Push {")
+            .and_then(|(_, rest)| rest.split_once("};"))
+            .expect("vrs.comp.slang declares `struct Push`")
+            .0;
+        let members: Vec<(&str, &str)> = block
+            .split(';')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(|m| m.split_once(' ').expect("`type name`"))
+            .collect();
+        let rust = [
+            (
+                "float",
+                "dThreshold",
+                std::mem::offset_of!(VrsPush, d_threshold),
+            ),
+            ("uint", "texelW", std::mem::offset_of!(VrsPush, texel_w)),
+            ("uint", "texelH", std::mem::offset_of!(VrsPush, texel_h)),
+            ("uint", "tilesX", std::mem::offset_of!(VrsPush, tiles_x)),
+            ("uint", "tilesY", std::mem::offset_of!(VrsPush, tiles_y)),
+            ("uint", "depthW", std::mem::offset_of!(VrsPush, depth_w)),
+            ("uint", "depthH", std::mem::offset_of!(VrsPush, depth_h)),
+            ("uint", "flags", std::mem::offset_of!(VrsPush, flags)),
+        ];
+        assert_eq!(
+            members,
+            rust.iter()
+                .map(|&(ty, name, _)| (ty, name))
+                .collect::<Vec<_>>()
+        );
+        for (i, &(_, name, offset)) in rust.iter().enumerate() {
+            assert_eq!(offset, i * 4, "{name}");
+        }
+        assert_eq!(size_of::<VrsPush>(), rust.len() * 4);
     }
 
     #[test]
     fn flag_bits_do_not_overlap() {
-        assert_eq!(FLAG_ALLOW_4X4, 1);
-        assert_eq!(FLAG_USE_HISTORY, 2);
-        assert_eq!(FLAG_WRITE_MIX, 4);
-        assert_eq!(FLAG_ALLOW_4X4 | FLAG_USE_HISTORY | FLAG_WRITE_MIX, 7);
+        let s = Shader::read();
+        assert_eq!(classify_flags(true, false, false), s.allow_4x4);
+        assert_eq!(classify_flags(false, true, false), s.use_history);
+        assert_eq!(classify_flags(false, false, true), s.write_mix);
+        assert_eq!(classify_flags(false, false, false), 0);
+        let all = classify_flags(true, true, true);
+        assert_eq!(all, s.allow_4x4 | s.use_history | s.write_mix);
+        assert_eq!(all.count_ones(), 3);
     }
 }
