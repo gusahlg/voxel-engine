@@ -90,12 +90,16 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             "fragmentMain",
             "tris2d.frag.spv",
         ),
-        job(
-            "shaders/tris2d_tex.frag.slang",
-            Stage::Fragment,
-            "fragmentMain",
-            "tris2d_tex.frag.spv",
-        ),
+        // Minimap overlay: tris2d.frag sampling RGBA and tinting by the vertex colour.
+        ShaderJob {
+            defines: &[("TRIS2D_TEX", None)],
+            ..job(
+                "shaders/tris2d.frag.slang",
+                Stage::Fragment,
+                "fragmentMain",
+                "tris2d_tex.frag.spv",
+            )
+        },
         job(
             "shaders/vrs.comp.slang",
             Stage::Compute,
