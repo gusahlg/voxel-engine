@@ -1,6 +1,8 @@
 /// A dedicated queue for staging copies (or the graphics queue as fallback).
 /// Three tiers in preference order: dedicated family, second queue in graphics family, or graphics queue.
 /// Callers don't branch on availability; only sync behavior changes by tier.
+use std::marker::PhantomData;
+
 use ash::vk;
 
 use super::mesh_residency::CopyConsumer;
@@ -33,10 +35,6 @@ impl LaneRecording {
     /// The buffer to record copies into.
     pub fn cmd(&self) -> vk::CommandBuffer {
         self.cmd
-    }
-
-    pub(crate) fn from_cmd(cmd: vk::CommandBuffer) -> Self {
-        Self { cmd }
     }
 }
 
@@ -131,14 +129,41 @@ struct LaneResources {
     timeline: Timeline,
 }
 
-pub(crate) struct TransferLane {
+/// Names a [`QueueLane`]'s work in its panic and log messages. The lanes
+/// differ only in these names and in the family, queue and tier passed to
+/// [`QueueLane::new`] (the device picks them for both).
+pub(crate) trait LaneWork {
+    /// Type name in "requires a separate queue" panics.
+    const NAME: &'static str;
+    /// Noun in Vulkan error and log messages.
+    const LABEL: &'static str;
+}
+
+/// Staging copies: [`TransferLane`].
+pub(crate) enum TransferWork {}
+
+impl LaneWork for TransferWork {
+    const NAME: &'static str = "TransferLane";
+    const LABEL: &'static str = "transfer";
+}
+
+/// The staging-copy lane.
+pub(crate) type TransferLane = QueueLane<TransferWork>;
+
+/// A submission lane beside the graphics queue, in one of the three [`Tier`]s.
+/// On the separate-queue tiers it owns a command pool on its family, a
+/// timeline, and per-batch command buffers recycled by that timeline; under
+/// `SameQueueFallback` it owns nothing and callers record inline. The
+/// transfer lane and the compute lane (`compute::ComputeLane`) are this type.
+pub(crate) struct QueueLane<W> {
     tier: Tier,
     family: u32,
     queue: vk::Queue,
     resources: Option<LaneResources>,
+    work: PhantomData<W>,
 }
 
-impl TransferLane {
+impl<W: LaneWork> QueueLane<W> {
     /// Create from family/queue selection. No pool allocated under SameQueueFallback.
     pub unsafe fn new(device: &ash::Device, family: u32, queue: vk::Queue, tier: Tier) -> Self {
         let resources = (tier != Tier::SameQueueFallback).then(|| unsafe {
@@ -147,7 +172,7 @@ impl TransferLane {
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
             let pool = device
                 .create_command_pool(&pool_info, None)
-                .expect("Failed to create transfer command pool");
+                .unwrap_or_else(|e| panic!("Failed to create {} command pool: {e:?}", W::LABEL));
             LaneResources {
                 pool,
                 ring: BatchRing::new(),
@@ -159,7 +184,20 @@ impl TransferLane {
             family,
             queue,
             resources,
+            work: PhantomData,
         }
+    }
+
+    fn resources(&self, op: &str) -> &LaneResources {
+        self.resources
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}::{op} requires a separate queue", W::NAME))
+    }
+
+    fn resources_mut(&mut self, op: &str) -> &mut LaneResources {
+        self.resources
+            .as_mut()
+            .unwrap_or_else(|| panic!("{}::{op} requires a separate queue", W::NAME))
     }
 
     pub fn tier(&self) -> Tier {
@@ -190,10 +228,8 @@ impl TransferLane {
     /// (one non-blocking counter read), else a newly allocated one. Never
     /// resets a buffer that may still be pending on the queue.
     pub unsafe fn begin(&mut self, device: &ash::Device) -> LaneRecording {
-        let res = self
-            .resources
-            .as_mut()
-            .expect("TransferLane::begin requires a separate queue");
+        let label = W::LABEL;
+        let res = self.resources_mut("begin");
         let recycled = res.ring.take_free().or_else(|| {
             let completed = unsafe { res.timeline.counter(device) };
             res.ring.reclaim(completed);
@@ -207,21 +243,22 @@ impl TransferLane {
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1);
                 let cmd = unsafe { device.allocate_command_buffers(&alloc_info) }
-                    .expect("Failed to allocate transfer command buffer")[0];
+                    .unwrap_or_else(|e| panic!("Failed to allocate {label} command buffer: {e:?}"))
+                    [0];
                 res.ring.push_recording(cmd);
-                log::debug!("transfer lane grew to {} command buffers", res.ring.len());
+                log::debug!("{label} lane grew to {} command buffers", res.ring.len());
                 cmd
             }
         };
         unsafe {
             device
                 .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
-                .expect("transfer command buffer reset failed");
+                .unwrap_or_else(|e| panic!("{label} command buffer reset failed: {e:?}"));
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             device
                 .begin_command_buffer(cmd, &begin)
-                .expect("begin transfer command buffer failed");
+                .unwrap_or_else(|e| panic!("begin {label} command buffer failed: {e:?}"));
         }
         LaneRecording { cmd }
     }
@@ -239,18 +276,17 @@ impl TransferLane {
         batch: LaneRecording,
         extra_wait: Option<(vk::Semaphore, TimelineValue, vk::PipelineStageFlags2)>,
     ) -> TimelineValue {
-        let res = self
-            .resources
-            .as_mut()
-            .expect("TransferLane::submit requires a separate queue");
+        let label = W::LABEL;
+        let queue = self.queue;
+        let res = self.resources_mut("submit");
         unsafe {
             device
                 .end_command_buffer(batch.cmd)
-                .expect("end transfer command buffer failed");
+                .unwrap_or_else(|e| panic!("end {label} command buffer failed: {e:?}"));
         }
         let rs = res.timeline.begin_render(batch.cmd);
         let value = rs.value();
-        let completion = unsafe { rs.submit(device, self.queue, &res.timeline, extra_wait) };
+        let completion = unsafe { rs.submit(device, queue, &res.timeline, extra_wait) };
         debug_assert_eq!(completion.value(), value);
         res.ring.submitted(batch.cmd, value);
         value
@@ -259,34 +295,29 @@ impl TransferLane {
     /// End a batch without submitting (nothing to do); its buffer is idle
     /// again immediately.
     pub unsafe fn discard(&mut self, device: &ash::Device, batch: LaneRecording) {
-        let res = self
-            .resources
-            .as_mut()
-            .expect("TransferLane::discard requires a separate queue");
+        let label = W::LABEL;
+        let res = self.resources_mut("discard");
         unsafe {
             device
                 .end_command_buffer(batch.cmd)
-                .expect("end empty transfer command buffer failed");
+                .unwrap_or_else(|e| panic!("end empty {label} command buffer failed: {e:?}"));
         }
         res.ring.discarded(batch.cmd);
     }
 
     /// The timeline semaphore for graphics submission's wait info.
     pub fn semaphore(&self) -> vk::Semaphore {
-        self.resources
-            .as_ref()
-            .expect("TransferLane::semaphore requires a separate queue")
-            .timeline
-            .semaphore()
+        self.resources("semaphore").timeline.semaphore()
+    }
+
+    /// [`Self::semaphore`], or `None` when there is no separate queue.
+    pub fn semaphore_opt(&self) -> Option<vk::Semaphore> {
+        self.resources.as_ref().map(|r| r.timeline.semaphore())
     }
 
     /// Wait until the queue reaches this timeline value.
     pub unsafe fn wait(&self, device: &ash::Device, value: TimelineValue) {
-        let res = self
-            .resources
-            .as_ref()
-            .expect("TransferLane::wait requires a separate queue");
-        unsafe { res.timeline.wait(device, value) };
+        unsafe { self.resources("wait").timeline.wait(device, value) };
     }
 
     /// Non-blocking read of the lane's timeline progress. None if no separate queue.

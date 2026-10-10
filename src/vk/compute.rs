@@ -31,19 +31,18 @@
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io::Cursor;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::khr;
 use ash::vk;
 
-use super::alloc::try_find_memory_type;
+use super::alloc::{create_bound_buffer, try_find_memory_type};
 use super::buffers::HOST_COHERENT;
-use super::mesh_staging::{StagingRegion, StagingRing, Stamp, sysmem_staging_type};
+use super::mesh_staging::{HostRing, StagingRegion, Stamp, sysmem_staging_type};
 use super::pass;
-use super::timeline::{Timeline, TimelineValue};
-use super::transfer::{BatchRing, LaneRecording, Tier};
+use super::timeline::TimelineValue;
+use super::transfer::{LaneWork, QueueLane, Tier};
 use crate::switches::{Switch, mib_or};
 
 /// In-flight GPU job cap on the dedicated / second-queue tiers.
@@ -314,267 +313,74 @@ pub(crate) fn pick_compute_queue(
     }
 }
 
-struct LaneResources {
-    pool: vk::CommandPool,
-    ring: BatchRing<vk::CommandBuffer>,
-    timeline: Timeline,
+/// Compute jobs: [`ComputeLane`].
+pub(crate) enum ComputeWork {}
+
+impl LaneWork for ComputeWork {
+    const NAME: &'static str = "ComputeLane";
+    const LABEL: &'static str = "compute";
 }
 
-/// Compute analogue of [`super::transfer::TransferLane`].
-pub(crate) struct ComputeLane {
-    tier: Tier,
-    family: u32,
-    queue: vk::Queue,
-    resources: Option<LaneResources>,
-}
+/// The compute-job lane: the transfer lane's type, on the queue
+/// [`pick_compute_queue`] chose.
+pub(crate) type ComputeLane = QueueLane<ComputeWork>;
 
-impl ComputeLane {
-    pub unsafe fn new(device: &ash::Device, family: u32, queue: vk::Queue, tier: Tier) -> Self {
-        let resources = (tier != Tier::SameQueueFallback).then(|| unsafe {
-            let pool_info = vk::CommandPoolCreateInfo::default()
-                .queue_family_index(family)
-                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-            let pool = device
-                .create_command_pool(&pool_info, None)
-                .expect("Failed to create compute command pool");
-            LaneResources {
-                pool,
-                ring: BatchRing::new(),
-                timeline: Timeline::new(device),
-            }
-        });
-        Self {
-            tier,
-            family,
-            queue,
-            resources,
-        }
-    }
-
-    pub fn tier(&self) -> Tier {
-        self.tier
-    }
-
-    pub fn family(&self) -> u32 {
-        self.family
-    }
-
-    pub fn is_separate_queue(&self) -> bool {
-        self.resources.is_some()
-    }
-
-    pub unsafe fn begin(&mut self, device: &ash::Device) -> LaneRecording {
-        let res = self
-            .resources
-            .as_mut()
-            .expect("ComputeLane::begin requires a separate queue");
-        let recycled = res.ring.take_free().or_else(|| {
-            let completed = unsafe { res.timeline.counter(device) };
-            res.ring.reclaim(completed);
-            res.ring.take_free()
-        });
-        let cmd = match recycled {
-            Some(cmd) => cmd,
-            None => {
-                let alloc_info = vk::CommandBufferAllocateInfo::default()
-                    .command_pool(res.pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1);
-                let cmd = unsafe { device.allocate_command_buffers(&alloc_info) }
-                    .expect("Failed to allocate compute command buffer")[0];
-                res.ring.push_recording(cmd);
-                log::debug!("compute lane grew to {} command buffers", res.ring.len());
-                cmd
-            }
-        };
-        unsafe {
-            device
-                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
-                .expect("compute command buffer reset failed");
-            let begin = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            device
-                .begin_command_buffer(cmd, &begin)
-                .expect("begin compute command buffer failed");
-        }
-        LaneRecording::from_cmd(cmd)
-    }
-
-    pub unsafe fn submit(&mut self, device: &ash::Device, batch: LaneRecording) -> TimelineValue {
-        let res = self
-            .resources
-            .as_mut()
-            .expect("ComputeLane::submit requires a separate queue");
-        let cmd = batch.cmd();
-        unsafe {
-            device
-                .end_command_buffer(cmd)
-                .expect("end compute command buffer failed");
-        }
-        let rs = res.timeline.begin_render(cmd);
-        let value = rs.value();
-        let completion = unsafe { rs.submit(device, self.queue, &res.timeline, None) };
-        debug_assert_eq!(completion.value(), value);
-        res.ring.submitted(cmd, value);
-        value
-    }
-
-    pub fn semaphore_opt(&self) -> Option<vk::Semaphore> {
-        self.resources.as_ref().map(|r| r.timeline.semaphore())
-    }
-
-    pub unsafe fn destroy(&mut self, device: &ash::Device) {
-        if let Some(res) = self.resources.take() {
-            unsafe {
-                res.timeline.destroy(device);
-                device.destroy_command_pool(res.pool, None);
-            }
-        }
-    }
-}
-
-struct HostRing {
-    ring: StagingRing,
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-    mapped: Option<NonNull<u8>>,
-    /// True when the mapping is HOST_CACHED | DEVICE_LOCAL (cheap GPU write).
-    is_direct: bool,
-    destroyed: AtomicBool,
-}
-
-// SAFETY: persistent mapping is process-wide; disjoint regions are written by
-// the workers that acquired them, and GPU reads start only after submit.
-unsafe impl Send for HostRing {}
-unsafe impl Sync for HostRing {}
-
-impl HostRing {
-    fn disabled() -> Self {
-        Self {
-            ring: StagingRing::new(0, 16),
-            buffer: vk::Buffer::null(),
-            memory: vk::DeviceMemory::null(),
-            mapped: None,
-            is_direct: false,
-            destroyed: AtomicBool::new(true),
-        }
-    }
-
-    unsafe fn new(
-        instance: &ash::Instance,
-        device: &ash::Device,
-        physical: vk::PhysicalDevice,
-        size: u64,
-        usage: vk::BufferUsageFlags,
-        align: u64,
-        prefer_direct: bool,
-    ) -> Arc<Self> {
-        if size == 0 {
-            return Arc::new(Self::disabled());
-        }
-        let align = align.max(16);
-        let size = size.next_multiple_of(align).max(align);
-        let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
-        let info = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe {
-            device
-                .create_buffer(&info, None)
-                .expect("create compute host ring buffer")
-        };
-        let req = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let type_index = if prefer_direct {
-            cheap_direct_type(&memory_props, req.memory_type_bits)
-                .or_else(|| sysmem_staging_type(&memory_props, req.memory_type_bits))
-        } else {
-            sysmem_staging_type(&memory_props, req.memory_type_bits)
-        }
-        .expect("no HOST_VISIBLE | HOST_COHERENT memory type for compute ring");
-        let memory = unsafe {
-            device
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(req.size)
-                        .memory_type_index(type_index),
-                    None,
-                )
-                .expect("allocate compute host ring memory")
-        };
-        unsafe {
-            device
-                .bind_buffer_memory(buffer, memory, 0)
-                .expect("bind compute host ring memory");
-        }
-        let mapped = unsafe {
-            device
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                .expect("map compute host ring") as *mut u8
-        };
-        let flags = memory_props.memory_types[type_index as usize].property_flags;
-        let is_direct = flags.contains(
-            HOST_COHERENT
-                | vk::MemoryPropertyFlags::HOST_CACHED
-                | vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
-        log::info!(
-            "compute ring: {} MiB usage={usage:?} type {type_index} direct={is_direct} ({flags:?})",
-            size / (1024 * 1024)
-        );
-        Arc::new(Self {
-            ring: StagingRing::new(size, align),
-            buffer,
-            memory,
-            mapped: NonNull::new(mapped),
-            is_direct,
-            destroyed: AtomicBool::new(false),
-        })
-    }
-
-    fn acquire(self: &Arc<Self>, bytes: usize) -> Option<(StagingRegion, *mut u8)> {
-        let mapped = self.mapped?;
-        let region = self.ring.acquire(bytes)?;
-        Some((region, unsafe {
-            mapped.as_ptr().add(region.offset as usize)
-        }))
-    }
-
-    fn copy_out(&self, region: StagingRegion, bytes: u32) -> Box<[u8]> {
-        let mapped = self.mapped.expect("compute readback is mapped");
-        let n = bytes as usize;
-        let src =
-            unsafe { std::slice::from_raw_parts(mapped.as_ptr().add(region.offset as usize), n) };
-        src.to_vec().into_boxed_slice()
-    }
-
-    fn reclaim(&self, render: u64, transfer: Option<u64>) {
-        self.ring.reclaim(render, transfer);
-    }
-
-    unsafe fn destroy(&self, device: &ash::Device) {
-        if self.destroyed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if self.buffer != vk::Buffer::null() {
-            unsafe {
-                device.destroy_buffer(self.buffer, None);
-                device.free_memory(self.memory, None);
-            }
-        }
-    }
-}
-
-/// HOST_VISIBLE | HOST_COHERENT | HOST_CACHED | DEVICE_LOCAL — UMA-class
+/// `HOST_VISIBLE | HOST_COHERENT | HOST_CACHED | DEVICE_LOCAL`: UMA-class
 /// memory where the shader can write the readback ring directly.
+const DIRECT_WRITE: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::from_raw(
+    HOST_COHERENT.as_raw()
+        | vk::MemoryPropertyFlags::HOST_CACHED.as_raw()
+        | vk::MemoryPropertyFlags::DEVICE_LOCAL.as_raw(),
+);
+
+/// A compute input or readback [`HostRing`] of `size` bytes (0 disables it),
+/// aligned to `align.max(16)`, in cached system memory; with `prefer_direct`
+/// in [`DIRECT_WRITE`] memory first, when the device has it.
+unsafe fn compute_ring(
+    device: &ash::Device,
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+    usage: vk::BufferUsageFlags,
+    align: u64,
+    prefer_direct: bool,
+    purpose: &str,
+) -> Arc<HostRing> {
+    if size == 0 {
+        return Arc::new(HostRing::disabled(16));
+    }
+    let pick = |props: &vk::PhysicalDeviceMemoryProperties, bits: u32| {
+        if prefer_direct {
+            cheap_direct_type(props, bits).or_else(|| sysmem_staging_type(props, bits))
+        } else {
+            sysmem_staging_type(props, bits)
+        }
+    };
+    let (ring, type_index) = unsafe {
+        HostRing::new(
+            device,
+            memory_props,
+            size,
+            align.max(16),
+            usage,
+            purpose,
+            pick,
+        )
+    };
+    let flags = ring.flags();
+    let is_direct = flags.contains(DIRECT_WRITE);
+    log::info!(
+        "compute ring: {} MiB usage={usage:?} type {type_index} direct={is_direct} ({flags:?})",
+        ring.ring().capacity() / (1024 * 1024)
+    );
+    Arc::new(ring)
+}
+
+/// A [`DIRECT_WRITE`] memory type for `type_filter`, if the device has one.
 fn cheap_direct_type(
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     type_filter: u32,
 ) -> Option<u32> {
-    let want = HOST_COHERENT
-        | vk::MemoryPropertyFlags::HOST_CACHED
-        | vk::MemoryPropertyFlags::DEVICE_LOCAL;
-    try_find_memory_type(memory_props, type_filter, want)
+    try_find_memory_type(memory_props, type_filter, DIRECT_WRITE)
 }
 
 fn device_local_type(
@@ -610,7 +416,7 @@ impl ComputeStager {
     /// Non-blocking acquire of a host-mapped region. `None` if the pool is
     /// exhausted (the job retries later).
     pub fn acquire(&self, bytes: usize) -> Option<ComputeInput> {
-        let (region, ptr) = HostRing::acquire(&self.ring, bytes)?;
+        let (region, ptr) = self.ring.acquire(bytes)?;
         Some(ComputeInput {
             ring: Arc::clone(&self.ring),
             region,
@@ -621,7 +427,7 @@ impl ComputeStager {
     }
 
     pub fn capacity_bytes(&self) -> u64 {
-        self.ring.ring.capacity()
+        self.ring.ring().capacity()
     }
 }
 
@@ -671,7 +477,7 @@ impl ComputeInput {
 impl Drop for ComputeInput {
     fn drop(&mut self) {
         if !self.consumed {
-            self.ring.ring.release(self.region);
+            self.ring.ring().release(self.region);
         }
     }
 }
@@ -683,14 +489,14 @@ struct InputLease {
 
 impl InputLease {
     fn stamp(self, stamp: Stamp) {
-        self.ring.ring.stamp(self.region, stamp);
+        self.ring.ring().stamp(self.region, stamp);
         std::mem::forget(self);
     }
 }
 
 impl Drop for InputLease {
     fn drop(&mut self) {
-        self.ring.ring.release(self.region);
+        self.ring.ring().release(self.region);
     }
 }
 
@@ -803,61 +609,44 @@ impl ComputeRuntime {
         let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
 
         let input = unsafe {
-            HostRing::new(
-                instance,
+            compute_ring(
                 device,
-                physical,
+                &memory_props,
                 input_size,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 align,
                 false,
+                "compute input ring",
             )
         };
 
         let readback = unsafe {
-            HostRing::new(
-                instance,
+            compute_ring(
                 device,
-                physical,
+                &memory_props,
                 readback_size,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 align,
                 true,
+                "compute readback ring",
             )
         };
-        let direct = readback.is_direct;
+        let direct = readback.flags().contains(DIRECT_WRITE);
 
-        let scratch = if direct || readback.buffer == vk::Buffer::null() {
+        let scratch = if direct || readback.buffer() == vk::Buffer::null() {
             None
         } else {
-            let size = readback.ring.capacity().max(align);
-            let info = vk::BufferCreateInfo::default()
-                .size(size)
-                .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let buffer = unsafe {
-                device
-                    .create_buffer(&info, None)
-                    .expect("create compute scratch buffer")
-            };
-            let req = unsafe { device.get_buffer_memory_requirements(buffer) };
-            let type_index = device_local_type(&memory_props, req.memory_type_bits)
-                .expect("no DEVICE_LOCAL memory type for compute scratch");
-            let memory = unsafe {
-                device
-                    .allocate_memory(
-                        &vk::MemoryAllocateInfo::default()
-                            .allocation_size(req.size)
-                            .memory_type_index(type_index),
-                        None,
-                    )
-                    .expect("allocate compute scratch")
-            };
-            unsafe {
-                device
-                    .bind_buffer_memory(buffer, memory, 0)
-                    .expect("bind compute scratch");
-            }
+            let size = readback.ring().capacity().max(align);
+            let (buffer, memory) = create_bound_buffer(
+                device,
+                size,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+                "compute scratch",
+                |bits| {
+                    device_local_type(&memory_props, bits)
+                        .expect("no DEVICE_LOCAL memory type for compute scratch")
+                },
+            );
             log::info!(
                 "compute scratch: {} MiB device-local (shader write → copy to readback)",
                 size / (1024 * 1024)
@@ -880,14 +669,15 @@ impl ComputeRuntime {
             (vk::QueryPool::null(), Vec::new())
         };
 
-        let enabled = input.buffer != vk::Buffer::null() && readback.buffer != vk::Buffer::null();
+        let enabled =
+            input.buffer() != vk::Buffer::null() && readback.buffer() != vk::Buffer::null();
         if !enabled {
             log::warn!("compute: rings disabled; register_compute will return NoCompute");
         } else {
             log::info!(
                 "compute: direct_write={direct} input={} MiB readback={} MiB",
-                input.ring.capacity() / (1024 * 1024),
-                readback.ring.capacity() / (1024 * 1024),
+                input.ring().capacity() / (1024 * 1024),
+                readback.ring().capacity() / (1024 * 1024),
             );
         }
 
@@ -981,7 +771,7 @@ impl ComputeRuntime {
         if !self.enabled {
             return Err(EngineError::NoCompute);
         }
-        validate_desc(desc, &self.limits, self.readback.ring.capacity())?;
+        validate_desc(desc, &self.limits, self.readback.ring().capacity())?;
         let bindings = descriptor_bindings(desc.inputs);
         let (set_layout, layout) = pass::push_descriptor_layouts(
             device,
@@ -1053,7 +843,7 @@ impl ComputeRuntime {
         {
             return Err(EngineError::InputGone);
         }
-        let Some((output, _)) = HostRing::acquire(&self.readback, job.output_bytes as usize) else {
+        let Some((output, _)) = self.readback.acquire(job.output_bytes as usize) else {
             return Err(EngineError::Busy);
         };
         let inputs = job.inputs.map(|inp| inp.map(ComputeInput::into_lease));
@@ -1150,13 +940,15 @@ impl ComputeRuntime {
                 break;
             }
             let job = inflight.pop_front().unwrap();
-            let bytes = self.readback.copy_out(job.output, job.output_bytes);
+            let bytes = self
+                .readback
+                .copy_out(job.output, job.output_bytes as usize);
             let stamp = if job.on_compute_lane {
                 Stamp::Transfer(job.value.raw())
             } else {
                 Stamp::Render(job.value.raw())
             };
-            self.readback.ring.stamp(job.output, stamp);
+            self.readback.ring().stamp(job.output, stamp);
             for lease in job.inputs.into_iter().flatten() {
                 lease.stamp(stamp);
             }
@@ -1325,12 +1117,12 @@ impl ComputeRuntime {
             }
 
             let out_buf = if self.direct {
-                self.readback.buffer
+                self.readback.buffer()
             } else {
                 self.scratch
                     .as_ref()
                     .map(|s| s.buffer)
-                    .unwrap_or(self.readback.buffer)
+                    .unwrap_or(self.readback.buffer())
             };
             let out_info = vk::DescriptorBufferInfo::default()
                 .buffer(out_buf)
@@ -1338,13 +1130,13 @@ impl ComputeRuntime {
                 .range(job.output.len.max(1));
             let in0 = job.inputs[0].as_ref().map(|l| {
                 vk::DescriptorBufferInfo::default()
-                    .buffer(self.input.buffer)
+                    .buffer(self.input.buffer())
                     .offset(l.region.offset)
                     .range(l.region.len.max(1))
             });
             let in1 = job.inputs[1].as_ref().map(|l| {
                 vk::DescriptorBufferInfo::default()
-                    .buffer(self.input.buffer)
+                    .buffer(self.input.buffer())
                     .offset(l.region.offset)
                     .range(l.region.len.max(1))
             });
@@ -1429,7 +1221,7 @@ impl ComputeRuntime {
                         .src_offset(job.output.offset)
                         .dst_offset(job.output.offset)
                         .size(u64::from(job.output_bytes))];
-                    device.cmd_copy_buffer(cmd, scratch.buffer, self.readback.buffer, &region);
+                    device.cmd_copy_buffer(cmd, scratch.buffer, self.readback.buffer(), &region);
                     let to_host = [vk::MemoryBarrier2::default()
                         .src_stage_mask(vk::PipelineStageFlags2::COPY)
                         .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)

@@ -765,7 +765,9 @@ pub(crate) fn host_mapped_memory_type(
         .unwrap_or_else(|| find_memory_type(memory_props, type_filter, plain))
 }
 
-fn create_bound_buffer(
+/// An `EXCLUSIVE` buffer bound at offset 0 to its own allocation in the
+/// memory type `pick_type` chooses from the buffer's `memory_type_bits`.
+pub(crate) fn create_bound_buffer(
     device: &ash::Device,
     size: u64,
     usage: vk::BufferUsageFlags,

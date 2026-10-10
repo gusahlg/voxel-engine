@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex};
 
 use ash::vk;
 
-use super::alloc::try_find_memory_type;
-use super::buffers::{HOST_BAR_BYTES, HOST_COHERENT};
+use super::alloc::{create_bound_buffer, try_find_memory_type};
+use super::buffers::HOST_COHERENT;
 use super::timeline::TimelineValue;
 use crate::mesh::{FACE_UPLOAD_ORDER, MeshData, MeshVertex};
 use crate::switches::{Switch, mib_or};
@@ -394,7 +394,7 @@ impl MeshStager {
 
     /// Ring capacity in bytes (aligned down to the vertex stride).
     pub fn capacity_bytes(&self) -> u64 {
-        self.pool.ring.capacity()
+        self.pool.host.ring.capacity()
     }
 }
 
@@ -553,7 +553,7 @@ impl MeshStaging {
 impl Drop for MeshStaging {
     fn drop(&mut self) {
         if !self.consumed {
-            self.pool.ring.release(self.region);
+            self.pool.host.ring.release(self.region);
         }
     }
 }
@@ -571,34 +571,173 @@ impl StagingLease {
     }
 
     pub(crate) fn stamp(self, stamp: Stamp) {
-        self.pool.ring.stamp(self.region, stamp);
+        self.pool.host.ring.stamp(self.region, stamp);
         std::mem::forget(self);
     }
 }
 
 impl Drop for StagingLease {
     fn drop(&mut self) {
-        self.pool.ring.release(self.region);
+        self.pool.host.ring.release(self.region);
     }
 }
 
-/// Fixed host-visible mesh staging buffer and its bump/ring.
-pub(crate) struct MeshStagingPool {
+/// Fixed host-visible buffer, persistently mapped and carved by a
+/// [`StagingRing`]: the mesh staging pool and the compute input and readback
+/// rings. A disabled ring (no buffer) returns `None` from every acquire.
+///
+/// Its users differ only in what they pass to [`Self::new`]: alignment,
+/// buffer usage, and the memory type pick (cached system memory for mesh
+/// staging and compute input; the compute readback ring first tries a cached
+/// device-local type the shader can write directly).
+pub(crate) struct HostRing {
     ring: StagingRing,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: Option<NonNull<u8>>,
-    bar_bytes: u64,
+    /// Property flags of the bound memory type; empty without a buffer.
+    flags: vk::MemoryPropertyFlags,
     destroyed: AtomicBool,
     /// Host-only backing for unit tests (the pointer in `mapped` aliases this).
-    #[allow(dead_code)]
+    #[cfg(test)]
     _pin: Option<Box<[u8]>>,
 }
 
 // SAFETY: the persistent mapping is process-wide; disjoint regions are written
 // by the workers that acquired them, and GPU reads start only after submit.
-unsafe impl Send for MeshStagingPool {}
-unsafe impl Sync for MeshStagingPool {}
+unsafe impl Send for HostRing {}
+unsafe impl Sync for HostRing {}
+
+impl HostRing {
+    /// No buffer and no capacity: every acquire returns `None`.
+    pub(crate) fn disabled(align: u64) -> Self {
+        Self {
+            ring: StagingRing::new(0, align),
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            mapped: None,
+            flags: vk::MemoryPropertyFlags::empty(),
+            destroyed: AtomicBool::new(true),
+            #[cfg(test)]
+            _pin: None,
+        }
+    }
+
+    /// Allocate `size` bytes rounded up to `align` (at least one unit) as a
+    /// `usage` buffer in the memory type `memory_type` picks from the device's
+    /// types and the buffer's type bits, and map it whole. `size` is non-zero
+    /// (a zero size is [`Self::disabled`]). Returns the ring and the memory
+    /// type index, for the caller's log line.
+    pub(crate) unsafe fn new(
+        device: &ash::Device,
+        memory_props: &vk::PhysicalDeviceMemoryProperties,
+        size: u64,
+        align: u64,
+        usage: vk::BufferUsageFlags,
+        purpose: &str,
+        memory_type: impl FnOnce(&vk::PhysicalDeviceMemoryProperties, u32) -> Option<u32>,
+    ) -> (Self, u32) {
+        debug_assert!(size > 0, "a zero-sized {purpose} is HostRing::disabled");
+        let size = size.next_multiple_of(align).max(align);
+        let mut type_index = 0;
+        let (buffer, memory) = create_bound_buffer(device, size, usage, purpose, |bits| {
+            type_index = memory_type(memory_props, bits).unwrap_or_else(|| {
+                panic!("no HOST_VISIBLE | HOST_COHERENT memory type for {purpose}")
+            });
+            type_index
+        });
+        let mapped = unsafe {
+            device
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .unwrap_or_else(|e| panic!("map {purpose}: {e:?}"))
+                .cast::<u8>()
+        };
+        let ring = Self {
+            ring: StagingRing::new(size, align),
+            buffer,
+            memory,
+            mapped: NonNull::new(mapped),
+            flags: memory_props.memory_types[type_index as usize].property_flags,
+            destroyed: AtomicBool::new(false),
+            #[cfg(test)]
+            _pin: None,
+        };
+        (ring, type_index)
+    }
+
+    pub(crate) fn ring(&self) -> &StagingRing {
+        &self.ring
+    }
+
+    pub(crate) fn buffer(&self) -> vk::Buffer {
+        self.buffer
+    }
+
+    /// Property flags of the bound memory type; empty without a buffer.
+    pub(crate) fn flags(&self) -> vk::MemoryPropertyFlags {
+        self.flags
+    }
+
+    /// Non-blocking acquire of a region and its mapped address. `None` when
+    /// the ring is disabled or has no room.
+    pub(crate) fn acquire(&self, bytes: usize) -> Option<(StagingRegion, *mut u8)> {
+        let mapped = self.mapped?;
+        let region = self.ring.acquire(bytes)?;
+        Some((region, unsafe {
+            mapped.as_ptr().add(region.offset as usize)
+        }))
+    }
+
+    /// Copy the first `bytes` of `region` out of the mapping.
+    pub(crate) fn copy_out(&self, region: StagingRegion, bytes: usize) -> Box<[u8]> {
+        let mapped = self.mapped.expect("copy_out from an unmapped host ring");
+        let src = unsafe {
+            std::slice::from_raw_parts(mapped.as_ptr().add(region.offset as usize), bytes)
+        };
+        src.to_vec().into_boxed_slice()
+    }
+
+    /// One reclaim pass over raw timeline counters: regions whose stamp they
+    /// have passed become reusable. `transfer` is the separate lane's
+    /// counter, `None` without one.
+    pub(crate) fn reclaim(&self, render: u64, transfer: Option<u64>) {
+        self.ring.reclaim(render, transfer);
+    }
+
+    /// Destroy the Vulkan buffer. Safe to call more than once; GPU must be idle.
+    pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
+        if self.destroyed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if self.buffer != vk::Buffer::null() {
+            unsafe {
+                device.destroy_buffer(self.buffer, None);
+                device.free_memory(self.memory, None);
+            }
+        }
+    }
+
+    /// Ring over host memory, without a Vulkan buffer (unit tests).
+    #[cfg(test)]
+    pub(crate) fn new_host(capacity: usize, align: u64) -> Self {
+        let mut pin = vec![0u8; capacity].into_boxed_slice();
+        let mapped = NonNull::new(pin.as_mut_ptr());
+        Self {
+            ring: StagingRing::new(capacity as u64, align),
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            mapped,
+            flags: vk::MemoryPropertyFlags::empty(),
+            destroyed: AtomicBool::new(true),
+            _pin: Some(pin),
+        }
+    }
+}
+
+/// Fixed host-visible mesh staging buffer and its bump/ring.
+pub(crate) struct MeshStagingPool {
+    host: HostRing,
+}
 
 impl MeshStagingPool {
     /// Allocate the pool buffer in host-visible *system* memory.
@@ -616,68 +755,31 @@ impl MeshStagingPool {
         if size == 0 {
             return Arc::new(Self::disabled());
         }
-        let size = size.next_multiple_of(VERTEX_STRIDE).max(VERTEX_STRIDE);
         let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
         // TRANSFER_SRC only: the ring is never bound as a vertex buffer.
-        let usage = vk::BufferUsageFlags::TRANSFER_SRC;
-        let info = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe {
-            device
-                .create_buffer(&info, None)
-                .expect("create mesh staging buffer")
+        let (host, type_index) = unsafe {
+            HostRing::new(
+                device,
+                &memory_props,
+                size,
+                VERTEX_STRIDE,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                "mesh staging",
+                sysmem_staging_type,
+            )
         };
-        let req = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let type_index = sysmem_staging_type(&memory_props, req.memory_type_bits)
-            .expect("no HOST_VISIBLE | HOST_COHERENT memory type for mesh staging");
-        let memory = unsafe {
-            device
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(req.size)
-                        .memory_type_index(type_index),
-                    None,
-                )
-                .expect("allocate mesh staging memory")
-        };
-        unsafe {
-            device
-                .bind_buffer_memory(buffer, memory, 0)
-                .expect("bind mesh staging memory");
-        }
-        let mapped = unsafe {
-            device
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                .expect("map mesh staging buffer") as *mut u8
-        };
-        let flags = memory_props.memory_types[type_index as usize].property_flags;
+        let flags = host.flags();
         let cached = flags.contains(vk::MemoryPropertyFlags::HOST_CACHED);
         log::info!(
             "mesh staging pool: {} MiB, memory type {type_index} cached={cached} ({flags:?})",
-            size / (1024 * 1024)
+            host.ring.capacity() / (1024 * 1024)
         );
-        Arc::new(Self {
-            ring: StagingRing::new(size, VERTEX_STRIDE),
-            buffer,
-            memory,
-            mapped: NonNull::new(mapped),
-            bar_bytes: 0,
-            destroyed: AtomicBool::new(false),
-            _pin: None,
-        })
+        Arc::new(Self { host })
     }
 
     fn disabled() -> Self {
         Self {
-            ring: StagingRing::new(0, VERTEX_STRIDE),
-            buffer: vk::Buffer::null(),
-            memory: vk::DeviceMemory::null(),
-            mapped: None,
-            bar_bytes: 0,
-            destroyed: AtomicBool::new(true),
-            _pin: None,
+            host: HostRing::disabled(VERTEX_STRIDE),
         }
     }
 
@@ -688,17 +790,16 @@ impl MeshStagingPool {
     }
 
     pub(crate) fn buffer(&self) -> vk::Buffer {
-        self.buffer
+        self.host.buffer()
     }
 
     fn acquire(pool: &Arc<Self>, bytes: usize) -> Option<MeshStaging> {
-        let mapped = pool.mapped?;
-        let region = pool.ring.acquire(bytes)?;
+        let (region, ptr) = pool.host.acquire(bytes)?;
         Some(MeshStaging {
             pool: Arc::clone(pool),
             region,
             requested: bytes,
-            ptr: unsafe { mapped.as_ptr().add(region.offset as usize) },
+            ptr,
             consumed: false,
             aabb: None,
         })
@@ -707,38 +808,21 @@ impl MeshStagingPool {
     /// One reclaim pass: regions whose stamp the given timelines have passed
     /// become reusable. `transfer` is `None` on the same-queue fallback tier.
     pub(crate) fn reclaim(&self, render: TimelineValue, transfer: Option<TimelineValue>) {
-        self.ring
+        self.host
             .reclaim(render.raw(), transfer.map(TimelineValue::raw));
     }
 
     /// Destroy the Vulkan buffer. Safe to call once; GPU must be idle.
     pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
-        if self.destroyed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if self.buffer != vk::Buffer::null() {
-            unsafe {
-                device.destroy_buffer(self.buffer, None);
-                device.free_memory(self.memory, None);
-            }
-            HOST_BAR_BYTES.fetch_sub(self.bar_bytes, Ordering::Relaxed);
-        }
+        unsafe { self.host.destroy(device) };
     }
 }
 
 #[cfg(test)]
 impl MeshStagingPool {
     pub(crate) fn new_host(capacity: usize) -> Arc<Self> {
-        let mut pin = vec![0u8; capacity].into_boxed_slice();
-        let mapped = NonNull::new(pin.as_mut_ptr());
         Arc::new(Self {
-            ring: StagingRing::new(capacity as u64, VERTEX_STRIDE),
-            buffer: vk::Buffer::null(),
-            memory: vk::DeviceMemory::null(),
-            mapped,
-            bar_bytes: 0,
-            destroyed: AtomicBool::new(true),
-            _pin: Some(pin),
+            host: HostRing::new_host(capacity, VERTEX_STRIDE),
         })
     }
 }
