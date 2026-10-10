@@ -806,6 +806,38 @@ fn build_table() -> Vec<Def> {
             doc: "Camera-distance edge (metres) between cull buckets 2 and 3 (farthest).",
             val: Val::Scalar(256.0),
         },
+        // Cull literals with a CPU twin in vk/cull_math.rs (and its shader
+        // mirror). cull.comp.slang reads these instead of inline literals.
+        Def {
+            name: "CULL_OPAQUE_LOD_GROUP",
+            doc: "Camera cull group for a coarse-LOD (scale > 1) Opaque mesh. Must match\nvk::cull::Group::OpaqueLod.",
+            val: Val::UInt(2),
+        },
+        Def {
+            name: "CULL_CAGE_DET_REL",
+            doc: "Singular cage frame cutoff: |det| at or below this fraction of the\nedge-length product (or of 1, when that is smaller) draws the mesh whole.",
+            val: Val::Scalar(1.0e-8),
+        },
+        Def {
+            name: "CULL_CAGE_VIS_BIAS",
+            doc: "Added to twice the cage's non-affinity error to form the margin on each\ncamera-in-cage-frame test of the caged face-run cull.",
+            val: Val::Scalar(1.0e-3),
+        },
+        Def {
+            name: "CULL_FLAG_FACE_RUNS",
+            doc: "CullParams.flags bit: emit per-direction face runs (meshes whose\nMESH_FLAG_FACE_RUNS is set). Clear draws every mesh whole.",
+            val: Val::UInt(1),
+        },
+        Def {
+            name: "CULL_FLAG_STATS",
+            doc: "Cull push-constant flags bit: accumulate the per-camera-group\n[draws, index_count] histogram (profiling only).",
+            val: Val::UInt(1),
+        },
+        Def {
+            name: "MESH_FLAG_FACE_RUNS",
+            doc: "MeshRecord.flags bit: face_quads holds valid u16 quad counts per upload\ndirection. Clear makes the cull draw the mesh whole.",
+            val: Val::UInt(1),
+        },
         Def {
             name: "EXPOSURE_TILE",
             doc: "Exposure metering tile edge in HDR texels. The CPU-side tile-grid dimensions\n(vk/exposure.rs) are ceil(hdr_dim / EXPOSURE_TILE) and must agree.",

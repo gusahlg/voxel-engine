@@ -4,10 +4,10 @@
 //! `(detail_bits & mask) - DETAIL_GPU_BIAS`. `q` is the unmorphed position in
 //! block units, before the cage and before the placement offset.
 //!
-//! The shader is the production caller. Host tests are the Rust caller, so the
-//! mirror is allowed to look unused to the library build.
+//! The shader is the production caller. Host tests are the only Rust caller,
+//! so the mirror is built for tests only.
 
-#![allow(dead_code)]
+#![cfg(test)]
 
 /// Cells along local +Y (`a * dy`). A level with no positive band, `dy == 0`,
 /// or morphing off contributes nothing.

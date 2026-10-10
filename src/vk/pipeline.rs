@@ -52,6 +52,19 @@ impl EyeSplit {
             _pad1: 0.0,
         }
     }
+
+    /// Camera-relative placement of integer `block`: `(block - self.block) -
+    /// self.frac` per axis, the subtraction wrapping. Same f32 operations, in
+    /// the same order, as the shaders' `float3(block - cam_block) - cam_frac`,
+    /// so a caller that adds further terms afterwards rounds as they do.
+    #[inline(always)]
+    pub(crate) fn rel(&self, block: [i32; 3]) -> [f32; 3] {
+        [
+            block[0].wrapping_sub(self.block[0]) as f32 - self.frac[0],
+            block[1].wrapping_sub(self.block[1]) as f32 - self.frac[1],
+            block[2].wrapping_sub(self.block[2]) as f32 - self.frac[2],
+        ]
+    }
 }
 
 /// 3D push constant data. 128 bytes: the LOD box reuses the old clip lanes
