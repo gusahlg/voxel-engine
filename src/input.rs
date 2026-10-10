@@ -88,12 +88,16 @@ pub enum Key {
     F4,
     F5,
     F6,
+    /// The key left of `1`, under Escape (US "`", Nordic ISO "§").
+    Backquote,
+    /// The ISO-only key between left Shift and Z ("<" / ">" on Nordic layouts).
+    IntlBackslash,
 }
 
 impl Key {
     /// One past the last discriminant. Keep tied to the last variant so the
     /// compile-time capacity check below tracks the enum.
-    const COUNT: u32 = Self::F6 as u32 + 1;
+    const COUNT: u32 = Self::IntlBackslash as u32 + 1;
 
     const fn bit(self) -> u32 {
         self as u32
@@ -395,6 +399,8 @@ fn map_key(code: KeyCode) -> Option<Key> {
         KeyCode::F4 => Key::F4,
         KeyCode::F5 => Key::F5,
         KeyCode::F6 => Key::F6,
+        KeyCode::Backquote => Key::Backquote,
+        KeyCode::IntlBackslash => Key::IntlBackslash,
         _ => return None,
     })
 }
@@ -508,20 +514,41 @@ mod tests {
     fn last_key_variant_down_pressed_release() {
         let mut input = InputState::new();
         input.begin_frame();
-        input.key_event(Key::F6, true, false);
-        assert!(input.is_key_pressed(Key::F6));
-        assert!(input.is_key_down(Key::F6));
-        // A low-index key must stay untouched (F6 lives in the second word).
+        input.key_event(Key::IntlBackslash, true, false);
+        assert!(input.is_key_pressed(Key::IntlBackslash));
+        assert!(input.is_key_down(Key::IntlBackslash));
+        // A low-index key must stay untouched (the last key lives in the second word).
         assert!(!input.is_key_down(Key::A));
         assert!(!input.is_key_pressed(Key::A));
 
         input.begin_frame();
-        assert!(!input.is_key_pressed(Key::F6), "edge must clear next frame");
-        assert!(input.is_key_down(Key::F6), "held state must persist");
+        assert!(
+            !input.is_key_pressed(Key::IntlBackslash),
+            "edge must clear next frame"
+        );
+        assert!(
+            input.is_key_down(Key::IntlBackslash),
+            "held state must persist"
+        );
 
-        input.key_event(Key::F6, false, false);
+        input.key_event(Key::IntlBackslash, false, false);
+        assert!(!input.is_key_down(Key::IntlBackslash));
+        assert!(!input.is_key_pressed(Key::IntlBackslash));
+    }
+
+    #[test]
+    fn iso_and_backquote_keys_map_from_winit() {
+        assert_eq!(map_key(KeyCode::Backquote), Some(Key::Backquote));
+        assert_eq!(map_key(KeyCode::IntlBackslash), Some(Key::IntlBackslash));
+        // Appended after F6, so every earlier discriminant is unchanged.
+        assert_eq!(Key::F6 as u32 + 1, Key::Backquote as u32);
+        assert_eq!(Key::Backquote as u32 + 1, Key::IntlBackslash as u32);
+        let mut input = InputState::new();
+        input.begin_frame();
+        input.key_event(Key::Backquote, true, false);
+        assert!(input.is_key_pressed(Key::Backquote));
+        assert!(!input.is_key_down(Key::IntlBackslash));
         assert!(!input.is_key_down(Key::F6));
-        assert!(!input.is_key_pressed(Key::F6));
     }
 
     #[test]
