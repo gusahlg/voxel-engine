@@ -423,27 +423,6 @@ impl ComputeLane {
         self.resources.as_ref().map(|r| r.timeline.semaphore())
     }
 
-    #[allow(dead_code)]
-    pub fn semaphore(&self) -> vk::Semaphore {
-        self.semaphore_opt()
-            .expect("ComputeLane::semaphore requires a separate queue")
-    }
-
-    #[allow(dead_code)]
-    pub unsafe fn wait(&self, device: &ash::Device, value: TimelineValue) {
-        let res = self
-            .resources
-            .as_ref()
-            .expect("ComputeLane::wait requires a separate queue");
-        unsafe { res.timeline.wait(device, value) };
-    }
-
-    #[allow(dead_code)]
-    pub unsafe fn counter(&self, device: &ash::Device) -> Option<TimelineValue> {
-        let res = self.resources.as_ref()?;
-        Some(unsafe { res.timeline.counter(device) })
-    }
-
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         if let Some(res) = self.resources.take() {
             unsafe {
@@ -462,7 +441,6 @@ struct HostRing {
     /// True when the mapping is HOST_CACHED | DEVICE_LOCAL (cheap GPU write).
     is_direct: bool,
     destroyed: AtomicBool,
-    _pin: Option<Box<[u8]>>,
 }
 
 // SAFETY: persistent mapping is process-wide; disjoint regions are written by
@@ -479,7 +457,6 @@ impl HostRing {
             mapped: None,
             is_direct: false,
             destroyed: AtomicBool::new(true),
-            _pin: None,
         }
     }
 
@@ -552,7 +529,6 @@ impl HostRing {
             mapped: NonNull::new(mapped),
             is_direct,
             destroyed: AtomicBool::new(false),
-            _pin: None,
         })
     }
 
