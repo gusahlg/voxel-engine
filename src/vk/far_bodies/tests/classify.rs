@@ -1,5 +1,7 @@
 //! The per-frame tile classification against the frozen d2f0e9f copy
-//! (`frozen.rs`), the shared stable partition, and `VOXEL_FAR_CULL=0`.
+//! (`frozen.rs`) with roundsolo off, and against that copy plus a written-out
+//! roundsolo split with it on; the shared stable partition; and
+//! `VOXEL_FAR_CULL=0`.
 
 use glam::{Quat, Vec3};
 
@@ -200,16 +202,48 @@ fn fill_horizons(table: &mut FarTableGpu, rng: &mut Rng, map_max: &[f32; MAX_FAR
     }
 }
 
+/// The roundsolo split on top of the frozen classification, written out with
+/// vectors: the heavy run's tiles whose mask is one Rounded body move, in
+/// order, to its end, and the plan counts them. Nothing else changes.
+fn reference_roundsolo(table: &mut FarTableGpu, draw: &mut SkyDraw) {
+    if !draw.quads {
+        return;
+    }
+    let kept = table.kept();
+    let solo = |mask: u32| {
+        mask.count_ones() == 1 && {
+            let k = mask.trailing_zeros() as usize;
+            k < kept && (2.5..3.5).contains(&table.body[k].atmosphere[3])
+        }
+    };
+    let start = (draw.n_base + draw.n_sphere) as usize;
+    let end = start + draw.n_heavy as usize;
+    let mut rest = Vec::new();
+    let mut rounded = Vec::new();
+    for &index in &table.tile_index[start..end] {
+        if solo(table.tile_mask[index as usize]) {
+            rounded.push(index);
+        } else {
+            rest.push(index);
+        }
+    }
+    draw.n_roundsolo = rounded.len() as u32;
+    for (slot, index) in rest.into_iter().chain(rounded).enumerate() {
+        table.tile_index[start + slot] = index;
+    }
+}
+
 /// The ring's host pipeline against the frozen d2f0e9f one, culling on:
 /// random scenes (every shape, 0 to 35 bodies, every horizon regime),
 /// projections from 100×70 to 8K (coarse tiles past 8192), several turns per
 /// projection so both rings reuse their tile frames, an occasional
 /// degenerate view and no view, synthetic horizon tables, and each scene with
-/// coarse on and off times mapsolo on and off. The new pack writes into one
-/// reused, dirtied table. The whole table must be byte-identical (so the
+/// coarse, mapsolo and roundsolo each on and off. The new pack writes into
+/// one reused, dirtied table. The whole table must be byte-identical (so the
 /// uploaded `table_bytes`/`list_bytes`: header, cones, bodies, horizon,
 /// masks, `list_header` and the index prefix), and so must the draw plan,
-/// the dip, the runs and the horizon pick.
+/// the dip, the runs and the horizon pick: to the frozen copy with roundsolo
+/// off, and to that copy after [`reference_roundsolo`] with it on.
 #[test]
 fn classification_matches_the_frozen_copy_on_random_scenes() {
     let extents = [
@@ -229,7 +263,7 @@ fn classification_matches_the_frozen_copy_on_random_scenes() {
     let mut scratch = Vec::new();
     let mut scenes = 0u32;
     // Cases with tile quads, each split taking tiles, and a horizon clear.
-    let mut seen = [0u32; 5];
+    let mut seen = [0u32; 6];
     for projection in 0..150u32 {
         // Mostly small extents; the 8K pair is slow in a debug build.
         let pick = rng.next() as usize % (extents.len() * 3);
@@ -309,10 +343,11 @@ fn classification_matches_the_frozen_copy_on_random_scenes() {
 
             fill_horizons(&mut old, &mut rng, &map_max);
             bytemuck::bytes_of_mut(&mut *reused).copy_from_slice(bytes(&old));
-            for (coarse, mapsolo) in [(false, false), (false, true), (true, false), (true, true)] {
+            for case in 0..8u32 {
+                let (coarse, mapsolo, roundsolo) = (case & 1 != 0, case & 2 != 0, case & 4 != 0);
                 let coarse = coarse.then_some(&query);
                 let mut old_case = copy_table(&old);
-                let old_draw = old_classify(
+                let mut old_draw = old_classify(
                     &mut old_case,
                     view.as_ref(),
                     &old_frames,
@@ -321,6 +356,11 @@ fn classification_matches_the_frozen_copy_on_random_scenes() {
                     true,
                     mapsolo,
                 );
+                // Before the split, the list bytes are the frozen ones.
+                let old_lists = list_bytes(&old_case).to_vec();
+                if roundsolo {
+                    reference_roundsolo(&mut old_case, &mut old_draw);
+                }
                 let mut new_case = copy_table(&reused);
                 let new_draw = classify_tiles(
                     &mut new_case,
@@ -331,14 +371,22 @@ fn classification_matches_the_frozen_copy_on_random_scenes() {
                     FarSwitches {
                         cull: true,
                         mapsolo,
+                        roundsolo,
                     },
                     &mut scratch,
                 );
-                let label = format!("{label} coarse {} mapsolo {mapsolo}", coarse.is_some());
+                let label = format!(
+                    "{label} coarse {} mapsolo {mapsolo} roundsolo {roundsolo}",
+                    coarse.is_some()
+                );
                 assert_eq!(new_draw, old_draw, "{label}");
                 assert!(table_bytes(&new_case) == table_bytes(&old_case), "{label}");
                 assert!(list_bytes(&new_case) == list_bytes(&old_case), "{label}");
                 assert!(bytes(&new_case) == bytes(&old_case), "{label}: whole table");
+                if !roundsolo {
+                    assert_eq!(new_draw.n_roundsolo, 0, "{label}");
+                    assert!(list_bytes(&new_case) == old_lists, "{label}: frozen lists");
+                }
                 scenes += 1;
                 let n = used_tiles(&old);
                 for (count, hit) in seen.iter_mut().zip([
@@ -346,6 +394,7 @@ fn classification_matches_the_frozen_copy_on_random_scenes() {
                     new_draw.n_coarse > 0,
                     new_draw.n_coarse_far > 0,
                     new_draw.n_mapsolo > 0,
+                    new_draw.n_roundsolo > 0,
                     new_case.tile_mask[..n] != old.tile_mask[..n],
                 ]) {
                     *count += u32::from(hit);
@@ -354,16 +403,17 @@ fn classification_matches_the_frozen_copy_on_random_scenes() {
         }
     }
     // The sweep reached every path it claims to.
-    assert_eq!(scenes, 150 * 4 * 4);
-    let [quads, coarse_base, coarse_far, mapsolo, cleared] = seen;
+    assert_eq!(scenes, 150 * 4 * 8);
+    let [quads, coarse_base, coarse_far, mapsolo, roundsolo, cleared] = seen;
     eprintln!(
         "{scenes} cases: quads {quads}, coarse base {coarse_base}, coarse far {coarse_far}, \
-         mapsolo {mapsolo}, horizon clear {cleared}"
+         mapsolo {mapsolo}, roundsolo {roundsolo}, horizon clear {cleared}"
     );
     assert!(quads > scenes / 2, "quads {quads} of {scenes}");
     assert!(coarse_base >= 100, "coarse base split {coarse_base} times");
     assert!(coarse_far >= 100, "coarse far split {coarse_far} times");
     assert!(mapsolo >= 100, "mapsolo split {mapsolo} times");
+    assert!(roundsolo >= 50, "roundsolo split {roundsolo} times");
     assert!(
         cleared >= 100,
         "horizon tables cleared tiles {cleared} times"
@@ -381,6 +431,12 @@ fn classification_reuses_the_ring_scratch() {
         mapped_down(4.0, 1.0, 0.0, 0.0),
         placed(Vec3::new(0.0, -1.0, -1.0), 0.15, FarShape::Sphere, 2),
         placed(Vec3::new(0.4, 0.3, -1.0), 0.05, FarShape::Sphere, 3),
+        placed(
+            Vec3::new(0.0, 0.35, -1.0),
+            0.03,
+            FarShape::Rounded { exponent: 8.0 },
+            4,
+        ),
     ];
     let map = [0.0f32; MAX_FAR_MAPS];
     let (sun_cos_rim, moon_cos_rim) = crate::vk::pipeline::SkyParams::disc_rims(0.03);
@@ -393,6 +449,7 @@ fn classification_reuses_the_ring_scratch() {
     let switches = FarSwitches {
         cull: true,
         mapsolo: true,
+        roundsolo: true,
     };
     let mut table = zeroed_table();
     let mut scratch = Vec::with_capacity(used_tiles_for(&view));
@@ -418,6 +475,7 @@ fn classification_reuses_the_ring_scratch() {
             &mut scratch,
         );
         assert!(draw.n_coarse > 0 && draw.n_coarse_far > 0 && draw.n_mapsolo > 0);
+        assert!(draw.n_roundsolo > 0);
         assert_eq!(scratch.capacity(), cap);
     }
 }
@@ -516,7 +574,7 @@ fn far_cull_off_keeps_every_kept_body_in_every_live_tile() {
         moon_cos_rim,
         stars: false,
     };
-    for mapsolo in [false, true] {
+    for solo in [false, true] {
         let mut table = copy_table(&off);
         let draw = classify_tiles(
             &mut table,
@@ -526,7 +584,8 @@ fn far_cull_off_keeps_every_kept_body_in_every_live_tile() {
             &map,
             FarSwitches {
                 cull: false,
-                mapsolo,
+                mapsolo: solo,
+                roundsolo: solo,
             },
             &mut Vec::new(),
         );
@@ -552,6 +611,7 @@ fn far_cull_off_keeps_every_kept_body_in_every_live_tile() {
         FarSwitches {
             cull: true,
             mapsolo: true,
+            roundsolo: true,
         },
         &mut Vec::new(),
     );

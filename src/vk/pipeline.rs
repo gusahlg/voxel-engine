@@ -211,6 +211,8 @@ const SKY_BASE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_base.
 const SKY_NOMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_nomap.frag.spv"));
 const SKY_SPHERE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_sphere.frag.spv"));
 const SKY_MAPSOLO_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_mapsolo.frag.spv"));
+const SKY_ROUNDSOLO_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/sky_roundsolo.frag.spv"));
 const TONEMAP_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.vert.spv"));
 const TONEMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
 const TONEMAP_TAA_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap_taa.frag.spv"));
@@ -1072,16 +1074,20 @@ pub(crate) enum SkyFrag {
     /// `sky_mapsolo.frag` (`FAR_MAPPED_SOLO`): one Mapped body, no loop.
     /// Tiles only; the fullscreen triangle has no per-tile mask.
     MapSolo,
+    /// `sky_roundsolo.frag` (`FAR_ROUNDED_SOLO`): one Rounded body, no loop.
+    /// Tiles only, 1×1 only: no rounded tile is coarse-eligible.
+    RoundSolo,
 }
 
 impl SkyFrag {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
     const ALL: [Self; Self::COUNT] = [
         Self::Base,
         Self::Sphere,
         Self::NoMap,
         Self::Full,
         Self::MapSolo,
+        Self::RoundSolo,
     ];
 
     /// Embedded SPIR-V and the shader-module label.
@@ -1092,6 +1098,7 @@ impl SkyFrag {
             Self::NoMap => (SKY_NOMAP_FRAG, "sky nomap fragment"),
             Self::Full => (SKY_FRAG, "sky fragment"),
             Self::MapSolo => (SKY_MAPSOLO_FRAG, "sky mapsolo fragment"),
+            Self::RoundSolo => (SKY_ROUNDSOLO_FRAG, "sky roundsolo fragment"),
         }
     }
 }
@@ -1150,7 +1157,7 @@ impl SkyRate {
 /// Every sky pipeline in creation order, with the name `VOXEL_SHADER_STATS`
 /// prints. Coarse rows are built only when the device lists a 2×2 fragment
 /// size for the sample count and `VOXEL_SKY_COARSE` is not `0`.
-const SKY_PIPELINES: [(SkyFrag, SkyPrim, SkyRate, &str); 12] = [
+const SKY_PIPELINES: [(SkyFrag, SkyPrim, SkyRate, &str); 13] = [
     (SkyFrag::Full, SkyPrim::Fullscreen, SkyRate::Fine, "sky"),
     (
         SkyFrag::Base,
@@ -1207,6 +1214,12 @@ const SKY_PIPELINES: [(SkyFrag, SkyPrim, SkyRate, &str); 12] = [
         SkyPrim::Tile,
         SkyRate::Coarse,
         "sky_tile_mapsolo_coarse",
+    ),
+    (
+        SkyFrag::RoundSolo,
+        SkyPrim::Tile,
+        SkyRate::Fine,
+        "sky_tile_roundsolo",
     ),
 ];
 
@@ -1333,10 +1346,11 @@ impl SkyPipelines {
             .expect("every sky fragment has a 1×1 tile pipeline")
     }
 
-    /// The fullscreen-triangle pipeline. There is no mapsolo triangle.
+    /// The fullscreen-triangle pipeline. There is no mapsolo or roundsolo
+    /// triangle.
     pub(crate) fn fullscreen(&self, frag: SkyFrag) -> vk::Pipeline {
         self.get(frag, SkyPrim::Fullscreen, SkyRate::Fine)
-            .expect("the fullscreen sky triangle has no mapsolo pipeline")
+            .expect("the fullscreen sky triangle has no solo pipeline")
     }
 
     /// Every pipeline, then the layout, set layout and sampler they share.
@@ -1805,10 +1819,11 @@ mod tests {
         );
     }
 
-    /// The stats and debug names stay the twelve pre-table names, each key is
-    /// built once, and the coarse rows are the three `SkyDraw::runs` draws.
+    /// The stats and debug names are the twelve pre-table names plus
+    /// `sky_tile_roundsolo`, each key is built once, and the coarse rows are
+    /// the three `SkyDraw::runs` draws.
     #[test]
-    fn sky_pipeline_table_keeps_the_twelve_names() {
+    fn sky_pipeline_table_keeps_its_names() {
         use super::{SKY_PIPELINES, SkyFrag, SkyPrim, SkyRate};
         let names: Vec<&str> = SKY_PIPELINES.iter().map(|row| row.3).collect();
         assert_eq!(
@@ -1826,6 +1841,7 @@ mod tests {
                 "sky_tile_coarse",
                 "sky_tile_mapsolo",
                 "sky_tile_mapsolo_coarse",
+                "sky_tile_roundsolo",
             ]
         );
         for (i, a) in SKY_PIPELINES.iter().enumerate() {
@@ -1842,7 +1858,7 @@ mod tests {
             assert!(has(SkyPrim::Tile, SkyRate::Fine), "{frag:?} tile");
             assert_eq!(
                 has(SkyPrim::Fullscreen, SkyRate::Fine),
-                frag != SkyFrag::MapSolo,
+                !matches!(frag, SkyFrag::MapSolo | SkyFrag::RoundSolo),
                 "{frag:?} fullscreen"
             );
             assert!(!has(SkyPrim::Fullscreen, SkyRate::Coarse));

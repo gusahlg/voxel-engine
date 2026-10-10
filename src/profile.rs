@@ -374,10 +374,12 @@ pub enum Gauge {
     /// Sky tiles drawn with the loop-free single-Mapped fragment, including
     /// the 2×2 interior prefix.
     SkyMapsolo,
+    /// Sky tiles drawn with the loop-free single-Rounded fragment.
+    SkyRoundsolo,
 }
 
 impl Gauge {
-    const ALL: [Gauge; 36] = [
+    const ALL: [Gauge; 37] = [
         Gauge::WorldChunks,
         Gauge::WorldChunksLive,
         Gauge::WorldTiles,
@@ -414,6 +416,7 @@ impl Gauge {
         Gauge::SkyCoarse,
         Gauge::SkyCoarseFar,
         Gauge::SkyMapsolo,
+        Gauge::SkyRoundsolo,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -455,6 +458,7 @@ impl Gauge {
             Gauge::SkyCoarse => "sky.coarse",
             Gauge::SkyCoarseFar => "sky.coarse_far",
             Gauge::SkyMapsolo => "sky.mapsolo",
+            Gauge::SkyRoundsolo => "sky.roundsolo",
         }
     }
 }

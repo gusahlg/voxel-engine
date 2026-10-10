@@ -86,6 +86,10 @@ impl FarBodyGpu {
         self.shape() == Some(ShapeCode::Mapped)
     }
 
+    pub(super) fn is_rounded(&self) -> bool {
+        self.shape() == Some(ShapeCode::Rounded)
+    }
+
     /// A sphere or an inner sphere, the pair the sphere fragment draws.
     pub(super) fn is_light(&self) -> bool {
         matches!(
@@ -154,7 +158,8 @@ const _: () = assert!(crate::genconst::MAX_FAR_TILES as usize == MAX_FAR_TILES);
 /// the rest (the heavy run). `n_full` is the last two runs. The ring may then
 /// stably reorder the base run (the disc-free coarse prefix first) and the
 /// heavy run (the coarse mapped interior first, then, with mapsolo on, the
-/// other single-Mapped tiles) so each sky pipeline draws one contiguous run.
+/// other single-Mapped tiles; with roundsolo on, the single-Rounded tiles
+/// last) so each sky pipeline draws one contiguous run.
 /// `list_header.x` is still every base tile. The sky tile vertex shader reads
 /// this tail; the `far_bodies()` fragment loop does not.
 ///

@@ -2189,8 +2189,8 @@ fn mirror_constants_match_the_shader() {
         rounded.contains("float p = far_round_p(exponent);"),
         "march exponent"
     );
-    // The march pads the corner sphere; the three air rims (far_add_rgb and
-    // both pass-1 gates) do not.
+    // The march pads the corner sphere; the four air rims (far_add_rgb, both
+    // pass-1 gates and the single-rounded variant) do not.
     let mut padded = 0;
     let mut rims = 0;
     for (at, _) in src.match_indices("far_round_bound(rho, ") {
@@ -2208,7 +2208,7 @@ fn mirror_constants_match_the_shader() {
             rims += 1;
         }
     }
-    assert_eq!((padded, rims), (1, 3), "far_round_bound call sites");
+    assert_eq!((padded, rims), (1, 4), "far_round_bound call sites");
     for axis in ["x", "y", "z"] {
         assert!(
             rounded.contains(&format!("far_slab(o.{axis}, d.{axis}, rho, lo, hi, ")),
@@ -2224,7 +2224,7 @@ fn mirror_constants_match_the_shader() {
         "enclosing-sphere fallback shade"
     );
     let widths = literals_after(src, "float width = max(rhoB * ");
-    assert_eq!(widths.len(), 3, "rounded rim widths");
+    assert_eq!(widths.len(), 4, "rounded rim widths");
     for lit in widths {
         assert_eq!(float_bits(lit), RIM_WIDTH.to_bits(), "rim width");
     }
@@ -2246,14 +2246,17 @@ fn mirror_constants_match_the_shader() {
         "far_ray_cube far t"
     );
 
-    // Composite start depth. The single-mapped variant tests its hit and limb
-    // against the same value the loop starts `bestDepth` at, so a mapsolo tile
-    // keeps the loop's pixels.
+    // Composite start depth. The single-body variants test their hits, blob,
+    // rim and limb against the same value the loop starts `bestDepth` at, so
+    // a mapsolo or roundsolo tile keeps the loop's pixels.
     let solo = shader_fn(src, "float4 far_mapped_solo(");
     let sentinels = literals_after(src, "float bestDepth = ");
     let solo_tests = literals_after(solo, "distance < ");
     assert_eq!(solo_tests.len(), 2, "far_mapped_solo depth tests");
-    for lit in sentinels.into_iter().chain(solo_tests) {
+    let round = shader_fn(src, "float4 far_rounded_solo(");
+    let round_tests = literals_after(round, "distance < ");
+    assert_eq!(round_tests.len(), 4, "far_rounded_solo depth tests");
+    for lit in sentinels.into_iter().chain(solo_tests).chain(round_tests) {
         assert_eq!(float_bits(lit), T_FAR.to_bits(), "far depth sentinel");
     }
 }

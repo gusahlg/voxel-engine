@@ -858,9 +858,11 @@ impl<'a> RenderPass<'a> {
     /// the full variant when the frame kept a mapped body. With mapsolo off,
     /// mapped-interior tiles are a prefix of the whole heavy run and use the
     /// full fragment at 2×2. Edge tiles stay at full rate. Both rates use the
-    /// fixed-point mapped march. No tile classification keeps one fullscreen
-    /// triangle on that same choice. No bodies use the base pipeline. The
-    /// fullscreen triangle never binds mapsolo: it has no per-tile mask.
+    /// fixed-point mapped march. A heavy tile whose mask is exactly one
+    /// Rounded body uses the loop-free roundsolo fragment at 1×1 (the last
+    /// run). No tile classification keeps one fullscreen triangle on that
+    /// same choice. No bodies use the base pipeline. The fullscreen triangle
+    /// never binds mapsolo or roundsolo: it has no per-tile mask.
     /// The runs, their order and their first tiles come from
     /// [`SkyDraw::runs`](super::far_bodies::SkyDraw::runs).
     pub(super) unsafe fn record_sky(&self) {

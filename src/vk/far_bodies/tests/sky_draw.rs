@@ -6,9 +6,11 @@ use super::support::{
 };
 use crate::far_body::mirror::{lowland_up, ray_mapped_fast};
 use crate::far_body::{FarShape, MAX_FAR_MAPS};
+use crate::vk::far_bodies::FarSwitches;
 use crate::vk::far_bodies::cones::{lo_disc_interior, mapped_interior_half};
 use crate::vk::far_bodies::sky_draw::{
-    self as sky, SkyBodyPipe, SkyCoarseQuery, SkyDraw, SkyRun, mask_is_mapsolo, stars_drawn,
+    self as sky, SkyBodyPipe, SkyCoarseQuery, SkyDraw, SkyRun, mask_is_mapsolo, mask_is_roundsolo,
+    stars_drawn,
 };
 use crate::vk::far_bodies::table::{FarTableGpu, zeroed_table};
 use crate::vk::far_bodies::tiles::{
@@ -24,6 +26,10 @@ use crate::vk::pipeline::{SkyFrag, SkyRate};
 
 fn partition_mapsolo(table: &mut FarTableGpu) -> u32 {
     sky::partition_mapsolo(table, TileRuns::count(table), &mut Vec::new())
+}
+
+fn partition_roundsolo(table: &mut FarTableGpu) -> u32 {
+    sky::partition_roundsolo(table, TileRuns::count(table), &mut Vec::new())
 }
 
 fn split_coarse_base(
@@ -125,6 +131,92 @@ fn mapsolo_is_the_single_mapped_prefix_of_the_heavy_run() {
     let heavy = &table.tile_index[2..6];
     assert!(heavy[..n as usize].windows(2).all(|w| w[0] < w[1]));
     assert!(heavy[n as usize..].windows(2).all(|w| w[0] < w[1]));
+}
+
+/// A single Rounded bit is a roundsolo tile; a Rounded bit shared with any
+/// other body is not. After the mapsolo split, the roundsolo split moves those
+/// tiles, in order, to the end of the heavy run and leaves the rest in place.
+#[test]
+fn roundsolo_is_the_single_rounded_suffix_of_the_heavy_run() {
+    let mut table = FarTableGpu::zeroed();
+    // 256×128 is 4×2 tiles of 64 px.
+    let (width, height, tile_px) = (256u32, 128u32, 64u32);
+    table.header = [4, tile_px, 4, 2];
+    // Kept 0 sphere, 1 mapped, 2 rounded, 3 cube.
+    for (k, shape) in [1.0, 4.0, 3.0, 0.0].into_iter().enumerate() {
+        table.body[k].atmosphere[3] = shape;
+    }
+    // 0 base, 1 rounded, 2 sphere, 3 mapped, 4 rounded+sphere, 5 cube,
+    // 6 rounded, 7 mapped+rounded.
+    let masks = [0, 0b0100, 0b0001, 0b0010, 0b0101, 0b1000, 0b0100, 0b0110];
+    table.tile_mask[..8].copy_from_slice(&masks);
+    fill_tile_lists(&mut table, width, height);
+    assert_eq!(&table.tile_index[..8], &[0, 2, 1, 3, 4, 5, 6, 7]);
+
+    let draw = SkyDraw::from_table(&table, true);
+    assert_eq!(
+        (draw.n_base, draw.n_sphere, draw.n_heavy),
+        (1, 1, 6),
+        "{draw:?}"
+    );
+    assert_eq!((draw.n_mapsolo, draw.n_roundsolo), (1, 2));
+    let off = SkyDraw::from_runs(
+        &table,
+        TileRuns::count(&table),
+        FarSwitches {
+            cull: true,
+            mapsolo: true,
+            roundsolo: false,
+        },
+    );
+    assert_eq!(off.n_roundsolo, 0);
+    assert_eq!(
+        off,
+        SkyDraw {
+            n_roundsolo: 0,
+            ..draw
+        }
+    );
+    for (index, solo) in [(1, true), (6, true), (4, false), (7, false), (3, false)] {
+        assert_eq!(
+            mask_is_roundsolo(&table, masks[index]),
+            solo,
+            "tile {index}"
+        );
+    }
+    assert!(!mask_is_roundsolo(&table, 0));
+    // A Rounded bit past the kept count is not a body.
+    table.header[0] = 2;
+    assert!(!mask_is_roundsolo(&table, 0b0100));
+    table.header[0] = 4;
+
+    assert_eq!(partition_mapsolo(&mut table), 1);
+    assert_eq!(&table.tile_index[2..8], &[3, 1, 4, 5, 6, 7]);
+    assert_eq!(partition_roundsolo(&mut table), 2);
+    // Base and sphere stay; mapsolo first, the rest, then roundsolo, each
+    // group in row-major order.
+    assert_eq!(&table.tile_index[..8], &[0, 2, 3, 4, 5, 7, 1, 6]);
+    // A second split is the identity.
+    assert_eq!(partition_roundsolo(&mut table), 2);
+    assert_eq!(&table.tile_index[..8], &[0, 2, 3, 4, 5, 7, 1, 6]);
+
+    let runs: Vec<SkyRun> = draw.runs(true).into_iter().flatten().collect();
+    let run = |frag, first, count| SkyRun {
+        frag,
+        rate: SkyRate::Fine,
+        first,
+        count,
+    };
+    assert_eq!(
+        runs,
+        [
+            run(SkyFrag::Base, 0, 1),
+            run(SkyFrag::Sphere, 1, 1),
+            run(SkyFrag::MapSolo, 2, 1),
+            run(SkyFrag::Full, 3, 3),
+            run(SkyFrag::RoundSolo, 6, 2),
+        ]
+    );
 }
 
 fn coarse_query(sun: Vec3, stars: bool) -> SkyCoarseQuery {
@@ -620,10 +712,13 @@ fn grid<const N: usize>(max: [u32; N]) -> impl Iterator<Item = [u32; N]> {
 /// `SkyDraw::runs` draws what the hand-unrolled `record_sky` drew: the
 /// same runs, counts, firstInstance values and bound pipelines, the same
 /// first pipeline, and the fullscreen triangle in the same cases. Small
-/// counts exhaustively, with the coarse and mapsolo prefixes past their
-/// runs to hit the clamps, coarse pipelines on and off, and mapsolo on
+/// counts exhaustively, with the coarse, mapsolo and roundsolo counts past
+/// their runs to hit the clamps, coarse pipelines on and off, and mapsolo on
 /// (`n_mapsolo` free) and off (`n_mapsolo == 0`, what `count_mapsolo`
-/// returns then).
+/// returns then). Roundsolo off is `n_roundsolo == 0`, and then the runs are
+/// the legacy ones. With it on, they are the legacy runs of the heavy run
+/// without its roundsolo suffix, then that suffix on the roundsolo pipeline
+/// at 1×1 (also when the legacy plan would have been the triangle).
 #[test]
 fn sky_runs_match_legacy_counts() {
     let bodies = [SkyBodyPipe::Full, SkyBodyPipe::NoMap, SkyBodyPipe::Sphere];
@@ -640,7 +735,8 @@ fn sky_runs_match_legacy_counts() {
         n_coarse,
         n_coarse_far,
         n_mapsolo,
-    ] in grid([1, 1, 2, 1, 1, 3, 2, 3, 4, 4, 4])
+        n_roundsolo,
+    ] in grid([1, 1, 2, 1, 1, 3, 2, 3, 4, 4, 4, 4])
     {
         if mapsolo == 0 && n_mapsolo != 0 {
             continue;
@@ -656,32 +752,53 @@ fn sky_runs_match_legacy_counts() {
             n_coarse,
             n_coarse_far,
             n_mapsolo,
+            n_roundsolo,
         };
+        let label = format!("{draw:?} coarse {coarse}");
         let runs: Vec<SkyRun> = draw.runs(coarse).into_iter().flatten().collect();
-        match legacy_sky_cmds(&draw, coarse) {
+        // The legacy plan of the heavy run without its roundsolo suffix.
+        let roundsolo = n_roundsolo.min(n_heavy - n_mapsolo.min(n_heavy));
+        let legacy = SkyDraw {
+            n_heavy: n_heavy - roundsolo,
+            n_roundsolo: 0,
+            ..draw
+        };
+        let mut expect = match legacy_sky_cmds(&legacy, coarse) {
             Err(fullscreen) => {
-                assert!(runs.is_empty(), "{draw:?} coarse {coarse}");
-                assert_eq!(draw.fullscreen_frag(), fullscreen, "{draw:?}");
+                assert_eq!(draw.fullscreen_frag(), fullscreen, "{label}");
+                Vec::new()
             }
             Ok(cmds) => {
-                assert_eq!(runs, bound_draws(&cmds), "{draw:?} coarse {coarse}");
                 assert_eq!(
                     cmds[0],
                     LegacyCmd::Bind(runs[0].frag, runs[0].rate),
-                    "{draw:?} coarse {coarse}"
+                    "{label}"
                 );
+                bound_draws(&cmds)
             }
+        };
+        if draw.quads && roundsolo > 0 {
+            expect.push(SkyRun {
+                frag: SkyFrag::RoundSolo,
+                rate: SkyRate::Fine,
+                first: n_base + n_sphere + n_heavy - roundsolo,
+                count: roundsolo,
+            });
+        }
+        assert_eq!(runs, expect, "{label}");
+        if roundsolo == 0 {
+            assert_eq!(draw.runs(coarse), legacy.runs(coarse), "{label}");
         }
         cases += 1;
     }
-    assert_eq!(cases, 2 * 2 * 3 * 2 * (1 + 5) * 4 * 3 * 4 * 5 * 5);
+    assert_eq!(cases, 2 * 2 * 3 * 2 * (1 + 5) * 4 * 3 * 4 * 5 * 5 * 5);
 }
 
 /// The runs cut the uploaded tile list where the CPU partition put each
 /// class. Built in `FarBodyRing::write` order (`fill_tile_lists` inside
-/// the pack, then `partition_mapsolo`, then the two coarse splits), they
-/// cover the live list contiguously from slot 0, and every tile in a run
-/// has that run's class.
+/// the pack, then `partition_mapsolo` and `partition_roundsolo`, then the
+/// two coarse splits), they cover the live list contiguously from slot 0,
+/// and every tile in a run has that run's class.
 #[test]
 fn sky_runs_tile_the_cpu_partition() {
     let view = view_pitched(0.0, 90.0, 1280, 720);
@@ -690,17 +807,25 @@ fn sky_runs_tile_the_cpu_partition() {
     let map_max = [0.0f32; MAX_FAR_MAPS];
     let map_min = [0.0f32; MAX_FAR_MAPS];
     // The planet below the horizon, a sphere on its disc (shared heavy
-    // tiles) and a sphere up in the sky (sphere-only tiles).
+    // tiles), a sphere up in the sky (sphere-only tiles) and a small rounded
+    // body up on the view axis, clear of both and of the sun (single-Rounded
+    // tiles).
     let bodies = [
         mapped_down(4.0, 1.0, 0.0, 0.0),
         placed(Vec3::new(0.0, -1.0, -1.0), 0.15, FarShape::Sphere, 2),
         placed(Vec3::new(0.4, 0.3, -1.0), 0.05, FarShape::Sphere, 3),
+        placed(
+            Vec3::new(0.0, 0.35, -1.0),
+            0.03,
+            FarShape::Rounded { exponent: 8.0 },
+            4,
+        ),
     ];
     // The sun up and to the left of the view axis keeps the base tiles
     // around its disc at 1x1. The moon is behind the camera.
     let query = coarse_query(Vec3::new(-0.4, 0.4, -1.0), false);
-    for [mapsolo, coarse] in grid([1, 1]) {
-        let (mapsolo, coarse) = (mapsolo == 1, coarse == 1);
+    for [mapsolo, roundsolo, coarse] in grid([1, 1, 1]) {
+        let (mapsolo, roundsolo, coarse) = (mapsolo == 1, roundsolo == 1, coarse == 1);
         let mut table = super::pack_table(&bodies, Some(view), &map_max);
         let mut draw = SkyDraw::from_table(&table, true);
         assert!(draw.quads);
@@ -709,11 +834,16 @@ fn sky_runs_tile_the_cpu_partition() {
         } else {
             0
         };
+        draw.n_roundsolo = if roundsolo {
+            partition_roundsolo(&mut table)
+        } else {
+            0
+        };
         if coarse {
             draw.n_coarse = split_coarse_base(&mut table, &frames, &view, &query);
             draw.n_coarse_far = split_coarse_far(&mut table, &frames, &view, &map_min);
         }
-        let label = format!("mapsolo {mapsolo} coarse {coarse} {draw:?}");
+        let label = format!("mapsolo {mapsolo} roundsolo {roundsolo} coarse {coarse} {draw:?}");
         let runs: Vec<SkyRun> = draw.runs(coarse).into_iter().flatten().collect();
         let n = used_tiles(&table);
         let mut next = 0u32;
@@ -735,12 +865,17 @@ fn sky_runs_tile_the_cpu_partition() {
             for &index in &table.tile_index[run.first as usize..end] {
                 let mask = table.tile_mask[index as usize];
                 let solo = mask_is_mapsolo(&table, mask);
+                let round = mask_is_roundsolo(&table, mask);
                 let ok = match (run.frag, run.rate) {
                     (SkyFrag::Base, _) => mask == 0,
                     (SkyFrag::Sphere, _) => mask != 0 && mask & heavy == 0,
                     (SkyFrag::MapSolo, _) => solo,
+                    (SkyFrag::RoundSolo, SkyRate::Fine) => round,
+                    (SkyFrag::RoundSolo, SkyRate::Coarse) => false,
                     (_, SkyRate::Coarse) => !mapsolo && solo,
-                    (_, SkyRate::Fine) => mask & heavy != 0 && !(mapsolo && solo),
+                    (_, SkyRate::Fine) => {
+                        mask & heavy != 0 && !(mapsolo && solo) && !(roundsolo && round)
+                    }
                 };
                 assert!(ok, "{label}: tile {index} mask {mask:#x} in {run:?}");
             }
@@ -753,6 +888,19 @@ fn sky_runs_tile_the_cpu_partition() {
         assert!(has(SkyFrag::Full, SkyRate::Fine), "{label}");
         assert_eq!(has(SkyFrag::Base, SkyRate::Coarse), coarse, "{label}");
         assert_eq!(has(SkyFrag::MapSolo, SkyRate::Fine), mapsolo, "{label}");
+        assert_eq!(has(SkyFrag::RoundSolo, SkyRate::Fine), roundsolo, "{label}");
+        assert!(!has(SkyFrag::RoundSolo, SkyRate::Coarse), "{label}");
+        // The rounded body has tiles of its own.
+        let n = used_tiles(&table);
+        let n_round = (0..n)
+            .filter(|&i| mask_is_roundsolo(&table, table.tile_mask[i]))
+            .count() as u32;
+        assert!(n_round > 0, "{label}");
+        assert_eq!(
+            draw.n_roundsolo,
+            if roundsolo { n_round } else { 0 },
+            "{label}"
+        );
         assert_eq!(
             has(SkyFrag::MapSolo, SkyRate::Coarse),
             mapsolo && coarse,

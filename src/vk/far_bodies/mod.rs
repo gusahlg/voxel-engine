@@ -8,6 +8,9 @@
 //! vertex shader: mask == 0, then sphere-only tiles, then tiles that meet a
 //! cube, rounded or mapped body. When mapsolo is on, that heavy run is stably
 //! split into tiles whose mask is exactly one Mapped body, then the rest.
+//! When roundsolo is on, tiles whose mask is exactly one Rounded body move,
+//! in order, to the end of that run and draw on their own loop-free fragment,
+//! always at 1×1.
 //! When a coarse-shading query is passed, the base run is stably split into
 //! tiles the sun and moon discs miss, then the rest, and the heavy run is
 //! split into mapped-interior tiles, then the rest. With mapsolo on, that
@@ -25,8 +28,9 @@
 //! Submodules: `table` (the GPU layout, packing and upload bytes), `view`
 //! (the view, its basis, the frustum cull), `cones` (angular extents of a
 //! body), `tiles` (the tile grid, masks and tile-index runs), `sky_draw` (the
-//! coarse and mapsolo splits, [`SkyDraw`]), `horizon` and `horizon_build`
-//! (the dip and the azimuthal horizon tables), `debug` (`VOXEL_SKY_DEBUG`).
+//! coarse, mapsolo and roundsolo splits, [`SkyDraw`]), `horizon` and
+//! `horizon_build` (the dip and the azimuthal horizon tables), `debug`
+//! (`VOXEL_SKY_DEBUG`).
 
 use ash::vk;
 
@@ -82,6 +86,18 @@ fn sky_mapsolo_enabled() -> bool {
 pub(crate) static VOXEL_SKY_MAPSOLO: Switch<bool> =
     Switch::new("VOXEL_SKY_MAPSOLO", on_unless_zero);
 
+/// `VOXEL_SKY_ROUNDSOLO=0` draws every heavy tile whose mask is exactly one
+/// Rounded body with the frame's body fragment (no-mapped or full). Any other
+/// value, including unset, draws such a tile with the loop-free fragment.
+/// Read once.
+fn sky_roundsolo_enabled() -> bool {
+    VOXEL_SKY_ROUNDSOLO.get()
+}
+
+/// Read by [`sky_roundsolo_enabled`].
+pub(crate) static VOXEL_SKY_ROUNDSOLO: Switch<bool> =
+    Switch::new("VOXEL_SKY_ROUNDSOLO", on_unless_zero);
+
 /// The far-body A/B switches. [`FarBodyRing::write`] reads them and passes
 /// them down, so the host pipeline can be tested with either setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +106,8 @@ pub(super) struct FarSwitches {
     pub(super) cull: bool,
     /// [`sky_mapsolo_enabled`].
     pub(super) mapsolo: bool,
+    /// [`sky_roundsolo_enabled`].
+    pub(super) roundsolo: bool,
 }
 
 impl FarSwitches {
@@ -97,6 +115,7 @@ impl FarSwitches {
         Self {
             cull: far_cull_enabled(),
             mapsolo: sky_mapsolo_enabled(),
+            roundsolo: sky_roundsolo_enabled(),
         }
     }
 }

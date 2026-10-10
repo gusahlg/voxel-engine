@@ -28,6 +28,7 @@
 //! | `VOXEL_SKY_COARSE` | flag, on unless `0` | on | 2×2 sky tiles where the device supports them | `vk/device.rs` |
 //! | `VOXEL_FAR_CULL` | flag, on unless `0` | on | far-body cone reject, frustum compaction and tile masks | `vk/far_bodies/mod.rs` |
 //! | `VOXEL_SKY_MAPSOLO` | flag, on unless `0` | on | loop-free fragment for heavy tiles that hold exactly one Mapped body | `vk/far_bodies/mod.rs` |
+//! | `VOXEL_SKY_ROUNDSOLO` | flag, on unless `0` | on | loop-free fragment for heavy tiles that hold exactly one Rounded body | `vk/far_bodies/mod.rs` |
 //! | `VOXEL_LOD_BUCKET_SCALE` | `f32`, finite and > 0 | `32` | coarse-LOD distance-bucket multiplier | `vk/cull_math.rs` |
 //! | `VOXEL_CPU_CULL_MAX` | `u32` | `1024` | camera live-mesh count up to which the CPU culls instead of the GPU | `vk/cull_math.rs` |
 //! | `VOXEL_SUBMIT_BATCH` | `usize`, clamped to `1..=FRAMES_IN_FLIGHT - 1` | `2` | command buffers per submit for unpresented uncapped frames | `vk/submit.rs` |
@@ -57,6 +58,8 @@
 //! |---|---|---|---|---|
 //! | `VOXEL_DEMO_FAR` | presence | unset | far-body showcase | `bin/demo.rs` |
 //! | `VOXEL_DEMO_MAPPED_RHO` | `f32` in `(0, 1)` | `0.12` | showcase planet rho; an override also turns on its horizon cull | `bin/demo.rs` |
+//! | `VOXEL_DEMO_ROUNDED_P` | `f32 >= 2`, or `cube` | `4` | showcase rounded exponent; `cube` draws a `FarShape::Cube` of the same size | `bin/demo.rs` |
+//! | `VOXEL_DEMO_ROUNDED_RHO` | `f32` in `(0, 1)` | `0.06` | showcase rounded rho; about `0.6` is a close-up whose tiles hold that body alone | `bin/demo.rs` |
 //! | `VOXEL_DEMO_RECREATE_CYCLE` | presence | unset | cycles vsync, MSAA, scale and fullscreen, then quits | `bin/demo.rs` |
 //! | `VOXEL_DEMO_UPLOAD_CYCLE` | `0` or empty is off; `1` or `all`; or a comma list of `far`, `set`, `append`, `mat` | off | repeats far-map, block-texture and material uploads every ~60 frames | `bin/demo.rs` |
 //! | `VOXEL_DEMO_VRS` | flag, on if set, not `0` | off | starts with VRS on | `bin/demo.rs` |
@@ -176,7 +179,7 @@ impl Logged for Presence {
 }
 
 /// Every runtime switch, in the order of the module table.
-static RUNTIME: [&dyn Logged; 21] = [
+static RUNTIME: [&dyn Logged; 22] = [
     &crate::profile::VOXEL_PROFILE,
     &crate::profile::VOXEL_PROFILE_FLUSH_MS,
     &crate::vk::shader_stats::VOXEL_SHADER_STATS,
@@ -185,6 +188,7 @@ static RUNTIME: [&dyn Logged; 21] = [
     &crate::vk::device::VOXEL_SKY_COARSE,
     &crate::vk::far_bodies::VOXEL_FAR_CULL,
     &crate::vk::far_bodies::VOXEL_SKY_MAPSOLO,
+    &crate::vk::far_bodies::VOXEL_SKY_ROUNDSOLO,
     &crate::vk::cull_math::VOXEL_LOD_BUCKET_SCALE,
     &crate::vk::cull_math::VOXEL_CPU_CULL_MAX,
     &crate::vk::submit::VOXEL_SUBMIT_BATCH,
@@ -373,6 +377,7 @@ mod tests {
             &vk::device::VOXEL_SKY_COARSE,
             &vk::far_bodies::VOXEL_FAR_CULL,
             &vk::far_bodies::VOXEL_SKY_MAPSOLO,
+            &vk::far_bodies::VOXEL_SKY_ROUNDSOLO,
         ] {
             same(on, true, |raw| !raw.is_some_and(|v| v == "0"));
         }
