@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use ash::khr;
 use ash::vk;
 
-use super::alloc::{create_bound_buffer, try_find_memory_type};
+use super::alloc::{cmd_copy_to_host, create_bound_buffer, try_find_memory_type};
 use super::buffers::HOST_COHERENT;
 use super::mesh_staging::{HostRing, StagingRegion, Stamp, sysmem_staging_type};
 use super::pass;
@@ -1217,20 +1217,11 @@ impl ComputeRuntime {
                         cmd,
                         &vk::DependencyInfo::default().memory_barriers(&to_copy),
                     );
-                    let region = [vk::BufferCopy::default()
+                    let region = vk::BufferCopy::default()
                         .src_offset(job.output.offset)
                         .dst_offset(job.output.offset)
-                        .size(u64::from(job.output_bytes))];
-                    device.cmd_copy_buffer(cmd, scratch.buffer, self.readback.buffer(), &region);
-                    let to_host = [vk::MemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-                        .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-                    device.cmd_pipeline_barrier2(
-                        cmd,
-                        &vk::DependencyInfo::default().memory_barriers(&to_host),
-                    );
+                        .size(u64::from(job.output_bytes));
+                    cmd_copy_to_host(device, cmd, scratch.buffer, self.readback.buffer(), region);
                 }
             } else {
                 let to_host = [vk::MemoryBarrier2::default()

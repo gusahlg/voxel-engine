@@ -642,27 +642,8 @@ impl CullState {
                 &vk::DependencyInfo::default().memory_barriers(&to_draws),
             );
             if stats {
-                device.cmd_copy_buffer(
-                    cmd,
-                    self.stats[slot].gpu,
-                    self.stats[slot].cpu,
-                    &[vk::BufferCopy {
-                        src_offset: 0,
-                        dst_offset: 0,
-                        size: STATS_BYTES,
-                    }],
-                );
-                // COPY / TRANSFER_WRITE → HOST / HOST_READ. Mapped read is after
-                // this slot's timeline wait (one cycle later).
-                let copy_to_host = [vk::MemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-                    .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-                device.cmd_pipeline_barrier2(
-                    cmd,
-                    &vk::DependencyInfo::default().memory_barriers(&copy_to_host),
-                );
+                // Mapped read is after this slot's timeline wait (one cycle later).
+                self.stats[slot].record_copy_to_host(device, cmd, STATS_BYTES);
             }
         }
         true
