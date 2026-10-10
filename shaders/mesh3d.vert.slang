@@ -4,7 +4,8 @@
 //
 // SV_VulkanInstanceID (not SV_InstanceID) to read plain InstanceIndex.
 //
-// Shifts/masks mirror mesh.rs. UV derives from position and normal. Baked
+// Shifts/masks are the generated SHIFT_*/MASK_* (build.rs `build_table()`,
+// shared with mesh.rs). UV derives from position and normal. Baked
 // sky/block/AO levels interpolate as scalars; the fragment multiplies by
 // frame light/candle (uniform × interpolated scalar == interpolated product).
 // Face index is packed — no float3 normal varying; the fragment looks
@@ -99,21 +100,22 @@ VertexOutput vertexMain(VertexInput input)
     uint w0 = input.packed.x;
     uint w1 = input.packed.y;
 
-    float x = float((w0 >> 0) & 0x1F);
-    float y = float((w0 >> 5) & 0x1F);
-    float z = float((w0 >> 10) & 0x1F);
-    uint normal = (w0 >> 15) & 0x7;   // 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
-    uint layer = (w0 >> 18) & 0x3FFF;
+    float x = float((w0 >> SHIFT_X) & MASK_COORD);
+    float y = float((w0 >> SHIFT_Y) & MASK_COORD);
+    float z = float((w0 >> SHIFT_Z) & MASK_COORD);
+    uint normal = (w0 >> SHIFT_NORMAL) & MASK_NORMAL; // 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
+    uint layer = (w0 >> SHIFT_LAYER) & MASK_LAYER;
     // w1: AO [0:2], skylight [2:6], blocklight [6:10], water [10],
     // micro [11:17), morph [17:23) (decoded in lod_morph.slang).
-    uint water = (w1 >> 10) & 0x1;
+    uint water = (w1 >> SHIFT_WATER) & 1u;
 
-    // Per-axis 2-bit two's-complement micro-offsets. Truth: mesh.rs
-    // SHIFT_MICRO_{X,Y,Z}=11,13,15, MASK_MICRO=0x3 (raw 0,1,2,3 -> 0,+1,-2,-1).
-    // The seam-overdraw anti-z-fight nudge; zero for ordinary vertices.
-    int mx = int(w1 << 19) >> 30;
-    int my = int(w1 << 17) >> 30;
-    int mz = int(w1 << 15) >> 30;
+    // Per-axis 2-bit two's-complement micro-offsets (MASK_MICRO is 2 bits):
+    // `<< (30 - shift)` parks the field's top bit on the sign, `>> 30`
+    // sign-extends (raw 0,1,2,3 -> 0,+1,-2,-1). The seam-overdraw
+    // anti-z-fight nudge; zero for ordinary vertices.
+    int mx = int(w1 << (30 - SHIFT_MICRO_X)) >> 30;
+    int my = int(w1 << (30 - SHIFT_MICRO_Y)) >> 30;
+    int mz = int(w1 << (30 - SHIFT_MICRO_Z)) >> 30;
     float3 micro = float3(float(mx), float(my), float(mz)) * MICRO_STEP;
 
     // UV mapping: X face (z,y), Y face (x,z), Z face (x,y).
@@ -125,12 +127,14 @@ VertexOutput vertexMain(VertexInput input)
     else
         uv = float2(x, y);
 
-    // Baked AO: level 0..3 → diffuse multiplier 0.4..1.0.
-    uint ao_level = w1 & 0x3;
+    // Baked AO: level 0..3 → diffuse multiplier 0.4..1.0. The field sits at
+    // bit 0 (SHIFT_AO == 0, pinned in genconst's tests): a `>> SHIFT_AO`
+    // here would lower to a no-op bitcast and change the module's bytes.
+    uint ao_level = w1 & MASK_AO;
     float ao_factor = 0.4 + float(ao_level) * 0.2;
     // Baked light levels: skylight [2:6], blocklight [6:10], 4-bit each.
-    uint sky = (w1 >> 2) & 0xF;
-    uint block = (w1 >> 6) & 0xF;
+    uint sky = (w1 >> SHIFT_SKY) & MASK_LIGHT;
+    uint block = (w1 >> SHIFT_BLOCK) & MASK_LIGHT;
     float sky_amount = float(sky) / 15.0;
     float block_amount = float(block) / 15.0;
 
@@ -185,10 +189,10 @@ VertexOutput vertexMain(VertexInput input)
 #endif
     output.light_lv = float3(sky_amount, block_amount, ao_factor);
     output.ids = uint2(
-        (layer & 0x3FFFu)
+        (layer & MASK_LAYER)
             | (water << 14)
             | ((style.mode & 1u) << 15)
-            | ((normal & 7u) << 16)
+            | ((normal & MASK_NORMAL) << 16)
             | (detail << 20),
         style.flat_rgba);
     return output;

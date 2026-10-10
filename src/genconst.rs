@@ -62,6 +62,57 @@ mod tests {
         assert_eq!(FAR_ROUNDED_P_MAX, 16384.0);
     }
 
+    /// Fields of one packed vertex word as `(shift, mask)`: no two overlap
+    /// and together they cover `0..bits` without a gap.
+    fn assert_packed_word(fields: &[(u32, u32)], bits: u32) {
+        let mut used = 0u64;
+        for &(shift, mask) in fields {
+            assert!(
+                mask != 0 && mask & (mask + 1) == 0,
+                "mask {mask:#x} is not a low run of ones"
+            );
+            let field = (mask as u64) << shift;
+            assert_eq!(used & field, 0, "field at shift {shift} overlaps");
+            used |= field;
+        }
+        assert_eq!(used, (1u64 << bits) - 1, "word fields leave a gap");
+    }
+
+    #[test]
+    fn packed_vertex_layout_tiles_both_words() {
+        assert_packed_word(
+            &[
+                (SHIFT_X, MASK_COORD),
+                (SHIFT_Y, MASK_COORD),
+                (SHIFT_Z, MASK_COORD),
+                (SHIFT_NORMAL, MASK_NORMAL),
+                (SHIFT_LAYER, MASK_LAYER),
+            ],
+            32,
+        );
+        assert_packed_word(
+            &[
+                (SHIFT_AO, MASK_AO),
+                (SHIFT_SKY, MASK_LIGHT),
+                (SHIFT_BLOCK, MASK_LIGHT),
+                (SHIFT_WATER, 1),
+                (SHIFT_MICRO_X, MASK_MICRO),
+                (SHIFT_MICRO_Y, MASK_MICRO),
+                (SHIFT_MICRO_Z, MASK_MICRO),
+                (SHIFT_MORPH, MASK_MORPH),
+            ],
+            SHIFT_MORPH + MASK_MORPH.count_ones(),
+        );
+        // The shaders sign-extend micro with `<< (30 - shift) >> 30` and morph
+        // with `<< (26 - SHIFT_MORPH) >> 26`: field widths 2 and 6.
+        assert_eq!(MASK_MICRO.count_ones(), 2);
+        assert_eq!(MASK_MORPH.count_ones(), 6);
+        // mesh3d.vert reads the AO level as `w1 & MASK_AO`, with no shift.
+        assert_eq!(SHIFT_AO, 0);
+        // Light levels are 0..=15 (mesh3d.vert divides by 15).
+        assert_eq!(MASK_LIGHT, 15);
+    }
+
     #[test]
     fn sky_cloud_lut_in_quality_band() {
         assert!(
