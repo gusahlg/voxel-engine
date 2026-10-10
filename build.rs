@@ -90,12 +90,16 @@ fn shipping_jobs() -> Vec<ShaderJob<'static>> {
             "fragmentMain",
             "tris2d.frag.spv",
         ),
-        job(
-            "shaders/tris2d_tex.frag.slang",
-            Stage::Fragment,
-            "fragmentMain",
-            "tris2d_tex.frag.spv",
-        ),
+        // Minimap overlay: tris2d.frag sampling RGBA and tinting by the vertex colour.
+        ShaderJob {
+            defines: &[("TRIS2D_TEX", None)],
+            ..job(
+                "shaders/tris2d.frag.slang",
+                Stage::Fragment,
+                "fragmentMain",
+                "tris2d_tex.frag.spv",
+            )
+        },
         job(
             "shaders/vrs.comp.slang",
             Stage::Compute,
@@ -505,6 +509,8 @@ fn lint_slang_constants() {
         lint_slang_file(&path, &mut violations);
     }
 
+    lint_packing_constants(&mut violations);
+
     if !violations.is_empty() {
         panic!(
             "Slang constant lint failed: hand-written numeric `static const` \
@@ -513,6 +519,69 @@ fn lint_slang_constants() {
              SLANG_CONST_ALLOWLIST for a pure math constant.\n\n{}",
             violations.join("\n")
         );
+    }
+}
+
+/// Packed-vertex (and AO curve) names each unpacking shader must reference,
+/// so the layout cannot quietly go back to inline literals in one of them.
+const PACKING_CONST_USES: &[(&str, &[&str])] = &[
+    (
+        "shaders/mesh3d.vert.slang",
+        &[
+            "SHIFT_X",
+            "SHIFT_Y",
+            "SHIFT_Z",
+            "SHIFT_NORMAL",
+            "SHIFT_LAYER",
+            "SHIFT_SKY",
+            "SHIFT_BLOCK",
+            "SHIFT_WATER",
+            "SHIFT_MICRO_X",
+            "SHIFT_MICRO_Y",
+            "SHIFT_MICRO_Z",
+            "MASK_COORD",
+            "MASK_NORMAL",
+            "MASK_LAYER",
+            "MASK_AO",
+            "MASK_LIGHT",
+            "AO_MIN",
+            "AO_STEP",
+        ],
+    ),
+    (
+        "shaders/shadow_depth.vert.slang",
+        &[
+            "SHIFT_X",
+            "SHIFT_Y",
+            "SHIFT_Z",
+            "SHIFT_MICRO_X",
+            "SHIFT_MICRO_Y",
+            "SHIFT_MICRO_Z",
+            "MASK_COORD",
+        ],
+    ),
+    ("shaders/lod_morph.slang", &["SHIFT_MORPH"]),
+];
+
+/// Every name in [`PACKING_CONST_USES`] must be in `build_table()` and in the
+/// shader that lists it.
+fn lint_packing_constants(violations: &mut Vec<String>) {
+    let table = build_table();
+    for (path, names) in PACKING_CONST_USES {
+        let src = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {path} for the packing-constant lint: {e}"));
+        for name in *names {
+            if !table.iter().any(|d| d.name == *name) {
+                violations.push(format!(
+                    "build_table() is missing packing constant `{name}`"
+                ));
+            }
+            if !src.contains(name) {
+                violations.push(format!(
+                    "{path}: vertex unpack does not use the generated `{name}`"
+                ));
+            }
+        }
     }
 }
 
@@ -619,6 +688,10 @@ fn compile_cull_wave(base: &Options) {
 enum Val {
     Scalar(f32),
     UInt(u32),
+    /// `u32` in Rust (same as [`Val::UInt`]), `static const int` in Slang, so a
+    /// shift amount lowers to the same signed SPIR-V constant as the bare
+    /// decimal literal (`w0 >> 15`) it replaces.
+    Int(u32),
     Arr(Vec<f32>),
     Arr2(Vec<[f32; 2]>),
 }
@@ -722,6 +795,119 @@ fn build_table() -> Vec<Def> {
             name: "MICRO_STEP",
             doc: "Per-vertex anti-z-fight nudge in local units. Applied before scale so it\ninherits LOD's 2^k scale. Read by mesh3d.vert.",
             val: Val::Scalar(0.01),
+        },
+        // Packed mesh vertex bit layout (mesh.rs pack/unpack). The Slang
+        // unpack in mesh3d.vert, shadow_depth.vert and lod_morph.slang uses
+        // these names; lint_packing_constants keeps it that way.
+        Def {
+            name: "SHIFT_X",
+            doc: "Packed vertex word 0: x-coordinate shift. 5-bit field, values 0..=16.",
+            val: Val::Int(0),
+        },
+        Def {
+            name: "SHIFT_Y",
+            doc: "Packed vertex word 0: y-coordinate shift. 5-bit field, values 0..=16.",
+            val: Val::Int(5),
+        },
+        Def {
+            name: "SHIFT_Z",
+            doc: "Packed vertex word 0: z-coordinate shift. 5-bit field, values 0..=16.",
+            val: Val::Int(10),
+        },
+        Def {
+            name: "SHIFT_NORMAL",
+            doc: "Packed vertex word 0: face-normal index shift. 3 bits: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z.",
+            val: Val::Int(15),
+        },
+        Def {
+            name: "SHIFT_LAYER",
+            doc: "Packed vertex word 0: texture-array layer shift. 14 bits, word 0's remaining span.",
+            val: Val::Int(18),
+        },
+        Def {
+            name: "SHIFT_AO",
+            doc: "Packed vertex word 1: AO level shift. 2 bits, 0..=3; 3 = no occlusion.",
+            val: Val::Int(0),
+        },
+        Def {
+            name: "SHIFT_SKY",
+            doc: "Packed vertex word 1: skylight shift. 4 bits, 0..=15.",
+            val: Val::Int(2),
+        },
+        Def {
+            name: "SHIFT_BLOCK",
+            doc: "Packed vertex word 1: blocklight shift. 4 bits, 0..=15.",
+            val: Val::Int(6),
+        },
+        Def {
+            name: "SHIFT_WATER",
+            doc: "Packed vertex word 1: water material bit. Set by the mesher for liquid faces;\nselects animated water shading in the transparent fragment.",
+            val: Val::Int(10),
+        },
+        Def {
+            name: "SHIFT_MICRO_X",
+            doc: "Packed vertex word 1: x micro-offset shift. 2-bit two's complement, -2..=1;\nnudges vertices on double-covered LOD borders to break z-fighting.",
+            val: Val::Int(11),
+        },
+        Def {
+            name: "SHIFT_MICRO_Y",
+            doc: "Packed vertex word 1: y micro-offset shift. See SHIFT_MICRO_X.",
+            val: Val::Int(13),
+        },
+        Def {
+            name: "SHIFT_MICRO_Z",
+            doc: "Packed vertex word 1: z micro-offset shift. See SHIFT_MICRO_X.",
+            val: Val::Int(15),
+        },
+        Def {
+            name: "SHIFT_MORPH",
+            doc: "Packed vertex word 1: LOD morph target shift. 6-bit two's complement,\n-31..=31 cells along local +Y. Decoded by lod_morph.slang.",
+            val: Val::Int(17),
+        },
+        Def {
+            name: "MASK_COORD",
+            doc: "Packed vertex coordinate mask (5 bits). Holds 0..=16; 17..=31 store without\ncorrupting a neighbour.",
+            val: Val::UInt(0x1F),
+        },
+        Def {
+            name: "MASK_NORMAL",
+            doc: "Packed vertex face-normal index mask (3 bits).",
+            val: Val::UInt(0x7),
+        },
+        Def {
+            name: "MASK_LAYER",
+            doc: "Packed vertex texture-array layer mask (14 bits, 16384 layers).",
+            val: Val::UInt(0x3FFF),
+        },
+        Def {
+            name: "MASK_AO",
+            doc: "Packed vertex AO-level mask (2 bits).",
+            val: Val::UInt(0x3),
+        },
+        Def {
+            name: "MASK_LIGHT",
+            doc: "Packed vertex skylight / blocklight mask (4 bits).",
+            val: Val::UInt(0xF),
+        },
+        Def {
+            name: "MASK_MICRO",
+            doc: "Packed vertex per-axis micro-offset mask (2 bits). The shaders sign-extend\nwith `int(w1 << (30 - SHIFT_MICRO_*)) >> 30`; 30 = 32 - 2.",
+            val: Val::UInt(0x3),
+        },
+        Def {
+            name: "MASK_MORPH",
+            doc: "Packed vertex morph-target mask (6 bits). lod_morph.slang sign-extends with\n`int(w1 << (26 - SHIFT_MORPH)) >> 26`; 26 = 32 - 6.",
+            val: Val::UInt(0x3F),
+        },
+        Def {
+            name: "AO_MIN",
+            doc: "Baked AO level-0 diffuse multiplier: ao_factor = AO_MIN + level * AO_STEP,\nlevels 0..=3 -> 0.4..=1.0 (3 = no occlusion). Read by mesh3d.vert.",
+            val: Val::Scalar(0.4),
+        },
+        Def {
+            name: "AO_STEP",
+            doc: "Baked AO multiplier step per level. See AO_MIN.",
+            val: Val::Scalar(0.2),
         },
         // Sun disc core/rim radii, tuned to match the sun's real angular size.
         Def {
@@ -1441,7 +1627,7 @@ fn emit_rust(defs: &[Def]) -> String {
             Val::Scalar(x) => {
                 s.push_str(&format!("pub const {}: f32 = {};\n\n", d.name, lit(*x)));
             }
-            Val::UInt(x) => {
+            Val::UInt(x) | Val::Int(x) => {
                 s.push_str(&format!("pub const {}: u32 = {};\n\n", d.name, x));
             }
             Val::Arr(v) => {
@@ -1493,6 +1679,9 @@ fn emit_slang(defs: &[Def]) -> String {
             }
             Val::UInt(x) => {
                 s.push_str(&format!("static const uint {} = {};\n\n", d.name, x));
+            }
+            Val::Int(x) => {
+                s.push_str(&format!("static const int {} = {};\n\n", d.name, x));
             }
             Val::Arr(v) => {
                 s.push_str(&format!(

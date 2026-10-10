@@ -10,9 +10,10 @@
 
 float lod_morph_cells(uint w1, uint detail, int3 block, float3 q)
 {
-    // Bits [17:23) of w1, 6-bit two's complement. Twin of MeshVertex::morph:
-    // `<< 9` parks bit 22 on the sign, `>> 26` brings bit 17 down to bit 0.
-    int dy = int(w1 << 9) >> 26;
+    // Bits [17:23) of w1, 6-bit two's complement (SHIFT_MORPH, MASK_MORPH).
+    // Twin of MeshVertex::morph: `<< (26 - SHIFT_MORPH)` parks bit 22 on the
+    // sign, `>> 26` brings bit 17 down to bit 0.
+    int dy = int(w1 << (26 - SHIFT_MORPH)) >> 26;
     if (dy == 0)
         return 0.0;
     int k = int(detail & ((1u << DETAIL_GPU_BITS) - 1u)) - int(DETAIL_GPU_BIAS);

@@ -64,12 +64,8 @@ pub fn jitter_at(frame_index: u64) -> JitterOffset {
 /// History format matches the HDR target (linear, not sRGB).
 pub const TAA_HISTORY_FORMAT: ash::vk::Format = ash::vk::Format::R16G16B16A16_SFLOAT;
 
-/// Legacy compute-pass bindings, kept for the public `skeleton` re-export.
-/// The fused tonemap set is HDR=0, spill=1, history=2, depth=3.
-pub const TAA_RESOLVE_CURRENT_BINDING: u32 = 0;
-pub const TAA_RESOLVE_HISTORY_BINDING: u32 = 1;
-
-/// Fused tonemap descriptor bindings (`layout_tonemap_taa`).
+/// Fused tonemap descriptor bindings (`layout_tonemap_taa`):
+/// HDR=0, spill=1, history=2, depth=3.
 pub(crate) const TONEMAP_TAA_HDR_BINDING: u32 = 0;
 pub(crate) const TONEMAP_TAA_SPILL_BINDING: u32 = 1;
 pub(crate) const TONEMAP_TAA_HISTORY_BINDING: u32 = 2;
