@@ -15,10 +15,10 @@ use super::gpu_timer::{GpuPass, PipeStatPass};
 use super::materials::MATERIAL_CONSUMER_STAGES;
 use super::pipeline;
 use super::present::{HdrReadable, OverlayPresent};
-use super::scene_pass::RenderPass;
+use super::scene_pass::{HdrFinalize, RenderPass, SceneInputs, ScenePlan, scene_plan};
 use super::timeline::{RenderSubmit, acquire_next_image};
 use super::transfer::TransferCtx;
-use super::{Env, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, SceneDepthUse, scene_depth_use};
+use super::{Env, Renderer, SAMPLEABLE_DEPTH_REST_LAYOUT, SceneDepthUse};
 
 pub(crate) use super::draw_prep::{DrawEntry, DrawRun, ImmOffsets};
 use super::submit::fold_transfer_wait;
@@ -187,10 +187,21 @@ impl Renderer {
             offsets
         };
 
+        // Project the sun to presented uv for the spill-pass godray march.
+        // Computed here (not in the copy submit) so it rides the same camera +
+        // frame-uniform snapshot the scene was drawn from — and so the bloom
+        // chain (same submit as the spill dispatch) sees the same values.
+        // `project` returns a strength-0 no-op when godrays are off, the sun
+        // is behind the camera, or there is no 3D camera this frame.
+        let godray = project_godray(self, lists);
+        // Every scene-pass decision this frame, made once.
+        let plan =
+            scene_plan(self.gather_scene_input(slot, lists, present_target.is_some(), &godray));
+
         // Far-body table (sky set 0 binding 2). Same slot fence as the UBO.
         // A sky with no bodies still uploads a zero count so the binding is live.
         // The pack also returns the horizon-dip sine the UBO stamps below.
-        let horizon_dip = if sky_drawn(&self.flags, lists) {
+        let horizon_dip = if plan.sky {
             let view = lists.scene.as_ref().map(|scene| {
                 super::far_bodies::far_view(
                     scene.fovy_tan_half,
@@ -275,24 +286,9 @@ impl Renderer {
             .scene
             .as_ref()
             .map_or(crate::camera::WarpMap::Identity, |s| s.warp_map);
-        // Project the sun to presented uv for the spill-pass godray march.
-        // Computed here (not in the copy submit) so it rides the same camera +
-        // frame-uniform snapshot the scene was drawn from — and so the bloom
-        // chain (same submit as the spill dispatch) sees the same values.
-        // `project` returns a strength-0 no-op when godrays are off, the sun
-        // is behind the camera, or there is no 3D camera this frame.
-        let godray = project_godray(self, lists);
-        let spill_live = self.flags.bloom || godray.strength > 0.0;
         let (rs, hdr_readable) = {
             let _p = scope(Meter::Record);
-            self.record_render(
-                &guard,
-                lists,
-                offsets,
-                present_target.is_some(),
-                warp_map,
-                godray,
-            )
+            self.record_render(&guard, lists, offsets, plan, warp_map, godray)
         };
 
         {
@@ -330,7 +326,7 @@ impl Renderer {
                 warp_map,
                 overlay,
                 hdr_readable,
-                spill_live,
+                plan.spill_live,
                 taa,
             );
         }
@@ -541,13 +537,56 @@ impl Renderer {
         }
         present_target
     }
+
+    /// Reads [`scene_plan`]'s inputs. Called once per frame by `draw_frame`
+    /// after `prepare_blend_draws` filled `draw_runs` and before anything is
+    /// recorded; nothing read here changes before the scene pass.
+    fn gather_scene_input(
+        &self,
+        slot: usize,
+        lists: &DrawLists,
+        present: bool,
+        godray: &crate::camera::Godray,
+    ) -> SceneInputs {
+        let s = &self.slots[FrameSlot::new(slot)];
+        SceneInputs {
+            scene: lists.scene.is_some(),
+            present,
+            sky: sky_drawn(&self.flags, lists),
+            vrs: self.flags.vrs && self.targets.vrs.is_some(),
+            classified: s.vrs_ready,
+            // MSAA with the sample-0 classifier: frames where VRS is the only
+            // depth consumer read the stored MS depth and skip the resolve.
+            classify_ms: self.targets.msaa.is_some()
+                && self
+                    .pipelines
+                    .vrs_compute
+                    .as_ref()
+                    .is_some_and(|c| c.pipeline_ms.is_some()),
+            taa: self.flags.taa,
+            exposure: self.flags.exposure,
+            spill_live: self.flags.bloom || godray.strength > 0.0,
+            // Absorb stores this frame's depth so the *next* frame can sample
+            // it. Known here because `prepare_blend_draws` already filled
+            // `draw_runs`.
+            absorb: self.pipelines.mesh3d_transparent_absorb.is_some()
+                && self.draw_runs.iter().any(|run| run.pass == Pass::Blend),
+            // Compile-time equivalent of every optional lighting lane off
+            // and fog off.
+            mesh_lean: super::uniforms::mesh_lean(&self.flags),
+            prev_depth_valid: self.prev_depth.valid(slot, self.render_extent),
+            depth_sampled: self.prev_depth.sampled(slot),
+            ms_depth_read: s.vrs_ms_depth_read,
+        }
+    }
+
     /// Records the command buffer: mesh copies, render pass, and transitions.
     fn record_render(
         &mut self,
         guard: &SlotGuard,
         lists: &DrawLists,
         offsets: ImmOffsets,
-        will_present: bool,
+        plan: ScenePlan,
         warp_map: crate::camera::WarpMap,
         godray: crate::camera::Godray,
     ) -> (RenderSubmit, HdrReadable) {
@@ -783,7 +822,7 @@ impl Renderer {
 
         // Cloud LUT: march (or zero) before the scene pass so the sky fragment
         // has a sampled image. Skipped when there is no sky.
-        if sky_drawn(&self.flags, lists) {
+        if plan.sky {
             let u = lists.lit_uniforms();
             self.record_sky_cloud_lut(
                 cmd,
@@ -794,52 +833,20 @@ impl Renderer {
             );
         }
 
-        // Bind the rate image classified at the end of this slot's previous
-        // use (`FRAMES_IN_FLIGHT` frames ago) — the same staleness the old
-        // begin-of-frame classify accepted. First scene pass after
-        // create/recreate skips VRS (`vrs_ready` is false); we still classify
-        // at end so the next use is primed.
-        let vrs_on = lists.scene.is_some() && self.flags.vrs && self.targets.vrs.is_some();
-        let do_vrs = vrs_on && self.slots[FrameSlot::new(slot)].vrs_ready;
-        let classify_vrs = vrs_on;
-        // Depth consumers after the scene pass, computed once: VRS classify,
-        // spill/godrays (presented + bloom or a live march), fused TAA.
-        let spill_live = self.flags.bloom || godray.strength > 0.0;
-        // Absorb stores this frame's depth so the *next* frame can sample it.
-        // Known here because `prepare_blend_draws` already filled `draw_runs`.
-        let absorb_this_frame = self.pipelines.mesh3d_transparent_absorb.is_some()
-            && self.draw_runs.iter().any(|run| run.pass == Pass::Blend);
-        // MSAA with the sample-0 classifier: frames where VRS is the only
-        // depth consumer read the stored MS depth and skip the resolve.
-        let classify_ms = self.targets.msaa.is_some()
-            && self
-                .pipelines
-                .vrs_compute
-                .as_ref()
-                .is_some_and(|c| c.pipeline_ms.is_some());
-        let depth_use = scene_depth_use(
-            classify_ms,
-            will_present,
-            self.flags.taa,
-            spill_live,
-            classify_vrs,
-            absorb_this_frame,
-        );
-        // WAR on the MS depth: this slot's previous classify read it.
-        let ms_depth_read = self.slots[FrameSlot::new(slot)].vrs_ms_depth_read;
-        // Lean opaque/LOD fragments: compile-time equivalent of every optional
-        // lighting lane off and fog off. Chosen once per frame from flags.
-        let mesh_lean = super::uniforms::mesh_lean(&self.flags);
-        // HDR colour is only read by bloom/exposure/spill/tonemap, all of which
-        // run on presented frames. Minimap is a separate texture; screenshots
-        // copy the swapchain after tonemap; VRS classify reads depth not colour.
-
-        let prev_valid = self.prev_depth.valid(slot, self.render_extent);
+        // This slot's begin barrier covers the reads of its depth since its
+        // last pass (`plan.depth_src`): consume them. Water absorption samples
+        // the previous slot's depth, or the dummy when that is invalid.
         let depth_sampled = self.prev_depth.begin_slot(slot);
-        if absorb_this_frame && !prev_valid {
+        debug_assert_eq!(
+            depth_sampled,
+            plan.depth_src
+                .contains(vk::PipelineStageFlags2::FRAGMENT_SHADER),
+            "the plan read this slot's depth state this frame",
+        );
+        if plan.absorb && !plan.prev_depth_valid {
             self.ensure_prev_depth_dummy(cmd);
         }
-        if absorb_this_frame && prev_valid {
+        if plan.absorb && plan.prev_depth_valid {
             self.prev_depth
                 .mark_sampled(super::PrevDepthTrack::prev_slot(slot));
         }
@@ -852,22 +859,7 @@ impl Renderer {
         };
         let pass = {
             let _g = crate::profile::scope(crate::profile::Meter::RecTransitions);
-            unsafe {
-                RenderPass::begin(
-                    self,
-                    cmd,
-                    slot,
-                    lists,
-                    offsets,
-                    do_vrs,
-                    depth_use,
-                    will_present,
-                    absorb_this_frame,
-                    depth_sampled,
-                    ms_depth_read,
-                    mesh_lean,
-                )
-            }
+            unsafe { RenderPass::begin(self, cmd, slot, lists, offsets, plan) }
         };
         if lists.scene.is_none() {
             crate::profile::gauge(crate::profile::Gauge::CallsFull, 0);
@@ -901,7 +893,7 @@ impl Renderer {
                         self.pipe_stats
                             .begin_pass(device, cmd, slot, PipeStatPass::Sky);
                     }
-                    if sky_drawn(&self.flags, lists) {
+                    if plan.sky {
                         pass.record_sky();
                     }
                     if profiling {
@@ -936,76 +928,62 @@ impl Renderer {
                 stamp(GpuPass::Transparent);
             }
         }
-        // The offscreen HDR must reach SHADER_READ_ONLY before the tonemap
-        // present copy samples it. `end` performs that COLOR_ATTACHMENT→
-        // SHADER_READ barrier UNLESS a later offscreen writer runs after it:
-        // exposure metering writes after `end` (it owns the finalize). TAA no
-        // longer writes the offscreen — it resolves in the present-time tonemap
-        // — so TAA-on is the same finalize path as TAA-off. Bloom and exposure
-        // metering feed only the tonemap present-copy, so they run solely on
-        // frames that will present (`decide_present` already ran; forced capture
-        // always presents).
-        let run_exposure = lists.scene.is_some() && self.flags.exposure && will_present;
         // Overlay is drawn in the present copy (`GpuTonemap`); this scene-pass
         // stamp stays so the report still lists overlay, and accounts 0.
         stamp(GpuPass::Overlay);
-        // Finalize the offscreen to SHADER_READ_ONLY exactly once and obtain the
-        // [`HdrReadable`] proof the tonemap present-copy requires. The branches
-        // are exhaustive: (a) exposure on + presenting → metering owns the
-        // transition; (b) presenting without exposure → the render pass
-        // finalizes; (c) unpresented → skip the sampled transition.
+        // The offscreen HDR must reach SHADER_READ_ONLY exactly once before the
+        // tonemap present copy samples it, and the copy requires the
+        // [`HdrReadable`] proof (`plan.hdr`): (a) exposure on + presenting →
+        // metering writes after `end` and owns the transition; (b) presenting
+        // without exposure → `end` finalizes; (c) unpresented → skip the
+        // sampled transition. TAA no longer writes the offscreen — it resolves
+        // in the present-time tonemap — so TAA-on is the same finalize path as
+        // TAA-off. Every branch ends the pass, stamps `Resolve` and classifies
+        // VRS, in that order; metering runs after the classify.
         let readable: HdrReadable = {
             let _g = crate::profile::scope(crate::profile::Meter::RecTransitions);
-            if run_exposure {
-                unsafe { pass.end_deferred(classify_vrs) };
-                stamp(GpuPass::Resolve);
-                self.finish_vrs_classify(cmd, slot, classify_vrs, depth_use, lists);
-                // Reduce the (jittered, unresolved) frame HDR to per-tile mean
-                // log2-luma, publish the smoothed exposure, and finalize the HDR
-                // in SHADER_READ. Metering the unresolved image is acceptable:
-                // it is spatial and low-frequency.
-                let readable = self.record_exposure_pass(cmd, FrameSlot::new(slot));
-                if profiling {
-                    unsafe {
-                        self.gpu_timer.recorded(slot);
-                        self.gpu_timer
-                            .mark(&self.device.device, cmd, slot, GpuPass::Exposure)
-                    };
+            let finalized = unsafe { pass.end() };
+            stamp(GpuPass::Resolve);
+            self.finish_vrs_classify(cmd, slot, plan, lists);
+            match plan.hdr {
+                HdrFinalize::Exposure => {
+                    // Reduce the (jittered, unresolved) frame HDR to per-tile
+                    // mean log2-luma, publish the smoothed exposure, and
+                    // finalize the HDR in SHADER_READ. Metering the unresolved
+                    // image is acceptable: it is spatial and low-frequency.
+                    let readable = self.record_exposure_pass(cmd, FrameSlot::new(slot));
+                    if profiling {
+                        unsafe {
+                            self.gpu_timer.recorded(slot);
+                            self.gpu_timer
+                                .mark(&self.device.device, cmd, slot, GpuPass::Exposure)
+                        };
+                    }
+                    readable
                 }
-                readable
-            } else if will_present {
-                let readable = unsafe { pass.end_sampled(classify_vrs) };
-                if profiling {
-                    unsafe {
-                        self.gpu_timer
-                            .mark(&self.device.device, cmd, slot, GpuPass::Resolve)
-                    };
-                }
-                self.finish_vrs_classify(cmd, slot, classify_vrs, depth_use, lists);
-                readable
-            } else {
-                // Unpresented, no later HDR writer: skip the sampled transition;
+                // Pass: `end` finalized and returned the proof. Skip
+                // (unpresented, no later HDR writer): no sampled transition;
                 // the next begin discards the offscreen from UNDEFINED. Depth
                 // rests only when this frame samples it (classifier: the MS
                 // depth under MSAA unless absorb needs the resolve); a later
                 // present uses a different slot's depth.
-                unsafe { pass.end_deferred(classify_vrs) };
-                stamp(GpuPass::Resolve);
-                self.finish_vrs_classify(cmd, slot, classify_vrs, depth_use, lists);
-                HdrReadable::new(slot)
+                HdrFinalize::Pass | HdrFinalize::Skip => {
+                    finalized.unwrap_or_else(|| HdrReadable::new(slot))
+                }
             }
         };
         // Water absorption sees only the sampleable depth: a classify-only
         // MSAA frame stored the MS depth, not the resolve.
         self.prev_depth
-            .finish(slot, depth_use.sampleable_stored(), self.render_extent);
-        self.slots[FrameSlot::new(slot)].vrs_ms_depth_read = depth_use == SceneDepthUse::ClassifyMs;
+            .finish(slot, plan.depth_use.sampleable_stored(), self.render_extent);
+        self.slots[FrameSlot::new(slot)].vrs_ms_depth_read =
+            plan.depth_use == SceneDepthUse::ClassifyMs;
         // Bloom pyramid + quarter-res spill (bloom composite + godrays). The
         // tonemap present-copy takes one bilinear tap of the spill. Present-only
         // — a dropped mailbox frame never samples either image. Forced capture
         // always presents, so it always gets a fresh chain. The GPU timer's
         // `Bloom` span covers this whole tail (pyramid + spill) when it ran.
-        let bloom_work = if will_present {
+        let bloom_work = if plan.present {
             self.record_bloom_pass(cmd, FrameSlot::new(slot), warp_map, godray)
         } else {
             false
@@ -1072,11 +1050,10 @@ impl Renderer {
         &mut self,
         cmd: vk::CommandBuffer,
         slot: usize,
-        classify: bool,
-        depth_use: SceneDepthUse,
+        plan: ScenePlan,
         lists: &DrawLists,
     ) {
-        if !classify {
+        if !plan.vrs.classifies() {
             return;
         }
         let scene = lists
@@ -1085,7 +1062,7 @@ impl Renderer {
             .expect("classify_vrs implies a 3D scene");
         let focal_px = 0.5 * self.render_extent.height as f32 / scene.fovy_tan_half.max(1e-4);
         let d_threshold = crate::camera::Z_NEAR / focal_px;
-        let depth_ms = depth_use == SceneDepthUse::ClassifyMs;
+        let depth_ms = plan.depth_use == SceneDepthUse::ClassifyMs;
         unsafe { self.record_vrs_generate(cmd, slot, d_threshold, depth_ms) };
         if crate::profile::is_enabled() {
             unsafe {

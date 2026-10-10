@@ -144,6 +144,11 @@ impl PrevDepthTrack {
         self.stored[p] && self.extent[p] == Some((extent.width, extent.height))
     }
 
+    /// A later frame sampled this slot's stored depth (not consumed).
+    pub(super) fn sampled(&self, slot: usize) -> bool {
+        self.sampled[slot]
+    }
+
     /// Consume the WAR bit for this slot's previous life. True → begin-of-frame
     /// depth transition src must include `FRAGMENT_SHADER`.
     pub(super) fn begin_slot(&mut self, slot: usize) -> bool {
